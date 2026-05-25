@@ -36,6 +36,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: magic-context-windows-build
-          # Adjust this path if the build outputs to 'out/' or another directory instead of 'dist/'
-          path: dist/ 
+          path: |
+            packages/plugin/dist/
+            packages/pi-plugin/dist/
+            packages/cli/dist/
           retention-days: 7
