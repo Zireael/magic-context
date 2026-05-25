@@ -1,0 +1,41 @@
+name: Windows Build
+
+on:
+  push:
+    branches:
+      - "fix/issue-97-multiplying-numbers"
+  pull_request:
+    branches:
+      - "fix/issue-97-multiplying-numbers"
+  workflow_dispatch: # Allows you to manually trigger the build from the Actions tab
+
+jobs:
+  build-windows:
+    name: Build on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Ensures it explicitly targets the branch you are working on
+          ref: fix/issue-97-multiplying-numbers
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Compile the project
+        run: bun run build
+
+      - name: Upload compiled plugin as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: magic-context-windows-build
+          # Adjust this path if the build outputs to 'out/' or another directory instead of 'dist/'
+          path: dist/ 
+          retention-days: 7
