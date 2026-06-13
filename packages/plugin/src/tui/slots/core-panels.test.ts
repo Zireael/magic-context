@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
     renderDetailsPanel,
     renderFlushPanel,
+    renderMemoryPanel,
     renderModePanel,
     renderStatusPanel,
     type SidebarSnapshot,
@@ -205,5 +206,95 @@ describe("visual fixtures", () => {
         const status = renderStatusPanel(snap);
         expect(details.title).toBeTruthy();
         expect(status.title).toBeTruthy();
+    });
+});
+
+describe("renderMemoryPanel", () => {
+    it("renders memory section with counts", () => {
+        const snap = makeSnapshot({ memoryCount: 10, memoryTokens: 5000 });
+        const panel = renderMemoryPanel(snap);
+        expect(panel.title).toBe("Memory / Maintenance");
+        const memSection = panel.sections.find((s) => s.heading === "Memory");
+        expect(memSection).toBeTruthy();
+        expect(memSection!.rows.length).toBeGreaterThan(0);
+    });
+
+    it("shows smart notes when present", () => {
+        const snap = makeSnapshot({ readySmartNoteCount: 3 });
+        const panel = renderMemoryPanel(snap);
+        const memSection = panel.sections.find((s) => s.heading === "Memory");
+        const smartRow = memSection!.rows.find((r) => r.label === "Smart notes");
+        expect(smartRow).toBeTruthy();
+        expect(smartRow!.value).toContain("3");
+    });
+
+    it("shows user profile tokens when present", () => {
+        const snap = makeSnapshot({ profileTokens: 2000 });
+        const panel = renderMemoryPanel(snap);
+        const memSection = panel.sections.find((s) => s.heading === "Memory");
+        const profileRow = memSection!.rows.find((r) => r.label === "User profile");
+        expect(profileRow).toBeTruthy();
+    });
+
+    it("shows empty state for fresh session", () => {
+        const snap = makeSnapshot({
+            memoryCount: 0,
+            memoryTokens: 0,
+            readySmartNoteCount: 0,
+            profileTokens: 0,
+            compartmentCount: 0,
+        });
+        const panel = renderMemoryPanel(snap);
+        const memSection = panel.sections.find((s) => s.heading === "Memory");
+        expect(memSection!.rows[0].value).toContain("No memories");
+    });
+
+    it("shows Dreamer last run", () => {
+        const snap = makeSnapshot({ lastDreamerRunAt: Date.now() - 300_000 });
+        const panel = renderMemoryPanel(snap);
+        const dreamerSection = panel.sections.find((s) => s.heading === "Dreamer");
+        expect(dreamerSection).toBeTruthy();
+        expect(dreamerSection!.rows[0].value).toBeTruthy();
+    });
+
+    it("shows Dreamer never run", () => {
+        const snap = makeSnapshot({ lastDreamerRunAt: null });
+        const panel = renderMemoryPanel(snap);
+        const dreamerSection = panel.sections.find((s) => s.heading === "Dreamer");
+        expect(dreamerSection!.rows[0].value).toBe("never");
+    });
+
+    it("shows Dreamer stale warning", () => {
+        const snap = makeSnapshot({ lastDreamerRunAt: Date.now() - 2 * 60 * 60 * 1000 });
+        const panel = renderMemoryPanel(snap);
+        const dreamerSection = panel.sections.find((s) => s.heading === "Dreamer");
+        const statusRow = dreamerSection!.rows.find((r) => r.label === "Status");
+        expect(statusRow?.warning).toBe(true);
+    });
+
+    it("shows Historian running", () => {
+        const snap = makeSnapshot({ historianRunning: true });
+        const panel = renderMemoryPanel(snap);
+        const histSection = panel.sections.find((s) => s.heading === "Historian");
+        expect(histSection!.rows[0].value).toContain("running");
+        expect(histSection!.rows[0].warning).toBe(true);
+    });
+
+    it("shows Historian failed", () => {
+        const snap = makeSnapshot({
+            recompProgress: { phase: "failed", processedMessages: 0, totalMessages: 0, passCount: 0, compartmentsCreated: 0 },
+        });
+        const panel = renderMemoryPanel(snap);
+        const histSection = panel.sections.find((s) => s.heading === "Historian");
+        expect(histSection!.rows[0].value).toBe("failed");
+    });
+
+    it("shows pending drops", () => {
+        const snap = makeSnapshot({ pendingOpsCount: 5 });
+        const panel = renderMemoryPanel(snap);
+        const histSection = panel.sections.find((s) => s.heading === "Historian");
+        const dropsRow = histSection!.rows.find((r) => r.label === "Pending drops");
+        expect(dropsRow).toBeTruthy();
+        expect(dropsRow!.warning).toBe(true);
     });
 });
