@@ -366,6 +366,91 @@ const RecompProgressSection = (props: {
     )
 }
 
+// Dense collapsed strip component
+const DenseCollapsedStrip = (props: {
+    snapshot: SidebarSnapshot
+    theme: TuiThemeCurrent
+}) => {
+    // Import renderDenseStrip from dense-strip module
+    const { renderDenseStrip, toDenseStripSnapshot, compactTokens } = require("./dense-strip")
+    const { classifyRisk } = require("./risk-classifier")
+    const { renderCacheRow } = require("./cache-telemetry")
+
+    const denseSnap = toDenseStripSnapshot(props.snapshot)
+    const strip = renderDenseStrip(denseSnap)
+    const risk = classifyRisk({ snapshot: props.snapshot })
+
+    // Build top row with capacity and risk info
+    const capacity = compactTokens(props.snapshot.contextLimit || props.snapshot.inputTokens)
+    const topParts = [capacity]
+
+    if (props.snapshot.historianRunning || props.snapshot.compartmentInProgress) {
+        topParts.push("HIST↻")
+    }
+    if (props.snapshot.pendingOpsCount > 0) {
+        topParts.push(`Q${props.snapshot.pendingOpsCount}`)
+    }
+    if (props.snapshot.usagePercentage >= 80) {
+        topParts.push("T!")
+    }
+    if (props.snapshot.usagePercentage > 100) {
+        topParts.push("OVERFLOW")
+    } else if (props.snapshot.contextLimit > 0) {
+        const free = props.snapshot.contextLimit - props.snapshot.inputTokens
+        if (free > 0 && topParts.length === 1) {
+            topParts.push(`${compactTokens(free)} free`)
+        }
+    }
+    if (topParts.length === 1 && risk.flags.length === 0 && !risk.processChip) {
+        topParts.push("OK")
+    }
+
+    const topRow = topParts.join(" · ")
+
+    // Build bar row
+    const barWidth = 12
+    const total = props.snapshot.contextLimit || props.snapshot.inputTokens || 1
+    const categories = []
+    if (props.snapshot.systemPromptTokens > 0) categories.push({ tokens: props.snapshot.systemPromptTokens, glyph: "█" })
+    if (props.snapshot.toolDefinitionTokens > 0) categories.push({ tokens: props.snapshot.toolDefinitionTokens, glyph: "█" })
+    if (props.snapshot.docsTokens > 0) categories.push({ tokens: props.snapshot.docsTokens, glyph: "▒" })
+    if (props.snapshot.compartmentTokens > 0) categories.push({ tokens: props.snapshot.compartmentTokens, glyph: "▒" })
+    if (props.snapshot.memoryTokens > 0) categories.push({ tokens: props.snapshot.memoryTokens, glyph: "█" })
+    if (props.snapshot.profileTokens > 0) categories.push({ tokens: props.snapshot.profileTokens, glyph: "█" })
+    if (props.snapshot.conversationTokens > 0) categories.push({ tokens: props.snapshot.conversationTokens, glyph: "▒" })
+    if (props.snapshot.toolCallTokens > 0) categories.push({ tokens: props.snapshot.toolCallTokens, glyph: "░" })
+
+    let bar = ""
+    for (const cat of categories) {
+        const width = Math.max(1, Math.round((cat.tokens / total) * barWidth))
+        bar += cat.glyph.repeat(width)
+    }
+    bar = bar.slice(0, barWidth)
+    if (props.snapshot.usagePercentage >= props.snapshot.executeThreshold && bar.length > 0) {
+        const pos = Math.min(Math.round((props.snapshot.executeThreshold / 100) * barWidth), bar.length - 1)
+        bar = `${bar.slice(0, pos)}|${bar.slice(pos + 1)}`
+    }
+    if (props.snapshot.usagePercentage > 100 && bar.length > 0) {
+        bar = `${bar.slice(0, -1)}>`
+    }
+    const barRow = `${bar.padEnd(barWidth)} ${props.snapshot.usagePercentage.toFixed(0)}%`
+
+    // Build action row
+    const actions = ["[D]", "[S]", "[A]"]
+    if (props.snapshot.pendingOpsCount > 0) {
+        actions.push(`[F]${props.snapshot.pendingOpsCount}`)
+    }
+    const actionRow = actions.join(" ")
+
+    return (
+        <box width="100%" flexDirection="column">
+            <text fg={props.theme.text}>{topRow}</text>
+            <text fg={props.theme.text}>{barRow}</text>
+            <text fg={props.theme.textMuted}>{actionRow}</text>
+        </box>
+    )
+}
+
 const SidebarContent = (props: {
     api: TuiPluginApi
     sessionID: () => string
@@ -663,7 +748,7 @@ const SidebarContent = (props: {
             {/* Collapsed view — progress bar (above) + 3 summary lines:
                 Historian (with compartment count), Memories (injected/total),
                 Status (Q=queued ops, N=session notes). */}
-            {collapsed() && (
+            {collapsed() && isClassicCollapsed() && (
                 <box width="100%" flexDirection="column">
                     {/* Collapsed rows are intentionally uniform faded-grey, not
                         bold/accent — they're a glanceable summary, so the label
@@ -694,6 +779,14 @@ const SidebarContent = (props: {
                         <RecompProgressSection theme={props.theme} progress={s()!.recompProgress!} />
                     )}
                 </box>
+            )}
+
+            {/* Dense collapsed view — instrument strip */}
+            {collapsed() && isDenseCollapsed() && s() && (
+                <DenseCollapsedStrip
+                    snapshot={s()!}
+                    theme={props.theme}
+                />
             )}
 
             {/* Expanded view — full section grid. */}
