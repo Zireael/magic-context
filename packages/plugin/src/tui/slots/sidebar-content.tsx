@@ -4,6 +4,12 @@ import type { TuiSlotPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/
 import packageJson from "../../../package.json"
 import { loadSidebarSnapshot, type SidebarSnapshot } from "../data/context-db"
 import { formatThresholdPercent } from "../../shared/format-threshold"
+import {
+    resolveDisplayMode,
+    persistDisplayMode,
+    parseConfigDisplayMode,
+    type SidebarDisplayMode,
+} from "./display-mode"
 
 // Module-level hook so the upgrade/recomp dialog can kick the sidebar into its
 // fast recomp self-poll the INSTANT the user confirms — without waiting for a
@@ -365,10 +371,28 @@ const SidebarContent = (props: {
     theme: TuiThemeCurrent
 }) => {
     const [snapshot, setSnapshot] = createSignal<SidebarSnapshot | null>(null)
-    // Collapsed view: progress bar + 3 summary lines (Historian / Memories /
-    // Status), no per-category legend or section grid. In-memory only (resets
-    // to expanded on TUI restart), mirroring the native MCP sidebar toggle.
-    const [collapsed, setCollapsed] = createSignal(false)
+    // Display mode: expanded, classic_collapsed, or dense_collapsed.
+    // Resolves from persisted user choice or config default (classic_collapsed).
+    const directory = props.api.state.path.directory ?? ""
+    const [displayMode, setDisplayMode] = createSignal<SidebarDisplayMode>(
+        resolveDisplayMode(directory),
+    )
+    // Derived convenience signals for backward compatibility with existing renders
+    const collapsed = () => displayMode() !== "expanded"
+    const isClassicCollapsed = () => displayMode() === "classic_collapsed"
+    const isDenseCollapsed = () => displayMode() === "dense_collapsed"
+    // Switch display mode and persist the choice
+    const switchMode = (mode: SidebarDisplayMode) => {
+        setDisplayMode(mode)
+        persistDisplayMode(directory, mode)
+    }
+    // Cycle through modes: expanded → classic_collapsed → dense_collapsed → expanded
+    const cycleMode = () => {
+        const current = displayMode()
+        if (current === "expanded") switchMode("classic_collapsed")
+        else if (current === "classic_collapsed") switchMode("dense_collapsed")
+        else switchMode("expanded")
+    }
     let refreshTimer: ReturnType<typeof setTimeout> | undefined
     // Self-sustaining poll while a recomp/upgrade is running. Recomp work
     // happens in CHILD sessions whose message events are filtered out of the
@@ -584,14 +608,12 @@ const SidebarContent = (props: {
             paddingLeft={1}
             paddingRight={1}
         >
-            {/* Header: triangle toggle + badge + version. Clicking the row
-                collapses/expands the panel (mirrors OpenCode's native MCP
-                sidebar section and AFT's sidebar). */}
+            {/* Header: mode indicator + badge + version. Clicking cycles display mode. */}
             <box
                 flexDirection="row"
                 justifyContent="space-between"
                 alignItems="center"
-                onMouseDown={() => setCollapsed((x) => !x)}
+                onMouseDown={cycleMode}
             >
                 <box paddingLeft={1} paddingRight={1} backgroundColor={props.theme.accent}>
                     <text fg={props.theme.background}>
