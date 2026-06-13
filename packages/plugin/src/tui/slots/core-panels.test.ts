@@ -6,8 +6,10 @@ import {
     renderModePanel,
     renderSettingsPanel,
     renderStatusPanel,
+    renderThemeSettingsPanel,
     type SettingsPanelInput,
     type SidebarSnapshot,
+    type ThemeSettingsInput,
 } from "./core-panels";
 
 function makeSnapshot(overrides: Partial<SidebarSnapshot> = {}): SidebarSnapshot {
@@ -383,5 +385,65 @@ describe("renderSettingsPanel", () => {
         const updateRow = versionSection!.rows.find((r) => r.label === "Update");
         expect(updateRow!.value).toBe("unknown");
         expect(updateRow!.dim).toBe(true);
+    });
+});
+
+function makeThemeSettingsInput(overrides: Partial<ThemeSettingsInput> = {}): ThemeSettingsInput {
+    return {
+        themeSource: "follow_opencode",
+        colorOverrides: {},
+        ...overrides,
+    };
+}
+
+describe("renderThemeSettingsPanel", () => {
+    it("renders theme source options", () => {
+        const panel = renderThemeSettingsPanel(makeThemeSettingsInput());
+        expect(panel.title).toBe("Theme Settings");
+        const sourceSection = panel.sections.find((s) => s.heading === "Theme Source");
+        expect(sourceSection).toBeTruthy();
+        expect(sourceSection!.rows.length).toBe(5);
+    });
+
+    it("highlights active theme source", () => {
+        const panel = renderThemeSettingsPanel(makeThemeSettingsInput({ themeSource: "magic_default" }));
+        const sourceSection = panel.sections.find((s) => s.heading === "Theme Source");
+        const magicRow = sourceSection!.rows.find((r) => r.label === "Magic Default");
+        expect(magicRow!.accent).toBe(true);
+        expect(magicRow!.value).toBe("●");
+    });
+
+    it("shows OpenCode theme name when following", () => {
+        const panel = renderThemeSettingsPanel(makeThemeSettingsInput({
+            themeSource: "follow_opencode",
+            openCodeThemeName: "catppuccin",
+        }));
+        const themeRow = panel.sections.find((s) => !s.heading)?.rows.find((r) => r.label.includes("OpenCode"));
+        expect(themeRow).toBeTruthy();
+        expect(themeRow!.value).toBe("catppuccin");
+    });
+
+    it("shows packaged preset picker", () => {
+        const panel = renderThemeSettingsPanel(makeThemeSettingsInput({
+            themeSource: "packaged_preset",
+            packagedPreset: "nord",
+        }));
+        const presetSection = panel.sections.find((s) => s.heading === "Packaged Preset");
+        expect(presetSection).toBeTruthy();
+        expect(presetSection!.rows.length).toBe(6);
+    });
+
+    it("shows color overrides count", () => {
+        const panel = renderThemeSettingsPanel(makeThemeSettingsInput({
+            colorOverrides: { warning: "#ff0000", cold: "#00ff00" },
+        }));
+        const overrideSection = panel.sections.find((s) => s.heading === "Color Overrides");
+        expect(overrideSection!.rows[0].value).toBe("2");
+    });
+
+    it("shows none when no overrides", () => {
+        const panel = renderThemeSettingsPanel(makeThemeSettingsInput({ colorOverrides: {} }));
+        const overrideSection = panel.sections.find((s) => s.heading === "Color Overrides");
+        expect(overrideSection!.rows[0].value).toBe("none");
     });
 });

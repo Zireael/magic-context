@@ -478,6 +478,86 @@ export function renderSettingsPanel(input: SettingsPanelInput): PanelContent {
 }
 
 // ---------------------------------------------------------------------------
+// Theme Settings Panel
+// ---------------------------------------------------------------------------
+
+export type SidebarThemeSourceUI =
+    | "follow_opencode"
+    | "magic_default"
+    | "packaged_preset"
+    | "monochrome"
+    | "high_contrast";
+
+export interface ThemeSettingsInput {
+    /** Current theme source */
+    themeSource: SidebarThemeSourceUI;
+    /** Current packaged preset name (if source is packaged_preset) */
+    packagedPreset?: string;
+    /** Current OpenCode theme name (if available) */
+    openCodeThemeName?: string;
+    /** Current color overrides */
+    colorOverrides: Record<string, string>;
+}
+
+export function renderThemeSettingsPanel(input: ThemeSettingsInput): PanelContent {
+    const sections: PanelSection[] = [];
+
+    // Theme source
+    const sources: Array<{ label: string; active: boolean }> = [
+        { label: "Follow OpenCode", active: input.themeSource === "follow_opencode" },
+        { label: "Magic Default", active: input.themeSource === "magic_default" },
+        { label: "Packaged Preset", active: input.themeSource === "packaged_preset" },
+        { label: "Monochrome", active: input.themeSource === "monochrome" },
+        { label: "High Contrast", active: input.themeSource === "high_contrast" },
+    ];
+    sections.push({
+        heading: "Theme Source",
+        rows: sources.map((s) => ({
+            label: s.label,
+            value: s.active ? "●" : "○",
+            accent: s.active,
+        })),
+    });
+
+    // Current OpenCode theme (if follow_opencode)
+    if (input.themeSource === "follow_opencode" && input.openCodeThemeName) {
+        sections.push({
+            rows: [
+                { label: "Current OpenCode theme", value: input.openCodeThemeName, dim: true },
+            ],
+        });
+    }
+
+    // Packaged preset picker (if packaged_preset)
+    if (input.themeSource === "packaged_preset") {
+        const presets = ["magicDefault", "nord", "gruvbox", "catppuccin", "tokyonight", "github"];
+        sections.push({
+            heading: "Packaged Preset",
+            rows: presets.map((p) => ({
+                label: p,
+                value: input.packagedPreset === p ? "●" : "○",
+                accent: input.packagedPreset === p,
+            })),
+        });
+    }
+
+    // Color overrides summary
+    const overrideCount = Object.keys(input.colorOverrides).length;
+    sections.push({
+        heading: "Color Overrides",
+        rows: [
+            {
+                label: "Active overrides",
+                value: overrideCount > 0 ? String(overrideCount) : "none",
+                dim: overrideCount === 0,
+            },
+        ],
+    });
+
+    return { title: "Theme Settings", sections };
+}
+
+// ---------------------------------------------------------------------------
 // Suggestion helper
 // ---------------------------------------------------------------------------
 
