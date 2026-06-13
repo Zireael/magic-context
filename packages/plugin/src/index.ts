@@ -287,26 +287,27 @@ const plugin: Plugin = async (ctx) => {
 
     // Auto-add TUI plugin entry to tui.json if missing.
     // This runs from the server plugin because the TUI plugin can't load without it.
-    if (pluginConfig.enabled) {
-        try {
-            const { ensureTuiPluginEntry } = await import("./shared/tui-config");
-            const tuiAdded = ensureTuiPluginEntry();
-            if (tuiAdded) {
-                // Notify user via ignored message (same pattern as conflict warnings)
-                const { sendTuiSetupNotification } = await import("./plugin/conflict-warning-hook");
-                const serverUrl = (ctx as Record<string, unknown>).serverUrl;
-                const serverUrlStr =
-                    serverUrl instanceof URL ? serverUrl.toString().replace(/\/$/, "") : undefined;
-                void sendTuiSetupNotification(
-                    ctx.client as unknown as Record<string, unknown>,
-                    ctx.directory,
-                    serverUrlStr,
-                );
-            }
-        } catch {
-            // Best-effort — don't block startup
-        }
-    }
+    // DISABLED in feature branch to prevent overwriting local dev paths.
+    // if (pluginConfig.enabled) {
+    //     try {
+    //         const { ensureTuiPluginEntry } = await import("./shared/tui-config");
+    //         const tuiAdded = ensureTuiPluginEntry();
+    //         if (tuiAdded) {
+    //             // Notify user via ignored message (same pattern as conflict warnings)
+    //             const { sendTuiSetupNotification } = await import("./plugin/conflict-warning-hook");
+    //             const serverUrl = (ctx as Record<string, unknown>).serverUrl;
+    //             const serverUrlStr =
+    //                 serverUrl instanceof URL ? serverUrl.toString().replace(/\/$/, "") : undefined;
+    //             void sendTuiSetupNotification(
+    //                 ctx.client as unknown as Record<string, unknown>,
+    //                 ctx.directory,
+    //                 serverUrlStr,
+    //             );
+    //         }
+    //     } catch {
+    //         // Best-effort — don't block startup
+    //     }
+    // }
 
     // Desktop-only startup announcement: post a one-shot ignored message
     // describing what's new in this release.
