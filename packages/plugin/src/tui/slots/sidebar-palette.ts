@@ -418,3 +418,71 @@ export function getPalette(
 export function getColor(palette: MagicSidebarPalette, token: SidebarColorToken): RGBA {
     return palette[token];
 }
+
+// ---------------------------------------------------------------------------
+// Color overrides
+// ---------------------------------------------------------------------------
+
+export type ColorOverrides = Partial<Record<SidebarColorToken, RGBA>>;
+
+/**
+ * Validate a color override value (must be a valid hex color or rgba string).
+ */
+function isValidColor(color: unknown): color is RGBA {
+    if (typeof color !== "string") return false;
+    // Accept hex colors (#RGB, #RRGGBB, #RRGGBBAA)
+    if (/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(color)) return true;
+    // Accept rgb/rgba
+    if (/^rgba?\(/.test(color)) return true;
+    return false;
+}
+
+/**
+ * Parse overrides from config, validating and filtering invalid entries.
+ */
+export function parseOverrides(raw: unknown): ColorOverrides {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const result: ColorOverrides = {};
+    const obj = raw as Record<string, unknown>;
+    for (const [key, value] of Object.entries(obj)) {
+        if (isValidColor(value)) {
+            result[key as SidebarColorToken] = value;
+        }
+    }
+    return result;
+}
+
+/**
+ * Apply overrides to a base palette, returning a new palette.
+ * Invalid override keys are silently ignored.
+ */
+export function applyOverrides(
+    base: MagicSidebarPalette,
+    overrides: ColorOverrides,
+): MagicSidebarPalette {
+    const result = { ...base };
+    for (const [key, value] of Object.entries(overrides)) {
+        if (key in result && isValidColor(value)) {
+            (result as Record<string, RGBA>)[key] = value;
+        }
+    }
+    return result;
+}
+
+/**
+ * Resolve final palette: base source + overrides.
+ */
+export function resolvePalette(
+    source: SidebarThemeSource,
+    overrides: ColorOverrides = {},
+    openCodeTheme?: OpenCodeThemeCurrent,
+    preset?: PackagedPresetName,
+): MagicSidebarPalette {
+    let base: MagicSidebarPalette;
+    if (source === "packaged_preset" && preset) {
+        base = getPackagedPreset(preset);
+    } else {
+        base = getPalette(source, openCodeTheme);
+    }
+    return applyOverrides(base, overrides);
+}

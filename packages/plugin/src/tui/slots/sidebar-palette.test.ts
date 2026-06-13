@@ -5,6 +5,9 @@ import {
     getColor,
     getPackagedPreset,
     isPackagedPreset,
+    parseOverrides,
+    applyOverrides,
+    resolvePalette,
     PACKAGED_PRESET_INFO,
     type OpenCodeThemeCurrent,
 } from "./sidebar-palette";
@@ -148,5 +151,69 @@ describe("PACKAGED_PRESET_INFO", () => {
             expect(info.name).toBeTruthy();
             expect(info.label).toBeTruthy();
         }
+    });
+});
+
+describe("parseOverrides", () => {
+    it("parses valid hex overrides", () => {
+        const raw = { warning: "#d79921", cold: "#7aa2f7" };
+        const overrides = parseOverrides(raw);
+        expect(overrides.warning).toBe("#d79921");
+        expect(overrides.cold).toBe("#7aa2f7");
+    });
+
+    it("ignores invalid colors", () => {
+        const raw = { warning: "not-a-color", cold: "#7aa2f7" };
+        const overrides = parseOverrides(raw);
+        expect(overrides.warning).toBeUndefined();
+        expect(overrides.cold).toBe("#7aa2f7");
+    });
+
+    it("returns empty for null/undefined", () => {
+        expect(parseOverrides(null)).toEqual({});
+        expect(parseOverrides(undefined)).toEqual({});
+    });
+
+    it("returns empty for arrays", () => {
+        expect(parseOverrides([])).toEqual({});
+    });
+});
+
+describe("applyOverrides", () => {
+    it("applies valid overrides", () => {
+        const base = getPalette("magic_default");
+        const overrides = { warning: "#ff0000" };
+        const result = applyOverrides(base, overrides);
+        expect(result.warning).toBe("#ff0000");
+        expect(result.text).toBe(base.text);
+    });
+
+    it("ignores invalid override keys", () => {
+        const base = getPalette("magic_default");
+        const overrides = { invalidKey: "#ff0000" } as any;
+        const result = applyOverrides(base, overrides);
+        expect(result).toEqual(base);
+    });
+});
+
+describe("resolvePalette", () => {
+    it("resolves magic_default without overrides", () => {
+        const palette = resolvePalette("magic_default");
+        expect(palette.text).toBe("#ffffff");
+    });
+
+    it("resolves with overrides", () => {
+        const palette = resolvePalette("magic_default", { warning: "#ff0000" });
+        expect(palette.warning).toBe("#ff0000");
+    });
+
+    it("resolves packaged preset", () => {
+        const palette = resolvePalette("packaged_preset", {}, undefined, "nord");
+        expect(palette.text).toBe("#eceff4");
+    });
+
+    it("resolves follow_opencode with theme", () => {
+        const palette = resolvePalette("follow_opencode", {}, MOCK_OPENCODE_THEME);
+        expect(palette.text).toBe("#ffffff");
     });
 });
