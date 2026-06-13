@@ -579,3 +579,52 @@ function getSuggestion(snap: SidebarSnapshot, risk: ReturnType<typeof classifyRi
     }
     return "All clear — no action needed";
 }
+
+// ---------------------------------------------------------------------------
+// TUI Settings Writer Integration
+// ---------------------------------------------------------------------------
+
+import {
+    readSidebarSettings,
+    patchSidebarSettings,
+    resetSidebarSettings,
+    type SidebarSettingsPatch,
+} from "./config-sync";
+import {
+    parseSidebarSettings,
+    type SidebarSettings,
+} from "./sidebar-settings";
+
+/**
+ * Read current sidebar settings from config.
+ */
+export function readCurrentSidebarSettings(): SidebarSettings {
+    const result = readSidebarSettings();
+    return result.settings;
+}
+
+/**
+ * Patch sidebar settings from TUI.
+ */
+export function patchTuiSidebarSettings(patch: SidebarSettingsPatch): SidebarSettings {
+    const result = patchSidebarSettings(patch);
+    return result.settings;
+}
+
+/**
+ * Reset sidebar settings to defaults.
+ */
+export function resetTuiSidebarSettings(keys?: string[]): SidebarSettings {
+    const result = resetSidebarSettings(keys);
+    return result.settings;
+}
+
+/**
+ * Check if settings have changed since last read.
+ */
+export function hasSettingsChanged(
+    current: SidebarSettings,
+    lastRead: SidebarSettings,
+): boolean {
+    return JSON.stringify(current) !== JSON.stringify(lastRead);
+}

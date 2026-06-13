@@ -447,3 +447,20 @@ describe("renderThemeSettingsPanel", () => {
         expect(overrideSection!.rows[0].value).toBe("none");
     });
 });
+
+describe("TUI Settings Writer Integration", () => {
+    it("readCurrentSidebarSettings returns settings", () => {
+        const { readCurrentSidebarSettings } = require("./core-panels");
+        const settings = readCurrentSidebarSettings();
+        expect(settings).toBeTruthy();
+        expect(settings.displayMode).toBeTruthy();
+    });
+
+    it("hasSettingsChanged detects changes", () => {
+        const { hasSettingsChanged } = require("./core-panels");
+        const base = { displayMode: { default: "classic_collapsed" } };
+        const changed = { displayMode: { default: "dense_collapsed" } };
+        expect(hasSettingsChanged(base, changed)).toBe(true);
+        expect(hasSettingsChanged(base, base)).toBe(false);
+    });
+});
