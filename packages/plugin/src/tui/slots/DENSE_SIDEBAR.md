@@ -251,3 +251,87 @@ Motion applies only to small UI tokens (chips, labels), not whole rows/bars.
 
 Packaged presets derived from OpenCode default themes preserve MIT attribution.
 OpenCode is MIT licensed (https://github.com/anomalyco/opencode).
+
+## Settings Synchronization
+
+### Source of Truth
+
+All Dense Sidebar settings are stored in the Magic Context user config file:
+
+```
+~/.config/opencode/magic-context.jsonc
+```
+
+Settings live under the `tui.sidebar.*` subtree:
+
+```jsonc
+{
+  "tui": {
+    "sidebar": {
+      "displayMode": { "default": "classic_collapsed" },
+      "theme": { "source": "follow_opencode" },
+      "motion": { "mode": "subtle" },
+      "glyphs": { "preset": "unicode" },
+      "alerts": { "blinkCritical": "auto" }
+    }
+  }
+}
+```
+
+### Dashboard and TUI Sync
+
+Both the Dashboard and TUI Settings panel edit the same config file:
+
+- Dashboard edits → config file → TUI reload/watch → TUI updates
+- TUI edits → config file → Dashboard reload/watch → Dashboard updates
+
+Last-writer-wins for edited keys. Unrelated config keys are preserved.
+
+### Display Mode
+
+- `default`: The default display mode for new sessions
+- User override: Stored separately in `~/.local/share/cortexkit/magic-context/`
+- Reset to default: Clears the user override
+
+### Color Overrides
+
+Per-semantic-token color overrides:
+
+| Token | Description |
+|-------|-------------|
+| `text` | Primary text color |
+| `textMuted` | Muted text color |
+| `border` | Border color |
+| `panel` | Panel background |
+| `selectedFg` | Selected item foreground |
+| `selectedBg` | Selected item background |
+| `ok` | Success/OK status |
+| `info` | Information status |
+| `warning` | Warning status |
+| `critical` | Critical/error status |
+| `cold` | Cold/stable context |
+| `warm` | Warm/movable context |
+| `hot` | Hot/volatile context |
+| `free` | Free headroom |
+| `threshold` | Threshold marker |
+| `overflow` | Overflow marker |
+| `cacheGood` | Cache healthy |
+| `cacheDegraded` | Cache degraded |
+| `cacheBad` | Cache critical |
+| `pulseActive` | Active process pulse |
+| `pulseWarning` | Warning pulse |
+| `pulseCritical` | Critical pulse |
+
+Override format: `#RRGGBB` or `#RRGGBBAA`
+
+### Troubleshooting
+
+**Invalid JSONC**: Dashboard raw mode preserves comments; form mode may normalize.
+
+**Config write failure**: Check file permissions at `~/.config/opencode/`.
+
+**Stale view**: Reload settings panel or restart TUI/Dashboard.
+
+**Invalid color value**: Only valid hex colors are accepted; invalid values are ignored.
+
+**OpenCode theme not enumerable**: Magic Context cannot list all OpenCode themes; use packaged presets or follow_opencode.
