@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "magic-context-sidebar-collapse-plus",
+  "project_id": "b7e08484-4666-40ac-9616-37cdf2f04651"
+}
