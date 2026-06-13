@@ -217,3 +217,35 @@ describe("resolvePalette", () => {
         expect(palette.text).toBe("#ffffff");
     });
 });
+
+describe("regression: monochrome preserves meaning", () => {
+    it("monochrome has distinct ok/critical", () => {
+        const palette = getPalette("monochrome");
+        // Monochrome uses same color for most, but critical should be different
+        expect(palette.critical).toBe("#ffffff");
+        expect(palette.ok).toBe("#cccccc");
+    });
+
+    it("high contrast has distinct colors", () => {
+        const palette = getPalette("high_contrast");
+        expect(palette.ok).toBe("#00ff00");
+        expect(palette.critical).toBe("#ff0000");
+        expect(palette.warning).toBe("#ffff00");
+    });
+});
+
+describe("regression: all palettes have required tokens", () => {
+    const requiredTokens = [
+        "text", "textMuted", "border", "panel", "ok", "info", "warning", "critical",
+        "cold", "warm", "hot", "free", "threshold", "overflow",
+    ] as const;
+
+    for (const preset of ["magicDefault", "nord", "gruvbox", "catppuccin", "tokyonight", "github"] as const) {
+        it(`${preset} has all required tokens`, () => {
+            const palette = getPackagedPreset(preset);
+            for (const token of requiredTokens) {
+                expect(palette[token]).toBeTruthy();
+            }
+        });
+    }
+});
