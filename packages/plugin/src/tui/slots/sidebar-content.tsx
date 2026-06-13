@@ -10,6 +10,7 @@ import {
     parseConfigDisplayMode,
     type SidebarDisplayMode,
 } from "./display-mode"
+import { readCurrentSidebarSettings } from "./core-panels"
 
 // Module-level hook so the upgrade/recomp dialog can kick the sidebar into its
 // fast recomp self-poll the INSTANT the user confirms — without waiting for a
@@ -374,8 +375,16 @@ const SidebarContent = (props: {
     // Display mode: expanded, classic_collapsed, or dense_collapsed.
     // Resolves from persisted user choice or config default (classic_collapsed).
     const directory = props.api.state.path.directory ?? ""
+    // Read config default for display mode
+    let configDefault: SidebarDisplayMode = "classic_collapsed"
+    try {
+        const settings = readCurrentSidebarSettings()
+        configDefault = settings.displayMode.default
+    } catch {
+        // Fall back to classic_collapsed if config read fails
+    }
     const [displayMode, setDisplayMode] = createSignal<SidebarDisplayMode>(
-        resolveDisplayMode(directory),
+        resolveDisplayMode(directory, configDefault),
     )
     // Derived convenience signals for backward compatibility with existing renders
     const collapsed = () => displayMode() !== "expanded"
