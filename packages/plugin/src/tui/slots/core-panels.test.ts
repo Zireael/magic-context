@@ -4,7 +4,9 @@ import {
     renderFlushPanel,
     renderMemoryPanel,
     renderModePanel,
+    renderSettingsPanel,
     renderStatusPanel,
+    type SettingsPanelInput,
     type SidebarSnapshot,
 } from "./core-panels";
 
@@ -296,5 +298,90 @@ describe("renderMemoryPanel", () => {
         const dropsRow = histSection!.rows.find((r) => r.label === "Pending drops");
         expect(dropsRow).toBeTruthy();
         expect(dropsRow!.warning).toBe(true);
+    });
+});
+
+function makeSettingsInput(overrides: Partial<SettingsPanelInput> = {}): SettingsPanelInput {
+    return {
+        displayMode: "classic_collapsed",
+        configDefault: "classic_collapsed",
+        userOverride: false,
+        glyphPreset: "unicode",
+        criticalBlinkOnly: true,
+        version: "0.23.1",
+        updateStatus: "current",
+        ...overrides,
+    };
+}
+
+describe("renderSettingsPanel", () => {
+    it("renders display mode options", () => {
+        const panel = renderSettingsPanel(makeSettingsInput());
+        expect(panel.title).toBe("Settings");
+        const displaySection = panel.sections.find((s) => s.heading === "Display Mode");
+        expect(displaySection).toBeTruthy();
+        expect(displaySection!.rows.length).toBe(3);
+    });
+
+    it("highlights active display mode", () => {
+        const panel = renderSettingsPanel(makeSettingsInput({ displayMode: "dense_collapsed" }));
+        const displaySection = panel.sections.find((s) => s.heading === "Display Mode");
+        const denseRow = displaySection!.rows.find((r) => r.label === "Dense");
+        expect(denseRow!.accent).toBe(true);
+        expect(denseRow!.value).toBe("●");
+    });
+
+    it("shows reset option when user override exists", () => {
+        const panel = renderSettingsPanel(makeSettingsInput({ userOverride: true }));
+        const resetSection = panel.sections.find((s) => !s.heading);
+        expect(resetSection).toBeTruthy();
+        expect(resetSection!.rows[0].label).toBe("Reset to default");
+    });
+
+    it("hides reset option when no override", () => {
+        const panel = renderSettingsPanel(makeSettingsInput({ userOverride: false }));
+        const resetSection = panel.sections.find((s) => !s.heading);
+        expect(resetSection).toBeFalsy();
+    });
+
+    it("renders glyph preset options", () => {
+        const panel = renderSettingsPanel(makeSettingsInput());
+        const glyphSection = panel.sections.find((s) => s.heading === "Glyphs");
+        expect(glyphSection).toBeTruthy();
+        expect(glyphSection!.rows.length).toBe(3);
+    });
+
+    it("shows version", () => {
+        const panel = renderSettingsPanel(makeSettingsInput({ version: "0.23.1" }));
+        const versionSection = panel.sections.find((s) => s.heading === "Version");
+        expect(versionSection).toBeTruthy();
+        expect(versionSection!.rows[0].value).toContain("0.23.1");
+    });
+
+    it("shows current update status", () => {
+        const panel = renderSettingsPanel(makeSettingsInput({ updateStatus: "current" }));
+        const versionSection = panel.sections.find((s) => s.heading === "Version");
+        const updateRow = versionSection!.rows.find((r) => r.label === "Update");
+        expect(updateRow!.value).toBe("current");
+        expect(updateRow!.accent).toBe(true);
+    });
+
+    it("shows available update", () => {
+        const panel = renderSettingsPanel(makeSettingsInput({
+            updateStatus: "available",
+            availableVersion: "0.24.0",
+        }));
+        const versionSection = panel.sections.find((s) => s.heading === "Version");
+        const updateRow = versionSection!.rows.find((r) => r.label === "Update");
+        expect(updateRow!.value).toContain("0.24.0");
+        expect(updateRow!.warning).toBe(true);
+    });
+
+    it("shows unknown update status", () => {
+        const panel = renderSettingsPanel(makeSettingsInput({ updateStatus: "unknown" }));
+        const versionSection = panel.sections.find((s) => s.heading === "Version");
+        const updateRow = versionSection!.rows.find((r) => r.label === "Update");
+        expect(updateRow!.value).toBe("unknown");
+        expect(updateRow!.dim).toBe(true);
     });
 });

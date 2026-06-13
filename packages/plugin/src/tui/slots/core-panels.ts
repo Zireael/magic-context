@@ -380,6 +380,104 @@ export function renderFlushPanel(snap: SidebarSnapshot): PanelContent {
 }
 
 // ---------------------------------------------------------------------------
+// Settings Panel
+// ---------------------------------------------------------------------------
+
+export type GlyphPreset = "unicode" | "nerd" | "ascii";
+export type UpdateStatus = "current" | "available" | "unknown";
+
+export interface SettingsPanelInput {
+    /** Current display mode */
+    displayMode: string;
+    /** Config default display mode */
+    configDefault: string;
+    /** Whether user has overridden config default */
+    userOverride: boolean;
+    /** Current glyph preset */
+    glyphPreset: GlyphPreset;
+    /** Critical blink policy (true = blink only on critical faults) */
+    criticalBlinkOnly: boolean;
+    /** Magic Context version */
+    version: string;
+    /** Update status */
+    updateStatus: UpdateStatus;
+    /** Available update version (if any) */
+    availableVersion?: string;
+}
+
+export function renderSettingsPanel(input: SettingsPanelInput): PanelContent {
+    const sections: PanelSection[] = [];
+
+    // Display mode
+    const modes: Array<{ label: string; active: boolean }> = [
+        { label: "Classic", active: input.displayMode === "classic_collapsed" },
+        { label: "Dense", active: input.displayMode === "dense_collapsed" },
+        { label: "Expanded", active: input.displayMode === "expanded" },
+    ];
+    sections.push({
+        heading: "Display Mode",
+        rows: modes.map((m) => ({
+            label: m.label,
+            value: m.active ? "●" : "○",
+            accent: m.active,
+        })),
+    });
+
+    // Reset option
+    if (input.userOverride) {
+        sections.push({
+            rows: [{ label: "Reset to default", value: `revert to ${input.configDefault}` }],
+        });
+    }
+
+    // Glyph preset
+    const glyphs: Array<{ label: string; active: boolean }> = [
+        { label: "Unicode", active: input.glyphPreset === "unicode" },
+        { label: "Nerd", active: input.glyphPreset === "nerd" },
+        { label: "ASCII", active: input.glyphPreset === "ascii" },
+    ];
+    sections.push({
+        heading: "Glyphs",
+        rows: glyphs.map((g) => ({
+            label: g.label,
+            value: g.active ? "●" : "○",
+            accent: g.active,
+        })),
+    });
+
+    // Alert policy
+    sections.push({
+        heading: "Alerts",
+        rows: [
+            {
+                label: "Critical blink only",
+                value: input.criticalBlinkOnly ? "enabled" : "disabled",
+                accent: input.criticalBlinkOnly,
+            },
+        ],
+    });
+
+    // Version
+    const versionRows: PanelRow[] = [
+        { label: "Magic Context", value: `v${input.version}` },
+    ];
+    if (input.updateStatus === "current") {
+        versionRows.push({ label: "Update", value: "current", accent: true });
+    } else if (input.updateStatus === "available" && input.availableVersion) {
+        versionRows.push({
+            label: "Update",
+            value: `v${input.availableVersion} available`,
+            warning: true,
+        });
+    } else {
+        versionRows.push({ label: "Update", value: "unknown", dim: true });
+    }
+    sections.push({ heading: "Version", rows: versionRows });
+
+    return { title: "Settings", sections };
+}
+
+// ---------------------------------------------------------------------------
 // Suggestion helper
 // ---------------------------------------------------------------------------
 
