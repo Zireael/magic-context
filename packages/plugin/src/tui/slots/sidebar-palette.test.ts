@@ -1,8 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
     fromOpenCodeTheme,
-    getColor,
     getPalette,
+    getColor,
+    getPackagedPreset,
+    isPackagedPreset,
+    PACKAGED_PRESET_INFO,
     type OpenCodeThemeCurrent,
 } from "./sidebar-palette";
 
@@ -82,5 +85,68 @@ describe("getColor", () => {
         const palette = getPalette("magic_default");
         expect(getColor(palette, "text")).toBe(palette.text);
         expect(getColor(palette, "critical")).toBe(palette.critical);
+    });
+});
+
+describe("getPackagedPreset", () => {
+    it("returns nord palette", () => {
+        const palette = getPackagedPreset("nord");
+        expect(palette.text).toBe("#eceff4");
+        expect(palette.panel).toBe("#2e3440");
+    });
+
+    it("returns gruvbox palette", () => {
+        const palette = getPackagedPreset("gruvbox");
+        expect(palette.text).toBe("#ebdbb2");
+        expect(palette.panel).toBe("#282828");
+    });
+
+    it("returns catppuccin palette", () => {
+        const palette = getPackagedPreset("catppuccin");
+        expect(palette.text).toBe("#cdd6f4");
+        expect(palette.panel).toBe("#1e1e2e");
+    });
+
+    it("returns tokyonight palette", () => {
+        const palette = getPackagedPreset("tokyonight");
+        expect(palette.text).toBe("#c0caf5");
+        expect(palette.panel).toBe("#1a1b26");
+    });
+
+    it("returns github palette", () => {
+        const palette = getPackagedPreset("github");
+        expect(palette.text).toBe("#f0f6fc");
+        expect(palette.panel).toBe("#0d1117");
+    });
+
+    it("falls back to magic_default for unknown preset", () => {
+        const palette = getPackagedPreset("unknown" as any);
+        expect(palette.text).toBe("#ffffff");
+    });
+});
+
+describe("isPackagedPreset", () => {
+    it("returns true for valid presets", () => {
+        expect(isPackagedPreset("nord")).toBe(true);
+        expect(isPackagedPreset("gruvbox")).toBe(true);
+        expect(isPackagedPreset("magicDefault")).toBe(true);
+    });
+
+    it("returns false for invalid presets", () => {
+        expect(isPackagedPreset("unknown")).toBe(false);
+        expect(isPackagedPreset("")).toBe(false);
+    });
+});
+
+describe("PACKAGED_PRESET_INFO", () => {
+    it("has info for all presets", () => {
+        expect(PACKAGED_PRESET_INFO.length).toBe(8);
+    });
+
+    it("each preset has name and label", () => {
+        for (const info of PACKAGED_PRESET_INFO) {
+            expect(info.name).toBeTruthy();
+            expect(info.label).toBeTruthy();
+        }
     });
 });
