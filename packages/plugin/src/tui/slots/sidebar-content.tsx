@@ -372,14 +372,23 @@ const DenseCollapsedStrip = (props: {
     theme: TuiThemeCurrent
     onAction?: (action: string) => void
 }) => {
-    // Import renderDenseStrip from dense-strip module
-    const { renderDenseStrip, toDenseStripSnapshot, compactTokens } = require("./dense-strip")
+    const { compactTokens } = require("./dense-strip")
     const { classifyRisk } = require("./risk-classifier")
-    const { renderCacheRow } = require("./cache-telemetry")
 
-    const denseSnap = toDenseStripSnapshot(props.snapshot)
-    const strip = renderDenseStrip(denseSnap)
     const risk = classifyRisk({ snapshot: props.snapshot })
+
+    // Context category colors matching OpenCode theme
+    const COLORS = {
+        system: props.theme.info || "#60a5fa",
+        docs: props.theme.info || "#22d3ee",
+        compartments: props.theme.primary || "#60a5fa",
+        memories: props.theme.success || "#34d399",
+        profile: props.theme.success || "#a3e635",
+        conversation: props.theme.warning || "#f87171",
+        toolCalls: props.theme.warning || "#fb923c",
+        toolDefs: props.theme.accent || "#f472b6",
+        free: props.theme.textMuted || "#666666",
+    }
 
     // Build top row with capacity and risk info
     const capacity = compactTokens(props.snapshot.contextLimit || props.snapshot.inputTokens)
@@ -408,33 +417,42 @@ const DenseCollapsedStrip = (props: {
 
     const topRow = topParts.join(" · ")
 
-    // Build bar row
-    const barWidth = 12
-    const total = props.snapshot.contextLimit || props.snapshot.inputTokens || 1
-    const categories = []
-    if (props.snapshot.systemPromptTokens > 0) categories.push({ tokens: props.snapshot.systemPromptTokens, glyph: "█" })
-    if (props.snapshot.toolDefinitionTokens > 0) categories.push({ tokens: props.snapshot.toolDefinitionTokens, glyph: "█" })
-    if (props.snapshot.docsTokens > 0) categories.push({ tokens: props.snapshot.docsTokens, glyph: "▒" })
-    if (props.snapshot.compartmentTokens > 0) categories.push({ tokens: props.snapshot.compartmentTokens, glyph: "▒" })
-    if (props.snapshot.memoryTokens > 0) categories.push({ tokens: props.snapshot.memoryTokens, glyph: "█" })
-    if (props.snapshot.profileTokens > 0) categories.push({ tokens: props.snapshot.profileTokens, glyph: "█" })
-    if (props.snapshot.conversationTokens > 0) categories.push({ tokens: props.snapshot.conversationTokens, glyph: "▒" })
-    if (props.snapshot.toolCallTokens > 0) categories.push({ tokens: props.snapshot.toolCallTokens, glyph: "░" })
+    // Usage percentage color
+    const usageColor = props.snapshot.usagePercentage >= 80
+        ? props.theme.error
+        : props.snapshot.usagePercentage >= 65
+            ? props.theme.warning
+            : props.theme.accent
 
-    let bar = ""
-    for (const cat of categories) {
-        const width = Math.max(1, Math.round((cat.tokens / total) * barWidth))
-        bar += cat.glyph.repeat(width)
+    // Build bar segments with colors
+    const barWidth = 14
+    const total = props.snapshot.contextLimit || props.snapshot.inputTokens || 1
+    const segments: Array<{ width: number; color: string }> = []
+
+    if (props.snapshot.systemPromptTokens > 0) {
+        segments.push({ width: Math.max(1, Math.round((props.snapshot.systemPromptTokens / total) * barWidth)), color: COLORS.system })
     }
-    bar = bar.slice(0, barWidth)
-    if (props.snapshot.usagePercentage >= props.snapshot.executeThreshold && bar.length > 0) {
-        const pos = Math.min(Math.round((props.snapshot.executeThreshold / 100) * barWidth), bar.length - 1)
-        bar = `${bar.slice(0, pos)}|${bar.slice(pos + 1)}`
+    if (props.snapshot.toolDefinitionTokens > 0) {
+        segments.push({ width: Math.max(1, Math.round((props.snapshot.toolDefinitionTokens / total) * barWidth)), color: COLORS.toolDefs })
     }
-    if (props.snapshot.usagePercentage > 100 && bar.length > 0) {
-        bar = `${bar.slice(0, -1)}>`
+    if (props.snapshot.docsTokens > 0) {
+        segments.push({ width: Math.max(1, Math.round((props.snapshot.docsTokens / total) * barWidth)), color: COLORS.docs })
     }
-    const barRow = `${bar.padEnd(barWidth)} ${props.snapshot.usagePercentage.toFixed(0)}%`
+    if (props.snapshot.compartmentTokens > 0) {
+        segments.push({ width: Math.max(1, Math.round((props.snapshot.compartmentTokens / total) * barWidth)), color: COLORS.compartments })
+    }
+    if (props.snapshot.memoryTokens > 0) {
+        segments.push({ width: Math.max(1, Math.round((props.snapshot.memoryTokens / total) * barWidth)), color: COLORS.memories })
+    }
+    if (props.snapshot.profileTokens > 0) {
+        segments.push({ width: Math.max(1, Math.round((props.snapshot.profileTokens / total) * barWidth)), color: COLORS.profile })
+    }
+    if (props.snapshot.conversationTokens > 0) {
+        segments.push({ width: Math.max(1, Math.round((props.snapshot.conversationTokens / total) * barWidth)), color: COLORS.conversation })
+    }
+    if (props.snapshot.toolCallTokens > 0) {
+        segments.push({ width: Math.max(1, Math.round((props.snapshot.toolCallTokens / total) * barWidth)), color: COLORS.toolCalls })
+    }
 
     const handleAction = (action: string) => {
         props.onAction?.(action)
@@ -443,7 +461,21 @@ const DenseCollapsedStrip = (props: {
     return (
         <box width="100%" flexDirection="column">
             <text fg={props.theme.text}>{topRow}</text>
-            <text fg={props.theme.text}>{barRow}</text>
+            {/* Colored bar segments */}
+            <box width="100%" flexDirection="row" height={1}>
+                {segments.map((seg) => (
+                    <box
+                        key={seg.color}
+                        flexGrow={seg.width}
+                        flexBasis={0}
+                        height={1}
+                        backgroundColor={seg.color}
+                    />
+                ))}
+            </box>
+            <text fg={usageColor}>
+                {`${compactTokens(props.snapshot.inputTokens)} / ${compactTokens(props.snapshot.contextLimit)} ${props.snapshot.usagePercentage.toFixed(1)}%`}
+            </text>
             <box width="100%" flexDirection="row" gap={1}>
                 <text
                     fg={props.theme.accent}
