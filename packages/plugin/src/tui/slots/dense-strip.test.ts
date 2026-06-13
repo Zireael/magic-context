@@ -230,4 +230,42 @@ describe("visual fixtures", () => {
         expect(strip.barRow).toBe("");
         expect(strip.actionRow).toBe("[D] [S] [A]");
     });
+
+    it("cold context (low usage)", () => {
+        const snap = makeSnapshot({ usagePercentage: 15, inputTokens: 30_000, contextLimit: 200_000 });
+        const strip = renderDenseStrip(snap);
+        expect(strip.topRow).toContain("free");
+        expect(strip.topRow).not.toContain("T!");
+    });
+
+    it("pending flush shows [F]n", () => {
+        const snap = makeSnapshot({ pendingOpsCount: 7 });
+        const strip = renderDenseStrip(snap);
+        expect(strip.actionRow).toBe("[D] [S] [A] [F]7");
+    });
+
+    it("no pending flush hides [F]n", () => {
+        const snap = makeSnapshot({ pendingOpsCount: 0 });
+        const strip = renderDenseStrip(snap);
+        expect(strip.actionRow).not.toContain("[F]");
+    });
+
+    it("bar row shows threshold marker at high usage", () => {
+        const snap = makeSnapshot({ usagePercentage: 70, executeThreshold: 65 });
+        const strip = renderDenseStrip(snap);
+        expect(strip.barRow).toContain("|");
+    });
+
+    it("bar row shows overflow marker", () => {
+        const snap = makeSnapshot({ usagePercentage: 105 });
+        const strip = renderDenseStrip(snap);
+        expect(strip.barRow).toContain(">");
+    });
+
+    it("handles zero context limit gracefully", () => {
+        const snap = makeSnapshot({ contextLimit: 0, inputTokens: 5000 });
+        const strip = renderDenseStrip(snap);
+        expect(strip.topRow).toBeTruthy();
+        expect(strip.barRow).toBeTruthy();
+    });
 });
