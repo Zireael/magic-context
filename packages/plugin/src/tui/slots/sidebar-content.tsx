@@ -370,6 +370,7 @@ const RecompProgressSection = (props: {
 const DenseCollapsedStrip = (props: {
     snapshot: SidebarSnapshot
     theme: TuiThemeCurrent
+    onAction?: (action: string) => void
 }) => {
     // Import renderDenseStrip from dense-strip module
     const { renderDenseStrip, toDenseStripSnapshot, compactTokens } = require("./dense-strip")
@@ -435,18 +436,34 @@ const DenseCollapsedStrip = (props: {
     }
     const barRow = `${bar.padEnd(barWidth)} ${props.snapshot.usagePercentage.toFixed(0)}%`
 
-    // Build action row
-    const actions = ["[D]", "[S]", "[A]"]
-    if (props.snapshot.pendingOpsCount > 0) {
-        actions.push(`[F]${props.snapshot.pendingOpsCount}`)
+    const handleAction = (action: string) => {
+        props.onAction?.(action)
     }
-    const actionRow = actions.join(" ")
 
     return (
         <box width="100%" flexDirection="column">
             <text fg={props.theme.text}>{topRow}</text>
             <text fg={props.theme.text}>{barRow}</text>
-            <text fg={props.theme.textMuted}>{actionRow}</text>
+            <box width="100%" flexDirection="row" gap={1}>
+                <text
+                    fg={props.theme.accent}
+                    onMouseDown={() => handleAction("D")}
+                >[D]</text>
+                <text
+                    fg={props.theme.accent}
+                    onMouseDown={() => handleAction("S")}
+                >[S]</text>
+                <text
+                    fg={props.theme.accent}
+                    onMouseDown={() => handleAction("A")}
+                >[A]</text>
+                {props.snapshot.pendingOpsCount > 0 && (
+                    <text
+                        fg={props.theme.warning}
+                        onMouseDown={() => handleAction("F")}
+                    >[F]{props.snapshot.pendingOpsCount}</text>
+                )}
+            </box>
         </box>
     )
 }
@@ -786,6 +803,13 @@ const SidebarContent = (props: {
                 <DenseCollapsedStrip
                     snapshot={s()!}
                     theme={props.theme}
+                    onAction={(action) => {
+                        // Handle action buttons: D=details, S=status, A=mode, F=flush
+                        console.log(`[DenseSidebar] Action: ${action}`)
+                        // For now, cycle display mode on any action
+                        // TODO: Implement proper panel routing
+                        cycleMode()
+                    }}
                 />
             )}
 
