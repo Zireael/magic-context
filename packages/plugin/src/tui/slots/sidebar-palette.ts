@@ -18,6 +18,7 @@
 export type SidebarThemeSource =
     | "follow_opencode"
     | "magic_default"
+    | "packaged_preset"
     | "monochrome"
     | "high_contrast";
 
