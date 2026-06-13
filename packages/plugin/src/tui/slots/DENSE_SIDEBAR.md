@@ -182,3 +182,72 @@ Display mode persists via file-based storage:
 - `~/.local/share/cortexkit/magic-context/sidebar-state-{hash}.json`
 - Per-project using directory hash
 - Reset to config default available in Settings
+
+## Theme System
+
+### Theme Sources
+
+| Source | Description |
+|--------|-------------|
+| `follow_opencode` | Use OpenCode's current theme tokens |
+| `magic_default` | Magic Context's default palette |
+| `packaged_preset` | Curated preset from list below |
+| `monochrome` | Grayscale palette |
+| `high_contrast` | High contrast for accessibility |
+
+### Packaged Presets
+
+| Preset | Description |
+|--------|-------------|
+| `magicDefault` | Magic Context's default |
+| `nord` | Arctic, north-bluish clean and elegant |
+| `gruvbox` | Retro groove warm color scheme |
+| `catppuccin` | Soothing pastel theme |
+| `tokyonight` | Dark and vibrant |
+| `github` | GitHub's dark theme colors |
+
+### Color Overrides
+
+Per-semantic-token color overrides in config:
+
+```jsonc
+{
+  "tui": {
+    "sidebar": {
+      "theme": {
+        "source": "follow_opencode",
+        "preset": "opencode",
+        "overrides": {
+          "warning": "#d79921",
+          "cold": "#7aa2f7"
+        }
+      }
+    }
+  }
+}
+```
+
+Override resolution: base palette → apply overrides → validated final palette.
+
+Invalid overrides are silently ignored.
+
+### Motion Policy
+
+| Mode | Description |
+|------|-------------|
+| `subtle` | Default. Pulse animations for active/critical states. |
+| `reduced` | Minimal motion. Color changes only. |
+| `off` | No motion at all. |
+
+Motion applies only to small UI tokens (chips, labels), not whole rows/bars.
+
+### Accessibility
+
+- Color is never the only information channel
+- Monochrome/High Contrast modes preserve meaning without relying on color
+- Critical alerts use inverse styling as fallback when blink is unavailable
+
+### License
+
+Packaged presets derived from OpenCode default themes preserve MIT attribution.
+OpenCode is MIT licensed (https://github.com/anomalyco/opencode).
