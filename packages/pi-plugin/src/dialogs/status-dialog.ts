@@ -1,6 +1,7 @@
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
+	ExtensionContext,
 	Theme,
 	ThemeColor,
 } from "@earendil-works/pi-coding-agent";
@@ -621,7 +622,7 @@ export function deriveDefaultProtectedTokensFloor(usableSoft?: number): number {
 
 export function buildPiStatusDetail(
 	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext,
 	deps: StatusDialogDeps,
 	sessionId: string,
 ): StatusDialogDetail {

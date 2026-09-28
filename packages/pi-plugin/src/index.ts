@@ -186,7 +186,12 @@ import {
 import { abortInFlightRecomps, awaitInFlightRecomps } from "./pi-recomp-runner";
 import { handlePiProviderFailure } from "./provider-error-recovery-pi";
 import { readPiSessionMessages } from "./read-session-pi";
-import { registerStatusLine, updateStatusLine } from "./status-line";
+import {
+	notifyMagicContextStatusMutation,
+	registerStatusLine,
+	updateStatusLine,
+} from "./status-line";
+import { registerMagicContextStatusObservability } from "./status-observability";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
 import {
 	configurePiSubagentExtensions,
@@ -1406,6 +1411,11 @@ async function startPiMagicContextRuntime(
 						resolveCurrentProject(ctx, cfg.allow_home_project)
 							.projectIdentity ?? "",
 				});
+				// Historian start/finish mutates rich status (REQ-MC1-004).
+				const mutatedSession = resolveSessionId(ctx);
+				if (mutatedSession) {
+					notifyMagicContextStatusMutation(mutatedSession, "historian");
+				}
 			};
 		}
 		const auto = resolveAutoSearchFromConfig(cfg);
@@ -1678,6 +1688,67 @@ async function startPiMagicContextRuntime(
 	// uses model-invisible custom entries when the runtime can render them.
 	const recompRunner = new PiSubagentRunner();
 	const wrapupRunner = new PiSubagentRunner();
+	// The SAME dynamic status-dependency resolver drives /ctx-status and the
+	// cross-extension status producer (REQ-MC1-001): one definition, so the
+	// command surface and the published StatusView can never drift apart.
+	const resolveCtxStatusDeps = (ctx: { cwd: string }) => {
+		const current = resolveCurrentProjectDeps(ctx);
+		const live = liveReaderFor(current.projectDir, current.config);
+		const failure = live.lastFailure();
+		return {
+			configGeneration: live.current().generation,
+			configAdoptedAt: live.current().adoptedAt,
+			configReloadFailure: failure
+				? { path: failure.path, message: failure.message }
+				: undefined,
+			db,
+			projectIdentity: current.projectIdentity,
+			protectedTags: current.config.protected_tags,
+			executeThresholdPercentage: current.config.execute_threshold_percentage,
+			historyBudgetPercentage: current.config.history_budget_percentage,
+			injectionBudgetTokens: current.config.memory?.injection_budget_tokens,
+			commitClusterTrigger: current.config.commit_cluster_trigger,
+			executeThresholdTokens: current.config.execute_threshold_tokens,
+			dreamer: {
+				runnable: current.dreamerEnabled,
+				scheduleSummary: summarizeDreamSchedule(current.config.dreamer),
+			},
+			modelChainWarning: (() => {
+				const registry = activeModelRegistry;
+				if (!registry) return undefined;
+				const tasks = validatePiDreamerModels(
+					buildDreamTaskRuntimeConfigs(
+						current.config.dreamer,
+						PI_HARNESS_KIND,
+						current.config.language,
+						current.config.mural.model,
+					),
+					registry,
+				);
+				const empty: string[] = tasks
+					.filter((task) => task.modelChainUnavailable)
+					.map((task) => task.task);
+				if (
+					!resolveHistorianFromConfig(
+						current.config,
+						PI_HARNESS_KIND,
+						registry,
+					) &&
+					current.historianConfig
+				)
+					empty.push("historian");
+				return empty.length
+					? `Pi model chain empty (no model found): ${empty.join(", ")}`
+					: undefined;
+			})(),
+			activeProfile: current.config.profile,
+			cacheTtlConfig: current.config.cache_ttl,
+			cacheTtlConfigured: current.cacheTtlConfigured,
+			configParseFailures: current.configParseFailures,
+			hasDeprecatedProtectedTags: current.hasDeprecatedProtectedTags,
+			compactionEnabled: isCompactionEnabled(current.config),
+		};
+	};
 	registerCtxStatusCommand(pi, {
 		db,
 		projectIdentity,
@@ -1700,68 +1771,20 @@ async function startPiMagicContextRuntime(
 		configParseFailures: bootProjectDeps.configParseFailures,
 		hasDeprecatedProtectedTags: bootProjectDeps.hasDeprecatedProtectedTags,
 		compactionEnabled: isCompactionEnabled(bootProjectDeps.config),
-		resolveStatusDeps: (ctx) => {
-			const current = resolveCurrentProjectDeps(ctx);
-			const live = liveReaderFor(current.projectDir, current.config);
-			const failure = live.lastFailure();
-			return {
-				configGeneration: live.current().generation,
-				configAdoptedAt: live.current().adoptedAt,
-				configReloadFailure: failure
-					? { path: failure.path, message: failure.message }
-					: undefined,
-				db,
-				projectIdentity: current.projectIdentity,
-				protectedTags: current.config.protected_tags,
-				executeThresholdPercentage: current.config.execute_threshold_percentage,
-				historyBudgetPercentage: current.config.history_budget_percentage,
-				injectionBudgetTokens: current.config.memory?.injection_budget_tokens,
-				commitClusterTrigger: current.config.commit_cluster_trigger,
-				executeThresholdTokens: current.config.execute_threshold_tokens,
-				dreamer: {
-					runnable: current.dreamerEnabled,
-					scheduleSummary: summarizeDreamSchedule(current.config.dreamer),
-				},
-				modelChainWarning: (() => {
-					const registry = activeModelRegistry;
-					if (!registry) return undefined;
-					const tasks = validatePiDreamerModels(
-						buildDreamTaskRuntimeConfigs(
-							current.config.dreamer,
-							PI_HARNESS_KIND,
-							current.config.language,
-							current.config.mural.model,
-						),
-						registry,
-					);
-					const empty: string[] = tasks
-						.filter((task) => task.modelChainUnavailable)
-						.map((task) => task.task);
-					if (
-						!resolveHistorianFromConfig(
-							current.config,
-							PI_HARNESS_KIND,
-							registry,
-						) &&
-						current.historianConfig
-					)
-						empty.push("historian");
-					return empty.length
-						? `Pi model chain empty (no model found): ${empty.join(", ")}`
-						: undefined;
-				})(),
-				activeProfile: current.config.profile,
-				cacheTtlConfig: current.config.cache_ttl,
-				cacheTtlConfigured: current.cacheTtlConfigured,
-				configParseFailures: current.configParseFailures,
-				hasDeprecatedProtectedTags: current.hasDeprecatedProtectedTags,
-				compactionEnabled: isCompactionEnabled(current.config),
-			};
-		},
+		resolveStatusDeps: resolveCtxStatusDeps,
 	});
 	info("registered /ctx-status");
 	registerStatusLine(pi, { db, projectIdentity });
 	info("registered magic-context status line");
+
+	// Cross-extension rich status producer (PRD §8, REQ-MC1-001): publishes
+	// the same authoritative StatusView /ctx-status renders over the shared
+	// bus, invalidation-driven and debounced. The cheap footer above and the
+	// /ctx-status command/dialog are untouched (REQ-MC1-010/011).
+	registerMagicContextStatusObservability(pi, {
+		resolveStatusDeps: resolveCtxStatusDeps,
+	});
+	info("registered magic-context status observability producer");
 
 	registerCtxFlushCommand(pi, { db, compactionOff });
 	info("registered /ctx-flush");

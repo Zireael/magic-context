@@ -8,6 +8,7 @@ import {
 	signalPiPendingMaterialization,
 	signalPiSystemPromptRefresh,
 } from "../context-handler";
+import { notifyMagicContextStatusMutation } from "../status-line";
 import { createCtxStatusSender, resolveSessionId } from "./pi-command-utils";
 
 export function registerCtxFlushCommand(
@@ -39,6 +40,7 @@ export function registerCtxFlushCommand(
 
 			const pendingBefore = getPendingOps(deps.db, sessionId).length;
 			const result = executeFlush(deps.db, sessionId);
+			notifyMagicContextStatusMutation(sessionId, "flush");
 
 			// Mirrors OpenCode `hook.ts:438-441` `onFlush`: explicit
 			// flush is a "force everything to refresh" semantic, so we

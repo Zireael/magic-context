@@ -10,6 +10,43 @@ const STATUS_KEY = "magic-context";
 const RECENT_FAILURE_MS = 60_000;
 const recompSessions = new Set<string>();
 
+/**
+ * Listener for rich status-content mutations (historian/recomp/command seams),
+ * as opposed to the cheap footer refresh path. The cross-extension status
+ * producer subscribes here so mutation call sites never import the producer
+ * module. Receives the session whose status changed and a short source tag.
+ */
+export type MagicContextStatusMutationListener = (
+	sessionId: string,
+	source: string,
+) => void;
+
+const statusMutationListeners = new Set<MagicContextStatusMutationListener>();
+
+/** Subscribe to rich status mutations; returns the unsubscribe function. */
+export function onMagicContextStatusMutation(
+	listener: MagicContextStatusMutationListener,
+): () => void {
+	statusMutationListeners.add(listener);
+	return () => {
+		statusMutationListeners.delete(listener);
+	};
+}
+
+/** Publish a rich status mutation for `sessionId` to all subscribers. */
+export function notifyMagicContextStatusMutation(
+	sessionId: string,
+	source: string,
+): void {
+	for (const listener of [...statusMutationListeners]) {
+		try {
+			listener(sessionId, source);
+		} catch {
+			// A listener must never break the seam that feeds it.
+		}
+	}
+}
+
 export interface StatusLineDeps {
 	db: ContextDatabase;
 	projectIdentity: string;
@@ -21,6 +58,11 @@ export function setMagicContextRecompActive(
 ): void {
 	if (active) recompSessions.add(sessionId);
 	else recompSessions.delete(sessionId);
+	// Recomp start AND end both mutate rich status (PRD REQ-MC1-004).
+	notifyMagicContextStatusMutation(
+		sessionId,
+		active ? "recomp-start" : "recomp-end",
+	);
 }
 
 type SessionMetaStatus = {

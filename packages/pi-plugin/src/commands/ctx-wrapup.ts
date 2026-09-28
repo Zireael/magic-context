@@ -46,7 +46,10 @@ import {
 	readPiSessionMessagePage,
 	readPiSessionMessages,
 } from "../read-session-pi";
-import { updateStatusLine } from "../status-line";
+import {
+	notifyMagicContextStatusMutation,
+	updateStatusLine,
+} from "../status-line";
 import { createCtxStatusSender, resolveSessionId } from "./pi-command-utils";
 
 export interface RegisterCtxWrapupDeps {
@@ -471,6 +474,7 @@ export async function runPiWrapup(
 							plan.snapshot.eligibleEndOrdinal >= plan.targetEligibleEndOrdinal,
 						onPublished: () => {
 							updateStatusLine(ctx, { db: deps.db, projectIdentity: ctx.cwd });
+							notifyMagicContextStatusMutation(sessionId, "wrapup");
 							signalPiDeferredHistoryRefresh(sessionId);
 							signalPiDeferredMaterialization(sessionId);
 						},
