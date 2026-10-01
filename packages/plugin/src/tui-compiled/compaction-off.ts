@@ -1,29 +1,8 @@
-import type { SidebarSnapshot } from "../shared/rpc-types";
-
-export interface CompactionOffSidebarRow {
-    label: "Memories" | "Notes" | "Archived compartments";
-    value: string;
-}
-
-/**
- * Formats context pressure from the current wire input and the model context
- * limit. It deliberately does not use the stored Magic Context threshold
- * percentage, because native compaction acts on the model window instead.
- */
-export function nativeCompactionContextLabel(snapshot: SidebarSnapshot): string {
-    if (snapshot.contextLimit <= 0) return "Context: unknown · native compaction";
-    const percentage = (snapshot.inputTokens / snapshot.contextLimit) * 100;
-    return `Context: ${percentage.toFixed(1)}% · native compaction`;
-}
-
-export function compactionOffSidebarRows(snapshot: SidebarSnapshot): CompactionOffSidebarRow[] {
-    const rows: CompactionOffSidebarRow[] = [
-        { label: "Memories", value: String(snapshot.memoryCount) },
-        { label: "Notes", value: String(snapshot.sessionNoteCount) },
-    ];
-    const archivedCount = snapshot.archivedCompartmentCount ?? 0;
-    if (archivedCount > 0) {
-        rows.push({ label: "Archived compartments", value: String(archivedCount) });
-    }
-    return rows;
-}
+// The compaction-off sidebar semantics moved into the shared host-neutral
+// sidebar model (IMPL-008 / shared/sidebar-view.ts). This module stays as a
+// stable import path for existing consumers (v2 fallback projection, tests).
+export {
+    type CompactionOffSidebarRow,
+    compactionOffSidebarRows,
+    nativeCompactionContextLabel,
+} from "../shared/sidebar-view";

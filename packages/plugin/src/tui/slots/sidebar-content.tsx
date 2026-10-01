@@ -1,12 +1,16 @@
 /** @jsxImportSource @opentui/solid */
 import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from "solid-js"
 import type { TuiSlotPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui"
-import packageJson from "../../../package.json"
 import { badgeTextColor } from '../badge-contrast';
 import { loadSidebarSnapshot, type SidebarSnapshot } from "../data/context-db"
-import { formatThresholdPercent } from "../../shared/format-threshold"
-import { renderUserFacingFailure } from "../../shared/user-facing-codes"
-import { compactionOffSidebarRows, nativeCompactionContextLabel } from "../compaction-off"
+import {
+    buildMagicContextSidebarView,
+    type SidebarRecompStatus,
+    type SidebarSection,
+    type SidebarTokenBar,
+    type SidebarTone,
+    type SidebarViewRow,
+} from "../../shared/sidebar-view"
 import {
     computeEffectiveOrder,
     DEFAULT_SLOT_ORDER,
@@ -100,388 +104,127 @@ function createSidebarController(initialPrefs: MagicContextTuiPrefs): SidebarCon
     }
 }
 
-function compactTokens(value: number): string {
-    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
-    if (value >= 1_000) return `${(value / 1_000).toFixed(0)}K`
-    // Token counts are whole numbers to the reader even when the tokenizer
-    // calibration leaves them fractional; a raw `522.4` beside a `63K` reads as
-    // a measurement error rather than as precision.
-    return String(Math.round(value))
+// Maps shared semantic tones onto the host theme. `success` falls back to the
+// accent color on themes that define no success token (pre-refactor behavior).
+const toneColor = (theme: TuiThemeCurrent, tone: SidebarTone) => {
+    if (tone === "muted") return theme.textMuted
+    if (tone === "accent") return theme.accent
+    if (tone === "warning") return theme.warning
+    if (tone === "error") return theme.error
+    if (tone === "success") return theme.success ?? theme.accent
+    return theme.text
 }
 
-/**
- * Sidebar form of the tail-hygiene reading: the reclaimable share and the
- * two masses it is computed from, in the same compact token unit as the
- * breakdown rows so the value fits beside its label at sidebar width. The
- * long, unit-spelled form stays in the status dialog.
- */
-function hygieneValue(status: { severity: number; u: number; t: number }): string {
-    return `${(status.severity * 100).toFixed(1)}% · ${compactTokens(status.u)}/${compactTokens(status.t)}`
-}
-
-function relativeTime(ms: number): string {
-    const diff = Date.now() - ms
-    if (diff < 60_000) return "just now"
-    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`
-    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`
-    return `${Math.floor(diff / 86_400_000)}d ago`
-}
-
-// Text progress bar, e.g. [██████░░░░] for the recomp/upgrade live indicator.
-function progressBar(fraction: number, width = 14): string {
-    const clamped = Math.max(0, Math.min(1, fraction))
-    const filled = Math.round(clamped * width)
-    return `[${"█".repeat(filled)}${"░".repeat(width - filled)}]`
-}
-
-// Token breakdown segment colors (hardcoded hex values)
-const COLORS = {
-    // Cool / structured — injected by the plugin into message[0]
-    system: "#c084fc", // Purple
-    docs: "#22d3ee", // Cyan — <project-docs>
-    compartments: "#60a5fa", // Blue
-    facts: "#fbbf24", // Yellow/orange
-    memories: "#34d399", // Green
-    profile: "#a3e635", // Lime — <user-profile>
-    // Warm / user-facing — regular chat and tool traffic. Grouped visually
-    // by hue family so the user reads them as a related block.
-    conversation: "#f87171", // Red
-    toolCalls: "#fb923c", // Orange
-    toolDefs: "#f472b6", // Pink
-}
-
-interface TokenSegment {
-    key: string
-    tokens: number
-    color: string
-    label: string
-}
-
-// Segmented token breakdown bar with legend
-const TokenBreakdown = (props: {
-    theme: TuiThemeCurrent
-    snapshot: SidebarSnapshot
-    // Collapsed mode renders only the proportional bar (no per-category legend
-    // rows) so the sidebar shrinks to the progress bar + a few summary lines.
-    collapsed?: boolean
-}) => {
-    // The bar is rendered as a flex row of colored boxes, each with
-    // flexGrow=tokens and flexBasis=0. opentui distributes the parent
-    // container's full width proportionally, so the bar always fills the
-    // sidebar regardless of terminal size. No hardcoded width is needed —
-    // this fixes both the over-wide bar that wrapped onto a second line on
-    // narrow sidebars (issue #90) and the under-wide bar that left empty
-    // space on the right on wide sidebars.
-    const segments = createMemo<TokenSegment[]>(() => {
-        const s = props.snapshot
-        const total = s.inputTokens || 1
-        const result: TokenSegment[] = []
-
-        // System Prompt (purple)
-        if (s.systemPromptTokens > 0) {
-            result.push({
-                key: "sys",
-                tokens: s.systemPromptTokens,
-                color: COLORS.system,
-                label: "System",
-            })
-        }
-
-        // Docs (cyan) — injected <project-docs> block (ARCHITECTURE/STRUCTURE)
-        if (s.docsTokens > 0) {
-            result.push({
-                key: "docs",
-                tokens: s.docsTokens,
-                color: COLORS.docs,
-                label: "Docs",
-            })
-        }
-
-        // Compartments (blue)
-        if (s.compartmentTokens > 0) {
-            result.push({
-                key: "comp",
-                tokens: s.compartmentTokens,
-                color: COLORS.compartments,
-                label: "Compartments",
-            })
-        }
-
-        // Facts (yellow/orange)
-        if (s.factTokens > 0) {
-            result.push({
-                key: "fact",
-                tokens: s.factTokens,
-                color: COLORS.facts,
-                label: "Facts",
-            })
-        }
-
-        // Memories (green)
-        if (s.memoryTokens > 0) {
-            result.push({
-                key: "mem",
-                tokens: s.memoryTokens,
-                color: COLORS.memories,
-                label: "Memories",
-            })
-        }
-
-        // User Profile (lime) — injected <user-profile> block (promoted user memories)
-        if (s.profileTokens > 0) {
-            result.push({
-                key: "profile",
-                tokens: s.profileTokens,
-                color: COLORS.profile,
-                label: "User Profile",
-            })
-        }
-
-        // Conversation = real user/assistant text/reasoning/images
-        // (excludes injected session-history and excludes tool call I/O).
-        //
-        // Always show this row even when conversationTokens === 0. The
-        // calibrator's residual-distribution math (tokenizer-calibration.ts)
-        // can round it down to zero when toolCallsLocal massively dominates
-        // conversationLocal — that's a calibration artifact, not a real
-        // "zero conversation". Suppressing the row leaves the legend looking
-        // truncated, which is more confusing than showing a 0% line. The
-        // segment is also skipped in the bar at 0 width because the segment
-        // builder uses `Math.max(1, ...)` only when tokens > 0 (see
-        // segmentWidths), so the visual bar stays correct either way.
-        result.push({
-            key: "conv",
-            tokens: s.conversationTokens,
-            color: COLORS.conversation,
-                label: "Conversation",
-        })
-
-        // Tool Calls = tool_use/tool_result/tool/tool-invocation parts in messages
-        // (actionable — users can reduce via ctx_reduce)
-        if (s.toolCallTokens > 0) {
-            result.push({
-                key: "tool-calls",
-                tokens: s.toolCallTokens,
-                color: COLORS.toolCalls,
-                label: "Tool Calls",
-            })
-        }
-
-        // Tool Definitions = measured description + JSON-schema parameters for
-        // each tool OpenCode sends in the `tools` request parameter, populated
-        // by the `tool.definition` plugin hook keyed by {provider, model, agent}.
-        // Zero until the first turn measures the active agent's tool set.
-        if (s.toolDefinitionTokens > 0) {
-            result.push({
-                key: "tool-defs",
-                tokens: s.toolDefinitionTokens,
-                color: COLORS.toolDefs,
-                label: "Tool Defs",
-            })
-        }
-
-        return result
-    })
-
-    const totalTokens = createMemo(() => props.snapshot.inputTokens || 1)
-
-    // Render-time segments for the bar. Zero-token segments are filtered out
-    // entirely (no flex weight, no rendered box) so they don't claim any
-    // width. Non-zero segments still get a Math.max(1, ...) floor on
-    // flexGrow so very small contributions remain visible as a thin sliver.
-    // The legend rows below show every segment (including zeros) for table
-    // stability — only the bar prunes them.
-    const barSegments = createMemo(() =>
-        segments().filter((seg) => seg.tokens > 0),
-    )
-
-    return (
-        <box width="100%" flexDirection="column">
-            {/* Segmented bar: a width="100%" flex row of colored boxes,
-                each with flexGrow proportional to its token count and
-                flexBasis=0. opentui distributes the parent's full width
-                proportionally, so the bar always fills the sidebar
-                regardless of terminal size. Height is fixed at 1 row;
-                backgroundColor renders the colored bar. */}
-            <box width="100%" flexDirection="row" height={1}>
-                {barSegments().map((seg) => (
-                    <box
-                        key={seg.key}
-                        flexGrow={Math.max(1, seg.tokens)}
-                        flexBasis={0}
-                        height={1}
-                        backgroundColor={seg.color}
-                    />
-                ))}
-            </box>
-
-            {/* Legend rows — suppressed in collapsed mode (bar only) */}
-            {!props.collapsed && (
-                <box flexDirection="column" marginTop={0}>
-                    {segments().map((seg) => {
-                        const pct = ((seg.tokens / totalTokens()) * 100).toFixed(0)
-                        return (
-                            <box
-                                key={seg.key}
-                                width="100%"
-                                flexDirection="row"
-                                justifyContent="space-between"
-                            >
-                                <text fg={seg.color}>{seg.label}</text>
-                                <text fg={props.theme.textMuted}>
-                                    {compactTokens(seg.tokens)} ({pct}%)
-                                </text>
-                            </box>
-                        )
-                    })}
-                </box>
-            )}
-        </box>
-    )
-}
-
-const StatRow = (props: {
-    theme: TuiThemeCurrent
-    label: string
-    value: string
-    accent?: boolean
-    warning?: boolean
-    dim?: boolean
-}) => {
-    const fg = createMemo(() => {
-        if (props.warning) return props.theme.warning
-        if (props.accent) return props.theme.accent
-        if (props.dim) return props.theme.textMuted
-        return props.theme.text
-    })
-
-    return (
-        <box width="100%" flexDirection="row" justifyContent="space-between">
-            <text fg={props.theme.textMuted}>{props.label}</text>
-            <text fg={fg()}>
-                <b>{props.value}</b>
-            </text>
-        </box>
-    )
-}
-
-const SectionHeader = (props: { theme: TuiThemeCurrent; title: string }) => (
-    <box width="100%" marginTop={1}>
-        <text fg={props.theme.text}>
-            <b>{props.title}</b>
+// One label/value line. `row.bold` preserves the pre-refactor split between
+// bold-value lines and the plain (non-bold) compact summary rows.
+const ViewRow = (props: { theme: TuiThemeCurrent; row: SidebarViewRow }) => (
+    <box width="100%" flexDirection="row" justifyContent="space-between">
+        <text fg={props.theme.textMuted}>{props.row.label}</text>
+        <text fg={toneColor(props.theme, props.row.tone)}>
+            {props.row.bold ? <b>{props.row.value}</b> : props.row.value}
         </text>
     </box>
 )
 
-// Live recomp progress. Renders while a rebuild runs (and briefly after it
-// finishes) so a multi-minute rebuild is visible instead of a single missed
-// toast (dogfood 2026-05-30).
-const RecompProgressSection = (props: {
-    theme: TuiThemeCurrent
-    progress: NonNullable<SidebarSnapshot["recompProgress"]>
-}) => {
-    // CRITICAL: read `props.progress` reactively on every access — do NOT
-    // destructure it into a local `const p = props.progress` at creation time.
-    // The parent keeps THIS component instance mounted as the phase advances
-    // (recomp → migration → done), so a frozen `p` would render the
-    // creation-time phase forever — the sidebar stuck on "upgrading / Running
-    // historian (pass 1)…" even though the upgrade finished. Each accessor below
-    // tracks the parent signal so the label/bar/note update live (root cause of
-    // the dogfood 2026-05-30 "recomp upgrading stays" freeze).
-    const phase = () => props.progress.phase
-    const fraction = () =>
-        props.progress.totalMessages > 0
-            ? props.progress.processedMessages / props.progress.totalMessages
-            : 0
-    const pct = () => Math.round(fraction() * 100)
-
-    // "Recomp" vs "Upgrade" vs "Embed" wording follows the flow that started this
-    // run, so a plain /ctx-recomp never renders as an "Upgrade" (dogfood 2026-06-04).
-    const verb = () =>
-        props.progress.kind === "upgrade"
-            ? "Upgrade"
-            : props.progress.kind === "embed"
-              ? "Embed"
-              : props.progress.kind === "wrapup"
-                ? "Wrapup"
-                : "Recomp"
-    const activeText = () =>
-        props.progress.kind === "upgrade"
-            ? "upgrading ⟳"
-            : props.progress.kind === "embed"
-              ? "embedding ⟳"
-              : props.progress.kind === "wrapup"
-                ? "wrapping ⟳"
-                : "comparting ⟳"
-    const label = createMemo(() => {
-        switch (props.progress.phase) {
-            case "recomp":
-                return {
-                    text: activeText(),
-                    color: props.theme.warning,
-                }
-            case "migration":
-                return { text: "Migrating memories ⟳", color: props.theme.warning }
-            case "done":
-                return { text: `✓ ${verb()} complete`, color: props.theme.success ?? props.theme.accent }
-            case "skipped":
-                // Neutral terse status next to the bold verb header; the full,
-                // self-contained reason (lease-busy "try again shortly" vs a
-                // partial-stall "run /ctx-embed start again") renders on its own
-                // line below. Don't re-prepend verb here (it's already the bold
-                // header — doing so read as "EmbedEmbed"), and don't hardcode
-                // "retry shortly" (wrong for a partial stall).
-                return { text: "stopped", color: props.theme.textMuted }
-            case "failed":
-                return { text: `✗ ${verb()} failed`, color: props.theme.error }
-        }
-    })
-
-    return (
-        <>
+// Section block: optional right-aligned live-status header, rows, and the
+// live recomp progress strip when the shared model attaches one.
+const SectionView = (props: { theme: TuiThemeCurrent; section: SidebarSection }) => (
+    <>
+        {props.section.header.status ? (
             <box width="100%" marginTop={1} flexDirection="row" justifyContent="space-between">
                 <text fg={props.theme.text}>
-                    <b>{verb()}</b>
+                    <b>{props.section.header.title}</b>
                 </text>
-                <text fg={label().color}>{label().text}</text>
+                <text fg={toneColor(props.theme, props.section.header.status.tone)}>
+                    {props.section.header.status.text}
+                </text>
             </box>
-            {/* Determinate bar during the compartment-rebuild phase. */}
-            {phase() === "recomp" && props.progress.totalMessages > 0 && (
+        ) : (
+            <box width="100%" marginTop={1}>
+                <text fg={props.theme.text}>
+                    <b>{props.section.header.title}</b>
+                </text>
+            </box>
+        )}
+        <For each={props.section.rows}>{(row) => <ViewRow theme={props.theme} row={row} />}</For>
+        <Show when={props.section.recomp}>
+            {(recomp) => <RecompProgressSection theme={props.theme} recomp={recomp()} />}
+        </Show>
+    </>
+)
+
+// Live recomp progress. Verb, phase label, bar, note, rows and terminal
+// reason all arrive from the shared builder — drawing only lives here.
+// CRITICAL: read `props.recomp` reactively on every access — do NOT
+// destructure it into a local `const` at creation time. The parent keeps
+// THIS component instance mounted as the phase advances (recomp → migration
+// → done), so a frozen local would render the creation-time phase forever.
+const RecompProgressSection = (props: { theme: TuiThemeCurrent; recomp: SidebarRecompStatus }) => (
+    <>
+        <box width="100%" marginTop={1} flexDirection="row" justifyContent="space-between">
+            <text fg={props.theme.text}>
+                <b>{props.recomp.verb}</b>
+            </text>
+            <text fg={toneColor(props.theme, props.recomp.statusTone)}>{props.recomp.statusText}</text>
+        </box>
+        {/* Determinate bar during the compartment-rebuild phase. */}
+        <Show when={props.recomp.bar}>
+            {(bar) => (
                 <box width="100%" flexDirection="row" justifyContent="space-between">
-                    <text fg={props.theme.accent}>{progressBar(fraction())}</text>
-                    <text fg={props.theme.textMuted}>{pct()}%</text>
+                    <text fg={props.theme.accent}>{bar().barText}</text>
+                    <text fg={props.theme.textMuted}>{bar().percentText}%</text>
                 </box>
             )}
-            {/* Transient status note (e.g. "Starting…", "Trying fallback
-                sonnet-4-6…", "Repair retry…") — surfaces live activity during a
-                long pass, including before the determinate range is known. */}
-            {(phase() === "recomp" || phase() === "migration") && props.progress.note && (
-                <text fg={props.theme.textMuted}>{props.progress.note}</text>
-            )}
-            {phase() === "recomp" && props.progress.kind !== "embed" && (
-                <StatRow
-                    theme={props.theme}
-                    label="Compartments"
-                    value={`${props.progress.compartmentsCreated} (${props.progress.passCount} pass${props.progress.passCount === 1 ? "" : "es"})`}
-                    dim
+        </Show>
+        {/* Transient status note (e.g. "Starting…", "Trying fallback
+            sonnet-4-6…", "Repair retry…") — surfaces live activity during a
+            long pass, including before the determinate range is known. */}
+        <Show when={props.recomp.note}>{(note) => <text fg={props.theme.textMuted}>{note()}</text>}</Show>
+        <For each={props.recomp.rows}>{(row) => <ViewRow theme={props.theme} row={row} />}</For>
+        {/* Terminal reason (failed/skipped) — kept visible so the user sees
+            WHY (a failure, or the transient "retry shortly" skip cause). */}
+        <Show when={props.recomp.message}>{(message) => <text fg={props.theme.textMuted}>{message()}</text>}</Show>
+    </>
+)
+
+// Segmented token breakdown bar with legend. Draws the shared canonical
+// category data only: keys, colors, order and text live in
+// shared/sidebar-view.ts (SIDEBAR_TOKEN_CATEGORIES).
+const TokenBreakdown = (props: { theme: TuiThemeCurrent; bar: SidebarTokenBar; collapsed?: boolean }) => (
+    <box width="100%" flexDirection="column">
+        {/* The bar is a width="100%" flex row of colored boxes, each with
+            flexGrow proportional to its weight and flexBasis=0. opentui
+            distributes the parent container's full width proportionally, so
+            the bar always fills the sidebar regardless of terminal size. No
+            hardcoded width is needed — this fixes both the over-wide bar that
+            wrapped onto a second line on narrow sidebars (issue #90) and the
+            under-wide bar that left empty space on the right. */}
+        <box width="100%" flexDirection="row" height={1}>
+            {props.bar.segments.map((segment) => (
+                <box
+                    key={segment.key}
+                    flexGrow={segment.weight}
+                    flexBasis={0}
+                    height={1}
+                    backgroundColor={segment.color}
                 />
-            )}
-            {phase() === "recomp" && props.progress.kind === "embed" && (
-                <StatRow
-                    theme={props.theme}
-                    label="Compartments"
-                    value={`${props.progress.processedMessages}/${props.progress.totalMessages} embedded`}
-                    dim
-                />
-            )}
-            {/* Terminal reason (failed/skipped) — kept visible so the user sees
-                WHY (a failure, or the transient "retry shortly" skip cause). */}
-            {(phase() === "failed" || phase() === "skipped") && props.progress.message && (
-                <text fg={props.theme.textMuted}>{props.progress.message}</text>
-            )}
-        </>
-    )
-}
+            ))}
+        </box>
+        {/* Legend rows — suppressed in collapsed mode (bar only) */}
+        {!props.collapsed && (
+            <box flexDirection="column" marginTop={0}>
+                {props.bar.legend.map((entry) => (
+                    <box key={entry.key} width="100%" flexDirection="row" justifyContent="space-between">
+                        <text fg={entry.color}>{entry.label}</text>
+                        <text fg={props.theme.textMuted}>
+                            {entry.valueText} ({entry.percentText}%)
+                        </text>
+                    </box>
+                ))}
+            </box>
+        )}
+    </box>
+)
 
 const SidebarContent = (props: {
     api: TuiPluginApi
@@ -730,15 +473,16 @@ const SidebarContent = (props: {
         ),
     )
 
-    const s = createMemo(() => snapshot())
-    const compactionOff = () => s()?.compaction_enabled === false
-    const contextSummaryColor = createMemo(() => {
-        if (compactionOff()) return props.theme.accent
-        const usage = s()?.usagePercentage ?? 0
-        if (usage >= 80) return props.theme.error
-        if (usage >= 65) return props.theme.warning
-        return props.theme.accent
-    })
+    // All persistent-sidebar semantics (presence, order, labels, colors,
+    // warnings, compact-vs-expanded, progress wording) come from the shared
+    // host-neutral builder; this component only acquires state and draws.
+    const view = createMemo(() =>
+        buildMagicContextSidebarView(snapshot(), {
+            collapsed: collapsed(),
+            sections: sections(),
+            headerLabel: headerLabel(),
+        }),
+    )
 
     return (
         <box
@@ -762,303 +506,85 @@ const SidebarContent = (props: {
             >
                 <box paddingLeft={1} paddingRight={1} backgroundColor={props.theme.accent}>
                     <text fg={badgeTextColor(props.theme.accent, props.theme.background)}>
-                        <b>{collapsed() ? "▶ " : "▼ "}{headerLabel()}</b>
+                        <b>{view().header.glyph}{view().header.label}</b>
                     </text>
                 </box>
-                <text fg={props.theme.textMuted}>v{packageJson.version}</text>
+                <text fg={props.theme.textMuted}>v{view().header.version}</text>
             </box>
 
-            {/* The fence probe writes the failure into the server-owned snapshot,
-                so this survives sidebar refreshes and is visible independently of
-                the one-shot toast. */}
-            {s()?.lastTransformError && (
-                <box marginTop={1} width="100%">
-                    <text fg={props.theme.error}>⚠ {s()!.lastTransformError}</text>
-                </box>
-            )}
-
-            {/* Named limitations of the host itself (for example an experimental
-                mode this OpenCode version cannot run). They stay for as long as
-                the process runs, so they are drawn like the transform error
-                rather than as a one-shot toast. */}
-            <For each={s()?.hostLimitations ?? []}>
-                {(limitation) => (
+            {/* Persistent warnings (transform failure, host limitations, live
+                Dreamer task) — drawn above everything else in shared order. */}
+            <For each={view().warnings}>
+                {(warning) => (
                     <box marginTop={1} width="100%">
-                        <text fg={props.theme.warning}>⚠ {renderUserFacingFailure(limitation, "plain")}</text>
+                        <text fg={warning.tone === "error" ? props.theme.error : props.theme.warning}>
+                            ⚠ {warning.text}
+                        </text>
                     </box>
                 )}
             </For>
 
-            {s()?.dreamerProgress && (
-                <box marginTop={1} width="100%">
-                    <text fg={props.theme.warning}>
-                        Dreamer {s()!.dreamerProgress!.task}: {s()!.dreamerProgress!.processed}/{s()!.dreamerProgress!.total} processed
-                    </text>
-                </box>
-            )}
-
-            {/* Token breakdown bar. In collapsed mode the header, bar and the
-                3 summary rows stack with no vertical padding for a compact look;
-                expanded mode keeps the 1-row gap above the bar. */}
-            {s() && s()!.inputTokens > 0 && (
-                <box marginTop={collapsed() ? 0 : 1} flexDirection="column">
-                    {(s()?.contextLimit ?? 0) > 0 && (
-                        <box width="100%" flexDirection="row" justifyContent="space-between">
-                            {compactionOff() ? (
-                                <text fg={contextSummaryColor()}>
-                                    <b>{nativeCompactionContextLabel(s()!)}</b>
-                                </text>
-                            ) : (
-                                <text fg={contextSummaryColor()}>
-                                    <b>{s()!.usagePercentage.toFixed(1)}%</b> / {formatThresholdPercent(s()!.executeThreshold)}%{s()!.executeThresholdClamped ? "*" : ""}
-                                </text>
+            {/* Pressure + token breakdown + hygiene. In collapsed mode the
+                header, bar and the summary rows stack with no vertical
+                padding for a compact look; expanded mode keeps the 1-row gap
+                above the bar. */}
+            <Show when={view().overview}>
+                {(overview) => (
+                    <box marginTop={collapsed() ? 0 : 1} flexDirection="column">
+                        <Show when={overview().pressure}>
+                            {(pressure) => (
+                                <box width="100%" flexDirection="row" justifyContent="space-between">
+                                    <text fg={toneColor(props.theme, pressure().tone)}>
+                                        <b>{pressure().primary}</b>
+                                        {pressure().detail}
+                                    </text>
+                                    {/* Right: absolute token usage against the usable
+                                        scheduler window — the same denominator as the
+                                        percentage and nudge/trigger scheduling. */}
+                                    <text fg={toneColor(props.theme, pressure().tone)}>
+                                        {pressure().right}
+                                    </text>
+                                </box>
                             )}
-                            {/* Right: absolute token usage against the usable
-                                scheduler window — the same denominator as the
-                                percentage and nudge/trigger scheduling. */}
-                            <text fg={contextSummaryColor()}>
-                                {compactTokens(s()!.inputTokens)} / {compactTokens(s()!.contextLimit)}
-                            </text>
-                        </box>
-                    )}
-                    <TokenBreakdown theme={props.theme} snapshot={s()!} collapsed={collapsed()} />
-                    {s()!.tailHygiene !== undefined && (
-                        <StatRow
-                            theme={props.theme}
-                            label="Hygiene"
-                            value={hygieneValue(s()!.tailHygiene!)}
-                            warning={!s()!.tailHygiene!.evaluable}
-                        />
-                    )}
-                </box>
-            )}
-
-            {/* Collapsed view — progress bar (above) + 3 summary lines:
-                Historian (with compartment count), Memories (injected/total),
-                Status (Q=queued ops, N=session notes). */}
-            {collapsed() && (
-                <box width="100%" flexDirection="column">
-                    {compactionOff() ? (
-                        compactionOffSidebarRows(s()!).map((row) => (
-                            <StatRow
-                                theme={props.theme}
-                                label={row.label}
-                                value={row.value}
-                                accent={row.label === "Memories"}
-                                dim={row.label !== "Memories"}
-                            />
-                        ))
-                    ) : (
-                        <>
-                            <box width="100%" flexDirection="row" justifyContent="space-between">
-                                <text fg={props.theme.textMuted}>Historian</text>
-                                {s()?.historianRunning ? (
-                                    <text fg={props.theme.warning}>comparting ⟳</text>
-                                ) : (
-                                    <text fg={props.theme.textMuted}>idle</text>
-                                )}
-                            </box>
-                            <Show when={s()?.dreamerProgress}>
-                                {(progress) => (
-                                    <box width="100%" flexDirection="row" justifyContent="space-between">
-                                        <text fg={props.theme.textMuted}>Dreamer</text>
-                                        <text fg={props.theme.warning}>
-                                            {progress().task} {progress().processed}/{progress().total}
-                                        </text>
-                                    </box>
-                                )}
-                            </Show>
-                            <box width="100%" flexDirection="row" justifyContent="space-between">
-                                <text fg={props.theme.textMuted}>Memories</text>
-                                <text fg={props.theme.textMuted}>
-                                    {(s()?.memoryBlockCount ?? 0) > 0
-                                        ? `${s()!.memoryBlockCount}/${s()?.memoryCount ?? 0}`
-                                        : String(s()?.memoryCount ?? 0)}
-                                </text>
-                            </box>
-                            <box width="100%" flexDirection="row" justifyContent="space-between">
-                                <text fg={props.theme.textMuted}>Status</text>
-                                <text fg={props.theme.textMuted}>
-                                    C:{s()?.compartmentCount ?? 0} Q:{s()?.pendingOpsCount ?? 0} N:{s()?.sessionNoteCount ?? 0}
-                                </text>
-                            </box>
-                            <Show when={s()?.recompProgress}>
-                                {(progress) => (
-                                    <RecompProgressSection theme={props.theme} progress={progress()} />
-                                )}
-                            </Show>
-                        </>
-                    )}
-                </box>
-            )}
-
-            {/* Expanded view — full section grid. */}
-            {!collapsed() && (
-                <>
-            {/* Historian section */}
-            {!compactionOff() && sections().historian && (
-                <>
-            <box width="100%" marginTop={1} flexDirection="row" justifyContent="space-between">
-                <text fg={props.theme.text}>
-                    <b>Historian</b>
-                </text>
-                {s()?.historianRunning ? (
-                    <text fg={props.theme.warning}>comparting ⟳</text>
-                ) : (
-                    <text fg={props.theme.textMuted}>idle</text>
-                )}
-            </box>
-            <StatRow
-                theme={props.theme}
-                label="Compartments"
-                value={String(s()?.compartmentCount ?? 0)}
-            />
-
-            {/* Recomp live progress */}
-            <Show when={s()?.recompProgress}>
-                {(progress) => (
-                    <RecompProgressSection theme={props.theme} progress={progress()} />
+                        </Show>
+                        <Show when={overview().tokenBar}>
+                            {(bar) => <TokenBreakdown theme={props.theme} bar={bar()} collapsed={collapsed()} />}
+                        </Show>
+                        <Show when={overview().hygiene}>
+                            {(hygiene) => <ViewRow theme={props.theme} row={hygiene()} />}
+                        </Show>
+                    </box>
                 )}
             </Show>
-                </>
-            )}
 
-            {/* Memory section */}
-            {sections().memory && (
-                <>
-            <SectionHeader theme={props.theme} title="Memory" />
-            {compactionOff() ? (
-                compactionOffSidebarRows(s()!)
-                    .filter((row) => row.label === "Memories")
-                    .map((row) => (
-                        <StatRow theme={props.theme} label={row.label} value={row.value} accent />
-                    ))
-            ) : (
-                <>
-                    <StatRow
-                        theme={props.theme}
-                        label="Memories"
-                        value={String(s()?.memoryCount ?? 0)}
-                        accent
-                    />
-                    {(s()?.memoryBlockCount ?? 0) > 0 && (
-                        <StatRow
-                            theme={props.theme}
-                            label="Injected"
-                            value={String(s()!.memoryBlockCount)}
-                            dim
-                        />
-                    )}
-                </>
-            )}
-                </>
-            )}
-
-            {/* Queue & Status */}
-            {sections().status &&
-                (compactionOff() ||
-                    (s()?.pendingOpsCount ?? 0) > 0 ||
-                    (s()?.sessionNoteCount ?? 0) > 0 ||
-                    (s()?.readySmartNoteCount ?? 0) > 0) && (
-                    <>
-                        <SectionHeader theme={props.theme} title="Status" />
-                        {compactionOff() ? (
-                            compactionOffSidebarRows(s()!)
-                                .filter((row) => row.label !== "Memories")
-                                .map((row) => (
-                                    <StatRow
-                                        theme={props.theme}
-                                        label={row.label}
-                                        value={row.value}
-                                        dim
-                                    />
-                                ))
-                        ) : (
-                            <>
-                                {(s()?.pendingOpsCount ?? 0) > 0 && (
-                                    <StatRow
-                                        theme={props.theme}
-                                        label="Queue"
-                                        value={`${s()!.pendingOpsCount} pending`}
-                                        warning
-                                    />
-                                )}
-                                {(s()?.sessionNoteCount ?? 0) > 0 && (
-                                    <StatRow
-                                        theme={props.theme}
-                                        label="Notes"
-                                        value={String(s()!.sessionNoteCount)}
-                                    />
-                                )}
-                                {(s()?.readySmartNoteCount ?? 0) > 0 && (
-                                    <StatRow
-                                        theme={props.theme}
-                                        label="Smart Notes"
-                                        value={`${s()!.readySmartNoteCount} ready`}
-                                        accent
-                                    />
-                                )}
-                            </>
-                        )}
-                    </>
+            {/* Collapsed view — shared summary rows (+ live recomp progress). */}
+            <Show when={view().collapsedSummary}>
+                {(summary) => (
+                    <box width="100%" flexDirection="column">
+                        <For each={summary().rows}>{(row) => <ViewRow theme={props.theme} row={row} />}</For>
+                        <Show when={summary().recomp}>
+                            {(recomp) => <RecompProgressSection theme={props.theme} recomp={recomp()} />}
+                        </Show>
+                    </box>
                 )}
+            </Show>
 
-            {/* Dreamer */}
-            {sections().dreamer && (s()?.lastDreamerRunAt || s()?.dreamerProgress) && (
-                <>
-                    <SectionHeader theme={props.theme} title="Dreamer" />
-                    <Show when={s()?.dreamerProgress}>
-                        {(progress) => (
-                            <StatRow
-                                theme={props.theme}
-                                label="Current"
-                                value={`${progress().task} ${progress().processed}/${progress().total}`}
-                                warning
-                            />
-                        )}
-                    </Show>
-                    <Show when={s()?.lastDreamerRunAt}>
-                        {(lastRunAt) => (
-                            <StatRow
-                                theme={props.theme}
-                                label="Last run"
-                                value={relativeTime(lastRunAt())}
-                                dim
-                            />
-                        )}
-                    </Show>
-                    <For each={Object.entries(s()?.dreamerBacklog ?? {})}>
-                        {([task, backlog]) => (
-                            <StatRow
-                                theme={props.theme}
-                                label={task}
-                                value={`${backlog.pending}/${backlog.total}`}
-                                dim
-                            />
-                        )}
-                    </For>
-                </>
-            )}
-
-            {/* Stats — v0.21.8 ships a single "Total tokens" number while we
-                figure out how to present the new-work / reprocessed
-                categorization without confusing users. The underlying
-                snapshot fields (newWorkTokens, totalInputTokens) and the
-                session_meta columns are still populated; only the UI is
-                simplified for now. */}
-            {sections().stats && s()?.totalInputTokens != null && (
-                <>
-                    <SectionHeader theme={props.theme} title="Stats" />
-                    <StatRow
-                        theme={props.theme}
-                        label="Total tokens"
-                        value={compactTokens(s()!.totalInputTokens ?? 0)}
-                        dim
-                    />
-                </>
-            )}
-                </>
-            )}
+            {/* Expanded view — shared sections in canonical order. */}
+            <Show when={view().historian}>
+                {(section) => <SectionView theme={props.theme} section={section()} />}
+            </Show>
+            <Show when={view().memory}>
+                {(section) => <SectionView theme={props.theme} section={section()} />}
+            </Show>
+            <Show when={view().status}>
+                {(section) => <SectionView theme={props.theme} section={section()} />}
+            </Show>
+            <Show when={view().dreamer}>
+                {(section) => <SectionView theme={props.theme} section={section()} />}
+            </Show>
+            <Show when={view().stats}>
+                {(section) => <SectionView theme={props.theme} section={section()} />}
+            </Show>
         </box>
     )
 }
