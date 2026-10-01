@@ -78,8 +78,12 @@ describe("/ctx-recomp post-completion signal contract", () => {
 		expect(codeOnly).toContain("const snapshot = readPiSessionSnapshot(ctx)");
 		expect(codeOnly).toContain("readMessages: () => snapshot.rawMessages");
 		expect(codeOnly).toContain("branchEntries: snapshot.branchEntries");
-		expect(codeOnly).toContain("work: async (signal)");
+		// The work callback's FIRST parameter is still the abort signal; the
+		// second is the runner's live-progress callback (IMPL-009), which only
+		// observes passes that already run.
+		expect(codeOnly).toContain("work: async (signal, onProgress)");
 		expect(codeOnly).toContain("signal,");
+		expect(codeOnly).toContain("onRecompProgress: onProgress");
 		expect(codeOnly).not.toContain("readPiSessionMessages(ctx)");
 	});
 });

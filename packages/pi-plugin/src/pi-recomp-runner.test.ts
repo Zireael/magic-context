@@ -5,6 +5,7 @@ import {
 	awaitInFlightRecomps,
 	spawnPiRecompRun,
 } from "./pi-recomp-runner";
+import { getPiRecompProgress } from "./sidebar-progress";
 
 function deferred() {
 	let resolve!: () => void;
@@ -60,6 +61,7 @@ test("abort fences a detached run before a late settle", async () => {
 		},
 	});
 	await Promise.resolve();
+	const statusChangesAfterStart = statusChanges;
 
 	abortInFlightRecomps("session-abort");
 	expect(observedSignal?.aborted).toBe(true);
@@ -67,7 +69,13 @@ test("abort fences a detached run before a late settle", async () => {
 	await awaitInFlightRecomps("session-abort");
 
 	expect(settled).toBe(true);
-	expect(statusChanges).toBe(1);
+	// One change for the immediate "starting" progress entry, and NO second one
+	// on the aborted settle: `statusChangesAfterStart` is captured once the run
+	// has started, so this asserts the abort contract rather than a total.
+	expect(statusChanges).toBe(statusChangesAfterStart);
+	expect(statusChangesAfterStart).toBe(1);
+	// The entry is still cleared, so a fenced run cannot leave a frozen bar.
+	expect(getPiRecompProgress("session-abort")).toBeNull();
 });
 
 test("historian client forwards cancellation and rejects a late result", async () => {

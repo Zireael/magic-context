@@ -33,6 +33,10 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { log } from "@magic-context/core/shared/logger";
 import {
+	buildMagicContextSidebarView,
+	type MagicContextSidebarView,
+} from "@magic-context/core/shared/sidebar-view";
+import {
 	buildStatusView as buildSharedStatusView,
 	type StatusView,
 } from "@magic-context/core/shared/status-view";
@@ -43,6 +47,8 @@ import {
 	buildPiStatusDetail,
 	statusViewSourceFromPiDetail,
 } from "./dialogs/status-dialog";
+import { getPiDreamerProgress, getPiRecompProgress } from "./sidebar-progress";
+import { piSidebarSnapshotFromDetail } from "./sidebar-snapshot";
 import { onMagicContextStatusMutation } from "./status-line";
 
 /** Producer → consumer channel (PRD §5). */
@@ -90,8 +96,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 export interface MagicContextObservabilityPayload {
 	statusView: StatusView;
-	/** Added later by the parity phase (rich contributed panels). */
-	sidebarView?: unknown;
+	/**
+	 * The shared host-neutral sidebar view (IMPL-008 model, IMPL-009 producer).
+	 * Additive: V1 consumers read `statusView` only and ignore this field, and a
+	 * producer that cannot build it simply omits the key.
+	 */
+	sidebarView?: MagicContextSidebarView;
 }
 
 export interface McStatusDiscoverEvent {
@@ -152,6 +162,15 @@ export interface MagicContextStatusObservabilityOptions {
 	 * (REQ-MC1-002). Called only from the debounced rebuild path.
 	 */
 	buildStatusView(ctx: ExtensionContext, sessionId: string): StatusView;
+	/**
+	 * The shared host-neutral sidebar view for the same rebuild (REQ-MC2-004).
+	 * Optional so a V1-only producer keeps working; when present the published
+	 * payload carries it alongside `statusView`.
+	 */
+	buildSidebarView?(
+		ctx: ExtensionContext,
+		sessionId: string,
+	): MagicContextSidebarView | undefined;
 	/** Debounce window; defaults to {@link DEFAULT_STATUS_DEBOUNCE_MS}. */
 	debounceMs?: number;
 	/** Non-fatal error sink; defaults to the shared logger. */
@@ -164,6 +183,8 @@ export interface PublishedMagicContextStatus {
 	sessionId: string;
 	revision: number;
 	statusView: StatusView;
+	/** Present only when the producer supplies a sidebar view. */
+	sidebarView?: MagicContextSidebarView;
 	/** Serialized form used by the equality gate (REQ-MC1-007). */
 	serialized: string;
 }
@@ -253,7 +274,13 @@ export function createMagicContextStatusProducer(
 			sessionId: entry.sessionId,
 			revision: entry.revision,
 			...(requestId !== undefined ? { requestId } : {}),
-			payload: { statusView: entry.statusView },
+			// The sidebar key is OMITTED, never `undefined`, when absent, so a
+			// V1 consumer sees byte-identical payloads to the ones it saw before
+			// rich parity existed.
+			payload: {
+				statusView: entry.statusView,
+				...(entry.sidebarView ? { sidebarView: entry.sidebarView } : {}),
+			},
 		});
 	};
 
@@ -266,11 +293,18 @@ export function createMagicContextStatusProducer(
 
 	// --- debounced rebuild (REQ-MC1-004/005/006) ------------------------------
 
-	const publish = (sessionId: string, statusView: StatusView): void => {
+	const publish = (
+		sessionId: string,
+		statusView: StatusView,
+		sidebarView: MagicContextSidebarView | undefined,
+	): void => {
 		// Equality gate (REQ-MC1-007): a semantically equal view does not mint
 		// a new revision and does not emit — but a pending discovery still gets
-		// a replay of the current entry.
-		const serialized = JSON.stringify(statusView);
+		// a replay of the current entry. The gate spans BOTH views, so a live
+		// recomp tick that only moves the sidebar still publishes.
+		const serialized = JSON.stringify(
+			sidebarView ? { statusView, sidebarView } : statusView,
+		);
 		const existing = publishedBySession.get(sessionId);
 		if (existing && existing.serialized === serialized) {
 			if (pendingRequestIds.length > 0) emitSnapshot(existing);
@@ -281,6 +315,7 @@ export function createMagicContextStatusProducer(
 			sessionId,
 			revision,
 			statusView,
+			...(sidebarView ? { sidebarView } : {}),
 			serialized,
 		};
 		publishedBySession.set(sessionId, entry);
@@ -303,11 +338,12 @@ export function createMagicContextStatusProducer(
 			do {
 				dirty.delete(sessionId);
 				const statusView = options.buildStatusView(ctx, sessionId);
+				const sidebarView = options.buildSidebarView?.(ctx, sessionId);
 				rebuilds += 1;
 				// Session released (or producer disposed) while building: drop
 				// the late result instead of publishing retired-session state.
 				if (disposed || !contextBySession.has(sessionId)) return;
-				publish(sessionId, statusView);
+				publish(sessionId, statusView, sidebarView);
 				guard += 1;
 			} while (dirty.has(sessionId) && !disposed && guard < 16);
 		} catch (err) {
@@ -471,15 +507,20 @@ export interface RegisterMagicContextStatusObservabilityOptions {
 }
 
 /**
- * The authoritative V1 build: exactly the pipeline `/ctx-status` renders
- * (REQ-MC1-002), callable outside the dialog with a plain event context.
+ * Both authoritative views from ONE detail read.
+ *
+ * The V1 build is exactly the pipeline `/ctx-status` renders (REQ-MC1-002).
+ * The sidebar view is the same detail adapted to the shared `SidebarSnapshot`
+ * and handed to the shared model (REQ-MC2-004), with live recomp/Dreamer
+ * progress pulled from the session/project trackers. They are produced
+ * together so a rebuild never reads the database twice for one publish.
  */
-function buildAuthoritativeStatusView(
+function buildAuthoritativeViews(
 	pi: ExtensionAPI,
 	options: RegisterMagicContextStatusObservabilityOptions,
 	ctx: ExtensionContext,
 	sessionId: string,
-): StatusView {
+): { statusView: StatusView; sidebarView: MagicContextSidebarView } {
 	const runtimeDeps = options.resolveStatusDeps?.(ctx) ?? options.baseDeps;
 	if (!runtimeDeps) {
 		throw new Error("mc status: no status-dependency resolver configured");
@@ -493,9 +534,44 @@ function buildAuthoritativeStatusView(
 		{ ...runtimeDeps, projectIdentity },
 		sessionId,
 	);
-	return buildSharedStatusView(statusViewSourceFromPiDetail(detail), {
-		version: packageJson.version,
+	const statusView = buildSharedStatusView(
+		statusViewSourceFromPiDetail(detail),
+		{
+			version: packageJson.version,
+		},
+	);
+	const snapshot = piSidebarSnapshotFromDetail(detail, {
+		projectIdentity,
+		recompProgress: getPiRecompProgress(sessionId),
+		dreamerProgress: getPiDreamerProgress(projectIdentity),
 	});
+	// Pi/OMP has no per-section TUI preference file like the OpenCode sidebar,
+	// so every named section is offered and the consumer decides what to show.
+	const sidebarView = buildMagicContextSidebarView(snapshot, {
+		collapsed: false,
+		sections: {
+			historian: true,
+			memory: true,
+			status: true,
+			dreamer: true,
+			stats: true,
+		},
+		headerLabel: "MagicContext",
+	});
+	return { statusView, sidebarView };
+}
+
+/**
+ * The authoritative V1 build alone, kept as the exported seam the existing
+ * tests and the `/ctx-status`-shaped callers use.
+ */
+function buildAuthoritativeStatusView(
+	pi: ExtensionAPI,
+	options: RegisterMagicContextStatusObservabilityOptions,
+	ctx: ExtensionContext,
+	sessionId: string,
+): StatusView {
+	return buildAuthoritativeViews(pi, options, ctx, sessionId).statusView;
 }
 
 /**
@@ -519,6 +595,8 @@ export function registerMagicContextStatusObservability(
 		events: pi.events,
 		buildStatusView: (ctx, sessionId) =>
 			buildAuthoritativeStatusView(pi, options, ctx, sessionId),
+		buildSidebarView: (ctx, sessionId) =>
+			buildAuthoritativeViews(pi, options, ctx, sessionId).sidebarView,
 		...(options.debounceMs !== undefined
 			? { debounceMs: options.debounceMs }
 			: {}),

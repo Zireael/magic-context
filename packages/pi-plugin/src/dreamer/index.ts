@@ -23,6 +23,10 @@ import { log } from "@magic-context/core/shared/logger";
 import type { ModelHarness } from "@magic-context/core/shared/model-resolution";
 import type { CompletedSubagentToolCall } from "@magic-context/core/shared/subagent-runner";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
+import {
+	getPiDreamerProgressTask,
+	setPiDreamerProgress,
+} from "../sidebar-progress";
 import { PiSubagentRunner } from "../subagent-runner";
 import { createPiPrimerRawProviderFactory } from "./primer-raw-provider-pi";
 import { PiRetrospectiveRawProvider } from "./retrospective-raw-provider-pi";
@@ -295,6 +299,19 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		// /ctx-dream path already uses.
 		retrospectiveRawProvider: () =>
 			new PiRetrospectiveRawProvider({ projectCwd: opts.projectDir }),
+		// Scheduled live progress for the persistent sidebar. The shared timer
+		// already forwards this into the executor's existing `onProgress`; we
+		// only record the value. No extra scheduling, no extra task.
+		onDreamerProgress: (progress, completedTask) => {
+			if (progress) {
+				setPiDreamerProgress(opts.projectIdentity, progress);
+			} else if (
+				completedTask !== undefined &&
+				getPiDreamerProgressTask(opts.projectIdentity) === completedTask
+			) {
+				setPiDreamerProgress(opts.projectIdentity, null);
+			}
+		},
 		// SCHEDULED refresh-primers likewise needs the Pi JSONL factory so its
 		// open-book seed renders raw U:/TC: lines; without it the scheduled task
 		// silently ran closed-book (the manual /ctx-dream path already wires this).
@@ -373,6 +390,20 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 				language: manualOpts.language,
 				retinaHandoff: manualOpts.retinaHandoff,
 				mural,
+				// Same observation seam as the scheduled path, wired directly
+				// because the manual executor is built here rather than by the
+				// shared timer.
+				onProgress: (progress, completedTask) => {
+					if (progress) {
+						setPiDreamerProgress(manualOpts.projectIdentity, progress);
+					} else if (
+						completedTask !== undefined &&
+						getPiDreamerProgressTask(manualOpts.projectIdentity) ===
+							completedTask
+					) {
+						setPiDreamerProgress(manualOpts.projectIdentity, null);
+					}
+				},
 			}),
 			task,
 		});

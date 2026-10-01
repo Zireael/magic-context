@@ -3,6 +3,7 @@ import {
 	setRawMessageProvider,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { sessionLog } from "@magic-context/core/shared/logger";
+import { type PiRecompProgress, setPiRecompProgress } from "./sidebar-progress";
 import { setMagicContextRecompActive } from "./status-line";
 
 /**
@@ -70,9 +71,38 @@ export function spawnPiRecompRun(args: {
 	sessionId: string;
 	provider: RawMessageProvider;
 	onStatusChange: () => void;
-	work: (signal: AbortSignal) => Promise<void>;
+	/** Flow label for the run ("Recomp" vs "Upgrade"); defaults to "recomp". */
+	progressKind?: PiRecompProgress["kind"];
+	work: (
+		signal: AbortSignal,
+		onProgress: (progress: PiRecompProgress) => void,
+	) => Promise<void>;
 }): void {
 	const { sessionId, provider, onStatusChange, work } = args;
+	const kind = args.progressKind ?? "recomp";
+	const publishProgress = (progress: PiRecompProgress): void => {
+		// The flow kind wins unless the runner explicitly set one: per-pass
+		// entries do not know which user-facing flow started them, and OpenCode
+		// inherits the starting entry's kind for exactly this reason.
+		setPiRecompProgress(sessionId, {
+			...progress,
+			kind: progress.kind ?? kind,
+		});
+		// Invalidate the shared observability producer so the next rebuild picks
+		// the new progress up. Synchronous, non-blocking, and coalesced there.
+		onStatusChange();
+	};
+	// Immediate entry so the sidebar shows activity the instant the run is
+	// accepted, not 60-90s later on the first per-pass emit. `totalMessages: 0`
+	// is the shared model's indeterminate "starting" state; the runner replaces
+	// it with real counters on its first pass.
+	publishProgress({
+		phase: "recomp",
+		processedMessages: 0,
+		totalMessages: 0,
+		passCount: 0,
+		compartmentsCreated: 0,
+	});
 	const controller = new AbortController();
 	const unregister = setRawMessageProvider(sessionId, provider);
 	setMagicContextRecompActive(sessionId, true);
@@ -81,7 +111,7 @@ export function spawnPiRecompRun(args: {
 	const runPromise = Promise.resolve()
 		.then(async () => {
 			try {
-				await work(controller.signal);
+				await work(controller.signal, publishProgress);
 			} catch (err) {
 				if (!controller.signal.aborted) {
 					sessionLog(
@@ -97,9 +127,17 @@ export function spawnPiRecompRun(args: {
 			}
 			setMagicContextRecompActive(sessionId, false);
 			unregister();
+			// The run is over: clear its entry so the sidebar does not keep
+			// showing a frozen bar. Unlike OpenCode's 30s "done" grace there is
+			// nothing to read here — the terminal reason already reached the user
+			// through detachedSendStatus.
+			setPiRecompProgress(sessionId, null);
 			if (!controller.signal.aborted) onStatusChange();
 		});
 	run = { promise: runPromise, controller };
 	inFlightRecomp.set(sessionId, run);
-	onStatusChange();
+	// No extra invalidation here: the immediate "starting" entry published
+	// above already signalled the run started, and the producer coalesces
+	// duplicate invalidations anyway. Firing twice here would only make the
+	// start indistinguishable from a second event.
 }

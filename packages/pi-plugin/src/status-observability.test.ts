@@ -193,6 +193,124 @@ describe("Magic Context status observability producer (core)", () => {
 		}
 	});
 });
+describe("Magic Context status observability producer (rich sidebarView)", () => {
+	function makeSidebarProducer(
+		bus: Bus,
+		buildStatusView: (ctx: ExtensionContext, sessionId: string) => unknown,
+		buildSidebarView?: (ctx: ExtensionContext, sessionId: string) => unknown,
+	) {
+		return createMagicContextStatusProducer({
+			events: bus.events,
+			buildStatusView: buildStatusView as never,
+			...(buildSidebarView
+				? { buildSidebarView: buildSidebarView as never }
+				: {}),
+			debounceMs: DEBOUNCE,
+			onWarn: () => undefined,
+		});
+	}
+
+	const status = (sessionId: string) => ({
+		title: "Status",
+		version: "vtest",
+		sessionId,
+		sections: [],
+		warnings: [],
+		footer: "Esc to close",
+	});
+
+	it("carries sidebarView alongside statusView when a builder is supplied", async () => {
+		const bus = makeBus();
+		const producer = makeSidebarProducer(
+			bus,
+			(_ctx, sessionId) => status(sessionId),
+			(_ctx, sessionId) => ({
+				header: { glyph: "M", label: "MagicContext", version: "vtest" },
+				warnings: [],
+				sessionId,
+			}),
+		);
+		try {
+			producer.noteLifecycle("ses-rich", makeCtx("ses-rich"), "session_start");
+			await sleep(AFTER);
+			const snapshot = snapshotEvents(bus)[0] as McStatusSnapshotEvent;
+			expect(snapshot.payload.statusView).toEqual(status("ses-rich"));
+			expect(snapshot.payload.sidebarView).toMatchObject({
+				sessionId: "ses-rich",
+			});
+		} finally {
+			producer.dispose({ withdraw: false });
+		}
+	});
+
+	it("omits the key entirely for a V1-only producer (additive, not breaking)", async () => {
+		const bus = makeBus();
+		const producer = makeSidebarProducer(bus, (_ctx, sessionId) =>
+			status(sessionId),
+		);
+		try {
+			producer.noteLifecycle("ses-v1", makeCtx("ses-v1"), "session_start");
+			await sleep(AFTER);
+			const snapshot = snapshotEvents(bus)[0] as McStatusSnapshotEvent;
+			// Omitted, not `undefined`: a V1 consumer sees the exact payload shape
+			// it saw before rich parity existed.
+			expect("sidebarView" in snapshot.payload).toBe(false);
+			expect(Object.keys(snapshot.payload)).toEqual(["statusView"]);
+		} finally {
+			producer.dispose({ withdraw: false });
+		}
+	});
+
+	it("a sidebar-only change still mints a revision and emits", async () => {
+		const bus = makeBus();
+		let tick = 0;
+		const producer = makeSidebarProducer(
+			bus,
+			(_ctx, sessionId) => status(sessionId),
+			// Status is constant; only the sidebar moves, as a live recomp tick does.
+			() => ({
+				header: { glyph: "M", label: "MagicContext", version: "vtest" },
+				tick,
+			}),
+		);
+		try {
+			producer.noteLifecycle("ses-tick", makeCtx("ses-tick"), "session_start");
+			await sleep(AFTER);
+			expect(snapshotEvents(bus)).toHaveLength(1);
+			tick = 1;
+			producer.invalidate("ses-tick", "recomp-progress");
+			await sleep(AFTER);
+			const events = snapshotEvents(bus);
+			expect(events).toHaveLength(2);
+			expect(events[1]?.revision).toBe(2);
+			expect(events[1]?.payload.sidebarView).toMatchObject({ tick: 1 });
+		} finally {
+			producer.dispose({ withdraw: false });
+		}
+	});
+
+	it("an unchanged sidebar does not re-emit (equality gate spans both views)", async () => {
+		const bus = makeBus();
+		const producer = makeSidebarProducer(
+			bus,
+			(_ctx, sessionId) => status(sessionId),
+			() => ({
+				header: { glyph: "M", label: "MagicContext", version: "vtest" },
+			}),
+		);
+		try {
+			producer.noteLifecycle("ses-eq", makeCtx("ses-eq"), "session_start");
+			await sleep(AFTER);
+			producer.invalidate("ses-eq", "noise");
+			await sleep(AFTER);
+			expect(snapshotEvents(bus)).toHaveLength(1);
+			expect(producer.currentRevision()).toBe(1);
+		} finally {
+			producer.dispose({ withdraw: false });
+		}
+	});
+});
+
 describe("Magic Context status observability producer (discovery)", () => {
 	function makeProducer(
 		bus: Bus,

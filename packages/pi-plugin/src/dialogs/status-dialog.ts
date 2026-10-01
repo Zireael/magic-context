@@ -329,7 +329,9 @@ class StatusDialogComponent implements Component {
 }
 
 /** Failure codes every Pi status surface prints as a warning. */
-function piStatusWarnings(s: StatusDialogDetail): UserFacingFailureKey[] {
+export function piStatusWarnings(
+	s: StatusDialogDetail,
+): UserFacingFailureKey[] {
 	const warnings: UserFacingFailureKey[] = [];
 	if (s.lastTransformError) warnings.push("transform_update_failed");
 	if (s.historianFailureCount > 0) warnings.push("historian_unavailable");

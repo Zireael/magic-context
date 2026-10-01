@@ -196,7 +196,7 @@ export function registerCtxRecompCommand(
 						db: currentDeps.db,
 						projectIdentity: cwd,
 					}),
-				work: async (signal) => {
+				work: async (signal, onProgress) => {
 					const detachedSendStatus = createCtxStatusSender(pi, ctx, signal);
 					const result = await executeContextRecompWithResult(
 						{
@@ -239,6 +239,10 @@ export function registerCtxRecompCommand(
 							fallbackModels: currentDeps.historianFallbacks,
 							language: currentDeps.language,
 							fallbackModelId,
+							// Existing live-progress seam on the shared runner. Forwarding
+							// it is what makes the recomp visible in the Pi sidebar; it
+							// observes passes that already run and adds no scheduling.
+							onRecompProgress: onProgress,
 						},
 						parsed.kind === "partial" ? { range: parsed.range } : {},
 					);
