@@ -2,6 +2,7 @@ import { jsx } from "@opentui/solid/jsx-runtime";
 import { COMPACTION_ENABLED_PATH } from "../../config/agent-disable";
 import { flushLogger, log } from "../../shared/logger";
 import type { SidebarSnapshot, StatusDetail } from "../../shared/rpc-types";
+import { buildMagicContextSidebarView } from "../../shared/sidebar-view";
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "../../tui/compaction-off";
 import {
     type CommandRpcResult,
@@ -25,6 +26,19 @@ import { eventSessionID } from "./events";
 import { mountV1Sidebar, type V1SidebarMount } from "./sidebar-mount";
 import { mountV1StatusDialog, type V1StatusDialogMount } from "./status-dialog-mount";
 import type { V2KeymapLayer, V2SidebarState, V2TuiContext } from "./types";
+
+/**
+ * Build options for the plain-text fallback: the collapsed arm, no sections.
+ *
+ * A fallback line list is not a sectioned panel, and asking for sections the
+ * fallback never draws would only cost work. `now` is left to default so the
+ * model's own relative-time wording stays live.
+ */
+const COLLAPSED_SIDEBAR = {
+    collapsed: true,
+    sections: { historian: false, memory: false, status: false, dreamer: false, stats: false },
+    headerLabel: "Magic Context",
+} as const;
 
 const SIDEBAR_REFRESH_MS = 1_000;
 const inflight = new Set<string>();
@@ -60,18 +74,20 @@ export function sidebarText(snapshot: SidebarSnapshot | undefined): string {
             ...(snapshot.lastTransformError ? [`Warning: ${snapshot.lastTransformError}`] : []),
         ].join("\n");
     }
-    const pressure =
-        snapshot.contextLimit > 0
-            ? `${snapshot.usagePercentage.toFixed(1)}% · ${compactTokens(snapshot.inputTokens)}/${compactTokens(snapshot.contextLimit)}`
-            : `${compactTokens(snapshot.inputTokens)} tokens`;
-    const historian = snapshot.historianRunning ? "running" : "idle";
-    return [
-        "Magic Context",
-        `Context ${pressure}`,
-        `Historian ${historian} · C:${snapshot.compartmentCount}`,
-        `Memories ${snapshot.memoryBlockCount}/${snapshot.memoryCount} · Q:${snapshot.pendingOpsCount}`,
-        ...(snapshot.lastTransformError ? [`Warning: ${snapshot.lastTransformError}`] : []),
-    ].join("\n");
+    // The compaction-on arm used to hand-write every line below from the raw
+    // snapshot: its own `toFixed`, its own token compaction, and `C:`/`Q:`
+    // counters merged into rows the model publishes separately. That made this
+    // a third copy of the sidebar's wording that could silently disagree with
+    // the other two. Project the model instead and only join rows into lines.
+    const view = buildMagicContextSidebarView(snapshot, COLLAPSED_SIDEBAR);
+    const lines: string[] = [view.header.label];
+    const pressure = view.overview?.pressure;
+    if (pressure) lines.push(`${pressure.primary}${pressure.detail} ${pressure.right}`.trim());
+    for (const row of view.collapsedSummary?.rows ?? []) {
+        lines.push(`${row.label} ${row.value}`);
+    }
+    for (const warning of view.warnings) lines.push(`Warning: ${warning.text}`);
+    return lines.join("\n");
 }
 
 /**
