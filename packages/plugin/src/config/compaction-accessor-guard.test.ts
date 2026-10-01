@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 // isCompactionEnabled (config/agent-disable.ts) is the ONLY non-schema reader
@@ -34,6 +34,24 @@ const ALLOWED_READERS = new Set<string>([
     "packages/cli/src/commands/doctor-omp.ts",
 ]);
 
+/**
+ * Normalize a relative path to POSIX separators on every platform.
+ *
+ * `path.relative` returns the PLATFORM separator. On Windows that is a
+ * backslash, so a repository-relative path came out as
+ * `packages\\plugin\\src\\...` while ALLOWED_READERS is written with forward
+ * slashes. `Set.has` compares strings exactly, so every sanctioned exception
+ * stopped matching and the guard reported its OWN allow-list as six offenders.
+ *
+ * The symptom is a permanently failing test, which is the state a guard is
+ * usually "fixed" by deleting rather than by repairing. Matching on a
+ * separator-independent form keeps the allow-list meaningful on every
+ * platform, which is the whole point of having one.
+ */
+function toPosixPath(path: string): string {
+    return path.replace(/\\/g, "/");
+}
+
 function sourceFiles(directory: string): string[] {
     const result: string[] = [];
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -60,7 +78,7 @@ describe("compaction.enabled accessor exclusivity (issue #266)", () => {
         const offenders: string[] = [];
         for (const root of SOURCE_ROOTS) {
             for (const path of sourceFiles(resolve(REPOSITORY_ROOT, root))) {
-                const relativePath = relative(REPOSITORY_ROOT, path);
+                const relativePath = toPosixPath(relative(REPOSITORY_ROOT, path));
                 if (ALLOWED_READERS.has(relativePath)) continue;
                 const source = readFileSync(path, "utf8");
                 if (COMPACTION_ENABLED_READ.test(source)) {
@@ -69,6 +87,45 @@ describe("compaction.enabled accessor exclusivity (issue #266)", () => {
             }
         }
         expect(offenders).toEqual([]);
+    });
+
+    it("normalizes path separators so the allow-list matches on Windows", () => {
+        // The bug this pins: `relative()` hands back backslashes on Windows,
+        // so without normalization ALLOWED_READERS grants no exception at all
+        // and the guard is red for reasons that have nothing to do with the
+        // rule it exists to enforce. Written separator-explicitly so it fails
+        // on every platform, not only where the separator happens to differ.
+        expect(toPosixPath("packages\\plugin\\src\\config\\agent-disable.ts")).toBe(
+            "packages/plugin/src/config/agent-disable.ts",
+        );
+        expect(
+            ALLOWED_READERS.has(toPosixPath("packages\\plugin\\src\\config\\agent-disable.ts")),
+        ).toBe(true);
+        // A POSIX path must survive unchanged.
+        expect(toPosixPath("packages/cli/src/lib/omp-helpers.ts")).toBe(
+            "packages/cli/src/lib/omp-helpers.ts",
+        );
+    });
+
+    it("allow-lists only files that still exist", () => {
+        // An entry naming a moved or deleted file is dead weight that hides the
+        // entry someone still needs to add.
+        const missing = [...ALLOWED_READERS].filter(
+            (entry) => !existsSync(resolve(REPOSITORY_ROOT, entry)),
+        );
+        expect(missing).toEqual([]);
+    });
+
+    it("grants every allow-listed file the exception it claims", () => {
+        // Each entry is only legitimate if the file really does mention the
+        // config path; otherwise it is a hole, not an exception.
+        const inert = [...ALLOWED_READERS].filter(
+            (entry) =>
+                !COMPACTION_ENABLED_READ.test(
+                    readFileSync(resolve(REPOSITORY_ROOT, entry), "utf8"),
+                ),
+        );
+        expect(inert).toEqual([]);
     });
 
     it("isCompactionEnabled is exported from the accessor module", async () => {
