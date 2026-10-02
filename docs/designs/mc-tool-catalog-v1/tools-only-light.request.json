@@ -1,7 +1,7 @@
 {
-  "preset": "primary",
+  "preset": "tools-only",
   "params": {
-    "tool_descs": "concise"
+    "model": "anthropic/claude-haiku-4-5"
   },
   "composition": {
     "providers": [
@@ -74,12 +74,6 @@
             ]
           },
           {
-            "name": "ctx_reduce",
-            "capabilities": [
-              "magic-context:context.reduce/v1"
-            ]
-          },
-          {
             "name": "ctx_search",
             "capabilities": [
               "magic-context:archive.search/v1"
@@ -107,9 +101,9 @@
     ]
   },
   "system_text": {
-    "preset": "primary",
+    "preset": "tools-only",
     "params": {
-      "surface": "light"
+      "model": "anthropic/claude-haiku-4-5"
     }
   }
 }

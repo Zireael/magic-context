@@ -1,8 +1,6 @@
 {
-  "preset": "primary",
-  "params": {
-    "tool_descs": "concise"
-  },
+  "preset": "tools-only",
+  "params": {},
   "composition": {
     "providers": [
       {
@@ -74,12 +72,6 @@
             ]
           },
           {
-            "name": "ctx_reduce",
-            "capabilities": [
-              "magic-context:context.reduce/v1"
-            ]
-          },
-          {
             "name": "ctx_search",
             "capabilities": [
               "magic-context:archive.search/v1"
@@ -107,9 +99,7 @@
     ]
   },
   "system_text": {
-    "preset": "primary",
-    "params": {
-      "surface": "light"
-    }
+    "preset": "tools-only",
+    "params": {}
   }
 }
