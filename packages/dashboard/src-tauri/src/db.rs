@@ -324,6 +324,79 @@ pub enum OpenCodeStoreGeneration {
     V2,
 }
 
+#[derive(Debug)]
+struct OpenCodeSessions {
+    generations: Vec<OpenCodeStoreGeneration>,
+    owners: HashMap<String, OpenCodeStoreGeneration>,
+}
+
+impl OpenCodeSessions {
+    fn owner(&self, id: &str) -> Option<OpenCodeStoreGeneration> {
+        self.owners.get(id).copied()
+    }
+
+    fn owns(&self, id: &str, generation: OpenCodeStoreGeneration) -> bool {
+        self.owner(id) == Some(generation)
+    }
+}
+
+fn resolve_opencode_sessions(conn: &Connection) -> Result<OpenCodeSessions, rusqlite::Error> {
+    let mut generations = Vec::new();
+    let mut owners = HashMap::new();
+    // OpenCode 1 can create session_message before an upgrade, so its
+    // presence alone does not identify V2. Only a populated session_v2
+    // alongside session_message adds V2 ownership to a mixed store.
+    let has_v1 = table_exists(conn, "session");
+    let has_v2 = table_exists(conn, "session_message") && table_exists(conn, "session_v2");
+    if has_v1 {
+        generations.push(OpenCodeStoreGeneration::V1);
+    }
+    if has_v2
+        && (!has_v1
+            || conn.query_row("SELECT EXISTS(SELECT 1 FROM session_v2)", [], |row| {
+                row.get::<_, bool>(0)
+            })?)
+    {
+        generations.push(OpenCodeStoreGeneration::V2);
+    }
+    if generations.is_empty() && table_exists(conn, "project") {
+        generations.push(OpenCodeStoreGeneration::V1);
+    }
+    for &generation in &generations {
+        if !table_exists(conn, opencode_session_table(generation)) {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM {}",
+            opencode_session_table(generation)
+        ))?;
+        for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            owners.insert(id?, generation);
+        }
+    }
+    if generations.is_empty() {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "OpenCode store generation is unknown",
+            ),
+        )));
+    }
+    Ok(OpenCodeSessions {
+        generations,
+        owners,
+    })
+}
+
+fn open_opencode_sessions(
+    path: &PathBuf,
+) -> Result<(Connection, OpenCodeSessions), rusqlite::Error> {
+    let conn = open_readonly(path)?;
+    let sessions = resolve_opencode_sessions(&conn)?;
+    Ok((conn, sessions))
+}
+
+#[cfg(test)]
 fn opencode_store_generation(
     conn: &Connection,
 ) -> Result<OpenCodeStoreGeneration, rusqlite::Error> {
@@ -334,9 +407,8 @@ fn opencode_store_generation(
             |row| row.get(0),
         )
     };
-    // OpenCode 1.18.x already ships session_message and session_v2 beside its own
-    // message/part tables, so only the ABSENCE of the 1.x message tables identifies an
-    // OpenCode 2 store. Mirrors the plugin's detectOpenCodeStoreGeneration.
+    // These schema tests preserve recognition of older message/part and
+    // session/project layouts; production readers resolve session ownership.
     if table_exists("message")? && table_exists("part")? {
         return Ok(OpenCodeStoreGeneration::V1);
     }
@@ -358,16 +430,13 @@ pub fn open_opencode_readonly(
     path: &PathBuf,
 ) -> Result<(Connection, OpenCodeStoreGeneration), rusqlite::Error> {
     let conn = open_readonly(path)?;
-    let generation = opencode_store_generation(&conn)?;
+    let resolved = resolve_opencode_sessions(&conn)?;
+    let generation = *resolved.generations.last().expect("resolved generation");
     Ok((conn, generation))
 }
 
-/// The table holding the host's sessions. OpenCode 2 keeps them in `session_v2`
-/// (same id, title, directory, project_id, parent_id, time_updated and
-/// time_archived columns); a fresh OpenCode 2 store has no `session` table at
-/// all, and a store converted from OpenCode 1 keeps only the pre-upgrade
-/// sessions there. Reading `session` on an OpenCode 2 store therefore lists no
-/// current session, which left the Projects page empty.
+/// The session table for one generation. Converted stores retain `session`
+/// alongside `session_v2`; the session index selects which row owns each ID.
 fn opencode_session_table(generation: OpenCodeStoreGeneration) -> &'static str {
     match generation {
         OpenCodeStoreGeneration::V1 => "session",
@@ -1538,18 +1607,65 @@ pub struct TableCount {
 
 // ── Helpers ───────────────────────────────────────────────────
 
-/// Compute a normalized hash matching the plugin's dedup logic:
-/// lowercase → trim whitespace → hash as hex string.
-/// Uses std::hash for portability (no SHA crate in deps); the exact
-/// hash algorithm doesn't matter as long as it's consistent within
-/// the dashboard. The plugin uses its own Bun-based hash path.
-/// Match the plugin's `computeNormalizedHash`: lowercase → collapse whitespace → trim → MD5 hex.
+/// Match the plugin's `computeNormalizedHash` (`normalize-hash.ts`): lowercase,
+/// replace every JS `\s+` run with one space, trim, then MD5 hex. The whitespace
+/// set must be JavaScript's, not Rust's `char::is_whitespace`: the two disagree on
+/// U+0085 (Rust only) and U+FEFF (JS only), and any disagreement gives the same
+/// memory two hashes, which defeats the `UNIQUE(project_path, category,
+/// normalized_hash)` dedup the plugin relies on.
 fn normalize_hash(content: &str) -> String {
-    let normalized = content.to_lowercase();
-    // Collapse all whitespace runs into a single space (mirrors JS /\s+/g → " ")
-    let normalized: String = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered = content.to_lowercase();
+    let normalized = lowered
+        .split(is_js_whitespace)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     let digest = md5::compute(normalized.as_bytes());
     format!("{:032x}", digest)
+}
+
+/// The characters matched by a JavaScript regex `\s`: ECMAScript WhiteSpace
+/// (including U+FEFF and the Unicode `Zs` spaces) plus LineTerminator.
+fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
+}
+
+#[cfg(test)]
+mod normalize_hash_tests {
+    use super::normalize_hash;
+
+    #[test]
+    fn memory_hash_uses_the_plugin_whitespace_set() {
+        // Expected digests come from the plugin's own code path:
+        // createHash("md5").update(s.toLowerCase().replace(/\s+/g, " ").trim()).
+        // U+0085 is not JS whitespace, so it stays inside the word.
+        assert_eq!(
+            normalize_hash("a\u{0085}b"),
+            "7337d246dc3bfd7109e19d37193e7f19"
+        );
+        // U+FEFF is JS whitespace: it collapses and trims away.
+        assert_eq!(
+            normalize_hash("\u{FEFF}User  Prefers\u{00A0}Bun\u{FEFF}"),
+            "c35b4c1bcc1a2fabeb3e9efa7bac6597"
+        );
+        assert_eq!(
+            normalize_hash("x\u{2028}y\u{3000}z\t"),
+            "a0971f3c1fc2d4c967b3cd362cc29f48"
+        );
+    }
 }
 
 fn format_timestamp_iso(timestamp: i64) -> String {
@@ -1608,8 +1724,29 @@ pub fn load_raw_db_cache_events(
         return Ok(Vec::new());
     };
 
-    let (conn, generation) = open_opencode_readonly(&opencode_db_path)?;
+    let (conn, sessions) = open_opencode_sessions(&opencode_db_path)?;
+    let mut events = Vec::new();
+    for &generation in &sessions.generations {
+        events.extend(load_raw_db_cache_events_for_generation(
+            &conn,
+            &sessions,
+            generation,
+            limit,
+            since_timestamp,
+        )?);
+    }
+    events.sort_by_key(|event| std::cmp::Reverse(event.timestamp));
+    events.truncate(limit.saturating_mul(10));
+    Ok(events)
+}
 
+fn load_raw_db_cache_events_for_generation(
+    conn: &Connection,
+    sessions: &OpenCodeSessions,
+    generation: OpenCodeStoreGeneration,
+    limit: usize,
+    since_timestamp: Option<i64>,
+) -> Result<Vec<RawDbCacheEvent>, rusqlite::Error> {
     // Per-session windowing: each session gets up to `limit` recent events
     // (so a session-filtered timeline always has full bar coverage), capped
     // globally at `limit * 10` to bound memory across many concurrent sessions.
@@ -1682,6 +1819,14 @@ pub fn load_raw_db_cache_events(
         )
     };
 
+    if generation == OpenCodeStoreGeneration::V1
+        && sessions.generations.contains(&OpenCodeStoreGeneration::V2)
+    {
+        sql = sql.replace(
+            "WHERE json_extract(m.data, '$.role') = 'assistant'",
+            "WHERE m.session_id NOT IN (SELECT id FROM session_v2) AND json_extract(m.data, '$.role') = 'assistant'",
+        );
+    }
     let harness = match generation {
         OpenCodeStoreGeneration::V1 => Harness::Opencode,
         OpenCodeStoreGeneration::V2 => {
@@ -1722,7 +1867,11 @@ pub fn load_raw_db_cache_events(
         })
     })?;
 
-    rows.collect()
+    Ok(rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|event| sessions.owns(&event.session_id, generation))
+        .collect())
 }
 
 /// Load Pi-compatible cache events from JSONL session files. Each native
@@ -2212,28 +2361,34 @@ fn build_db_cache_events_with_attribution(
         .collect();
     if !oc_session_ids.is_empty() {
         if let Some(opencode_db_path) = resolve_opencode_db_path() {
-            if let Ok((conn, generation)) = open_opencode_readonly(&opencode_db_path) {
-                let first_event_sql = match generation {
-                    OpenCodeStoreGeneration::V1 => FIRST_OPENCODE_CACHE_EVENT_SQL,
-                    OpenCodeStoreGeneration::V2 => FIRST_OPENCODE2_CACHE_EVENT_SQL,
-                };
-                let harness = match generation {
-                    OpenCodeStoreGeneration::V1 => Harness::Opencode,
-                    OpenCodeStoreGeneration::V2 => Harness::Opencode2,
-                };
-                if let Ok(mut stmt) = conn.prepare(first_event_sql) {
-                    for sid in oc_session_ids {
-                        let db_earliest = stmt
-                            .query_row(params![&sid], |row| row.get::<_, i64>(0))
-                            .optional()
-                            .ok()
-                            .flatten();
-                        let window_earliest = earliest_ts_in_window.get(&(harness, sid.clone()));
-                        if db_earliest
-                            .zip(window_earliest)
-                            .is_some_and(|(db, window)| *window <= db)
-                        {
-                            true_first_sessions.insert((harness, sid));
+            if let Ok((conn, resolved)) = open_opencode_sessions(&opencode_db_path) {
+                for &generation in &resolved.generations {
+                    let first_event_sql = match generation {
+                        OpenCodeStoreGeneration::V1 => FIRST_OPENCODE_CACHE_EVENT_SQL,
+                        OpenCodeStoreGeneration::V2 => FIRST_OPENCODE2_CACHE_EVENT_SQL,
+                    };
+                    let harness = match generation {
+                        OpenCodeStoreGeneration::V1 => Harness::Opencode,
+                        OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+                    };
+                    if let Ok(mut stmt) = conn.prepare(first_event_sql) {
+                        for sid in &oc_session_ids {
+                            if !resolved.owns(sid, generation) {
+                                continue;
+                            }
+                            let db_earliest = stmt
+                                .query_row(params![&sid], |row| row.get::<_, i64>(0))
+                                .optional()
+                                .ok()
+                                .flatten();
+                            let window_earliest =
+                                earliest_ts_in_window.get(&(harness, sid.clone()));
+                            if db_earliest
+                                .zip(window_earliest)
+                                .is_some_and(|(db, window)| *window <= db)
+                            {
+                                true_first_sessions.insert((harness, sid.clone()));
+                            }
                         }
                     }
                 }
@@ -2413,9 +2568,10 @@ fn build_db_cache_events_with_attribution(
     // Expected next cache_read = prev.cache_read + growth, where growth is the
     // freshly-cacheable content the previous step contributed:
     //   - Anthropic reports it directly as cache_write (cache_creation tokens).
-    //   - Other providers never report cache_write (always 0), so the previous
-    //     step's own input + output is what becomes cached on the next step.
-    //   growth = prev.cache_write > 0 ? prev.cache_write : prev.input + prev.output
+    //   - When cache_write is absent, use only the previous uncached input.
+    //     Generated output (including reasoning) is not automatically part of
+    //     the next step's cached input; measured comparisons support this rule
+    //     (docs/reports/pi-openai-cache-busts-2026-09-28.md).
     // retention = current.cache_read / expected (only when prev had a cache):
     //   >= 0.95 stable · 0.80..0.95 warning · < 0.80 bust · ==0 full_bust
     // (Verified empirically: on a stable step retention is 0.97-1.00+ across
@@ -2547,25 +2703,19 @@ fn build_db_cache_events_with_attribution(
                 }
             } else if let Some(&prev_idx) = prev_event_idx_by_session.get(&session_key) {
                 // Snapshot prev values out before mutating chronological[i].
-                let (prev_read, prev_write, prev_input, prev_total) = {
+                let (prev_read, prev_write, prev_input) = {
                     let prev = &chronological[prev_idx];
-                    (
-                        prev.cache_read,
-                        prev.cache_write,
-                        prev.input_tokens,
-                        prev.total_tokens,
-                    )
+                    (prev.cache_read, prev.cache_write, prev.input_tokens)
                 };
                 if prev_read == 0 {
                     // No cache was established on the prior step (cold / still
                     // warming up), so a low/zero cache_read now isn't a LOSS.
                     ("stable".to_string(), None, None)
                 } else {
-                    let prev_output = (prev_total - prev_input - prev_read - prev_write).max(0);
                     let growth = if prev_write > 0 {
                         prev_write
                     } else {
-                        prev_input + prev_output
+                        prev_input
                     };
                     let expected = prev_read + growth; // > 0 since prev_read > 0
                     if cur_read == 0 {
@@ -2761,7 +2911,7 @@ fn load_broca_cache_sessions(limit: usize) -> Vec<CacheSessionListEntry> {
     let Ok(conn) = open_broca_store(&root.join("run-index.db")) else {
         return Vec::new();
     };
-    load_broca_cache_sessions_from_conn(&conn, limit).unwrap_or_default()
+    load_broca_cache_sessions_from_conn(&conn, Some(&root), limit).unwrap_or_default()
 }
 
 // Every Broca run is started by one of our own systems (Alfonso heads and
@@ -2773,42 +2923,87 @@ fn load_broca_cache_sessions(limit: usize) -> Vec<CacheSessionListEntry> {
 // in progress is listed before any of its runs has finished. Both tables hold
 // the same JSON identity; `json()` normalizes the index's spelling to the one
 // `json_extract` returns for the facts, so one session is one row.
+//
+// A running run's index row is stamped once, when the run starts, and Broca
+// does not touch it again until the run ends; the steps in between are only
+// appended to the session's WAL. The Cache tab refetches a session's events
+// only when its listed activity moves, so a session dated by that stamp alone
+// stayed frozen at whatever its WAL held when it was first listed: a short
+// run (a gather research run) first seen just after `run_started` showed no steps
+// until it finished. With `wal_state_root`, a session with a running run is
+// dated by its live WAL's modification time as well, which moves on every
+// append. Such sessions are fetched past `limit` (there are only a few), so a
+// long run started before newer sessions can still rise into the list.
 fn load_broca_cache_sessions_from_conn(
     conn: &Connection,
+    wal_state_root: Option<&Path>,
     limit: usize,
 ) -> rusqlite::Result<Vec<CacheSessionListEntry>> {
     let active_runs = if table_exists(conn, "run_index") {
         "UNION ALL
-         SELECT CASE WHEN json_valid(session) THEN json(session) END, state_changed_ms
+         SELECT CASE WHEN json_valid(session) THEN json(session) END, state_changed_ms, 1
          FROM run_index WHERE state = 'active'"
     } else {
         ""
     };
     let mut stmt = conn.prepare(&format!(
-        "SELECT identity, MAX(activity) AS activity FROM (
-             SELECT json_extract(segment_json, '$.session') AS identity,
-                    CAST(json_extract(segment_json, '$.occurred_at_ms') AS INTEGER) AS activity
-             FROM export_facts
-             {active_runs}
+        "SELECT identity, activity, running FROM (
+             SELECT identity, MAX(activity) AS activity, MAX(running) AS running,
+                    ROW_NUMBER() OVER (ORDER BY MAX(activity) DESC) AS rank
+             FROM (
+                 SELECT json_extract(segment_json, '$.session') AS identity,
+                        CAST(json_extract(segment_json, '$.occurred_at_ms') AS INTEGER) AS activity,
+                        0 AS running
+                 FROM export_facts
+                 {active_runs}
+             )
+             WHERE identity IS NOT NULL
+             GROUP BY identity HAVING MAX(activity) IS NOT NULL
          )
-         WHERE identity IS NOT NULL
-         GROUP BY identity HAVING MAX(activity) IS NOT NULL
-         ORDER BY activity DESC LIMIT ?1"
+         WHERE rank <= ?1 OR running = 1
+         ORDER BY activity DESC"
     ))?;
     let rows = stmt.query_map(params![limit as i64], |row| {
         let session_id: String = row.get(0)?;
         let activity: i64 = row.get(1)?;
+        let running: i64 = row.get(2)?;
+        Ok((session_id, activity, running != 0))
+    })?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        let (session_id, mut activity, running) = row?;
+        if running {
+            if let Some(written) = wal_state_root
+                .zip(broca_wal::SessionIdentity::from_json(&session_id))
+                .and_then(|(root, identity)| live_wal_modified_ms(root, &identity))
+            {
+                activity = activity.max(written);
+            }
+        }
         let title = serde_json::from_str::<serde_json::Value>(&session_id)
             .ok()
             .and_then(|identity| identity["session"].as_str().map(str::to_owned));
-        Ok(CacheSessionListEntry {
+        sessions.push(CacheSessionListEntry {
             harness: Harness::Broca,
+            title,
             session_id,
             last_activity_ms: activity,
-            title,
-        })
-    })?;
-    rows.collect()
+        });
+    }
+    sessions.sort_by_key(|row| std::cmp::Reverse(row.last_activity_ms));
+    sessions.truncate(limit);
+    Ok(sessions)
+}
+
+/// When the session's live WAL was last written, in Unix milliseconds, or
+/// `None` when it has no live WAL (not started yet, or already archived).
+fn live_wal_modified_ms(state_root: &Path, identity: &broca_wal::SessionIdentity) -> Option<i64> {
+    let path = state_root
+        .join("wal")
+        .join(format!("{}.wal", identity.addr()));
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since_epoch.as_millis()).ok()
 }
 
 fn get_broca_session_cache_events(
@@ -2822,12 +3017,15 @@ fn get_broca_session_cache_events(
     let Ok(conn) = open_broca_store(&root.join("run-index.db")) else {
         return Vec::new();
     };
-    let wal_runs = broca_wal::SessionIdentity::from_json(session_id)
+    let snapshot = broca_wal::SessionIdentity::from_json(session_id)
         .and_then(|identity| broca_wal::session_runs(&root, &identity));
-    load_broca_cache_events_from_conn(
+    let wal_runs = snapshot.as_ref().map(|(runs, _)| runs.as_slice());
+    let partial = snapshot.as_ref().is_some_and(|(_, note)| note.is_some());
+    load_broca_cache_events_with_compatibility(
         &conn,
         session_id,
-        wal_runs.as_deref(),
+        wal_runs,
+        !partial,
         limit,
         since_timestamp,
     )
@@ -2850,6 +3048,7 @@ fn get_broca_session_cache_events(
 //
 // `limit` and `since_timestamp` select runs, not steps: a run's steps are
 // always loaded together so a run is never cut in half.
+#[cfg(test)]
 fn load_broca_cache_events_from_conn(
     conn: &Connection,
     session_id: &str,
@@ -2857,11 +3056,35 @@ fn load_broca_cache_events_from_conn(
     limit: Option<usize>,
     since_timestamp: Option<i64>,
 ) -> rusqlite::Result<Vec<RawDbCacheEvent>> {
+    load_broca_cache_events_with_compatibility(
+        conn,
+        session_id,
+        wal_runs,
+        true,
+        limit,
+        since_timestamp,
+    )
+}
+
+fn load_broca_cache_events_with_compatibility(
+    conn: &Connection,
+    session_id: &str,
+    wal_runs: Option<&[broca_wal::WalRun]>,
+    allow_totals: bool,
+    limit: Option<usize>,
+    since_timestamp: Option<i64>,
+) -> rusqlite::Result<Vec<RawDbCacheEvent>> {
     struct RunRows {
         activity: i64,
         rows: Vec<RawDbCacheEvent>,
     }
-    let totals = load_broca_run_totals(conn, session_id)?;
+    // A compatibility stop promises only the verified WAL prefix, not later
+    // completed runs from the index that the reader could not interpret.
+    let totals = if !allow_totals {
+        Vec::new()
+    } else {
+        load_broca_run_totals(conn, session_id)?
+    };
     let mut runs: Vec<RunRows> = Vec::with_capacity(totals.len());
     let mut stepped: HashSet<&str> = HashSet::new();
     for run in wal_runs.unwrap_or_default() {
@@ -3178,21 +3401,38 @@ fn load_recent_opencode_cache_sessions(
     let Some(path) = resolve_opencode_db_path() else {
         return (Vec::new(), None);
     };
-    let Ok((conn, generation)) = open_opencode_readonly(&path) else {
+    let Ok((conn, resolved)) = open_opencode_sessions(&path) else {
         return (Vec::new(), None);
     };
-    let note = opencode_cache_activity_note(&conn, generation);
-    let sessions = if let Ok(mut cache) = opencode_cache_presence().write() {
-        load_recent_opencode_cache_sessions_with_cache(
-            &conn,
-            generation,
-            limit,
-            hidden_subagent_ids,
-            &mut cache,
-        )
-    } else {
-        load_recent_opencode_cache_sessions_from_conn(&conn, generation, limit, hidden_subagent_ids)
-    };
+    let note = resolved
+        .generations
+        .iter()
+        .find_map(|&generation| opencode_cache_activity_note(&conn, generation));
+    let mut sessions = Vec::new();
+    for &generation in &resolved.generations {
+        let rows = if let Ok(mut cache) = opencode_cache_presence().write() {
+            load_recent_opencode_cache_sessions_with_cache(
+                &conn,
+                generation,
+                limit,
+                hidden_subagent_ids,
+                &mut cache,
+            )
+        } else {
+            load_recent_opencode_cache_sessions_from_conn(
+                &conn,
+                generation,
+                limit,
+                hidden_subagent_ids,
+            )
+        };
+        sessions.extend(
+            rows.into_iter()
+                .filter(|row| resolved.owns(&row.session_id, generation)),
+        );
+    }
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.last_activity_ms));
+    sessions.truncate(limit);
     (sessions, note)
 }
 
@@ -3240,9 +3480,22 @@ fn load_recent_opencode_cache_sessions_with_cache(
         .clamp(256, ABSOLUTE_MAX_SCANNED_SESSIONS);
     let batch_size = limit.saturating_mul(4).clamp(1, max_scanned_sessions);
     let activity = opencode_cache_activity(conn, generation);
-    let Ok(mut candidates_stmt) =
-        conn.prepare(&recent_opencode_cache_sessions_sql(generation, activity))
-    else {
+    let mut candidate_sql = recent_opencode_cache_sessions_sql(generation, activity);
+    if generation == OpenCodeStoreGeneration::V1
+        && table_exists(conn, "session_v2")
+        && table_exists(conn, "session_message")
+    {
+        candidate_sql = candidate_sql
+            .replace(
+                "WHERE time_archived IS NULL",
+                "WHERE time_archived IS NULL AND id NOT IN (SELECT id FROM session_v2)",
+            )
+            .replace(
+                "WHERE s.time_archived IS NULL",
+                "WHERE s.time_archived IS NULL AND s.id NOT IN (SELECT id FROM session_v2)",
+            );
+    }
+    let Ok(mut candidates_stmt) = conn.prepare(&candidate_sql) else {
         return Vec::new();
     };
     let harness = match generation {
@@ -3452,23 +3705,27 @@ pub fn load_cache_session_titles(
         .collect();
     if !opencode_ids.is_empty() {
         if let Some(path) = resolve_opencode_db_path() {
-            if let Ok((conn, generation)) = open_opencode_readonly(&path) {
-                let harness = match generation {
-                    OpenCodeStoreGeneration::V1 => Harness::Opencode,
-                    OpenCodeStoreGeneration::V2 => Harness::Opencode2,
-                };
-                let placeholders = vec!["?"; opencode_ids.len()].join(",");
-                let sql = format!(
-                    "SELECT id, COALESCE(title, '') FROM {} WHERE id IN ({placeholders})",
-                    opencode_session_table(generation)
-                );
-                if let Ok(mut stmt) = conn.prepare(&sql) {
-                    if let Ok(rows) = stmt.query_map(params_from_iter(opencode_ids.iter()), |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    }) {
-                        for (sid, title) in rows.flatten() {
-                            if !title.is_empty() {
-                                titles.insert((harness, sid), title);
+            if let Ok((conn, resolved)) = open_opencode_sessions(&path) {
+                for &generation in &resolved.generations {
+                    let harness = match generation {
+                        OpenCodeStoreGeneration::V1 => Harness::Opencode,
+                        OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+                    };
+                    let placeholders = vec!["?"; opencode_ids.len()].join(",");
+                    let sql = format!(
+                        "SELECT id, COALESCE(title, '') FROM {} WHERE id IN ({placeholders})",
+                        opencode_session_table(generation)
+                    );
+                    if let Ok(mut stmt) = conn.prepare(&sql) {
+                        if let Ok(rows) = stmt
+                            .query_map(params_from_iter(opencode_ids.iter()), |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            })
+                        {
+                            for (sid, title) in rows.flatten() {
+                                if !title.is_empty() && resolved.owns(&sid, generation) {
+                                    titles.insert((harness, sid), title);
+                                }
                             }
                         }
                     }
@@ -3691,6 +3948,14 @@ pub fn get_session_cache_stats_from_db(
         .into_iter()
         .map(|row| {
             let key = (row.harness, row.session_id.clone());
+            let broca_note = if row.harness == Harness::Broca {
+                broca_state_root().and_then(|root| {
+                    broca_wal::SessionIdentity::from_json(&row.session_id)
+                        .and_then(|identity| broca_wal::session_activity_note(&root, &identity))
+                })
+            } else {
+                None
+            };
             SessionCacheStats {
                 harness: row.harness,
                 session_id: row.session_id,
@@ -3708,7 +3973,8 @@ pub fn get_session_cache_stats_from_db(
                 activity_note: (row.harness == Harness::Opencode2)
                     .then_some(opencode_activity_note)
                     .flatten()
-                    .map(str::to_owned),
+                    .map(str::to_owned)
+                    .or(broca_note),
             }
         })
         .collect()
@@ -3806,7 +4072,10 @@ fn get_opencode_session_cache_events(
     let Some(opencode_db_path) = resolve_opencode_db_path() else {
         return Vec::new();
     };
-    let Ok((conn, generation)) = open_opencode_readonly(&opencode_db_path) else {
+    let Ok((conn, sessions)) = open_opencode_sessions(&opencode_db_path) else {
+        return Vec::new();
+    };
+    let Some(generation) = sessions.owner(session_id) else {
         return Vec::new();
     };
     get_opencode_session_cache_events_from_conn(
@@ -3934,14 +4203,14 @@ fn get_pi_session_cache_events(
     };
     let mut rows: Vec<RawDbCacheEvent> = detail
         .messages
-        .into_iter()
+        .iter()
         .filter(|message| message.role == "assistant")
         .filter_map(|message| {
-            let usage = message.usage?;
+            let usage = message.usage.as_ref()?;
             let (provider, model) = pi_message_provider_model(&message.raw_json);
-            (usage.total > 0).then_some(RawDbCacheEvent {
+            (usage.total > 0).then(|| RawDbCacheEvent {
                 harness,
-                message_id: message.entry_id,
+                message_id: message.entry_id.clone(),
                 session_id: session_id.to_string(),
                 timestamp: message.timestamp_ms,
                 input_tokens: usage.input as i64,
@@ -3949,7 +4218,7 @@ fn get_pi_session_cache_events(
                 cache_write: usage.cache_write as i64,
                 total_tokens: usage.total as i64,
                 agent: None,
-                finish: message.stop_reason,
+                finish: message.stop_reason.clone(),
                 native_turn_id: None,
                 context_limit: None,
                 provider,
@@ -4087,22 +4356,28 @@ pub fn get_projects_for_config(
     let mut paths = HashMap::new();
     let mut names = HashMap::new();
     if let Some(path) = opencode_path {
-        if let Ok((opencode, generation)) = open_opencode_readonly(path) {
-            let harness = match generation {
-                OpenCodeStoreGeneration::V1 => Harness::Opencode,
-                OpenCodeStoreGeneration::V2 => Harness::Opencode2,
-            };
-            if let Ok(mut stmt) = opencode.prepare(&format!(
-                "SELECT id, directory FROM {} WHERE directory IS NOT NULL AND directory != ''",
-                opencode_session_table(generation)
-            )) {
-                if let Ok(rows) = stmt.query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                }) {
-                    for (session_id, directory) in rows.flatten() {
-                        let identity = lookup_session_identity(&identities, harness, &session_id);
-                        if !identity.is_empty() {
-                            paths.insert(directory, identity);
+        if let Ok((opencode, resolved)) = open_opencode_sessions(path) {
+            for &generation in &resolved.generations {
+                let harness = match generation {
+                    OpenCodeStoreGeneration::V1 => Harness::Opencode,
+                    OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+                };
+                if let Ok(mut stmt) = opencode.prepare(&format!(
+                    "SELECT id, directory FROM {} WHERE directory IS NOT NULL AND directory != ''",
+                    opencode_session_table(generation)
+                )) {
+                    if let Ok(rows) = stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                        for (session_id, directory) in rows.flatten() {
+                            if !resolved.owns(&session_id, generation) {
+                                continue;
+                            }
+                            let identity =
+                                lookup_session_identity(&identities, harness, &session_id);
+                            if !identity.is_empty() {
+                                paths.insert(directory, identity);
+                            }
                         }
                     }
                 }
@@ -4282,25 +4557,31 @@ fn mapped_session_directories(identities: &SessionIdentityMap) -> Vec<(String, S
     let mut dirs = Vec::new();
 
     if let Some(oc) = resolve_opencode_db_path() {
-        if let Ok((conn, generation)) = open_opencode_readonly(&oc) {
-            let harness = match generation {
-                OpenCodeStoreGeneration::V1 => Harness::Opencode,
-                OpenCodeStoreGeneration::V2 => Harness::Opencode2,
-            };
-            if let Ok(mut stmt) = conn.prepare(&format!(
-                "SELECT id, COALESCE(directory, '')
+        if let Ok((conn, resolved)) = open_opencode_sessions(&oc) {
+            for &generation in &resolved.generations {
+                let harness = match generation {
+                    OpenCodeStoreGeneration::V1 => Harness::Opencode,
+                    OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+                };
+                if let Ok(mut stmt) = conn.prepare(&format!(
+                    "SELECT id, COALESCE(directory, '')
                  FROM {}
                  WHERE directory IS NOT NULL AND directory != ''",
-                opencode_session_table(generation)
-            )) {
-                if let Ok(rows) = stmt.query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                }) {
-                    for row in rows.flatten() {
-                        let (session_id, dir) = row;
-                        let identity = lookup_session_identity(identities, harness, &session_id);
-                        if !identity.is_empty() {
-                            dirs.push((identity, dir));
+                    opencode_session_table(generation)
+                )) {
+                    if let Ok(rows) = stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                        for row in rows.flatten() {
+                            let (session_id, dir) = row;
+                            if !resolved.owns(&session_id, generation) {
+                                continue;
+                            }
+                            let identity =
+                                lookup_session_identity(identities, harness, &session_id);
+                            if !identity.is_empty() {
+                                dirs.push((identity, dir));
+                            }
                         }
                     }
                 }
@@ -4392,41 +4673,51 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
     let identity_by_dir = session_identity_by_directory(&session_identities);
 
     if let Some(opencode_db_path) = resolve_opencode_db_path() {
-        if let Ok((conn, generation)) = open_opencode_readonly(&opencode_db_path) {
-            let harness = match generation {
-                OpenCodeStoreGeneration::V1 => Harness::Opencode,
-                OpenCodeStoreGeneration::V2 => Harness::Opencode2,
-            };
-            if let Ok(mut stmt) = conn.prepare(&format!(
-                "SELECT p.name, p.worktree, COUNT(s.id)
+        if let Ok((conn, resolved)) = open_opencode_sessions(&opencode_db_path) {
+            for &generation in &resolved.generations {
+                let harness = match generation {
+                    OpenCodeStoreGeneration::V1 => Harness::Opencode,
+                    OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+                };
+                if let Ok(mut stmt) = conn.prepare(&format!(
+                    "SELECT p.name, p.worktree, COUNT(s.id)
                  FROM project p LEFT JOIN {} s ON s.project_id = p.id
                  GROUP BY p.id, p.name, p.worktree",
-                opencode_session_table(generation)
-            )) {
-                if let Ok(rows) = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                }) {
-                    for (name, worktree, count) in rows.flatten() {
-                        if let Some(allowed_paths) = project_paths_filter {
-                            if !allowed_paths.contains(&worktree) {
-                                continue;
+                    if generation == OpenCodeStoreGeneration::V1
+                        && resolved.generations.contains(&OpenCodeStoreGeneration::V2)
+                    {
+                        "(SELECT * FROM session WHERE id NOT IN (SELECT id FROM session_v2))"
+                    } else {
+                        opencode_session_table(generation)
+                    }
+                )) {
+                    if let Ok(rows) = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    }) {
+                        for (name, worktree, count) in rows.flatten() {
+                            if let Some(allowed_paths) = project_paths_filter {
+                                if !allowed_paths.contains(&worktree) {
+                                    continue;
+                                }
                             }
+                            let Some(identity) = identity_by_dir.get(&worktree).cloned() else {
+                                continue;
+                            };
+                            let entry = groups.entry(identity).or_default();
+                            if !name.is_empty() {
+                                entry.opencode_name = Some(name);
+                            }
+                            entry.opencode_path = Some(worktree);
+                            if count > 0 {
+                                entry.harnesses.insert(harness);
+                            }
+                            entry.session_count =
+                                entry.session_count.saturating_add(count.max(0) as u32);
                         }
-                        let Some(identity) = identity_by_dir.get(&worktree).cloned() else {
-                            continue;
-                        };
-                        let entry = groups.entry(identity).or_default();
-                        if !name.is_empty() {
-                            entry.opencode_name = Some(name);
-                        }
-                        entry.opencode_path = Some(worktree);
-                        entry.harnesses.insert(harness);
-                        entry.session_count =
-                            entry.session_count.saturating_add(count.max(0) as u32);
                     }
                 }
             }
@@ -4757,6 +5048,23 @@ fn enrich_memories_workspace_source(
     Ok(())
 }
 
+/// A `LIKE ... ESCAPE '\'` pattern that matches `raw` literally anywhere in the
+/// value. The escape character itself must be escaped first: an unescaped `\`
+/// would swallow the next character, so a Windows path like `C:\Users` would
+/// only match `C:Users`.
+fn like_contains_pattern(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len() + 2);
+    escaped.push('%');
+    for ch in raw.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped.push('%');
+    escaped
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn get_memories(
     conn: &Connection,
@@ -4812,7 +5120,7 @@ pub fn get_memories(
     // For very short queries (< 3 chars) or if FTS sanitization produces nothing,
     // fall back to LIKE which handles partial matches better
     let use_like_fallback = has_search && (!use_fts || raw_search.len() < 3);
-    let like_pattern = format!("%{}%", raw_search.replace('%', "\\%").replace('_', "\\_"));
+    let like_pattern = like_contains_pattern(&raw_search);
 
     // Build WHERE clauses and params dynamically
     let mut conditions = Vec::new();
@@ -4944,6 +5252,25 @@ pub fn get_memories(
         Ok(mut memories) if !memories.is_empty() || !use_fts => {
             enrich_memories_workspace_source(conn, workspace_filter, &mut memories)?;
             Ok(memories)
+        }
+        Ok(empty) if use_fts && !use_like_fallback && offset > 0 && {
+            // An empty page past the first one only falls back to LIKE when FTS
+            // matches nothing at all. Otherwise it is just the end of the FTS
+            // results, and a LIKE page at the same offset would splice a
+            // different result set onto the pages already shown.
+            let mut probe: Vec<&dyn rusqlite::types::ToSql> = params[..params.len() - 2]
+                .iter()
+                .map(|p| p.as_ref())
+                .collect();
+            probe.push(&1i64);
+            probe.push(&0i64);
+            conn.prepare(&sql)?
+                .query(probe.as_slice())?
+                .next()?
+                .is_some()
+        } =>
+        {
+            Ok(empty)
         }
         Ok(_empty) if use_fts && !use_like_fallback => {
             // FTS returned nothing — retry with LIKE for better partial matching
@@ -6089,9 +6416,24 @@ pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
     let Some(opencode_db_path) = resolve_opencode_db_path() else {
         return Vec::new();
     };
-    let Ok((conn, generation)) = open_opencode_readonly(&opencode_db_path) else {
+    let Ok((conn, sessions)) = open_opencode_sessions(&opencode_db_path) else {
         return Vec::new();
     };
+    sessions
+        .generations
+        .iter()
+        .flat_map(|&generation| {
+            list_opencode_sessions_for_generation(&conn, &sessions, generation, filter)
+        })
+        .collect()
+}
+
+fn list_opencode_sessions_for_generation(
+    conn: &Connection,
+    sessions: &OpenCodeSessions,
+    generation: OpenCodeStoreGeneration,
+    filter: &SessionFilter,
+) -> Vec<SessionRow> {
     let harness = match generation {
         OpenCodeStoreGeneration::V1 => Harness::Opencode,
         OpenCodeStoreGeneration::V2 => Harness::Opencode2,
@@ -6169,7 +6511,9 @@ pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
 
     rows.map(|rows| {
         rows.flatten()
-            .filter(|row| session_matches_filter(row, filter))
+            .filter(|row| {
+                sessions.owns(&row.session_id, generation) && session_matches_filter(row, filter)
+            })
             .collect()
     })
     .unwrap_or_default()
@@ -6354,20 +6698,23 @@ fn load_opencode_store_child_session_ids() -> HashSet<String> {
     let Some(path) = resolve_opencode_db_path() else {
         return out;
     };
-    let Ok((conn, generation)) = open_opencode_readonly(&path) else {
+    let Ok((conn, resolved)) = open_opencode_sessions(&path) else {
         return out;
     };
-    let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT id FROM {}
-         WHERE parent_id IS NOT NULL AND TRIM(parent_id) != ''",
-        opencode_session_table(generation)
-    )) else {
-        return out;
-    };
-    if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-        for id in rows.flatten() {
-            out.insert(id);
-        }
+    for &generation in &resolved.generations {
+        let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT id FROM {} WHERE parent_id IS NOT NULL AND TRIM(parent_id) != ''",
+            opencode_session_table(generation)
+        )) else {
+            continue;
+        };
+        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+            for id in rows.flatten() {
+                if resolved.owns(&id, generation) {
+                    out.insert(id);
+                }
+            }
+        };
     }
     out
 }
@@ -6405,8 +6752,11 @@ pub fn get_session_messages(
             let Some(opencode_db_path) = resolve_opencode_db_path() else {
                 return Ok(Vec::new());
             };
-            let (conn, generation) = open_opencode_readonly(&opencode_db_path)?;
-            load_opencode_messages(&conn, generation, session_id)
+            let (conn, sessions) = open_opencode_sessions(&opencode_db_path)?;
+            match sessions.owner(session_id) {
+                Some(generation) => load_opencode_messages(&conn, generation, session_id),
+                None => Ok(Vec::new()),
+            }
         }
         Harness::Pi | Harness::Omp => {
             let Some(path) = find_pi_session_path_for_harness(harness, session_id) else {
@@ -6438,7 +6788,10 @@ pub fn get_opencode_session_detail(
     let Some(opencode_db_path) = resolve_opencode_db_path() else {
         return Ok(None);
     };
-    let (oc_conn, generation) = open_opencode_readonly(&opencode_db_path)?;
+    let (oc_conn, sessions) = open_opencode_sessions(&opencode_db_path)?;
+    let Some(generation) = sessions.owner(session_id) else {
+        return Ok(None);
+    };
     let row = oc_conn.query_row(
         &format!(
             "SELECT s.id, COALESCE(s.title, ''), COALESCE(p.name, ''), COALESCE(p.worktree, ''),
@@ -6730,7 +7083,7 @@ pub fn get_pi_session_detail(
         notes,
         meta,
         token_breakdown,
-        pi_compaction_entries: detail.compaction_entries,
+        pi_compaction_entries: detail.compaction_entries.clone(),
     })
 }
 
@@ -6783,32 +7136,33 @@ fn resolve_session_info(
         return result;
     };
 
-    let (conn, generation) = match open_opencode_readonly(&opencode_db) {
+    let (conn, resolved) = match open_opencode_sessions(&opencode_db) {
         Ok(value) => value,
         Err(_) => return result,
     };
-
-    let mut stmt = match conn.prepare(&format!(
-        "SELECT s.id, COALESCE(s.title, '') FROM {} s",
-        opencode_session_table(generation)
-    )) {
-        Ok(s) => s,
-        Err(_) => return result,
-    };
     let session_identities = load_session_identity_map();
-    let harness = match generation {
-        OpenCodeStoreGeneration::V1 => Harness::Opencode,
-        OpenCodeStoreGeneration::V2 => Harness::Opencode2,
-    };
-
-    if let Ok(rows) = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    }) {
-        for row in rows.flatten() {
-            let (session_id, title) = row;
-            let identity = lookup_session_identity(&session_identities, harness, &session_id);
-            result.insert(session_id, (title, identity));
-        }
+    for &generation in &resolved.generations {
+        let Ok(mut stmt) = conn.prepare(&format!(
+            "SELECT s.id, COALESCE(s.title, '') FROM {} s",
+            opencode_session_table(generation)
+        )) else {
+            continue;
+        };
+        let harness = match generation {
+            OpenCodeStoreGeneration::V1 => Harness::Opencode,
+            OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+        };
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for (session_id, title) in rows.flatten() {
+                if !resolved.owns(&session_id, generation) {
+                    continue;
+                }
+                let identity = lookup_session_identity(&session_identities, harness, &session_id);
+                result.insert(session_id, (title, identity));
+            }
+        };
     }
 
     result
@@ -6858,29 +7212,32 @@ pub fn get_compartments(
 
     // Resolve message timestamps from OpenCode DB
     if let Some(opencode_db_path) = resolve_opencode_db_path() {
-        if let Ok((oc_conn, generation)) = open_opencode_readonly(&opencode_db_path) {
-            let message_table = match generation {
-                OpenCodeStoreGeneration::V1 => "message",
-                OpenCodeStoreGeneration::V2 => "session_message",
-            };
-            let timestamp_sql = format!("SELECT time_created FROM {message_table} WHERE id = ?1");
-            for comp in compartments.iter_mut() {
-                if let Some(ref start_id) = comp.start_message_id {
-                    if let Ok(ts) =
-                        oc_conn.query_row(&timestamp_sql, rusqlite::params![start_id], |row| {
-                            row.get::<_, Option<i64>>(0)
-                        })
-                    {
-                        comp.start_time = ts;
+        if let Ok((oc_conn, resolved)) = open_opencode_sessions(&opencode_db_path) {
+            if let Some(generation) = resolved.owner(session_id) {
+                let message_table = match generation {
+                    OpenCodeStoreGeneration::V1 => "message",
+                    OpenCodeStoreGeneration::V2 => "session_message",
+                };
+                let timestamp_sql =
+                    format!("SELECT time_created FROM {message_table} WHERE id = ?1");
+                for comp in compartments.iter_mut() {
+                    if let Some(ref start_id) = comp.start_message_id {
+                        if let Ok(ts) =
+                            oc_conn.query_row(&timestamp_sql, rusqlite::params![start_id], |row| {
+                                row.get::<_, Option<i64>>(0)
+                            })
+                        {
+                            comp.start_time = ts;
+                        }
                     }
-                }
-                if let Some(ref end_id) = comp.end_message_id {
-                    if let Ok(ts) =
-                        oc_conn.query_row(&timestamp_sql, rusqlite::params![end_id], |row| {
-                            row.get::<_, Option<i64>>(0)
-                        })
-                    {
-                        comp.end_time = ts;
+                    if let Some(ref end_id) = comp.end_message_id {
+                        if let Ok(ts) =
+                            oc_conn.query_row(&timestamp_sql, rusqlite::params![end_id], |row| {
+                                row.get::<_, Option<i64>>(0)
+                            })
+                        {
+                            comp.end_time = ts;
+                        }
                     }
                 }
             }
@@ -10713,11 +11070,10 @@ mod cache_turn_tests {
     }
 
     #[test]
-    fn non_anthropic_growth_uses_input_plus_output() {
-        // No cache_write (write=0) → expected growth = prev.input + prev.output.
-        // m1: read=100000, input=2000, output=500 (total=102500), write=0.
-        //     expected next prefix = 100000 + 2000 + 500 = 102500.
-        // m2: read=102500 → retention = 1.0 → stable.
+    fn non_anthropic_growth_uses_input_only() {
+        // Without a reported cache write, generated output is not counted as
+        // next-step cached input; measured traces show cache growth comes from
+        // previously uncached input.
         let rows = vec![
             raw(
                 Harness::Opencode,
@@ -10736,14 +11092,53 @@ mod cache_turn_tests {
                 "s1",
                 200,
                 1_000,
-                102_500,
+                102_000,
                 0,
-                103_700,
+                103_200,
                 Some("tool-calls"),
             ),
         ];
         let events = build_db_cache_events(rows, false);
         assert_eq!(events[1].severity, "stable");
+    }
+
+    #[test]
+    fn broca_input_only_retention_clears_output_sensitive_warnings() {
+        let steps = [
+            (5726, 0, 205),
+            (559, 5632, 177),
+            (6012, 5632, 349),
+            (5141, 10752, 345),
+            (10485, 14848, 448),
+            (1956, 25088, 455),
+            (3053, 26112, 825),
+            (2650, 28160, 3053),
+        ];
+        let rows = steps
+            .iter()
+            .enumerate()
+            .map(|(index, &(input, read, output))| {
+                raw(
+                    Harness::Broca,
+                    &format!("step{}", index + 1),
+                    "broca-sequence",
+                    (index as i64 + 1) * 100,
+                    input,
+                    read,
+                    0,
+                    input + read + output,
+                    Some("tool-calls"),
+                )
+            })
+            .collect();
+        let events = build_db_cache_events(rows, false);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.severity.as_str())
+                .collect::<Vec<_>>(),
+            ["stable", "stable", "warning", "warning", "warning", "stable", "stable", "stable"]
+        );
     }
 
     #[test]
@@ -11418,6 +11813,83 @@ mod memory_project_filter_tests {
         assert!(rows.is_empty(), "archived-only project leaked: {rows:?}");
     }
 
+    fn insert_memory_with_content(conn: &Connection, content: &str, updated_at: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO memories
+                (project_path, category, content, normalized_hash,
+                 source_type, seen_count, retrieval_count,
+                 first_seen_at, last_seen_at, verification_status,
+                 status, created_at, updated_at)
+             VALUES ('/tmp/search', 'CONSTRAINTS', ?1, ?2,
+                     'historian', 1, 0,
+                     1000, 1000, 'unverified',
+                     'active', 1000, ?3)",
+            (content, format!("{:x}", md5::compute(content)), updated_at),
+        )
+        .expect("insert memory");
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO memories_fts(rowid, content, category) VALUES (?1, ?2, 'CONSTRAINTS')",
+            (id, content),
+        )
+        .expect("index memory");
+        id
+    }
+
+    #[test]
+    fn like_search_matches_a_backslash_literally() {
+        // Two-character queries take the LIKE path. `\n` must find the memory
+        // containing a literal backslash-n, not every memory containing an `n`.
+        let conn = make_memory_db();
+        let literal = insert_memory_with_content(&conn, r"join lines with \n here", 1000);
+        insert_memory_with_content(&conn, "nothing special", 2000);
+        insert_memory_with_content(&conn, r"the tree lives under C:\Users\dev", 3000);
+
+        let rows = get_memories(&conn, None, None, None, None, Some(r"\n"), 100, 0)
+            .expect("get_memories");
+        assert_eq!(rows.iter().map(|m| m.id).collect::<Vec<_>>(), vec![literal]);
+
+        // A Windows path whose FTS tokens match nothing exactly falls back to
+        // LIKE, which must also treat the backslash literally.
+        let rows = get_memories(&conn, None, None, None, None, Some(r"C:\Users\de"), 100, 0)
+            .expect("get_memories");
+        assert_eq!(rows.len(), 1, "windows path search: {rows:?}");
+        assert!(rows[0].content.contains(r"C:\Users\dev"));
+    }
+
+    #[test]
+    fn a_page_past_the_fts_results_does_not_switch_to_like_results() {
+        let conn = make_memory_db();
+        for i in 0..3 {
+            insert_memory_with_content(&conn, &format!("alpha fact {i}"), 1000 + i);
+        }
+        // LIKE '%alpha%' also matches these; FTS's whole-token match does not.
+        for i in 0..3 {
+            insert_memory_with_content(&conn, &format!("alphabet soup {i}"), 2000 + i);
+        }
+
+        let page = |offset| {
+            get_memories(&conn, None, None, None, None, Some("alpha"), 2, offset)
+                .expect("get_memories")
+                .into_iter()
+                .map(|m| m.content)
+                .collect::<Vec<_>>()
+        };
+        let mut seen = page(0);
+        seen.extend(page(2));
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|c| c.starts_with("alpha fact")), "{seen:?}");
+        assert_eq!(page(4), Vec::<String>::new());
+
+        // With no FTS match at all, every page comes from LIKE consistently.
+        let like_page = |offset| {
+            get_memories(&conn, None, None, None, None, Some("phabe"), 2, offset)
+                .expect("get_memories")
+                .len()
+        };
+        assert_eq!((like_page(0), like_page(2), like_page(4)), (2, 1, 0));
+    }
+
     #[test]
     fn enumerate_memory_projects_empty_db_returns_empty() {
         let conn = make_memory_db();
@@ -11875,7 +12347,7 @@ mod broca_cache_tests {
             params![segment.to_string()],
         )
         .unwrap();
-        let sessions = load_broca_cache_sessions_from_conn(&conn, 10).unwrap();
+        let sessions = load_broca_cache_sessions_from_conn(&conn, None, 10).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title.as_deref(), Some("alfonso:bg_errored"));
         let events = build_db_cache_events(
@@ -12066,6 +12538,31 @@ mod broca_cache_tests {
         })
         .collect();
         (conn, id, vec![wal_run("r1", 1_000, steps)])
+    }
+
+    #[test]
+    fn compatibility_stop_does_not_add_later_index_totals() {
+        let (conn, id, runs) = stepped_session();
+        insert(
+            &conn,
+            "later",
+            "r2",
+            &id,
+            2000,
+            serde_json::json!({"input_tokens": 999}),
+        );
+        let rows = load_broca_cache_events_with_compatibility(
+            &conn,
+            &id.to_string(),
+            Some(&runs),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let events = build_db_cache_events(rows, false);
+        assert_eq!(ids(&events), ["r1#1", "r1#2", "r1#3", "r1#4"]);
+        assert!(events.iter().all(|e| !e.aggregate));
     }
 
     #[test]
@@ -12291,9 +12788,9 @@ mod broca_cache_tests {
         assert_eq!(events[1].cache_read, 0);
         assert_eq!(events[1].severity, "unknown");
         // Step 3 is measured against step 1, the last step that reported
-        // reads: 4,000 of an expected 4,000 + 10 + 10.
+        // reads: 4,000 of an expected 4,000 + 10 uncached input tokens.
         assert_eq!(events[2].severity, "stable");
-        assert!((events[2].hit_ratio - 4_000.0 / 4_020.0).abs() < 1e-9);
+        assert!((events[2].hit_ratio - 4_000.0 / 4_010.0).abs() < 1e-9);
     }
 
     #[test]
@@ -12365,7 +12862,7 @@ mod broca_cache_tests {
             )
             .unwrap();
         }
-        let sessions = load_broca_cache_sessions_from_conn(&conn, 10).unwrap();
+        let sessions = load_broca_cache_sessions_from_conn(&conn, None, 10).unwrap();
         let listed: Vec<_> = sessions
             .iter()
             .map(|s| (s.title.as_deref().unwrap(), s.last_activity_ms))
@@ -12376,6 +12873,137 @@ mod broca_cache_tests {
         );
         // The run index's identity is the same session id the facts give.
         assert_eq!(sessions[0].session_id, finished.to_string());
+    }
+
+    /// Writes `bytes` as the session's live WAL under `root`, last modified
+    /// at `modified_ms`.
+    fn write_live_wal(root: &Path, identity: &serde_json::Value, bytes: &[u8], modified_ms: u64) {
+        let identity = broca_wal::SessionIdentity::from_json(&identity.to_string()).unwrap();
+        let dir = root.join("wal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.wal", identity.addr()));
+        std::fs::write(&path, bytes).unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_millis(modified_ms);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    /// A gather session is listed the moment its run starts, while its WAL
+    /// holds no finished step yet. The run's index row keeps its start time
+    /// until the run ends, so the listed activity must follow the WAL as
+    /// steps are appended: the Cache tab refetches a session's steps only
+    /// when that activity moves, and otherwise showed `0 events` for the
+    /// whole run.
+    #[test]
+    fn a_running_gather_session_is_dated_by_its_wal_and_shows_its_steps() {
+        let started: i64 = 1_790_597_628_357;
+        let conn = store();
+        conn.execute_batch(
+            "CREATE TABLE run_index (run_id TEXT PRIMARY KEY, session TEXT NOT NULL,
+                                     state TEXT NOT NULL, state_changed_ms INTEGER);",
+        )
+        .unwrap();
+        let gather = identity("alfonso:gather-test");
+        let gather_id = gather.to_string();
+        conn.execute(
+            "INSERT INTO run_index (run_id, session, state, state_changed_ms)
+             VALUES ('g1', ?1, 'active', ?2)",
+            params![gather.to_string(), started],
+        )
+        .unwrap();
+        // Two finished sessions newer than the gather's start: with a limit
+        // of 2 the gather only makes the list once its WAL dates it.
+        let usage = serde_json::json!({"input_tokens": 1, "cached_input_tokens": 0});
+        insert(
+            &conn,
+            "f1",
+            "r1",
+            &identity("alfonso:bg_a"),
+            started + 10_000,
+            usage.clone(),
+        );
+        insert(
+            &conn,
+            "f2",
+            "r2",
+            &identity("alfonso:bg_b"),
+            started + 20_000,
+            usage,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let started_ms = started as u64;
+
+        // Just after run_started: no step has finished yet.
+        write_live_wal(
+            root,
+            &gather,
+            &broca_wal::tests::gather_wal("g1", started_ms, &[], false),
+            started_ms + 5,
+        );
+        let listed = load_broca_cache_sessions_from_conn(&conn, Some(root), 10).unwrap();
+        let row = listed
+            .iter()
+            .find(|row| row.session_id == gather_id)
+            .unwrap();
+        assert_eq!(row.last_activity_ms, started + 5);
+        let first_seen = row.last_activity_ms;
+
+        // Three model steps later.
+        let steps = [
+            (started_ms + 5_700, 6_026, 0),
+            (started_ms + 12_100, 930, 5_632),
+            (started_ms + 24_500, 4_042, 5_632),
+        ];
+        let written = started_ms + 25_000;
+        write_live_wal(
+            root,
+            &gather,
+            &broca_wal::tests::gather_wal("g1", started_ms, &steps, false),
+            written,
+        );
+        let listed = load_broca_cache_sessions_from_conn(&conn, Some(root), 2).unwrap();
+        let titles: Vec<_> = listed
+            .iter()
+            .map(|row| row.title.as_deref().unwrap())
+            .collect();
+        assert_eq!(titles, ["alfonso:gather-test", "alfonso:bg_b"]);
+        assert_eq!(listed[0].last_activity_ms, written as i64);
+        assert!(listed[0].last_activity_ms > first_seen);
+
+        // The refetch that activity change triggers finds every step.
+        let wal_runs = broca_wal::WalCache::default().session_runs(
+            root,
+            &broca_wal::SessionIdentity::from_json(&gather.to_string()).unwrap(),
+        );
+        let events = build_db_cache_events(
+            load_broca_cache_events_from_conn(
+                &conn,
+                &gather.to_string(),
+                wal_runs.as_deref(),
+                None,
+                None,
+            )
+            .unwrap(),
+            false,
+        );
+        assert_eq!(ids(&events), ["g1#1", "g1#2", "g1#3"]);
+        assert!(events
+            .iter()
+            .all(|event| event.cache_reported && !event.cache_write_reported));
+        assert_eq!(events[1].cache_read, 5_632);
+
+        // Without a WAL (or a state root) the run keeps its start time.
+        let listed = load_broca_cache_sessions_from_conn(&conn, None, 10).unwrap();
+        let row = listed
+            .iter()
+            .find(|row| row.session_id == gather_id)
+            .unwrap();
+        assert_eq!(row.last_activity_ms, started);
     }
 
     #[test]
@@ -12390,7 +13018,7 @@ mod broca_cache_tests {
         ] {
             insert(&conn, fact, fact, &identity(session), ts, usage.clone());
         }
-        let sessions = load_broca_cache_sessions_from_conn(&conn, 10).unwrap();
+        let sessions = load_broca_cache_sessions_from_conn(&conn, None, 10).unwrap();
         let titles: Vec<_> = sessions.iter().filter_map(|s| s.title.as_deref()).collect();
         assert_eq!(
             titles,
@@ -12410,8 +13038,156 @@ mod broca_cache_tests {
             ));
         }
         assert_eq!(
-            load_broca_cache_sessions_from_conn(&conn, 2).unwrap().len(),
+            load_broca_cache_sessions_from_conn(&conn, None, 2)
+                .unwrap()
+                .len(),
             2
+        );
+    }
+}
+
+#[cfg(test)]
+mod converted_opencode_store_tests {
+    use super::*;
+
+    fn fixture(v1: bool, v2: bool) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT NOT NULL);
+            INSERT INTO project VALUES ('p', 'converted', '/tmp/converted');",
+        )
+        .unwrap();
+        if v1 {
+            conn.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                title TEXT NOT NULL, directory TEXT NOT NULL, time_updated INTEGER NOT NULL,
+                time_archived INTEGER, parent_id TEXT);
+                CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, data TEXT NOT NULL);
+                CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+                INSERT INTO session VALUES ('old', 'p', 'old v1', '/tmp/converted', 100, NULL, NULL);
+                INSERT INTO session VALUES ('shared', 'p', 'shared v1', '/tmp/converted', 100, NULL, NULL);
+                INSERT INTO message VALUES ('m_old', 'old', 100, '{\"role\":\"assistant\",\"tokens\":{\"total\":2}}');
+                INSERT INTO message VALUES ('m_shared', 'shared', 100, '{\"role\":\"assistant\",\"tokens\":{\"total\":2}}');
+                INSERT INTO part VALUES ('part_old','m_old','old',100,'{\"type\":\"text\",\"text\":\"legacy\"}');").unwrap();
+        }
+        if v2 {
+            // A converted database retains the legacy tables and copies session
+            // IDs into session_v2. Here `old` has no matching V2 row, while
+            // `shared` does, so both ownership paths remain observable.
+            conn.execute_batch("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                title TEXT, directory TEXT NOT NULL, time_updated INTEGER NOT NULL,
+                time_archived INTEGER, parent_id TEXT);
+                CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+                INSERT INTO session_v2 VALUES ('shared','p','shared v2','/tmp/converted',200,NULL,NULL);
+                INSERT INTO session_v2 VALUES ('new','p','new v2','/tmp/converted',300,NULL,NULL);
+                INSERT INTO session_message VALUES ('m2','new','assistant',1,300,300,
+                    '{\"role\":\"assistant\",\"tokens\":{\"input\":3,\"output\":2,\"cache\":{\"read\":1,\"write\":1}},\"content\":\"v2\"}');").unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn converted_store_merges_new_old_and_shared_sessions_with_v2_ownership() {
+        let conn = fixture(true, true);
+        let resolved = resolve_opencode_sessions(&conn).unwrap();
+        assert_eq!(
+            resolved.generations,
+            vec![OpenCodeStoreGeneration::V1, OpenCodeStoreGeneration::V2]
+        );
+        assert_eq!(resolved.owners.len(), 3);
+        assert_eq!(resolved.owner("old"), Some(OpenCodeStoreGeneration::V1));
+        assert_eq!(resolved.owner("shared"), Some(OpenCodeStoreGeneration::V2));
+        assert_eq!(resolved.owner("new"), Some(OpenCodeStoreGeneration::V2));
+        let mut env = crate::test_env::EnvGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        env.set("XDG_DATA_HOME", root.path());
+        env.set("XDG_CONFIG_HOME", root.path());
+        env.set("XDG_STATE_HOME", root.path());
+        env.set("XDG_RUNTIME_DIR", root.path());
+        env.set("MAGIC_CONTEXT_STORAGE_DIR", root.path());
+        env.set("OPENCODE_DB", root.path().join("opencode.db"));
+        let rows: Vec<_> = resolved
+            .generations
+            .iter()
+            .flat_map(|&generation| {
+                list_opencode_sessions_for_generation(
+                    &conn,
+                    &resolved,
+                    generation,
+                    &SessionFilter::default(),
+                )
+            })
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "shared")
+                .unwrap()
+                .title,
+            "shared v2"
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "new")
+                .unwrap()
+                .harness,
+            Harness::Opencode2
+        );
+        let cache_rows: Vec<_> = resolved
+            .generations
+            .iter()
+            .flat_map(|&generation| {
+                load_recent_opencode_cache_sessions_from_conn(
+                    &conn,
+                    generation,
+                    10,
+                    &HashSet::new(),
+                )
+                .into_iter()
+                .filter(|row| resolved.owns(&row.session_id, generation))
+                .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(cache_rows.len(), 2);
+        assert!(cache_rows.iter().any(|row| row.session_id == "new"));
+        let messages =
+            load_opencode_messages(&conn, resolved.owner("new").unwrap(), "new").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, "m2");
+        let cache = get_opencode_session_cache_events_from_conn(
+            &conn,
+            resolved.owner("new").unwrap(),
+            "new",
+            None,
+            None,
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].harness, Harness::Opencode2);
+    }
+
+    #[test]
+    fn pure_generations_keep_their_original_owners_and_message_sources() {
+        let v1 = fixture(true, false);
+        let v2 = fixture(false, true);
+        let first = resolve_opencode_sessions(&v1).unwrap();
+        let second = resolve_opencode_sessions(&v2).unwrap();
+        assert_eq!(first.generations, vec![OpenCodeStoreGeneration::V1]);
+        assert_eq!(second.generations, vec![OpenCodeStoreGeneration::V2]);
+        assert_eq!(first.owner("old"), Some(OpenCodeStoreGeneration::V1));
+        assert_eq!(second.owner("new"), Some(OpenCodeStoreGeneration::V2));
+        assert_eq!(
+            load_opencode_messages(&v1, OpenCodeStoreGeneration::V1, "old").unwrap()[0]
+                .text_preview,
+            "legacy"
+        );
+        assert_eq!(
+            load_opencode_messages(&v2, OpenCodeStoreGeneration::V2, "new")
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

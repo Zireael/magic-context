@@ -6,17 +6,21 @@ import {
     type ContextDatabase,
     getDatabasePersistenceError,
     isDatabasePersisted,
-    openDatabase,
 } from "../../features/magic-context/storage";
+import {
+    BOOT_SQLITE_BUSY_TIMEOUT_MS,
+    openDatabaseAsync,
+} from "../../features/magic-context/storage-db";
 import { describeStorageUnavailability } from "../../features/magic-context/storage-unavailable-reason";
 import { getErrorMessage } from "../../shared/error-message";
+import { startBootDeadline } from "../../shared/off-thread-migration-clock";
 
 /**
  * The shortest time between two storage open attempts while the context database
  * is unavailable. A refused open is not free: the migration guard lists processes
  * and reads every RPC discovery file, so a session that sends turns quickly must
- * not repeat it on every pass. Five seconds still lets the first turn a user sends
- * after stopping the blocking host go through.
+ * not repeat it on every pass. The interval starts when an attempt finishes;
+ * a later turn can join recovery without blocking the host event loop.
  */
 export const V2_STORAGE_REOPEN_INTERVAL_MS = 5_000;
 
@@ -25,8 +29,8 @@ export interface V2StorageGate {
     current(): ContextDatabase | undefined;
     /** Why the last attempt left no durable database, or null when none has failed. */
     reason(): FailClosedReason | null;
-    /** Attempt an open now, whatever the interval, without throwing. */
-    probe(): ContextDatabase | undefined;
+    /** Start or join a bounded open attempt, respecting the retry interval. */
+    probe(): Promise<ContextDatabase | undefined>;
     /**
      * The durable database. While storage is unavailable this re-attempts the open
      * at most once per interval and otherwise throws a `FailClosedBlockingError`
@@ -36,7 +40,7 @@ export interface V2StorageGate {
 }
 
 export interface V2StorageGateOptions {
-    open?: () => ContextDatabase | null;
+    open?: () => ContextDatabase | null | Promise<ContextDatabase | null>;
     now?: () => number;
     reopenIntervalMs?: number;
     /** Called when an attempt fails for a reason different from the previous one. */
@@ -53,19 +57,27 @@ export interface V2StorageGateOptions {
  * cause is gone.
  */
 export function createV2StorageGate(options: V2StorageGateOptions = {}): V2StorageGate {
-    const open = options.open ?? (() => openDatabase());
+    const open =
+        options.open ??
+        (async () => {
+            const opened = await openDatabaseAsync({ busyTimeoutMs: 0 });
+            // Boot probes must yield instead of blocking HTTP. Once ready, restore the
+            // normal per-attempt wait used by foreground retries and background writers.
+            opened?.exec(`PRAGMA busy_timeout=${BOOT_SQLITE_BUSY_TIMEOUT_MS}`);
+            return opened;
+        });
     const now = options.now ?? (() => Date.now());
     const interval = options.reopenIntervalMs ?? V2_STORAGE_REOPEN_INTERVAL_MS;
     let db: ContextDatabase | undefined;
     let failure: FailClosedReason | null = null;
     let failureKey: string | null = null;
     let lastAttemptAt: number | undefined;
+    let pending: Promise<ContextDatabase | undefined> | undefined;
 
-    const attempt = (): ContextDatabase | undefined => {
-        lastAttemptAt = now();
+    const attempt = async (): Promise<ContextDatabase | undefined> => {
         let next: FailClosedReason;
         try {
-            const opened = open();
+            const opened = await open();
             if (opened && isDatabasePersisted(opened)) {
                 db = opened;
                 const recovered = failure !== null;
@@ -89,19 +101,52 @@ export function createV2StorageGate(options: V2StorageGateOptions = {}): V2Stora
         return undefined;
     };
 
+    const probe = (): Promise<ContextDatabase | undefined> => {
+        if (db) return Promise.resolve(db);
+        if (pending) return pending;
+        if (lastAttemptAt !== undefined && now() - lastAttemptAt < interval)
+            return Promise.resolve(undefined);
+        // Defer even injected synchronous openers until after the caller returns.
+        // The production opener uses asynchronous process probes, not this deferral,
+        // to keep the event loop responsive while discovery is running.
+        pending = Promise.resolve()
+            .then(attempt)
+            .finally(() => {
+                lastAttemptAt = now();
+                pending = undefined;
+            });
+        return pending;
+    };
+
     return {
         current: () => db,
         reason: () => failure,
-        probe: () => db ?? attempt(),
+        probe,
         require: () => {
             if (db) return db;
-            if (lastAttemptAt === undefined || now() - lastAttemptAt >= interval) {
-                const opened = attempt();
-                if (opened) return opened;
-            }
+            void probe();
             throw createFailClosedBlockingError(
                 failure ?? { kind: "storage_failure", cause: "context storage is not durable" },
             );
         },
     };
+}
+
+/**
+ * Give slow healthy opens time to retain the tools registered during setup.
+ * OpenCode serves HTTP while this asynchronous wait is pending. An open
+ * still unresolved after fifteen seconds takes the degraded, tool-less route.
+ * Time spent applying schema migrations on the worker thread does not count
+ * towards those fifteen seconds, so a long first-start upgrade keeps its tools.
+ */
+export async function probeV2StorageAtBoot(
+    storage: V2StorageGate,
+    timeoutMs = 15_000,
+): Promise<ContextDatabase | undefined> {
+    const deadline = startBootDeadline(timeoutMs);
+    try {
+        return await Promise.race([storage.probe(), deadline.expired.then(() => undefined)]);
+    } finally {
+        deadline.cancel();
+    }
 }

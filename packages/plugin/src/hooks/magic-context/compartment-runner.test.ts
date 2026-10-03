@@ -2,10 +2,11 @@ import {
     __resetNotificationStateForTests,
     drainNotifications,
 } from "../../shared/rpc-notifications";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -19,7 +20,10 @@ import {
     replaceAllCompartments,
 } from "../../features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
-import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
+import {
+    getMemoriesByProject,
+    insertMemory,
+} from "../../features/magic-context/memory/storage-memory";
 import {
     acquireWrapupInProgress,
     closeDatabase,
@@ -37,8 +41,9 @@ import { rebaseSessionCoordinates } from "../../features/magic-context/store-gen
 import { createTagger } from "../../features/magic-context/tagger";
 import type { PluginContext } from "../../plugin/types";
 import * as shared from "../../shared";
-import { Database } from "../../shared/sqlite";
+import { Database, withPrivilegedWriter, withSqliteTransformPass } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
 import {
     executeContextRecomp as executeContextRecompImpl,
     executeContextRecompWithResult as executeContextRecompWithResultImpl,
@@ -47,6 +52,9 @@ import {
     runCompartmentAgent as runCompartmentAgentImpl,
     startCompartmentAgent as startCompartmentAgentImpl,
 } from "./compartment-runner";
+import { resolveHistorianProducerWindow } from "./historian-prompt-fit";
+import { renderHistorianMemoryBlock } from "./inject-compartments";
+import { producerPromptFailureReason } from "./producer-window-guard";
 import {
     clearProducerModelObservations,
     observeProducerModelsForTest,
@@ -57,6 +65,7 @@ import {
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
 import { readRawSessionMessages } from "./read-session-chunk";
+import { estimateTokens } from "./read-session-formatting";
 import { __ignoredNotificationTest } from "./send-session-notification";
 import { tagMessages } from "./tag-messages";
 
@@ -545,6 +554,66 @@ describe("executeContextRecomp", () => {
         expect(historianFetches).toBe(2);
         expect(getCompartments(db, sessionId)).toEqual([
             expect.objectContaining({ title: "repaired", p1: "tiered summary", legacy: 0 }),
+        ]);
+    });
+
+    it("reports a published recomp complete and signaled when post-publish project registration throws", async () => {
+        useTempDataHome("magic-recomp-post-publish-throw-");
+        const sessionId = "ses-recomp-post-publish-throw";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "eligible one" },
+            { id: "m-2", role: "assistant", text: "eligible two" },
+            { id: "m-3", role: "user", text: "eligible three" },
+            { id: "m-4", role: "assistant", text: "eligible four" },
+            { id: "m-5", role: "user", text: "protected 1" },
+            { id: "m-6", role: "user", text: "protected 2" },
+            { id: "m-7", role: "user", text: "protected 3" },
+            { id: "m-8", role: "user", text: "protected 4" },
+            { id: "m-9", role: "user", text: "protected 5" },
+        ]);
+        const db = openDatabase();
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: "/tmp/post-publish-throw" } })),
+                create: mock(async () => ({ data: { id: "ses-agent-post-publish" } })),
+                prompt: mock(async () => ({})),
+                messages: mock(async (input: { query?: { directory?: string } }) => {
+                    if (!input.query?.directory) return { data: [] };
+                    return {
+                        data: [
+                            {
+                                info: { role: "assistant", time: { created: 1 } },
+                                parts: [
+                                    {
+                                        type: "text",
+                                        text: `<output><compartment start="1" end="4" title="rebuilt"><p1>summary</p1></compartment></output>`,
+                                    },
+                                ],
+                            },
+                        ],
+                    };
+                }),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+        const onPublished = mock(() => undefined);
+
+        const result = await executeContextRecomp({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            directory: "/tmp",
+            ensureProjectRegistered: async () => {
+                throw new Error("embedding provider unavailable");
+            },
+            onCompartmentStatePublished: onPublished,
+        });
+
+        expect(result).toContain("## Magic Recomp — Complete");
+        expect(onPublished).toHaveBeenCalledWith(sessionId);
+        expect(getCompartments(db, sessionId)).toEqual([
+            expect.objectContaining({ title: "rebuilt", endMessage: 4 }),
         ]);
     });
 
@@ -1046,7 +1115,7 @@ describe("executeContextRecomp", () => {
 });
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -1181,6 +1250,48 @@ function _getHistorianDumpContents(sessionId: string): string[] {
 }
 
 describe("runCompartmentAgent", () => {
+    it("keeps historian writes outside the foreground pass that launched it", async () => {
+        useTempDataHome("compartment-runner-background-scope-");
+        const db = openDatabase();
+        const sessionId = "ses-background-scope";
+        getOrCreateSessionMeta(db, sessionId);
+        let attempts = 0;
+        let callbacks = 0;
+        let failure: unknown;
+        await withSqliteTransformPass(async () => {
+            startCompartmentAgent(
+                {
+                    client: {} as PluginContext["client"],
+                    db,
+                    sessionId,
+                    historianChunkTokens: 10000,
+                    directory: "/tmp",
+                },
+                async () => {
+                    await Promise.resolve();
+                    const exec = spyOn(db, "exec").mockImplementation(() => {
+                        attempts++;
+                        throw Object.assign(new Error("background busy"), { code: "SQLITE_BUSY" });
+                    });
+                    const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+                    try {
+                        withPrivilegedWriter(db, () => {
+                            callbacks++;
+                        });
+                    } catch (error) {
+                        failure = error;
+                    } finally {
+                        exec.mockRestore();
+                        wait.mockRestore();
+                    }
+                },
+            );
+            await getActiveCompartmentRun(sessionId)?.promise;
+        });
+        expect(attempts).toBe(1);
+        expect(callbacks).toBe(0);
+        expect((failure as Error).message).toBe("background busy");
+    });
     it("clears compartment-in-progress when another process holds the lease", () => {
         useTempDataHome("compartment-runner-lease-denied-");
         const db = openDatabase();
@@ -1538,6 +1649,97 @@ describe("runCompartmentAgent", () => {
         ).toEqual({ status: "success" });
     });
 
+    for (const variant of [
+        {
+            name: "the compaction-marker update throws",
+            // Caught where it is raised, so the steps after it still run.
+            laterStepsRun: true,
+            deps: () => ({
+                compactionMarkerStrategy: {
+                    publish: () => {
+                        throw Object.assign(new Error("database is locked"), {
+                            code: "SQLITE_BUSY",
+                        });
+                    },
+                },
+            }),
+        },
+        {
+            // Not caught where it is raised, so this exercises the run's outer handler.
+            name: "the deferred-marker signal throws",
+            laterStepsRun: false,
+            deps: () => ({
+                preserveInjectionCacheUntilConsumed: true,
+                onDeferredMarkerPending: () => {
+                    throw new Error("signal consumer failed");
+                },
+            }),
+        },
+    ]) {
+        it(`keeps a committed publish succeeded when ${variant.name} after COMMIT`, async () => {
+            useTempDataHome("compartment-runner-post-commit-step-throw-");
+            const sessionId = "ses-post-commit-step";
+            createOpenCodeDb(sessionId, [
+                { id: "m-1", role: "user", text: "First" },
+                { id: "m-2", role: "assistant", text: "Second" },
+                { id: "m-3", role: "user", text: "protected 1" },
+                { id: "m-4", role: "user", text: "protected 2" },
+                { id: "m-5", role: "user", text: "protected 3" },
+                { id: "m-6", role: "user", text: "protected 4" },
+                { id: "m-7", role: "user", text: "protected 5" },
+            ]);
+            const db = openDatabase();
+            const onPublished = mock(() => undefined);
+            const prompt = mock(async () => ({}));
+            const client = {
+                session: {
+                    get: mock(async () => ({ data: { directory: "/tmp/post-commit-step" } })),
+                    create: mock(async () => ({ data: { id: "ses-agent-post-commit-step" } })),
+                    prompt,
+                    messages: mock(async () => ({
+                        data: [
+                            {
+                                info: { role: "assistant", time: { created: 1 } },
+                                parts: [
+                                    {
+                                        type: "text",
+                                        text: `<compartment start="1" end="2" title="Published"><p1>Summary</p1></compartment>`,
+                                    },
+                                ],
+                            },
+                        ],
+                    })),
+                    delete: mock(async () => ({})),
+                },
+            } as unknown as PluginContext["client"];
+
+            await runCompartmentAgentWithLease({
+                client,
+                db,
+                sessionId,
+                historianChunkTokens: 10_000,
+                directory: "/tmp",
+                onCompartmentStatePublished: onPublished,
+                ...variant.deps(),
+            });
+
+            expect(getCompartments(db, sessionId)).toHaveLength(1);
+            expect(onPublished).toHaveBeenCalledWith(sessionId);
+            // A post-publish step failing must not count as a historian failure or be
+            // announced as one.
+            expect(getHistorianFailureState(db, sessionId).failureCount).toBe(0);
+            expect(getRpcNotificationTexts(prompt).join("\n")).not.toContain("failed");
+            expect(getOrCreateSessionMeta(db, sessionId).compartmentInProgress).toBe(false);
+            const run = db
+                .prepare(
+                    "SELECT status, compartments_produced FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                )
+                .get(sessionId) as { status: string; compartments_produced: number };
+            expect(run.status).toBe("success");
+            if (variant.laterStepsRun) expect(run.compartments_produced).toBe(1);
+        });
+    }
+
     it("rolls back compartments and boundary when durable fact insertion fails inside publish tx", async () => {
         useTempDataHome("compartment-runner-fact-insert-rollback-");
         createOpenCodeDb("ses-fact-insert-rollback", [
@@ -1722,7 +1924,12 @@ describe("runCompartmentAgent", () => {
 
         expect(createSession).toHaveBeenCalledTimes(0);
         expect(promptSession).toHaveBeenCalledTimes(0);
-        expect(getHistorianFailureState(db, "ses-window-refuse").lastError).toBeNull();
+        // A window that cannot hold even the fixed prompt parts is a failure the
+        // next run cannot fix, so it is recorded (and backed off on), but no drain
+        // budget is spent because nothing was read or sent.
+        expect(getHistorianFailureState(db, "ses-window-refuse").lastError).toContain(
+            "producer_prompt_unfit",
+        );
         expect(loadProtectedTailMeta(db, "ses-window-refuse").protectedTailDrainTokens).toBe(0);
 
         await runCompartmentAgentWithLease({
@@ -1740,9 +1947,12 @@ describe("runCompartmentAgent", () => {
         expect(promptSession).toHaveBeenCalledTimes(1);
     });
 
-    it("does not reserve an unsent default output cap for a 32k producer", async () => {
+    it("does not reserve an unsent default output cap for a 64k producer", async () => {
         // With no configured output cap and no catalog output metadata, the
         // hidden carrier sends no cap; reserving 32k would reject every run.
+        // The window is 64k because an uncalibrated model counts the ~15k-token
+        // historian system prompt at twice its size, so a 32k window cannot hold
+        // a historian prompt at all; with a 32k reserve this one cannot either.
         useTempDataHome("compartment-runner-producer-window-default-");
         createOpenCodeDb("ses-window-default", [
             { id: "default-1", role: "user", text: "producer source token ".repeat(2_000) },
@@ -1771,13 +1981,18 @@ describe("runCompartmentAgent", () => {
             db,
             sessionId: "ses-window-default",
             historianChunkTokens: 100_000,
-            historianContextLimit: 32_001,
+            historianContextLimit: 64_001,
             model: "test/model",
             directory: "/tmp",
         });
 
         expect(createSession).toHaveBeenCalledTimes(1);
-        expect(getHistorianFailureState(db, "ses-window-default").lastError).toBeNull();
+        expect(promptSession).toHaveBeenCalledTimes(1);
+        // The mock returns no assistant output, so the run fails after sending;
+        // what matters is that the prompt was admitted and sent.
+        expect(getHistorianFailureState(db, "ses-window-default").lastError ?? "").not.toMatch(
+            /producer_prompt/,
+        );
     });
 
     it("records length-capped reasoning-only output with the actionable error and drain backoff", async () => {
@@ -1830,7 +2045,7 @@ describe("runCompartmentAgent", () => {
         });
 
         const error =
-            "historian output length-capped at 8192 tokens (all reasoning, no text) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant";
+            'historian ran out of output budget while reasoning (length-capped at 8192 tokens, no text; tokens={"input":null,"output":8192,"reasoning":null,"cache_read":null,"cache_write":null,"max_tokens":null,"finish_reason":"length"}) — set historian.maxTokens or route historian.model to a low-reasoning lane/variant';
         expect(getCompartments(db, sessionId)).toHaveLength(0);
         expect(getHistorianFailureState(db, sessionId)).toMatchObject({
             failureCount: 1,
@@ -3292,5 +3507,164 @@ describe("stored compartments a store-projection rebase left unresolved", () => 
         });
         expect(getHistorianFailureState(db, sessionId).failureCount).toBe(1);
         expect(getHistorianPromptCount(prompt)).toBe(0);
+    });
+});
+
+describe("historian prompt sized to the producer window", () => {
+    const sevenMessages = (prefix: string, firstText: string) => [
+        { id: `${prefix}-1`, role: "user", text: firstText },
+        { id: `${prefix}-2`, role: "assistant", text: "Second eligible message" },
+        { id: `${prefix}-3`, role: "user", text: "protected 1" },
+        { id: `${prefix}-4`, role: "user", text: "protected 2" },
+        { id: `${prefix}-5`, role: "user", text: "protected 3" },
+        { id: `${prefix}-6`, role: "user", text: "protected 4" },
+        { id: `${prefix}-7`, role: "user", text: "protected 5" },
+    ];
+    const markup =
+        '<compartment start="1" end="2" title="Sized"><p1>Summary of both messages.</p1></compartment>';
+
+    function sizedClient(label: string) {
+        const prompt = mock(async () => ({}));
+        const create = mock(async () => ({ data: { id: `ses-agent-${label}` } }));
+        const client = {
+            session: {
+                get: mock(async () => ({ data: { directory: `/tmp/${label}` } })),
+                create,
+                prompt,
+                messages: mock(async () => ({
+                    data: [
+                        {
+                            info: { role: "assistant", time: { created: 1 } },
+                            parts: [{ type: "text", text: markup }],
+                        },
+                    ],
+                })),
+                delete: mock(async () => ({})),
+            },
+        } as unknown as PluginContext["client"];
+        return { client, prompt, create };
+    }
+
+    it("counts a window too small for the fixed prompt as one failure and backs off until the window changes", async () => {
+        useTempDataHome("compartment-runner-prompt-unfit-backoff-");
+        const sessionId = "ses-prompt-unfit-backoff";
+        createOpenCodeDb(sessionId, sevenMessages("unfit", "First eligible message"));
+        const db = openDatabase();
+        const { client, prompt, create } = sizedClient("unfit");
+        // 33k window with a 32k output reserve leaves ~1k input: not even the
+        // historian system prompt fits.
+        const tooSmall = {
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            historianContextLimit: 33_000,
+            historianMaxOutputTokens: 32_000,
+            model: "test/model",
+            directory: "/tmp",
+        };
+
+        await runCompartmentAgentWithLease(tooSmall);
+        const first = getHistorianFailureState(db, sessionId);
+        expect(first.failureCount).toBe(1);
+        expect(first.lastError).toContain("producer_prompt_unfit");
+        expect(create).toHaveBeenCalledTimes(0);
+        const firstNotices = getRpcNotificationTexts(prompt);
+        expect(firstNotices.filter((text) => text.includes("(MC-H05)"))).toHaveLength(1);
+
+        // Nothing changed, so the next triggers neither fail again, notify, nor
+        // open a child session.
+        await runCompartmentAgentWithLease(tooSmall);
+        await runCompartmentAgentWithLease(tooSmall);
+        expect(getHistorianFailureState(db, sessionId).failureCount).toBe(1);
+        // Delivery is at-least-once, so the queue still holds the first notice
+        // until a client acknowledges it; no second notice joined it.
+        expect(
+            getRpcNotificationTexts(prompt).filter((text) => text.includes("(MC-H05)")),
+        ).toHaveLength(1);
+        expect(create).toHaveBeenCalledTimes(0);
+
+        // A larger window changes the outcome, so the historian runs again.
+        await runCompartmentAgentWithLease({ ...tooSmall, historianContextLimit: 1_000_000 });
+        expect(create).toHaveBeenCalledTimes(1);
+        expect(getHistorianPromptCount(prompt)).toBe(1);
+        expect(
+            getCompartments(db, sessionId).map((row) => [row.startMessage, row.endMessage]),
+        ).toEqual([[1, 2]]);
+    });
+
+    it("trims the memory block so the chunk fits a window the full prompt would overflow", async () => {
+        useTempDataHome("compartment-runner-prompt-fit-memory-");
+        const sessionId = "ses-prompt-fit-memory";
+        createOpenCodeDb(
+            sessionId,
+            sevenMessages("memory", `${"session source token ".repeat(1_500)}SOURCE_END`),
+        );
+        const db = openDatabase();
+        const projectPath = resolveProjectIdentity("/tmp");
+        const memoryCount = 400;
+        for (let index = 0; index < memoryCount; index += 1) {
+            insertMemory(db, {
+                projectPath,
+                category: "ARCHITECTURE",
+                content: `Remembered architecture fact number ${index}: ${"the module keeps a durable ledger of every decision it made ".repeat(4)}`,
+            });
+        }
+        const { client, prompt, create } = sizedClient("memory");
+        const contextLimit = 100_000;
+        const model = "test/fixture-historian";
+
+        // Control: the untrimmed prompt cannot fit this window, so before the
+        // prompt was sized the transport refused it on every run.
+        const memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+        expect(memories).toHaveLength(memoryCount);
+        await observeProducerModelsForTest([model], contextLimit);
+        const window = resolveHistorianProducerWindow(model, undefined, contextLimit);
+        const fullBlock = renderHistorianMemoryBlock(memories);
+        const admit = (user: string) =>
+            producerPromptFailureReason({
+                sourceLocal: estimateTokens(user),
+                systemLocal: estimateTokens(COMPARTMENT_AGENT_SYSTEM_PROMPT),
+                toolsLocal: 0,
+                modelKey: model,
+                contextLimitTokens: window.contextLimitTokens,
+                inputLimitTokens: window.inputLimitTokens,
+                maxOutputTokens: window.maxOutputTokens,
+            });
+        expect(admit(`${fullBlock}\n\n${"session source token ".repeat(1_500)}`)).toContain(
+            "producer_prompt_exceeds_window",
+        );
+
+        await runCompartmentAgentWithLease({
+            client,
+            db,
+            sessionId,
+            historianChunkTokens: 10_000,
+            historianContextLimit: contextLimit,
+            model,
+            directory: "/tmp",
+        });
+
+        expect(create).toHaveBeenCalledTimes(1);
+        const sent = prompt.mock.calls
+            .map(
+                (call) =>
+                    call[0] as { body?: { noReply?: boolean; parts?: Array<{ text?: string }> } },
+            )
+            .filter((input) => input.body?.noReply !== true)
+            .map((input) => input.body?.parts?.map((part) => part.text ?? "").join("\n") ?? "");
+        expect(sent).toHaveLength(1);
+        const user = sent[0] ?? "";
+        // The whole chunk went out; the memory block made room for it.
+        expect(user).toContain("SOURCE_END");
+        expect(user).toContain("<project-memory>");
+        const keptLines = user.split("\n").filter((line) => line.startsWith("- Remembered"));
+        expect(keptLines.length).toBeGreaterThan(0);
+        expect(keptLines.length).toBeLessThan(memoryCount);
+        expect(admit(user)).toBeNull();
+        expect(
+            getCompartments(db, sessionId).map((row) => [row.startMessage, row.endMessage]),
+        ).toEqual([[1, 2]]);
+        expect(getHistorianFailureState(db, sessionId).failureCount).toBe(0);
     });
 });

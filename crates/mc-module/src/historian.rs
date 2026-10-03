@@ -213,106 +213,6 @@ fn to_stored_compartment(
 /// Project a validated fact candidate onto the store's promotion input. Historian facts
 /// have no importance or expiry at publish time, but retain the source session so later
 /// maintenance can relate them to the publication that created them.
-/// Project one validated publish onto the shape the single-store writers take.
-///
-/// Built from the rows that are already on their way into the module's own store, so the
-/// two writers are handed the same publish rather than two independently derived ones.
-///
-/// The harness label is the route's own, carried on the request, so a module-written row
-/// and a host-written row for the same session carry the same label.
-fn fold_publish_view(
-    request: &ValidatedPublishRequest<'_>,
-    compartments: &[StoredCompartment],
-    facts: &[FactCandidate],
-    events: &[HistorianEventCandidate],
-    primer_candidates: &[HistorianPrimerCandidate],
-    user_memory_candidates: &[HistorianUserMemoryCandidate],
-) -> crate::host_store::FoldPublish {
-    use crate::host_store as single_store;
-
-    single_store::FoldPublish {
-        session_id: request.session_id.to_string(),
-        project_path: request.project_path.to_string(),
-        harness: request.harness.to_string(),
-        now_ms: request.created_at_ms,
-        compartments: compartments
-            .iter()
-            .map(|compartment| single_store::HostCompartment {
-                sequence: compartment.sequence,
-                start_message: compartment.start_message,
-                end_message: compartment.end_message,
-                start_message_id: compartment.start_message_id.clone(),
-                end_message_id: compartment.end_message_id.clone(),
-                title: compartment.title.clone(),
-                content: compartment.content.clone(),
-                p1: compartment.p1.clone(),
-                p2: compartment.p2.clone(),
-                p3: compartment.p3.clone(),
-                p4: compartment.p4.clone(),
-                importance: Some(i64::from(compartment.importance)),
-                episode_type: compartment.episode_type.clone(),
-                created_at: compartment.created_at,
-            })
-            .collect(),
-        facts: facts
-            .iter()
-            .map(|fact| single_store::HostSessionFact {
-                category: fact.category.clone(),
-                content: fact.content.clone(),
-            })
-            .collect(),
-        events: events
-            .iter()
-            .map(|event| single_store::HostCompartmentEvent {
-                kind: event.kind.clone(),
-                at_compartment: event.at_compartment.map(|value| value as i64),
-                fields_json: event.fields_json.clone(),
-            })
-            .collect(),
-        memories: facts
-            .iter()
-            .map(|fact| single_store::HostMemory {
-                category: fact.category.clone(),
-                content: fact.content.clone(),
-                importance: fact.importance.map(i64::from),
-                source_session_id: fact.source_session_id.clone(),
-                expires_at: fact.expires_at,
-                metadata_json: None,
-            })
-            .collect(),
-        notes: Vec::new(),
-        primer_candidates: primer_candidates
-            .iter()
-            .map(|candidate| single_store::HostPrimerCandidate {
-                question: candidate.question.clone(),
-                source_compartment_start: candidate
-                    .source_compartment_start
-                    .map(|value| value as i64),
-                source_compartment_end: candidate.source_compartment_end.map(|value| value as i64),
-                source_start_message_id: candidate.source_start_message_id.clone(),
-                source_end_message_id: candidate.source_end_message_id.clone(),
-                source_message_time: candidate.source_message_time,
-                created_at: candidate.created_at,
-            })
-            .collect(),
-        user_observations: user_memory_candidates
-            .iter()
-            .map(|candidate| single_store::HostUserObservation {
-                content: candidate.content.clone(),
-                source_compartment_start: candidate
-                    .source_compartment_start
-                    .map(|value| value as i64),
-                source_compartment_end: candidate.source_compartment_end.map(|value| value as i64),
-                created_at: candidate.created_at,
-            })
-            .collect(),
-        user_memories: Vec::new(),
-        // The module has already applied the privacy gate: an empty candidate list means
-        // collection is off, and re-deriving the gate here could disagree with it.
-        user_memory_collection_enabled: !user_memory_candidates.is_empty(),
-    }
-}
-
 fn to_store_fact(
     f: &crate::historian_validate::FactCandidate,
     source_session_id: &str,
@@ -849,13 +749,13 @@ pub fn persist_historian_state(
     session_id: &str,
     next_state: HistorianDurableState,
 ) -> Result<u64, HistorianStateError> {
-    let loaded = store.load(session_id)?;
+    let loaded = store.load_meta(session_id)?;
     let mut meta = loaded.meta.clone();
     meta.historian = next_state;
     if meta == loaded.meta {
         return Ok(loaded.row_version.unwrap_or(0));
     }
-    Ok(store.commit(session_id, loaded.row_version, &loaded.core, &meta)?)
+    Ok(store.commit_meta(session_id, loaded.row_version, &meta)?)
 }
 
 pub trait HistorianPublicationFence: Send + Sync {
@@ -984,6 +884,7 @@ pub fn publish_validated_chunk(
         };
 
     let publish_request = HistorianPublishRequest {
+        harness: Some(request.harness),
         session_id: request.session_id,
         expected_row_version: request.expected_row_version,
         expected_revert_epoch: request.expected_revert_epoch,
@@ -1019,24 +920,6 @@ pub fn publish_validated_chunk(
                     "[magic-context] could not record publish duration for {}: {error}",
                     request.session_id
                 );
-            }
-            // The single-store writers, when configured. Off by default: one atomic load
-            // and nothing else, not even building the view.
-            if crate::host_store::mode() != crate::host_store::SingleStoreMode::Off {
-                if let Some(crate::host_store::ModePublish::Shadow(report)) =
-                    crate::host_store::apply_publish_for_mode(&fold_publish_view(
-                        &request,
-                        &compartments,
-                        &facts,
-                        &events,
-                        &primer_candidates,
-                        &user_memory_candidates,
-                    ))
-                {
-                    if !report.divergences.is_empty() {
-                        eprintln!("[magic-context] {}", report.summary());
-                    }
-                }
             }
             Ok(result)
         }
@@ -1128,7 +1011,7 @@ pub fn handle_restart_load(
     now_ms: i64,
     failure_backoff_at_ms: i64,
 ) -> Result<RestartAction, HistorianStateError> {
-    let loaded = store.load(session_id)?;
+    let loaded = store.load_meta(session_id)?;
     let state = loaded.meta.historian.clone();
     match state.state {
         HistorianPhase::Idle => Ok(RestartAction::Done),
@@ -1446,6 +1329,8 @@ impl HistorianProducerDriver for HistorianProducer {
 pub struct HistorianModelLimits {
     #[serde(default)]
     pub context: Option<usize>,
+    #[serde(default)]
+    pub input: Option<usize>,
     #[serde(default)]
     pub output: Option<u32>,
 }
@@ -1967,7 +1852,7 @@ fn persist_idle_runner_refusal_detail(
     chain_exhausted: bool,
 ) -> Result<u64, HistorianStateError> {
     for attempt in 0..3 {
-        let loaded = store.load(session_id)?;
+        let loaded = store.load_meta(session_id)?;
         if loaded.meta.historian.state != HistorianPhase::Idle
             || expected_firing_seq
                 .is_some_and(|expected| loaded.meta.historian.firing_seq != expected)
@@ -1981,7 +1866,7 @@ fn persist_idle_runner_refusal_detail(
         if chain_exhausted {
             record_runner_refusal_outage(&mut meta.historian, retry_at_ms);
         }
-        match store.commit(session_id, loaded.row_version, &loaded.core, &meta) {
+        match store.commit_meta(session_id, loaded.row_version, &meta) {
             Ok(row_version) => return Ok(row_version),
             Err(McStoreError::CasConflict { .. }) if attempt < 2 => continue,
             Err(error) => return Err(HistorianStateError::Store(error)),
@@ -1998,42 +1883,67 @@ fn producer_output_reserve(window: usize, max_output_tokens: u32) -> usize {
     (max_output_tokens as usize).min(window / 4)
 }
 
-pub(crate) fn producer_input_token_limit(
+pub(crate) fn producer_input_token_limit_with_input(
     context_limit_tokens: Option<usize>,
+    input_limit_tokens: Option<usize>,
     max_output_tokens: u32,
 ) -> Option<usize> {
-    let window = context_limit_tokens?;
-    // The runner clamps the generous output request to the model's allowed output.
-    // A catalog ceiling cannot reserve more than a quarter of the input window.
-    let reserve = producer_output_reserve(window, max_output_tokens);
-    let limit = window
-        .saturating_sub(reserve)
-        .saturating_mul(100 - PRODUCER_WINDOW_ESTIMATOR_MARGIN_PERCENT)
-        / 100;
+    let shared = context_limit_tokens
+        .map(|window| window.saturating_sub(producer_output_reserve(window, max_output_tokens)));
+    let usable = match (shared, input_limit_tokens) {
+        (Some(shared), Some(input)) => shared.min(input),
+        (Some(shared), None) => shared,
+        (None, Some(input)) => input,
+        (None, None) => return None,
+    };
+    let limit = usable.saturating_mul(100 - PRODUCER_WINDOW_ESTIMATOR_MARGIN_PERCENT) / 100;
     (limit > 0).then_some(limit)
 }
 
-pub(crate) fn producer_window_failure_reason(
+pub(crate) fn producer_window_failure_reason_with_input(
     producer_source_tokens: usize,
     context_limit_tokens: Option<usize>,
+    input_limit_tokens: Option<usize>,
     max_output_tokens: u32,
 ) -> Option<String> {
-    let context_limit_tokens = context_limit_tokens?;
     if producer_source_tokens == 0 {
         return None;
     }
-    let usable_input_tokens = context_limit_tokens.saturating_sub(producer_output_reserve(
+    let shared = context_limit_tokens
+        .map(|window| window.saturating_sub(producer_output_reserve(window, max_output_tokens)));
+    let usable_input_tokens = shared
+        .unwrap_or(usize::MAX)
+        .min(input_limit_tokens.unwrap_or(usize::MAX));
+    let producer_input_limit_tokens = producer_input_token_limit_with_input(
         context_limit_tokens,
+        input_limit_tokens,
         max_output_tokens,
-    ));
-    let producer_input_limit_tokens =
-        producer_input_token_limit(Some(context_limit_tokens), max_output_tokens)?;
+    )?;
     if producer_source_tokens <= producer_input_limit_tokens {
         return None;
     }
     Some(format!(
-        "producer_source_exceeds_window producer_source_tokens={producer_source_tokens} usable_input_tokens={usable_input_tokens} producer_input_limit_tokens={producer_input_limit_tokens} context_limit_tokens={context_limit_tokens} max_output_tokens={max_output_tokens} estimator_margin=0.03"
+        "producer_source_exceeds_window producer_source_tokens={producer_source_tokens} usable_input_tokens={usable_input_tokens} producer_input_limit_tokens={producer_input_limit_tokens} context_limit_tokens={} max_output_tokens={max_output_tokens} estimator_margin=0.03",
+        context_limit_tokens.map_or("unknown".to_string(), |value| value.to_string())
     ))
+}
+
+/// Record a prompt refused before any producer run as a failure with the
+/// configured backoff. These refusals return before `fire` touches durable
+/// state, so without this the scheduler saw no failure and re-fired the same
+/// unfit prompt on every turn.
+fn record_admission_refusal(
+    request: &HistorianFireRequest<'_>,
+    reason: &str,
+) -> Result<(), HistorianDriveError> {
+    let loaded = request.store.load_meta(request.session_id)?;
+    let mut meta = loaded.meta.clone();
+    meta.historian.last_failure = Some(reason.to_string());
+    meta.historian.failure_backoff_at_ms = Some(request.failure_backoff_at_ms);
+    request
+        .store
+        .commit_meta(request.session_id, loaded.row_version, &meta)?;
+    Ok(())
 }
 
 pub async fn run_historian_firing<P>(
@@ -2058,15 +1968,27 @@ where
     if request.model_chain.is_empty() {
         return Err(HistorianDriveError::NoModels);
     }
-    if let Some(reason) = producer_window_failure_reason(
+    let primary_limits = request
+        .model_chain
+        .first()
+        .and_then(|model| request.model_limits.get(model));
+    let primary_input = primary_limits.and_then(|limits| limits.input);
+    let primary_context = if primary_input.is_some() {
+        primary_limits.and_then(|limits| limits.context)
+    } else {
+        request.historian_context_limit_tokens
+    };
+    if let Some(reason) = producer_window_failure_reason_with_input(
         request.producer_source_tokens,
-        request.historian_context_limit_tokens,
+        primary_context,
+        primary_input,
         request.max_output_tokens,
     ) {
         tracing::warn!(
             "[mc-module][{}] historian oversize admission refused before spawn: {reason}",
             request.session_id
         );
+        record_admission_refusal(&request, &reason)?;
         return Err(HistorianDriveError::Producer(
             HistorianProducerError::context_overflow(reason),
         ));
@@ -2117,14 +2039,22 @@ where
             .or(legacy_window)
             .or(request.historian_context_limit_tokens)
             .map(|window| {
-                request
-                    .historian_context_limit_tokens
-                    .map_or(window, |cap| window.min(cap))
+                if resolved.and_then(|limit| limit.input).is_some() {
+                    window
+                } else {
+                    request
+                        .historian_context_limit_tokens
+                        .map_or(window, |cap| window.min(cap))
+                }
             });
         let output = resolved
             .and_then(|limit| limit.output)
             .unwrap_or(request.max_output_tokens);
-        let fit_limit = producer_input_token_limit(current_window, output);
+        let fit_limit = producer_input_token_limit_with_input(
+            current_window,
+            resolved.and_then(|limit| limit.input),
+            output,
+        );
         if fit_limit.is_none() {
             static UNKNOWN_WINDOWS: std::sync::OnceLock<
                 std::sync::Mutex<std::collections::HashSet<String>>,
@@ -2141,11 +2071,15 @@ where
         if fit_limit.is_some_and(|limit| {
             !full_tokens.is_finite() || full_tokens <= 0.0 || full_tokens > limit as f64
         }) {
-            return Err(HistorianDriveError::Producer(HistorianProducerError::context_overflow(
-                format!("producer_prompt_fit_refused model={model} calibrated_tokens={full_tokens} limit={fit_limit:?}"),
-            )));
+            let reason = format!(
+                "producer_prompt_fit_refused model={model} calibrated_tokens={full_tokens} limit={fit_limit:?}"
+            );
+            record_admission_refusal(&request, &reason)?;
+            return Err(HistorianDriveError::Producer(
+                HistorianProducerError::context_overflow(reason),
+            ));
         }
-        let loaded = request.store.load(request.session_id)?;
+        let loaded = request.store.load_meta(request.session_id)?;
         let mut recent_decision = request.recent_decision.clone();
         if let Some(decision) = recent_decision.as_mut() {
             decision.producer_model = Some(model.clone());
@@ -2454,6 +2388,7 @@ where
             harness: request.harness,
             awaiting,
             output: output.clone(),
+            max_output_tokens: Some(crate::historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
             observed_chunk_fingerprint: request.observed_chunk_fingerprint,
             validation_chunk: request.validation_chunk,
             chunk_transcript: request.chunk_transcript,
@@ -2556,18 +2491,29 @@ pub async fn run_historian_firing_on_host(
     if request.model_chain.is_empty() {
         return Err(HistorianDriveError::NoModels);
     }
-    if let Some(reason) = producer_window_failure_reason(
+    let primary_limits = request
+        .model_chain
+        .first()
+        .and_then(|model| request.model_limits.get(model));
+    let primary_input = primary_limits.and_then(|limits| limits.input);
+    let primary_context = if primary_input.is_some() {
+        primary_limits.and_then(|limits| limits.context)
+    } else {
+        request.historian_context_limit_tokens
+    };
+    if let Some(reason) = producer_window_failure_reason_with_input(
         request.producer_source_tokens,
-        request.historian_context_limit_tokens,
+        primary_context,
+        primary_input,
         request.max_output_tokens,
     ) {
-        let loaded = request.store.load(request.session_id)?;
+        let loaded = request.store.load_meta(request.session_id)?;
         let mut meta = loaded.meta.clone();
         meta.historian.last_failure = Some(reason.clone());
         meta.historian.failure_backoff_at_ms = Some(request.failure_backoff_at_ms);
         request
             .store
-            .commit(request.session_id, loaded.row_version, &loaded.core, &meta)?;
+            .commit_meta(request.session_id, loaded.row_version, &meta)?;
         eprintln!(
             "[mc-module][{}] historian oversize admission refused before queueing: {reason}",
             request.session_id
@@ -2581,7 +2527,7 @@ pub async fn run_historian_firing_on_host(
         request.chunk_fingerprint,
         request.observed_chunk_fingerprint,
     )?;
-    let loaded = request.store.load(request.session_id)?;
+    let loaded = request.store.load_meta(request.session_id)?;
     let mut recent_decision = request.recent_decision.clone();
     if let Some(decision) = recent_decision.as_mut() {
         // The claimant picks the model from the chain, so the decision record
@@ -2681,7 +2627,7 @@ pub async fn run_historian_firing_on_host(
 
     // Reload rather than reusing `fired`: the claim advanced the phase, the
     // attempt and the token, and the publish predicate CASes on the attempt.
-    let claimed = request.store.load(request.session_id)?.meta.historian;
+    let claimed = request.store.load_meta(request.session_id)?.meta.historian;
     if claimed.state != HistorianPhase::AwaitingProducer
         || claimed.producer_run_id.as_deref() != Some(run_id.as_str())
     {
@@ -2700,6 +2646,7 @@ pub async fn run_historian_firing_on_host(
         harness: request.harness,
         awaiting: claimed.clone(),
         output,
+        max_output_tokens: None,
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
         chunk_transcript: request.chunk_transcript,
@@ -2828,7 +2775,7 @@ pub fn adopt_historian_run_on_host(
     // queue row stops being claimable the moment a report lands on it, so this is
     // a guard against a state that moved on some other way (a refire, a publish
     // that already happened) rather than against a racing claimant.
-    let awaiting = request.store.load(request.session_id)?.meta.historian;
+    let awaiting = request.store.load_meta(request.session_id)?.meta.historian;
     if awaiting.state != HistorianPhase::AwaitingProducer
         || awaiting.producer_run_id.as_deref() != Some(run_id.as_str())
         || awaiting.producer_attempt != parked.attempt
@@ -2844,6 +2791,7 @@ pub fn adopt_historian_run_on_host(
         harness: request.harness,
         awaiting,
         output,
+        max_output_tokens: None,
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
         chunk_transcript: request.chunk_transcript,
@@ -2964,7 +2912,7 @@ where
         }
     }
 
-    let loaded = request.store.load(request.session_id)?;
+    let loaded = request.store.load_meta(request.session_id)?;
     let awaiting = loaded.meta.historian.clone();
     let output = match producer
         .await_output_with_timeout(&producer_run_id, request.await_timeout)
@@ -3025,6 +2973,7 @@ where
         harness: request.harness,
         awaiting,
         output,
+        max_output_tokens: None,
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
         chunk_transcript: request.chunk_transcript,
@@ -3055,6 +3004,7 @@ struct PublishOutputRequest<'a> {
     harness: &'a str,
     awaiting: HistorianDurableState,
     output: ProducerOutput,
+    max_output_tokens: Option<u32>,
     observed_chunk_fingerprint: &'a str,
     validation_chunk: &'a HistorianChunk,
     chunk_transcript: &'a str,
@@ -3079,6 +3029,7 @@ fn publish_output_from_awaiting(
         harness,
         awaiting,
         output,
+        max_output_tokens,
         observed_chunk_fingerprint,
         validation_chunk,
         chunk_transcript,
@@ -3092,14 +3043,25 @@ fn publish_output_from_awaiting(
         completion_now_ms,
         publication_fence,
     } = request;
+    // The host report does not carry usage; omitted values must not look like zero spend.
+    let tokens = crate::historian_producer::producer_token_log(
+        output.usage,
+        max_output_tokens,
+        output.length_capped,
+    );
+    tracing::info!(
+        session_id,
+        response_chars = output.text.chars().count(),
+        tokens = %tokens,
+        "historian response received"
+    );
     let validating = output_received(&awaiting, &output.text)?;
     persist_historian_state(store, session_id, validating.clone())?;
 
     let validation_result = if output.length_capped {
         Err(HistorianValidationError {
             message:
-                "Historian output hit the length cap; refusing a potentially partial document."
-                    .to_string(),
+                format!("Historian output hit the length cap; refusing a potentially partial document. tokens={tokens}"),
         })
     } else {
         validate_historian_output(
@@ -3182,7 +3144,7 @@ fn abandon_current_state_with_detail(
     failure_backoff_at_ms: i64,
     detail: Option<String>,
 ) -> Result<(), HistorianStateError> {
-    let loaded = store.load(session_id)?;
+    let loaded = store.load_meta(session_id)?;
     persist_historian_state(
         store,
         session_id,
@@ -3266,7 +3228,7 @@ mod tests {
     use crate::transform::{transform, ProducerContext, TransformRequest};
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&StorageDescriptor {
+        McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
             storage_namespace: "mc_cache".to_string(),
             isolation: Isolation::Module,
@@ -3353,6 +3315,7 @@ mod tests {
             historian_model_chain: None,
             historian_model_limits: Default::default(),
             historian_timeout_ms: None,
+            historian_max_output_tokens: None,
             declared_trim: None,
             lineage_switched: false,
             descent_edge_id: 0,
@@ -3367,48 +3330,6 @@ mod tests {
     fn empty_boundary_dates() -> &'static BTreeMap<String, String> {
         static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
         EMPTY.get_or_init(BTreeMap::new)
-    }
-
-    /// The single-store view stamps the route's own harness label, not a module-wide
-    /// one. `harness` is part of `primer_candidates`' upsert key, so any other label makes
-    /// the module add a second candidate row beside the host's instead of updating it.
-    #[test]
-    fn the_single_store_view_carries_the_routes_harness_label() {
-        let predicate = HistorianPublishPredicate {
-            firing_seq: 1,
-            producer_run_id: "run-1".into(),
-            producer_attempt: 0,
-            chunk_fingerprint: "fp".into(),
-            selected_range_identities: Vec::new(),
-            compartment_set_generation: CompartmentSetGeneration {
-                max_sequence: 0,
-                count: 0,
-            },
-        };
-        let validated = ValidatedChunk::default();
-        for harness in ["opencode", "opencode2", "pi"] {
-            let request = ValidatedPublishRequest {
-                session_id: "ses",
-                project_path: "git:proj",
-                harness,
-                expected_row_version: None,
-                expected_revert_epoch: 0,
-                predicate: &predicate,
-                observed_chunk_fingerprint: "fp",
-                validated: &validated,
-                promote_facts: false,
-                collect_user_memory_candidates: false,
-                publication_floor_ordinal: 1,
-                chunk_transcript: "",
-                raw_chunk_messages: "[]",
-                boundary_dates: empty_boundary_dates(),
-                created_at_ms: 1,
-                failure_backoff_at_ms: 0,
-                publication_fence: None,
-            };
-            let view = fold_publish_view(&request, &[], &[], &[], &[], &[]);
-            assert_eq!(view.harness, harness);
-        }
     }
 
     fn pctx<'a>() -> ProducerContext<'a> {
@@ -3435,6 +3356,7 @@ mod tests {
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
             historian_active: false,
             wrapup_active: false,
+            caveman_english_word_rules: true,
             injected_reductions: Vec::new(),
         }
     }
@@ -3902,9 +3824,19 @@ mod tests {
         let mut request = fire_request(&store, &prompt, &models, &chunk, &prior);
         request.historian_context_limit_tokens = Some(10_000);
         request.max_output_tokens = 1000;
+        let configured_backoff = request.failure_backoff_at_ms;
         let mut producer = ScriptedProducer::default();
         assert!(run_historian_firing(&mut producer, request).await.is_err());
         assert!(producer.observed_starts.is_empty());
+        let refused_state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(
+            refused_state.failure_backoff_at_ms,
+            Some(configured_backoff)
+        );
+        assert!(refused_state
+            .last_failure
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with("producer_prompt_fit_refused")));
         let mut missing = fire_request(&store, "small", &models, &chunk, &prior);
         missing.historian_context_limit_tokens = None;
         let mut missing_producer = ScriptedProducer::default()
@@ -3934,15 +3866,24 @@ mod tests {
         refused_request.producer_source_tokens = 20_000;
         refused_request.historian_context_limit_tokens = Some(11_000);
         refused_request.max_output_tokens = 1_000;
+        let configured_backoff = refused_request.failure_backoff_at_ms;
         let mut refused_producer = ScriptedProducer::default();
 
         assert!(run_historian_firing(&mut refused_producer, refused_request)
             .await
             .is_err());
         assert!(refused_producer.observed_starts.is_empty());
+        // A refused prompt is a failure the scheduler must back off on; without
+        // the durable record it re-fired the same prompt on every turn.
         let refused_state = refused_store.load("ses").unwrap().meta.historian;
-        assert_eq!(refused_state.failure_backoff_at_ms, None);
-        assert_eq!(refused_state.last_failure, None);
+        assert_eq!(
+            refused_state.failure_backoff_at_ms,
+            Some(configured_backoff)
+        );
+        assert!(refused_state
+            .last_failure
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with("producer_source_exceeds_window")));
 
         let admitted_dir = tempfile::tempdir().unwrap();
         let admitted_store = store(admitted_dir.path());
@@ -3969,22 +3910,76 @@ mod tests {
         assert_eq!(admitted_producer.observed_starts.len(), 1);
 
         assert_eq!(
-            producer_window_failure_reason(10_000, Some(11_000), 1_000).as_deref(),
+            producer_window_failure_reason_with_input(10_000, Some(11_000), None, 1_000).as_deref(),
             Some("producer_source_exceeds_window producer_source_tokens=10000 usable_input_tokens=10000 producer_input_limit_tokens=9700 context_limit_tokens=11000 max_output_tokens=1000 estimator_margin=0.03")
         );
     }
 
     #[test]
+    fn historian_input_cap_and_context_reserve_match_typescript_admission() {
+        let limits: HistorianModelLimits =
+            serde_json::from_str(r#"{"context":400000,"input":272000,"output":128000}"#).unwrap();
+        assert_eq!(limits.input, Some(272_000));
+        // Unconfigured output reserves at most a quarter of the shared window.
+        assert_eq!(
+            producer_input_token_limit_with_input(limits.context, limits.input, 128_000),
+            Some(263_840)
+        );
+        assert_eq!(
+            producer_input_token_limit_with_input(Some(400_000), None, 128_000),
+            Some(291_000)
+        );
+        assert_eq!(
+            producer_input_token_limit_with_input(Some(300_000), limits.input, 128_000),
+            Some(218_250)
+        );
+        assert_eq!(
+            producer_input_token_limit_with_input(None, limits.input, 128_000),
+            Some(263_840)
+        );
+    }
+
+    #[test]
+    fn historian_model_limits_wire_accepts_missing_input_and_ignores_extra_input_on_old_module() {
+        let old_plugin_limits: HistorianModelLimits =
+            serde_json::from_str(r#"{"context":400000,"output":128000}"#).unwrap();
+        assert_eq!(old_plugin_limits.input, None);
+        assert_eq!(
+            producer_input_token_limit_with_input(
+                old_plugin_limits.context,
+                old_plugin_limits.input,
+                128_000,
+            ),
+            Some(291_000)
+        );
+        #[derive(serde::Deserialize)]
+        struct OldModuleLimits {
+            context: usize,
+            output: u32,
+        }
+        let old_module: OldModuleLimits =
+            serde_json::from_str(r#"{"context":400000,"input":272000,"output":128000}"#).unwrap();
+        assert_eq!((old_module.context, old_module.output), (400_000, 128_000));
+    }
+
+    #[test]
     fn small_producer_window_reserves_only_allowed_output_and_still_refuses_oversize() {
         assert_eq!(
-            producer_input_token_limit(Some(32_000), 32_000),
+            producer_input_token_limit_with_input(Some(32_000), None, 32_000),
             Some(23_280)
         );
-        assert!(producer_window_failure_reason(1_000, Some(32_000), 32_000).is_none());
-        assert!(producer_window_failure_reason(25_000, Some(32_000), 32_000)
-            .unwrap()
-            .contains("producer_input_limit_tokens=23280"));
-        assert_eq!(producer_input_token_limit(Some(0), 32_000), None);
+        assert!(
+            producer_window_failure_reason_with_input(1_000, Some(32_000), None, 32_000).is_none()
+        );
+        assert!(
+            producer_window_failure_reason_with_input(25_000, Some(32_000), None, 32_000)
+                .unwrap()
+                .contains("producer_input_limit_tokens=23280")
+        );
+        assert_eq!(
+            producer_input_token_limit_with_input(Some(0), None, 32_000),
+            None
+        );
     }
 
     #[tokio::test]
@@ -4162,6 +4157,7 @@ mod tests {
             models[1].clone(),
             HistorianModelLimits {
                 context: Some(4),
+                input: None,
                 output: Some(4),
             },
         );
@@ -6919,6 +6915,7 @@ mod tests {
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: loaded.row_version,
                 expected_revert_epoch: 0,
@@ -7042,6 +7039,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: Some(row_version),
                 expected_revert_epoch: 0,

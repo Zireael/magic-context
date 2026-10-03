@@ -13,14 +13,13 @@ import {
     getProjectEmbeddings,
     type Memory,
     ModuleMemoryAuthorityError,
-    peekProjectEmbeddings,
     searchMemoriesFTS,
     searchMemoriesFTSUnion,
     updateMemoryRetrievalCount,
 } from "./memory";
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
-import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
+import { relaxedFtsQuery, sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import { recordShadowMeasurement } from "./search-measurement";
 import { getNotes, type Note } from "./storage-notes";
@@ -35,6 +34,13 @@ import {
 } from "./workspaces";
 
 const DEFAULT_UNIFIED_SEARCH_LIMIT = 10;
+/**
+ * Upper bound on the results one search returns. The limit comes from the
+ * model, and each tier fetches three times it, so without a bound a call like
+ * `limit: 1e6` could dump the whole archive into one tool result. Matches the
+ * Rust module's ctx_search clamp.
+ */
+export const MAX_UNIFIED_SEARCH_LIMIT = 25;
 const FTS_SEMANTIC_CANDIDATE_LIMIT = 50;
 const SEMANTIC_WEIGHT = 0.7;
 const FTS_WEIGHT = 0.3;
@@ -248,7 +254,7 @@ function normalizeLimit(limit?: number): number {
     if (typeof limit !== "number" || !Number.isFinite(limit)) {
         return DEFAULT_UNIFIED_SEARCH_LIMIT;
     }
-    return Math.max(1, Math.floor(limit));
+    return Math.min(MAX_UNIFIED_SEARCH_LIMIT, Math.max(1, Math.floor(limit)));
 }
 
 interface InclusiveDateRange {
@@ -588,6 +594,16 @@ function getBatchedFtsCountStatement(
     return statement;
 }
 
+/**
+ * Restrict a sanitized message FTS query to the `content` column. The table
+ * also indexes `role`, so a bare query for "user" or "assistant" (or any term
+ * porter-stemming to them, such as "users") would otherwise match every message
+ * of that role. Applied to the bound MATCH value so the SQL text is unchanged.
+ */
+function contentOnlyMessageQuery(ftsQuery: string): string {
+    return ftsQuery.length === 0 ? "" : `content : (${ftsQuery})`;
+}
+
 /** Read all per-probe document frequencies in one SQLite statement. */
 function countSessionFtsMatchesBatch(
     db: Database,
@@ -599,7 +615,7 @@ function countSessionFtsMatchesBatch(
     if (ftsQueries.length === 0) return [];
     const bindings: unknown[] = [];
     for (const query of ftsQueries) {
-        bindings.push(sessionId, query);
+        bindings.push(sessionId, contentOnlyMessageQuery(query));
         if (dateRange !== null) bindings.push(dateRange.from, dateRange.to);
         if (cutoff !== null) bindings.push(cutoff);
     }
@@ -761,6 +777,7 @@ function getFtsScores(matches: Memory[]): Map<number, number> {
 }
 
 function selectSemanticCandidates(args: {
+    db: Database;
     memories: Memory[];
     projectPath: string;
     ftsMatches: Memory[];
@@ -777,9 +794,11 @@ function selectSemanticCandidates(args: {
             ? args.workspace.identities
             : [args.projectPath];
         for (const projectPath of embeddingProjects) {
-            const cachedEmbeddings = peekProjectEmbeddings(projectPath, args.queryModelId);
-            if (!cachedEmbeddings) continue;
-            for (const memoryId of cachedEmbeddings.keys()) {
+            // Load (not peek) the stored vectors: a cold or expired cache would
+            // otherwise shrink the candidate set to the FTS hits alone and drop
+            // every memory that only matches by meaning.
+            const storedEmbeddings = getProjectEmbeddings(args.db, projectPath, args.queryModelId);
+            for (const memoryId of storedEmbeddings.keys()) {
                 candidateIds.add(memoryId);
             }
         }
@@ -904,6 +923,7 @@ async function searchMemories(args: {
     });
     const ftsScores = getFtsScores(ftsMatches);
     const semanticCandidates = selectSemanticCandidates({
+        db: args.db,
         memories,
         projectPath: args.projectPath,
         ftsMatches,
@@ -998,8 +1018,9 @@ function runMessageFtsQuery(
 ): NormalizedMessageRow[] {
     if (ftsQuery.length === 0) return [];
     let rawRows: unknown[];
+    const matchQuery = contentOnlyMessageQuery(ftsQuery);
     if (dateRange !== null) {
-        const bindings: unknown[] = [sessionId, ftsQuery, dateRange.from, dateRange.to];
+        const bindings: unknown[] = [sessionId, matchQuery, dateRange.from, dateRange.to];
         if (cutoff !== null) bindings.push(cutoff);
         bindings.push(fetchLimit);
         rawRows = getMessageSearchStatementWithDateRange(db, cutoff !== null).all(...bindings);
@@ -1009,11 +1030,11 @@ function runMessageFtsQuery(
             cutoff !== null
                 ? getMessageSearchStatementWithCutoff(db).all(
                       sessionId,
-                      ftsQuery,
+                      matchQuery,
                       cutoff,
                       fetchLimit,
                   )
-                : getMessageSearchStatement(db).all(sessionId, ftsQuery, fetchLimit);
+                : getMessageSearchStatement(db).all(sessionId, matchQuery, fetchLimit);
     }
     const rows = rawRows.map((row) => row as MessageSearchRow);
 
@@ -1034,18 +1055,19 @@ function runMessageFtsQueryWithDiagnostics(args: {
     dateRange: InclusiveDateRange | null;
 }): { rows: NormalizedMessageRow[]; suppressedCount: number } {
     if (args.ftsQuery.length === 0) return { rows: [], suppressedCount: 0 };
+    const matchQuery = contentOnlyMessageQuery(args.ftsQuery);
     const rawRows = (
         args.dateRange === null
             ? getMessageSearchDiagnosticStatement(args.db).all(
                   args.sessionId,
-                  args.ftsQuery,
+                  matchQuery,
                   args.cutoff,
                   args.fetchLimit,
                   args.cutoff,
               )
             : getMessageSearchDiagnosticStatementWithDateRange(args.db).all(
                   args.sessionId,
-                  args.ftsQuery,
+                  matchQuery,
                   args.dateRange.from,
                   args.dateRange.to,
                   args.cutoff,
@@ -1122,7 +1144,7 @@ function runMessageFtsQueriesBatch(
     if (ftsQueries.length === 0) return [];
     const bindings: unknown[] = [];
     for (const query of ftsQueries) {
-        bindings.push(sessionId, query);
+        bindings.push(sessionId, contentOnlyMessageQuery(query));
         if (dateRange !== null) bindings.push(dateRange.from, dateRange.to);
         if (cutoff !== null) bindings.push(cutoff);
         bindings.push(fetchLimit);
@@ -1180,6 +1202,7 @@ function searchMessages(args: {
     /** Literal probes to additionally query (multi-probe recall). Empty = the
      * original single-query behavior (unchanged for NL queries / hot path). */
     probes?: string[];
+    relaxedRecall?: boolean;
     diagnostics?: UnifiedSearchDiagnostics;
     dateRange: InclusiveDateRange | null;
 }): MessageSearchResult[] {
@@ -1217,7 +1240,20 @@ function searchMessages(args: {
         if (args.diagnostics) {
             args.diagnostics.suppressedLiveMessageMatches = outcome.suppressedCount;
         }
-        const filtered = outcome.rows.slice(0, args.limit);
+        // Exact conjunctions remain the ranking authority; only empty searches
+        // need a disjunction to recover a relevant term from a long question.
+        const rows =
+            outcome.rows.length > 0 || !args.relaxedRecall
+                ? outcome.rows
+                : runMessageFtsQuery(
+                      args.db,
+                      args.sessionId,
+                      relaxedFtsQuery(args.query),
+                      fetchLimit,
+                      cutoff,
+                      args.dateRange,
+                  );
+        const filtered = rows.slice(0, args.limit);
         return filtered.map((row, rank) => ({
             source: "message" as const,
             content: previewText(row.content),
@@ -1941,7 +1977,7 @@ export async function unifiedSearch(
 ): Promise<UnifiedSearchResult[]> {
     const trimmedQuery = query.trim();
     const measurementStartedAt = Date.now();
-    if (trimmedQuery.length === 0) {
+    if (trimmedQuery.length === 0 || options.signal?.aborted) {
         return [];
     }
 
@@ -2015,6 +2051,7 @@ export async function unifiedSearch(
     // before the embed fetch is processed, and the embedding HTTP request
     // doesn't actually leave the process until we await later.
     await Promise.resolve();
+    if (options.signal?.aborted) return [];
 
     // Run the synchronous message-FTS SELECT now that the embed fetch is
     // in flight. Message indexing is event-driven and never runs here;
@@ -2031,6 +2068,7 @@ export async function unifiedSearch(
               limit: tierLimit,
               maxOrdinal: options.maxMessageOrdinal,
               probes: messageProbes,
+              relaxedRecall: options.explicitSearch,
               diagnostics: options.diagnostics,
               dateRange,
           })
@@ -2039,6 +2077,9 @@ export async function unifiedSearch(
     // Wait for the single embed call (if any) and then run the two
     // embedding-dependent searches in parallel using the same vector.
     const capturedQuery = await queryEmbeddingPromise;
+    // A provider may ignore cancellation and resolve after the hint deadline.
+    // Do not turn that late vector into another synchronous database scan.
+    if (options.signal?.aborted) return [];
     const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
     const queryContract =
         capturedQuery instanceof Float32Array || capturedQuery === null ? null : capturedQuery;

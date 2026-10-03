@@ -879,7 +879,11 @@ describe("Magic Context status observability seams", () => {
 		// stage of the pipeline fails this control.
 		expect(source).toMatch(/buildPiStatusDetail\(/);
 		expect(source).toMatch(/statusViewSourceFromPiDetail\(/);
-		expect(source).toMatch(/buildSharedStatusView\(/);
+		// The shared builder is reached only through its checked entry point.
+		expect(source).toMatch(
+			/checkLocalStatusSource\(statusViewSourceFromPiDetail\(/,
+		);
+		expect(source).toMatch(/buildStatusViewFor\(/);
 		expect(source).not.toMatch(/\bsetInterval\s*\(/);
 	});
 });

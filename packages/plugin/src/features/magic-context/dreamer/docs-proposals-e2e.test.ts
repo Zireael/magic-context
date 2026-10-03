@@ -1,15 +1,17 @@
 import { afterEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DREAMER_DOCS_ALLOWED_TOOLS } from "../../../agents/dreamer";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { listPendingDocsProposals } from "./docs-proposals";
 import { acquireLease } from "./lease";
+import { writeTaskStateJson } from "./storage-task-schedule";
 import { createDreamTaskExecutor } from "./task-executor";
 import { leaseKeyFor } from "./task-registry";
 
@@ -21,9 +23,9 @@ afterEach(() => {
 });
 
 test("maintain-docs stub model cannot edit docs, emits a proposal and skips the next run", async () => {
-    dir = mkdtempSync(join(tmpdir(), "mc-docs-e2e-"));
+    dir = createTestTempDirFromPath(join(tmpdir(), "mc-docs-e2e-"));
     const git = (...args: string[]) =>
-        execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+        execFileSync("git", args, { windowsHide: true, cwd: dir, encoding: "utf8" }).trim();
     const file = join(dir, "ARCHITECTURE.md");
     writeFileSync(file, "# Architecture\n\n## Core\nOld sentence.\n");
     writeFileSync(join(dir, "STRUCTURE.md"), "# Structure\n\n## Layout\nLayout.\n");
@@ -94,10 +96,15 @@ test("maintain-docs stub model cannot edit docs, emits a proposal and skips the 
     const config = { task: "maintain-docs" as const, schedule: "0 4 * * *", timeoutMinutes: 20 };
     const first = await executor(config, ctx);
     expect(first.status).toBe("completed");
+    expect(JSON.parse(first.schedulePatch?.taskStateJson ?? "null")).toEqual({
+        head: git("rev-parse", "HEAD"),
+    });
+    writeTaskStateJson(db, dir, "maintain-docs", first.schedulePatch?.taskStateJson ?? "{}");
     expect(readFileSync(file)).toEqual(before);
     expect(listPendingDocsProposals(dir)).toHaveLength(1);
     const second = await executor(config, ctx);
     expect(second.status).toBe("completed");
+    expect(second.detail).toBe("no commits since last run");
     expect(prompts).toBe(1);
     expect(readFileSync(file)).toEqual(before);
 });

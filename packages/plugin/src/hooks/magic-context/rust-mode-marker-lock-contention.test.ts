@@ -1,10 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { openDatabase } from "../../features/magic-context/storage-db";
 import {
@@ -28,6 +27,7 @@ import {
     type SqliteWriteLocker,
     startSqliteWriteLocker,
 } from "../../shared/sqlite-write-locker-test-support";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { resetLkgSlotsForTest } from "./lkg-slot";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
@@ -36,8 +36,6 @@ import type { TransformDeps } from "./transform";
 import type { MessageLike } from "./transform-operations";
 import { RUST_MARKER_LOCK_SKIP_LOG } from "./transform-postprocess-phase";
 
-// Every test database lives under $TMPDIR/magic-context/ and is removed afterwards.
-const TEST_ROOT = join(tmpdir(), "magic-context", "rust-marker-lock-contention");
 const MODULE_TEXT = "module-rendered tail";
 
 const cleanups: Array<() => void> = [];
@@ -50,8 +48,7 @@ afterEach(() => {
 });
 
 function openFileDb(): { db: ContextDatabase; dbPath: string } {
-    mkdirSync(TEST_ROOT, { recursive: true });
-    const directory = mkdtempSync(join(TEST_ROOT, "run-"));
+    const directory = createTestTempDirFromPath(join(tmpdir(), "rust-marker-lock-contention-"));
     const dbPath = join(directory, "context.db");
     const db = openDatabase(dbPath) as ContextDatabase | null;
     if (!db) throw new Error("file-backed test database did not open");
@@ -176,7 +173,6 @@ async function runPassUnderLock(args: {
         sessionDirectoryBySession: new Map(),
         transformMode: "rust",
         rustModeModuleClient: moduleClient,
-        rustModeAllowAuthorityProtocolBypassForTests: true,
         compactionMarkerStrategy: {
             applyDeferred: (markerDb, markerSessionId) => {
                 drained.push(getPendingCompactionMarkerState(markerDb, markerSessionId));
@@ -198,7 +194,6 @@ async function runPassUnderLock(args: {
 
     const transform = createRustModeTransform(deps, {
         moduleClient,
-        allowAuthorityProtocolBypassForTests: true,
         scheduleLkgCapture: (capture) => capture(),
     });
     const input = inputMessages(sessionId);
@@ -229,7 +224,7 @@ function servedText(messages: MessageLike[]): string[] {
 }
 
 describe("Rust-mode compaction target recording under cross-process write contention", () => {
-    it("waits for a lock released within busy_timeout, serves the module output and records the target once", async () => {
+    it("yields for a lock released within the foreground budget, serves the module output and records the target once", async () => {
         const { db, dbPath } = openFileDb();
         expect(busyTimeoutMs(db)).toBe(5000);
         const sessionId = "ses_lock_released";
@@ -255,10 +250,10 @@ describe("Rust-mode compaction target recording under cross-process write conten
         expect(result.drained[0]).toMatchObject({ ordinal: 7, endMessageId: "m1" });
     }, 20_000);
 
-    it("serves the module output and skips recording when the lock outlasts busy_timeout", async () => {
+    it("serves the module output and skips recording when the lock outlasts bounded acquisition retries", async () => {
         const { db, dbPath } = openFileDb();
-        // A short timeout stands in for the production 5 s so the test stays fast;
-        // the lock is held well past it.
+        // The foreground admission has its own budget; this connection's normal
+        // timeout must be restored even when the separate locker outlasts it.
         db.exec("PRAGMA busy_timeout = 300");
         const sessionId = "ses_lock_held";
         const sessionLog = spyOn(logger, "sessionLog");
@@ -271,11 +266,11 @@ describe("Rust-mode compaction target recording under cross-process write conten
                 db,
                 dbPath,
                 sessionId,
-                lockHoldMs: 3000,
+                lockHoldMs: 20000,
                 decision: "SOFT+",
             });
-            // The pass gives up after busy_timeout instead of waiting out the lock.
-            expect(result.elapsedSinceLockMs).toBeLessThan(2500);
+            // The async admission exhausts before the lock releases.
+            expect(result.elapsedSinceLockMs).toBeLessThan(19500);
             const skipCall = sessionLog.mock.calls.find(
                 ([loggedSession, message]) =>
                     loggedSession === sessionId &&
@@ -290,7 +285,7 @@ describe("Rust-mode compaction target recording under cross-process write conten
         } finally {
             sessionLog.mockRestore();
         }
-    }, 20_000);
+    }, 30_000);
 
     it("leaves a newer pending target unchanged", async () => {
         const { db, dbPath } = openFileDb();

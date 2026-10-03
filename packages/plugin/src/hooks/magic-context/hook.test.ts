@@ -1,3 +1,5 @@
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+
 /// <reference types="bun-types" />
 // Tests exercise server-side (Desktop) notification behavior — set OPENCODE_CLIENT
 // to prevent the TUI toast path from intercepting sendIgnoredMessage calls.
@@ -5,12 +7,12 @@ process.env.OPENCODE_CLIENT = "desktop";
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
-import { ensureContextStoreUuid } from "../../features/magic-context/context-authority";
 import { writeTaskScheduleState } from "../../features/magic-context/dreamer/storage-task-schedule";
+import { ensureContextStoreUuid } from "../../features/magic-context/legacy-authority-fixture.test-support";
 import { insertMemory } from "../../features/magic-context/memory";
 import type {
     EmbeddingProvider,
@@ -86,7 +88,7 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -154,6 +156,9 @@ function createMockDeps(promptMocks: PromptMocks = createPromptMocks()): MagicCo
     return {
         client: {
             session: {
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: promptMocks.createSession,
                 ...(promptMocks.prompt ? { prompt: promptMocks.prompt } : {}),
                 promptAsync: promptMocks.promptAsync,
@@ -251,49 +256,7 @@ function countIndexedHookMessage(sessionId: string, messageId: string): number {
 }
 
 describe("magic-context hook", () => {
-    it("review: refusing ordinary mirror must not extend the 1.9s tool reply budget", async () => {
-        process.env.XDG_DATA_HOME = makeTempDir("hook-review-memory-budget-");
-        const deps = createMockDeps();
-        deps.config = { ...deps.config, transform_mode: "rust" } as never;
-        let targeted = false;
-        let drained = false;
-        deps.rustModeModuleClient = {
-            async call() {
-                return {
-                    memory_operation: { action: "write", module_id: 9101, category: "CONSTRAINTS" },
-                };
-            },
-            async mirrorMemory() {
-                targeted = true;
-                return { row: null };
-            },
-            async mirrorPull() {
-                drained = true;
-                await new Promise((resolve) => setTimeout(resolve, 2_200));
-                throw new Error("refusing slow mirror");
-            },
-        } as never;
-        const hook = requireHook(createMagicContextHook(deps));
-        const started = performance.now();
-        const reply = await hook.rustToolBackends!.memory!({
-            sessionId: "review-budget",
-            projectRoot: "/tmp",
-            projectPath: "/tmp",
-            memoryProject: "/tmp",
-            action: "write",
-            category: "CONSTRAINTS",
-            content: "budget probe",
-        });
-        const elapsed = performance.now() - started;
-        expect(targeted).toBe(true);
-        expect(drained).toBe(false);
-        expect(reply).toBe(
-            "Saved memory in CONSTRAINTS. Its id will appear in <project-memory> on the next pass.",
-        );
-        expect(reply).not.toContain("9101");
-        expect(elapsed).toBeLessThan(2_000);
-    });
-    it("constructs with directory fallback when load-time identity resolution throws", () => {
+    it("leaves the project unbound when git fails before any durable identity is known", () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-identity-fallback-data-");
         const projectDir = makeTempDir("hook-identity-fallback-project-");
         mkdirSync(join(projectDir, ".git"));
@@ -307,7 +270,7 @@ describe("magic-context hook", () => {
         const deps = createMockDeps();
         deps.directory = projectDir;
 
-        expect(createMagicContextHook(deps)).not.toBeNull();
+        expect(createMagicContextHook(deps)).toBeNull();
     });
 
     it("constructs and resolves a project when sandbox policy denies realpath for the home directory", () => {
@@ -540,7 +503,7 @@ describe("magic-context hook", () => {
 
         try {
             await runTransform();
-            await waitUntil(() => !autoEmbedAttemptedBySession.has(sessionId));
+            await waitUntil(() => autoEmbedAttemptedBySession.has(sessionId));
 
             for (let i = 1; i <= 7; i++) {
                 appendCompartments(db, sessionId, [
@@ -575,7 +538,8 @@ describe("magic-context hook", () => {
             expect(prompts.promptAsync).not.toHaveBeenCalled();
             const calls = embedBatch.mock.calls.length;
             expect(calls).toBeGreaterThan(0);
-            // Leave new work eligible: without the latch a second transform would drain it.
+            // Appending a compartment after a completed drain allows automatic
+            // embedding to process that new compartment on the next transform.
             appendCompartments(db, sessionId, [
                 {
                     sequence: 7,
@@ -592,11 +556,15 @@ describe("magic-context hook", () => {
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             ).run(sessionId, 8, "u8", "user", "Later source text");
             await runTransform();
-            await new Promise((resolve) => setTimeout(resolve, 30));
-            expect(embedBatch.mock.calls.length).toBe(calls);
+            await waitUntil(
+                () =>
+                    getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session.embedded ===
+                    8,
+            );
+            expect(embedBatch.mock.calls.length).toBeGreaterThan(calls);
             expect(getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session).toEqual({
                 total: 8,
-                embedded: 7,
+                embedded: 8,
             });
             expect(userRows()).toEqual([]);
         } finally {

@@ -10,10 +10,7 @@ import { join } from "node:path";
 import { COMPACTION_ENABLED_PATH, isCompactionEnabled } from "../config/agent-disable";
 import { currentPluginConfigReader, historianRunConfig } from "../config/live-run-config";
 import type { MagicContextConfig } from "../config/schema/magic-context";
-import {
-    getAuthorityManagedMarker,
-    getMemoryMirrorStatus,
-} from "../features/magic-context/context-authority";
+
 import {
     getFailingDreamTasks,
     getMostRecentTaskRunAt,
@@ -34,12 +31,18 @@ import {
     emptyMemoryImportanceHistogram,
     getActiveMemoryImportanceHistogram,
 } from "../features/magic-context/memory/memory-diagnostics";
-import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import {
+    ProjectIdentityError,
+    resolveProjectIdentity,
+    resolveProjectIdentityForSession,
+    shouldSkipHomeProjectMemory,
+} from "../features/magic-context/memory/project-identity";
 import { getMessageIndexQueueHeapStats } from "../features/magic-context/message-index-async";
 import { getMural } from "../features/magic-context/mural/storage-mural";
 import { getEmbeddingCoverageStatus } from "../features/magic-context/project-embedding-registry";
 import { getProtectionWindowForSession } from "../features/magic-context/protection-window";
 import { parseCacheTtl } from "../features/magic-context/scheduler";
+import { readSessionCacheTtl } from "../features/magic-context/session-cache-ttl";
 import { getQuickJsNativeMemoryStats } from "../features/magic-context/smart-notes/sandbox-runner";
 import {
     type ContextDatabase as Database,
@@ -48,6 +51,7 @@ import {
 } from "../features/magic-context/storage";
 import {
     getPersistedSchemaVersion,
+    getUnconfirmedMigrationHolders,
     LATEST_SUPPORTED_VERSION,
 } from "../features/magic-context/storage-db";
 import {
@@ -79,7 +83,7 @@ import { getLiveNotificationParams } from "../hooks/magic-context/hook-handlers"
 import type { LiveSessionState } from "../hooks/magic-context/live-session-state";
 import { getLkgSlotHeapStats } from "../hooks/magic-context/lkg-slot";
 import { computeM0BlockTokens } from "../hooks/magic-context/m0-token-breakdown";
-import { getCompartmentMirrorHeapStats } from "../hooks/magic-context/module-state-sync";
+
 import {
     findLastAssistantModelFromOpenCodeDb,
     openCodeDbExists,
@@ -105,6 +109,8 @@ import { getMagicContextStorageDir } from "../shared/data-path";
 import { listHiddenVariantWarnings } from "../shared/hidden-variant-warnings";
 import { activeHostLimitations } from "../shared/host-limitations";
 import { getLoggerDiagnostics, log } from "../shared/logger";
+import { pluginPackageVersion } from "../shared/plugin-package-version";
+import { canonicalProjectDirectory } from "../shared/project-directory-key";
 import { pushNotification } from "../shared/rpc-notifications";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
 import type {
@@ -346,7 +352,13 @@ export function buildSidebarSnapshot(
     compactionEnabled = true,
 ): SidebarSnapshot {
     try {
-        const projectIdentity = resolveProjectIdentity(directory);
+        const projectIdentity = resolveProjectIdentityForSession(directory);
+        if (projectIdentity === undefined)
+            throw new ProjectIdentityError(
+                "git_identity_unavailable",
+                directory,
+                "Memory features paused while project identity is unavailable",
+            );
 
         const meta = db
             .prepare<[string], Record<string, unknown>>(
@@ -706,7 +718,7 @@ export function buildSidebarSnapshot(
         // last good breakdown instead of letting the bar flicker.
         return applyStickySnapshotCache(sessionId, fresh);
     } catch (err) {
-        log("[rpc] sidebar-snapshot error:", err);
+        if (!(err instanceof ProjectIdentityError)) log("[rpc] sidebar-snapshot error:", err);
         throw err;
     }
 }
@@ -723,6 +735,9 @@ export function buildSidebarSnapshotRpcResponse(
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
 ): Record<string, unknown> {
+    if (shouldSkipHomeProjectMemory(directory)) return { sessionId, disabled: true };
+    if (resolveProjectIdentityForSession(directory) === undefined)
+        return { sessionId, disabled: true, paused: true };
     try {
         return buildSidebarSnapshot(
             db,
@@ -770,10 +785,9 @@ export function buildStatusDetail(
         compactionEnabled,
     );
     const rustMode = config?.transform_mode === "rust";
-    const projectIdentity = rustMode ? resolveProjectIdentity(directory) : null;
     const moduleMemoryAuthority = moduleStatus?.authority?.memories;
-    const moduleMemoryState = moduleMemoryAuthority?.state;
-    const moduleFeedHead = moduleStatus?.memory_mirror?.feed_head;
+    const _moduleMemoryState = moduleMemoryAuthority?.state;
+    const _moduleFeedHead = moduleStatus?.memory_mirror?.feed_head;
     const moduleHistorian = moduleStatus?.historian;
     const historianRefusalDetail =
         moduleHistorian?.last_failure ?? moduleHistorian?.last_no_fire ?? null;
@@ -801,14 +815,7 @@ export function buildStatusDetail(
         dreamerTickFailure: safeTickFailure(db),
         hiddenVariantWarnings: listHiddenVariantWarnings(),
         hostBackendsModuleSide: rustMode,
-        memoryMirror: rustMode ? getMemoryMirrorStatus(db, moduleFeedHead) : undefined,
         compactionMarker: getCompactionMarkerHealth(db, sessionId),
-        memoryAuthorityMismatch:
-            rustMode &&
-            moduleStatus?.authority !== undefined &&
-            projectIdentity !== null &&
-            getAuthorityManagedMarker(db, projectIdentity) !== null &&
-            (moduleMemoryState === "TS" || moduleMemoryAuthority === null),
         activeProfile: typeof config?.profile === "string" ? config.profile : null,
         tagCounter: 0,
         activeTags: 0,
@@ -995,6 +1002,7 @@ export function buildStatusDetail(
             }
 
             const ttlDisplay = resolveCacheTtlDisplay({
+                frozen: readSessionCacheTtl(db, sessionId),
                 configured: (config.cache_ttl ?? "5m") as MagicContextConfig["cache_ttl"],
                 configuredExplicitly: config.cacheTtlConfigured === true,
                 modelKey,
@@ -1197,7 +1205,7 @@ export function buildDebugMemoryUsage(
     const lkg = getLkgSlotHeapStats();
     const tagger = runtimeHolders.taggerCache ?? EMPTY_TAGGER_HEAP_STATS;
     const wire = runtimeHolders.wireCache ?? EMPTY_WIRE_HEAP_STATS;
-    const mirrors = getCompartmentMirrorHeapStats();
+
     const messageIndexQueue = getMessageIndexQueueHeapStats();
     const sessions = new Map<string, DebugMemoryHolders["sessions"][number]>();
     const session = (sessionId: string) => {
@@ -1263,7 +1271,7 @@ export function buildDebugMemoryUsage(
                 rawContentSnapshots: wire.rawContentSnapshots,
                 estimatedBytes: wire.estimatedBytes,
             },
-            compartmentMirrors: { entries: mirrors.entries },
+            compartmentMirrors: { entries: 0 },
             messageIndexQueue,
             sessions: [...sessions.values()].sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
         },
@@ -1398,6 +1406,37 @@ async function generateDebugHeapSnapshot(
 }
 
 /**
+ * The session's directory from the host's own session record, or null when the
+ * host client has no session API or the lookup fails.
+ */
+async function readHostSessionDirectory(
+    client: unknown,
+    sessionId: string,
+): Promise<string | null> {
+    if (typeof client !== "object" || client === null || !("session" in client)) return null;
+    const session = client.session;
+    if (typeof session !== "object" || session === null || !("get" in session)) return null;
+    const get = session.get;
+    if (typeof get !== "function") return null;
+    try {
+        const response: unknown = await get.call(session, { path: { id: sessionId } });
+        const data =
+            typeof response === "object" && response !== null && "data" in response
+                ? response.data
+                : null;
+        const sessionDirectory =
+            typeof data === "object" && data !== null && "directory" in data
+                ? data.directory
+                : null;
+        return typeof sessionDirectory === "string" && sessionDirectory.length > 0
+            ? sessionDirectory
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Register all RPC handlers on the server.
  */
 export function registerRpcHandlers(
@@ -1411,9 +1450,11 @@ export function registerRpcHandlers(
         hiddenCompletionExecutor?: HiddenCompletionExecutor;
         storageDir?: string;
         getDebugMemoryHolders?: () => RuntimeDebugMemoryHolders | undefined;
+        getDatabase?: () => Database | null;
     },
 ): void {
     const { directory, config, liveSessionState, rustModeModuleClient } = args;
+    const readDatabase = args.getDatabase ?? getDb;
     // Resolve mode once at the RPC boundary. The TUI receives this data and
     // never reads the config itself.
     const compactionEnabled = isCompactionEnabled(config);
@@ -1446,7 +1487,7 @@ export function registerRpcHandlers(
     rpcServer.handle("sidebar-snapshot", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        const db = getDb();
+        const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
         const rustMode = config.transform_mode === "rust";
         const moduleStatus = rustMode
@@ -1469,12 +1510,36 @@ export function registerRpcHandlers(
         );
     });
 
+    // A TUI whose session directory matched no discovery directory asks every
+    // local server whether it owns the session. The host's own session record
+    // decides, compared in the canonical spelling this server's discovery file
+    // is filed under.
+    rpcServer.handle("session-owner", async (params) => {
+        const sessionId = String(params.sessionId ?? "");
+        if (!sessionId) return { owner: false };
+        const sessionDirectory =
+            liveSessionState.sessionDirectoryBySession.get(sessionId) ??
+            (await readHostSessionDirectory(args.client, sessionId));
+        if (!sessionDirectory) return { owner: false };
+        return {
+            owner:
+                canonicalProjectDirectory(sessionDirectory) ===
+                canonicalProjectDirectory(directory),
+        };
+    });
+
     rpcServer.handle("status-detail", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
+        // Every reply names this server's version so the TUI can tell the user
+        // when it is talking to a server from a different release.
+        const pluginVersion = pluginPackageVersion() ?? undefined;
+        if (shouldSkipHomeProjectMemory(dir)) return { sessionId, disabled: true, pluginVersion };
+        if (resolveProjectIdentityForSession(dir) === undefined)
+            return { sessionId, disabled: true, paused: true, pluginVersion };
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
-        const db = getDb();
-        if (!db || !sessionId) return { error: "unavailable" };
+        const db = readDatabase();
+        if (!db || !sessionId) return { error: "unavailable", pluginVersion };
         const rustMode = config.transform_mode === "rust";
         const moduleStatus = rustMode
             ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
@@ -1482,6 +1547,7 @@ export function registerRpcHandlers(
         if (rustMode && !moduleStatus) {
             return {
                 error: "Rust module status unavailable; canonical session state was not read",
+                pluginVersion,
             };
         }
         const detail = buildStatusDetail(
@@ -1502,13 +1568,19 @@ export function registerRpcHandlers(
         if (args.hiddenCompletionExecutor?.capabilities.tools === false) {
             detail.dreamerUnsupportedTasks = toolLoopDreamTasks();
         }
+        detail.pluginVersion = pluginVersion;
+        const unconfirmedHolders = getUnconfirmedMigrationHolders();
+        if (unconfirmedHolders) detail.unconfirmedMigrationHolders = unconfirmedHolders;
         return detail as unknown as Record<string, unknown>;
     });
 
     rpcServer.handle("embed-detail", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        const db = getDb();
+        if (shouldSkipHomeProjectMemory(dir)) return { sessionId, disabled: true };
+        if (resolveProjectIdentityForSession(dir) === undefined)
+            return { sessionId, disabled: true, paused: true };
+        const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
         try {
             return buildEmbedDetail(db, sessionId, dir, liveSessionState) as unknown as Record<
@@ -1524,7 +1596,7 @@ export function registerRpcHandlers(
     rpcServer.handle("compartment-count", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        const db = getDb();
+        const db = readDatabase();
         if (!db || !sessionId) return { count: 0 };
         const rustMode = config.transform_mode === "rust";
         const moduleStatus = rustMode
@@ -1592,7 +1664,7 @@ export function registerRpcHandlers(
         if (config.transform_mode === "rust") {
             return executeRustRecompRpc(rustModeModuleClient, sessionId, dir);
         }
-        const db = getDb();
+        const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
 
         const { runManagedRecomp } = await import("../hooks/magic-context/recomp-orchestrator");
@@ -1600,11 +1672,27 @@ export function registerRpcHandlers(
             "../hooks/magic-context/send-session-notification"
         );
         log(`[rpc] recomp requested for session ${sessionId}`);
+        // The historian needs a way to run hidden completions: OpenCode 1 opens
+        // child sessions through its SDK client, OpenCode 2 through the hidden
+        // completion executor. With neither there is nothing to run it on, and
+        // saying so beats a generic rebuild failure.
+        if (!args.client && !args.hiddenCompletionExecutor) {
+            return {
+                ok: false,
+                error: "History rebuild is unavailable: this host gave Magic Context no way to run the historian.",
+            };
+        }
         const ctx = await buildManagedCtx(db);
-        // Fire-and-forget; outcome is force-persisted so a multi-minute recomp's
-        // result stays visible in scrollback instead of a 5s toast.
+        // Fire-and-forget. OpenCode 1 force-persists the outcome as a chat row so a
+        // multi-minute recomp's result stays in scrollback instead of a 5s toast.
+        // OpenCode 2 has no SDK client to write that row with, so the outcome goes
+        // to the result dialog on the notification channel, as wrapup's does.
         void runManagedRecomp(ctx, sessionId)
             .then((message) => {
+                if (!args.client) {
+                    pushResultDialog(sessionId, "Recomp", message);
+                    return;
+                }
                 void sendIgnoredMessage(
                     args.client,
                     sessionId,
@@ -1653,7 +1741,7 @@ export function registerRpcHandlers(
                 return { ok: false, error: renderCapabilityRefusal("context_cleanup") };
             }
         } else {
-            const db = getDb();
+            const db = readDatabase();
             if (!db) return { ok: false, error: "db unavailable" };
             message = executeFlush(db, sessionId);
         }
@@ -1676,7 +1764,7 @@ export function registerRpcHandlers(
         if (config.transform_mode === "rust") {
             return { ok: false, error: renderCapabilityRefusal("history_compression") };
         }
-        const db = getDb();
+        const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
 
         const { runManagedWrapup } = await import("../hooks/magic-context/wrapup-orchestrator");
@@ -1714,7 +1802,7 @@ export function registerRpcHandlers(
     rpcServer.handle("embed", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
-        const db = getDb();
+        const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
         const action = String(params.action ?? "status");
         const embedDeps: EmbedHistoryDeps = {

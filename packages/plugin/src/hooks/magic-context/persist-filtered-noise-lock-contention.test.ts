@@ -1,10 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import {
     appendCompartments,
     getCompartments,
@@ -14,11 +13,9 @@ import { initializeDatabase, openDatabase } from "../../features/magic-context/s
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { startSqliteWriteLocker } from "../../shared/sqlite-write-locker-test-support";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { persistFilteredNoise } from "./persist-filtered-noise";
 import { readSessionChunk, setRawMessageProvider } from "./read-session-chunk";
-
-// Every test database lives under $TMPDIR/magic-context/ and is removed afterwards.
-const TEST_ROOT = join(tmpdir(), "magic-context", "persist-filtered-noise-lock-contention");
 
 const cleanups: Array<() => void> = [];
 
@@ -62,9 +59,10 @@ function persistNoiseHead(db: Database, sessionId: string): boolean {
 }
 
 describe("persistFilteredNoise write lock", () => {
-    it("waits for another process's write lock instead of failing the read-then-append", async () => {
-        mkdirSync(TEST_ROOT, { recursive: true });
-        const directory = mkdtempSync(join(TEST_ROOT, "run-"));
+    it("waits outside a pass for a brief write lock without a partial append", async () => {
+        const directory = createTestTempDirFromPath(
+            join(tmpdir(), "persist-filtered-noise-lock-contention-"),
+        );
         cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
         const dbPath = join(directory, "context.db");
         const db = openDatabase(dbPath);
@@ -75,15 +73,13 @@ describe("persistFilteredNoise write lock", () => {
 
         const locker = await startSqliteWriteLocker(dbPath, 800);
         const startedAt = performance.now();
-        let saved: boolean;
         try {
-            saved = persistNoiseHead(db, sessionId);
+            expect(persistNoiseHead(db, sessionId)).toBe(true);
+            expect(performance.now() - startedAt).toBeGreaterThanOrEqual(700);
+            expect(getCompartments(db, sessionId)).toHaveLength(2);
         } finally {
             await locker.exited;
         }
-
-        expect(performance.now() - startedAt).toBeGreaterThanOrEqual(700);
-        expect(saved).toBe(true);
         expect(getCompartments(db, sessionId).map((row) => row.endMessageId)).toEqual(["m1", "m2"]);
     }, 20_000);
 

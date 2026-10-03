@@ -11,6 +11,7 @@ import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from
 import { badgeTextColor } from "../badge-contrast";
 import { loadSidebarSnapshot } from "../data/context-db";
 import { buildMagicContextSidebarView } from "../../shared/sidebar-view";
+import { directoryForSession } from "../data/session-directory";
 import { computeEffectiveOrder, DEFAULT_SLOT_ORDER, PLUGIN_KEY, queueTuiPreferenceUpdate, readTuiPreferencesFile, readTuiPreferencesFileSync, resolveMagicContextPrefs, watchTuiPreferences } from "../../shared/tui-preferences";
 
 // Module-level hook so the upgrade/recomp dialog can kick the sidebar into its
@@ -395,7 +396,7 @@ const SidebarContent = props => {
     const sid = props.sessionID();
     if (!sid) return;
     const sequence = ++snapshotRequestSequence;
-    const directory = props.api.state.path.directory ?? "";
+    const directory = directoryForSession(props.api.state.session?.get?.(sid)?.directory, props.api.state.path.directory ?? "");
     void loadSidebarSnapshot(sid, directory).then(data => {
       // Guard against a session switch while this load was in flight:
       // painting session A's snapshot into the now-active session B shows
@@ -455,7 +456,7 @@ const SidebarContent = props => {
       return;
     }
     const sequence = ++snapshotRequestSequence;
-    const directory = props.api.state.path.directory ?? "";
+    const directory = directoryForSession(props.api.state.session?.get?.(sid)?.directory, props.api.state.path.directory ?? "");
     void loadSidebarSnapshot(sid, directory).then(data => {
       if (!recompActive || recompSessionId !== sid || props.sessionID() !== sid || sequence !== snapshotRequestSequence) return;
       const phase = data?.recompProgress?.phase;

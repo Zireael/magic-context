@@ -41,6 +41,8 @@ import {
 } from "./rust-runner/hermetic-subc";
 
 export interface RustTestHarnessOptions {
+    /** Preallocated throwaway paths for database-copy drills. dispose() removes dataDir's parent. */
+    existingEnv?: IsolatedEnv;
     /** magic-context USER-tier config overrides (thresholds, memory, etc.). */
     magicContextConfig?: Record<string, unknown>;
     /** Extra opencode.json config. Merged onto test defaults. */
@@ -250,7 +252,7 @@ export class RustTestHarness {
         // Env first: the daemon must write its connection file into
         // <dataDir>/cortexkit/run/ before opencode boots and the plugin's Rust
         // client connects on the first transform.
-        const env = createIsolatedEnv();
+        const env = options.existingEnv ?? createIsolatedEnv();
         if (options.seedModuleStorePath) {
             const moduleStoreDir = join(env.dataDir, "cortexkit", "magic-context");
             mkdirSync(moduleStoreDir, { recursive: true });
@@ -421,7 +423,7 @@ export class RustTestHarness {
             }
             this.contextDbCached = null;
         }
-        await this.opencodeInstance.kill();
+        await this.opencodeInstance.kill({ root: "keep" });
         this.opencodeInstance = await RustTestHarness.spawnServe({
             env: this.env,
             mockURL: this.mockBaseURL,
@@ -762,7 +764,8 @@ export class RustTestHarness {
             throw new Error(
                 `sendPrompt did not complete within ${timeoutMs}ms. stderr:\n${this.opencodeInstance
                     .stderr()
-                    .slice(-2000)}\nmodule log:\n${this.subc.moduleLog().slice(-2000)}`,
+                    .slice(-2000)}\nmodule log:\n${this.subc.moduleLog().slice(-2000)}\n` +
+                    `plugin log:\n${await this.flushedPluginLogTail()}`,
             );
         }
         if (result.data === undefined) {
@@ -770,7 +773,8 @@ export class RustTestHarness {
                 `sendPrompt returned without session data: ${JSON.stringify(result.error ?? null)}\n` +
                     `stdout:\n${this.opencodeInstance.stdout().slice(-2000)}\n` +
                     `stderr:\n${this.opencodeInstance.stderr().slice(-2000)}\n` +
-                    `module log:\n${this.subc.moduleLog().slice(-2000)}`,
+                    `module log:\n${this.subc.moduleLog().slice(-2000)}\n` +
+                    `plugin log:\n${await this.flushedPluginLogTail()}`,
             );
         }
         return result;
@@ -875,6 +879,17 @@ export class RustTestHarness {
             },
             { timeoutMs, label: `>= ${minCount} rust passes` },
         );
+    }
+
+    /**
+     * The end of the plugin's log, for a failure message. The plugin writes its
+     * diagnostics (a refused pass among them) to this file rather than to the
+     * host's stderr, and buffers them for up to half a second, so wait out one
+     * buffer interval before reading. Only failure reporting calls this.
+     */
+    private async flushedPluginLogTail(): Promise<string> {
+        await Bun.sleep(1_000);
+        return this.diagnosticLog().slice(-4000);
     }
 
     /** Read the subprocess diagnostic log for assertions about the active lineage. */
@@ -1012,7 +1027,7 @@ export class RustTestHarness {
         }
         // Kill order: opencode (holds the plugin's subc client) → module → daemon.
         try {
-            await this.opencodeInstance.kill();
+            await this.opencodeInstance.kill({ root: "remove" });
         } catch {
             // ignore
         }

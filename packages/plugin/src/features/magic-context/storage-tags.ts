@@ -1,6 +1,7 @@
 import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
 import { newestCtxReduceTagNumbers } from "./reclaim-protection";
 import type { TagEntry } from "./types";
 
@@ -130,7 +131,6 @@ export interface MessageTokenTotal {
     hasNull: boolean;
 }
 
-const CONTENT_ID_SUFFIX = /:(?:p|file)\d+$/;
 const RECENT_OWNER_SCAN_PAGE_SIZE = 128;
 const recentTagOwnerStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -142,7 +142,7 @@ function ownerMessageIdForTagRow(row: {
     if (row.type === "tool") {
         return row.tool_owner_message_id ?? row.message_id;
     }
-    return row.message_id.replace(CONTENT_ID_SUFFIX, "");
+    return contentTagOwnerMessageId(row.message_id);
 }
 
 function getRecentTagOwnerStatement(db: Database): PreparedStatement {
@@ -189,7 +189,7 @@ export function getRecentTagOwnerMessageIds(
                     ? typeof row.tool_owner_message_id === "string"
                         ? row.tool_owner_message_id
                         : null
-                    : row.message_id.replace(CONTENT_ID_SUFFIX, "");
+                    : contentTagOwnerMessageId(row.message_id);
             // Reclaim selectors withhold legacy tool rows whose owner is unknown.
             // Skip them here too so they do not consume a known-owner slot.
             if (!ownerId || recent.has(ownerId)) continue;
@@ -724,7 +724,7 @@ function getTagNumbersByMessageIdStatement(db: Database): PreparedStatement {
     let stmt = getTagNumbersByMessageIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT tag_number FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\') ORDER BY tag_number ASC",
+            "SELECT tag_number FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\') ORDER BY tag_number ASC",
         );
         getTagNumbersByMessageIdStatements.set(db, stmt);
     }
@@ -735,7 +735,7 @@ function getDeleteTagsByMessageIdStatement(db: Database): PreparedStatement {
     let stmt = deleteTagsByMessageIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "DELETE FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\')",
+            "DELETE FROM tags WHERE session_id = ? AND (message_id = ? OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\' OR message_id LIKE ? ESCAPE '\\')",
         );
         deleteTagsByMessageIdStatements.set(db, stmt);
     }
@@ -972,7 +972,31 @@ export function markWhitespaceAssistantTagInert(
 export function getInertWhitespaceAssistantTags(
     db: Database,
     sessionId: string,
+    messageIds?: readonly string[],
 ): InertWhitespaceAssistantTag[] {
+    if (messageIds) {
+        // The fingerprint index lets the wire reader seek each visible owner instead
+        // of scanning every compacted tag. Keep the unscoped API for reduction tools.
+        const statement = db.prepare(
+            `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
+             FROM tags
+             WHERE session_id = ? AND type = 'message' AND status = 'compacted'
+               AND entry_fingerprint >= ? AND entry_fingerprint < ?`,
+        );
+        return [...new Set(messageIds)].flatMap((messageId) => {
+            const prefix = `${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}${messageId}:p`;
+            const rows = statement.all(sessionId, prefix, `${prefix.slice(0, -1)}q`) as Array<{
+                tagNumber: number;
+                entryFingerprint: string;
+            }>;
+            return rows.map((row) => ({
+                tagNumber: row.tagNumber,
+                contentId: row.entryFingerprint.slice(
+                    WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
+                ),
+            }));
+        });
+    }
     const rows = db
         .prepare(
             `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
@@ -1402,9 +1426,14 @@ function foldDuplicateIntoSurvivor(
      * duplicate, which lets a bulk fold skip the per-tag queue lookup.
      */
     duplicateMayHaveQueuedOps = true,
+    /**
+     * False when the duplicate's content is now only a fragment of the
+     * survivor's, so its executed drop must not hide the survivor.
+     */
+    propagateDroppedStatus = true,
 ): void {
     mergeSizeAndTokenColumnsIntoSurvivor(db, sessionId, survivor, duplicate);
-    applyDroppedStatusIfNeeded(db, sessionId, survivor, duplicate);
+    if (propagateDroppedStatus) applyDroppedStatusIfNeeded(db, sessionId, survivor, duplicate);
     if (duplicateMayHaveQueuedOps) {
         retargetPendingOps(db, sessionId, duplicate.tagNumber, survivor.tagNumber);
     }
@@ -1520,6 +1549,11 @@ function readQueuedTagNumbers(
  * after the merge that same operation would remove the whole joined text, which
  * is a larger deletion than the one they asked for. Those queue entries are
  * removed and reported to the caller instead.
+ *
+ * An executed drop follows the same rule: a folded tag's `dropped` status is
+ * not copied onto the surviving tag, because the survivor now stands for the
+ * whole joined text. When every fragment was dropped the survivor is one of
+ * them and is already `dropped`, so the joined text stays hidden.
  */
 export function foldShrunkPartTags(
     db: Database,
@@ -1583,6 +1617,7 @@ export function foldShrunkPartTags(
                 survivor,
                 orphan,
                 queuedTags.any.has(orphan.tagNumber),
+                false,
             );
             result.foldedTagNumbers.push(orphan.tagNumber);
         }
@@ -1788,6 +1823,7 @@ export function markTagsCompactedByMessageIds(
  *   - Message tags: `messageId == <removed-msg-id>` (text parts).
  *   - File tags: `messageId LIKE <removed-msg-id>:p%` /
  *     `<removed-msg-id>:file%`.
+ *   - Content-derived text tags (Pi): `<removed-msg-id>:mc-text-v1:%`.
  *   - Tool tags owned by the removed message:
  *     `tool_owner_message_id == <removed-msg-id>` (v3.3.1 Layer C).
  *
@@ -1809,8 +1845,9 @@ export function deleteTagsByMessageId(
         const escapedMessageId = escapeLikePattern(messageId);
         const textPartPattern = `${escapedMessageId}:p%`;
         const filePartPattern = `${escapedMessageId}:file%`;
+        const contentDerivedTextPattern = `${escapedMessageId}${escapeLikePattern(TEXT_TAG_IDENTITY_MARKER)}%`;
         const messageScopedTags = getTagNumbersByMessageIdStatement(db)
-            .all(sessionId, messageId, textPartPattern, filePartPattern)
+            .all(sessionId, messageId, textPartPattern, filePartPattern, contentDerivedTextPattern)
             .filter(isTagNumberRow)
             .map((row) => row.tag_number);
 
@@ -1830,6 +1867,7 @@ export function deleteTagsByMessageId(
                 messageId,
                 textPartPattern,
                 filePartPattern,
+                contentDerivedTextPattern,
             );
         }
         if (ownerScopedTagNumbers.length > 0) {
@@ -2128,18 +2166,24 @@ export function getDroppedTagsBySession(
     sessionId: string,
     scope?: { ownerIds: readonly string[]; messageAddresses: readonly string[] },
 ): TagEntry[] {
-    // Filter before hydrating tag rows: a long folded history can dwarf the servable tail.
+    // Query owner and message addresses separately so their indexes bound both
+    // scans to the visible tail. Unary + keeps the status filter but prevents
+    // choosing the session-wide dropped-tag index for these scoped lookups.
     const rows = (
         scope
             ? db
-                  .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags
-        WHERE session_id = ? AND status = 'dropped'
-          AND ((type = 'tool' AND tool_owner_message_id IN (SELECT value FROM json_each(?)))
-            OR (type != 'tool' AND message_id IN (SELECT value FROM json_each(?))))
+                  .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags INDEXED BY idx_tags_pi_fallback_tool_owner
+        WHERE session_id = ? AND type = 'tool' AND +status = 'dropped'
+          AND tool_owner_message_id IN (SELECT value FROM json_each(?))
+        UNION ALL
+        SELECT ${TAG_SELECT_COLUMNS} FROM tags INDEXED BY idx_tags_session_message_id
+        WHERE session_id = ? AND type != 'tool' AND +status = 'dropped'
+          AND message_id IN (SELECT value FROM json_each(?))
         ORDER BY tag_number ASC, id ASC`)
                   .all(
                       sessionId,
                       JSON.stringify(scope.ownerIds),
+                      sessionId,
                       JSON.stringify(scope.messageAddresses),
                   )
             : getDroppedTagsBySessionStatement(db).all(sessionId)

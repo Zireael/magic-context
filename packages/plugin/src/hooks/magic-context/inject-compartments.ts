@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { MEMORY_MURAL_BLOCK } from "../../agents/magic-context-prompt";
 import {
     buildCompartmentBlock,
     type Compartment,
@@ -7,6 +8,7 @@ import {
     escapeXmlContent,
     getCompartments,
     getLastCompartmentEndMessageId,
+    isPartialCompartmentEnd,
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
 import {
@@ -62,6 +64,9 @@ import {
     decodeCachedM0UpgradeIdentity,
     encodeCachedM0UpgradeIdentity,
     MEMORY_RENDER_FORMAT_EPOCH,
+    renderBudgetIdentityChanged,
+    renderedBudgetShrinkReason,
+    renderedBudgetSnapshot,
 } from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
 import { historyLocalBudget } from "./decision-calibration";
@@ -243,6 +248,23 @@ export interface CompartmentInjectionResult {
 
 export function renderMemoryBlock(memories: Memory[]): string | null {
     return renderMemoryBlockV2(memories) || null;
+}
+
+/**
+ * Return the memories `renderHistorianMemoryBlock` renders, in the order it
+ * renders them (by category priority, then input order). Rendering any prefix
+ * of this list reproduces the first lines of the full block, so a caller that
+ * must shrink the block to fit a model window can drop the lowest-priority
+ * lines by taking a shorter prefix.
+ */
+export function orderHistorianMemories(memories: Memory[]): Memory[] {
+    const ordered: Memory[] = [];
+    for (const category of CATEGORY_PRIORITY) {
+        for (const memory of memories) {
+            if (memory.category === category) ordered.push(memory);
+        }
+    }
+    return ordered;
 }
 
 /**
@@ -434,7 +456,16 @@ export function prepareCompartmentInjection(
                     prepared.compartmentEndMessageId,
                 );
                 if (cutoffIndex >= 0) {
-                    const remaining = messages.slice(cutoffIndex + 1);
+                    const remaining = messages.slice(
+                        cutoffIndex +
+                            (isPartialCompartmentEnd(
+                                db,
+                                sessionId,
+                                prepared.compartmentEndMessageId,
+                            )
+                                ? 0
+                                : 1),
+                    );
                     messages.splice(0, messages.length, ...remaining);
                 } else {
                     // Boundary message not in array — covered messages were already
@@ -573,7 +604,9 @@ export function prepareCompartmentInjection(
 
     const lastCompartment = compartments[compartments.length - 1];
     const lastEnd = lastCompartment.endMessage;
-    const lastEndMessageId = lastCompartment.endMessageId;
+    // A newest compartment without an end id cannot be placed; trim at the
+    // newest one that can (see lastCompartmentBoundaryId).
+    const lastEndMessageId = newestCompartmentEndId(compartments) ?? "";
 
     // Modern m0/m1 preparation keeps the persisted baseline boundary. Only final
     // delivery may advance it after prefix preflight, so contention cannot remove
@@ -638,8 +671,9 @@ export function prepareCompartmentInjection(
         // Natural boundary is visible — normal splice, and any degraded-mode
         // bookkeeping from earlier passes is cleared.
         clearDegradedRebuild(sessionId);
-        skippedVisibleMessages = cutoffIndex + 1;
-        const remaining = messages.slice(cutoffIndex + 1);
+        skippedVisibleMessages =
+            cutoffIndex + (isPartialCompartmentEnd(db, sessionId, trimEndMessageId) ? 0 : 1);
+        const remaining = messages.slice(skippedVisibleMessages);
         messages.splice(0, messages.length, ...remaining);
         resultEndMessageId = trimEndMessageId;
     } else {
@@ -671,8 +705,12 @@ export function prepareCompartmentInjection(
                     reAnchorCompartment.endMessageId,
                 );
                 if (reAnchorCutoff >= 0) {
-                    skippedVisibleMessages = reAnchorCutoff + 1;
-                    const remaining = messages.slice(reAnchorCutoff + 1);
+                    skippedVisibleMessages =
+                        reAnchorCutoff +
+                        (isPartialCompartmentEnd(db, sessionId, reAnchorCompartment.endMessageId)
+                            ? 0
+                            : 1);
+                    const remaining = messages.slice(skippedVisibleMessages);
                     messages.splice(0, messages.length, ...remaining);
                     resultEndMessage = reAnchorCompartment.endMessage;
                     resultEndMessageId = reAnchorCompartment.endMessageId;
@@ -834,6 +872,8 @@ export interface M0SnapshotMarkers {
     muralHash?: string | null;
     muralEnabled: boolean | null;
     renderBudgetIdentity: string | null;
+    /** Numeric allowances used by the cached render; absent on older baselines. */
+    renderedBudgets?: string | null;
 }
 
 /**
@@ -921,6 +961,7 @@ export interface M0M1RenderOptions {
     memoryEnabled?: boolean;
     memoryInjectionBudgetTokens?: number;
     historyBudgetTokens?: number;
+    historyBudgetPolicyIdentity?: string;
     userProfileBudgetTokens?: number;
     temporalAwareness?: boolean;
     /** Experimental image injection. The caller resolves model capability from
@@ -1067,20 +1108,33 @@ type M0Compartment = Compartment & {
 
 /**
  * The boundary (OpenCode message id) covered by a compartment set rendered into
- * m[0]+m[1] — the highest-sequence compartment's end message id, or null when
- * there are none / the latest has no stored boundary (legacy rows). The input
- * is ordered `sequence ASC`, so the last element is the latest compartment.
+ * m[0]+m[1] — the end message id of the newest compartment that has one, or
+ * null when none does. Newer compartments without an end id (legacy rows, or
+ * rows carried into a forked session) cannot be placed, so the rows after the
+ * boundary stay raw rather than the whole window. The input is ordered
+ * `sequence ASC`.
  */
 function lastCompartmentBoundaryId(compartments: readonly M0Compartment[]): string | null {
-    const last = compartments.at(-1);
-    return last?.endMessageId && last.endMessageId.length > 0 ? last.endMessageId : null;
+    return newestCompartmentEndId(compartments);
+}
+
+function newestCompartmentEndId(compartments: readonly Compartment[]): string | null {
+    for (let index = compartments.length - 1; index >= 0; index -= 1) {
+        const id = compartments[index]?.endMessageId;
+        if (typeof id === "string" && id.length > 0) return id;
+    }
+    return null;
 }
 
 const DEFAULT_HISTORY_BUDGET_TOKENS = 60_000;
 export const DEFAULT_MEMORY_BUDGET_TOKENS = 8_000;
 
-function renderBudgetIdentity(memoryBudget?: number, historyBudget?: number): string {
-    return `m${memoryBudget ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${historyBudget ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
+function renderBudgetIdentity(
+    memoryBudget?: number,
+    historyBudget?: number,
+    historyPolicy?: string,
+): string {
+    return `m${memoryBudget ?? DEFAULT_MEMORY_BUDGET_TOKENS}-h${historyPolicy ?? historyBudget ?? DEFAULT_HISTORY_BUDGET_TOKENS}`;
 }
 
 export const DEFAULT_USER_PROFILE_BUDGET_TOKENS = 4_000;
@@ -1299,6 +1353,7 @@ interface M0SnapshotMarkerReadArgs {
     muralEnabled?: boolean;
     memoryInjectionBudgetTokens?: number;
     historyBudgetTokens?: number;
+    historyBudgetPolicyIdentity?: string;
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
 }
@@ -1544,6 +1599,11 @@ function readCurrentM0SnapshotMarkersUncached(args: M0SnapshotMarkerReadArgs): {
             renderBudgetIdentity: renderBudgetIdentity(
                 args.memoryInjectionBudgetTokens,
                 args.historyBudgetTokens,
+                args.historyBudgetPolicyIdentity,
+            ),
+            renderedBudgets: renderedBudgetSnapshot(
+                args.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+                args.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
             ),
         },
     };
@@ -1565,6 +1625,11 @@ function refreshVolatileMarkerInputs(
         renderBudgetIdentity: renderBudgetIdentity(
             args.memoryInjectionBudgetTokens,
             args.historyBudgetTokens,
+            args.historyBudgetPolicyIdentity,
+        ),
+        renderedBudgets: renderedBudgetSnapshot(
+            args.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
+            args.historyBudgetTokens ?? DEFAULT_HISTORY_BUDGET_TOKENS,
         ),
     };
 }
@@ -1650,6 +1715,7 @@ function snapshotMarkersFromCachedM0(state: M0M1State): M0SnapshotMarkers | null
         muralHash: state.cachedM0MuralHash ?? null,
         muralEnabled: cachedUpgradeIdentity.muralEnabled,
         renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity,
+        renderedBudgets: cachedUpgradeIdentity.renderedBudgets,
     };
 }
 
@@ -1692,6 +1758,7 @@ export function mustMaterialize(args: {
     muralEnabled?: boolean;
     memoryInjectionBudgetTokens?: number;
     historyBudgetTokens?: number;
+    historyBudgetPolicyIdentity?: string;
 }): MaterializeDecision {
     if (!args.state.cachedM0Bytes) return { value: true, reason: "first_render" };
     if (!args.state.cachedM1Bytes) return { value: true, reason: "cached_m1_missing" };
@@ -1708,7 +1775,7 @@ export function mustMaterialize(args: {
     // The rendered bytes make this transition self-consuming without another
     // durable flag: once suppressed, the next pass finds no memory-derived block.
     if (args.memoryEnabled === false && cachedMemoryDerivedSurfacePresent(args.state)) {
-        return { value: true, reason: "render_config" };
+        return { value: true, reason: "render_config:memory_disabled" };
     }
 
     // Renderer-format changes must fold cached m[0] once before sanitized bytes can
@@ -1723,13 +1790,33 @@ export function mustMaterialize(args: {
     // rather than folding the whole fleet once at upgrade. Only a real change
     // against a RECORDED component triggers.
     if (
-        (cachedUpgradeIdentity.muralEnabled !== null &&
-            cachedUpgradeIdentity.muralEnabled !== current.muralEnabled) ||
-        (cachedUpgradeIdentity.renderBudgetIdentity !== null &&
-            cachedUpgradeIdentity.renderBudgetIdentity !== current.renderBudgetIdentity)
+        cachedUpgradeIdentity.muralEnabled !== null &&
+        cachedUpgradeIdentity.muralEnabled !== current.muralEnabled
     ) {
-        return { value: true, reason: "render_config" };
+        return {
+            value: true,
+            reason: `render_config:mural(${cachedUpgradeIdentity.muralEnabled}→${current.muralEnabled})`,
+        };
     }
+    if (
+        cachedUpgradeIdentity.renderBudgetIdentity !== null &&
+        current.renderBudgetIdentity != null &&
+        renderBudgetIdentityChanged(
+            cachedUpgradeIdentity.renderBudgetIdentity,
+            current.renderBudgetIdentity,
+        )
+    ) {
+        return {
+            value: true,
+            reason: `render_config:budget(${cachedUpgradeIdentity.renderBudgetIdentity}→${current.renderBudgetIdentity})`,
+        };
+    }
+
+    const budgetShrinkReason = renderedBudgetShrinkReason(
+        cachedUpgradeIdentity.renderedBudgets,
+        current.renderedBudgets,
+    );
+    if (budgetShrinkReason) return { value: true, reason: budgetShrinkReason };
 
     // ── HARD: provider-side cache eviction (the cache was already dead) ──
     // Folding m[1] into m[0] here is "free" — the prefix is being re-cached
@@ -2206,14 +2293,14 @@ function renderSessionHistoryWithDecay(args: {
     });
 }
 
-const MEMORY_MURAL_BLOCK =
-    "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
-
 /** Remove a stale mural reference when a legacy cached baseline has no paired image payload. */
 export function stripMemoryMuralBlock(m0Text: string): string {
     return m0Text
         .split("\n\n")
-        .filter((section) => section !== MEMORY_MURAL_BLOCK)
+        .filter(
+            (section) =>
+                !(section.startsWith("<memory-mural>\n") && section.endsWith("\n</memory-mural>")),
+        )
         .join("\n\n")
         .trim();
 }
@@ -2295,6 +2382,7 @@ function applyMarkersToState(
         markers.muralEnabled,
         markers.renderBudgetIdentity,
         markers.memoryRenderEpoch,
+        markers.renderedBudgets ?? null,
     );
     // Runtime markers must be mirrored into flat state because the next
     // mustMaterialize pass reads cachedM0SystemHash/ToolSetHash/ModelKey directly
@@ -2382,6 +2470,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             muralEnabled: options.muralEnabled,
             memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
             historyBudgetTokens: options.historyBudgetTokens,
+            historyBudgetPolicyIdentity: options.historyBudgetPolicyIdentity,
             hardSignals: options.hardSignals,
             workspaceIdentitySet: {
                 identities: workspace.identities,
@@ -2513,8 +2602,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
 
     let m1Text = M1_EMPTY_PLACEHOLDER;
     let m1Bytes = Buffer.from(m1Text, "utf8");
-    const transactionStartedAt = performance.now();
     options.db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     try {
         const currentWorkspace = resolveWorkspaceRenderContext({
             db: options.db,
@@ -2561,6 +2650,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             projectIdentity: projectPath ?? null,
             muralEnabled: snapshotMarkers.muralEnabled,
             renderBudgetIdentity: snapshotMarkers.renderBudgetIdentity,
+            renderedBudgets: snapshotMarkers.renderedBudgets,
         };
         // NOTE: maxMemoryId is deliberately EXCLUDED from this stale-check.
         // Additive memory writes (write/promote) do not invalidate the rendered
@@ -2623,6 +2713,7 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
                 snapshotMarkers.muralEnabled,
                 snapshotMarkers.renderBudgetIdentity,
                 snapshotMarkers.memoryRenderEpoch,
+                snapshotMarkers.renderedBudgets ?? null,
             ),
             systemHash: snapshotMarkers.systemHash,
             toolSetHash: snapshotMarkers.toolSetHash,
@@ -3060,6 +3151,7 @@ function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
         muralHash: row.cached_m0_mural_hash ?? null,
         muralEnabled: cachedUpgradeIdentity.muralEnabled,
         renderBudgetIdentity: cachedUpgradeIdentity.renderBudgetIdentity,
+        renderedBudgets: cachedUpgradeIdentity.renderedBudgets,
     };
 }
 
@@ -3115,6 +3207,7 @@ function applyCachedRowToState(state: M0M1State, row: CachedM0M1Row): void {
         markers.muralEnabled,
         markers.renderBudgetIdentity,
         markers.memoryRenderEpoch,
+        markers.renderedBudgets ?? null,
     );
     state.cachedM0SystemHash = markers.systemHash;
     state.cachedM0ToolSetHash = markers.toolSetHash;
@@ -3131,8 +3224,8 @@ function replayCachedM1(state: M0M1State): string {
 }
 
 function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
-    const transactionStartedAt = performance.now();
     options.db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     try {
         const row = readCachedM0M1Row(options.db, options.sessionId);
         if (!row || !cachedRowMatchesState(row, options.state)) {
@@ -3275,6 +3368,7 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
         muralEnabled: options.muralEnabled,
         memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
         historyBudgetTokens: options.historyBudgetTokens,
+        historyBudgetPolicyIdentity: options.historyBudgetPolicyIdentity,
         hardSignals: options.hardSignals,
         workspaceIdentitySet: {
             identities: workspace.identities,
@@ -3726,7 +3820,12 @@ function trimToPreparedPrefix(
                             break;
                         }
                         lastSourcePosition = position;
-                        if (position > boundaryPosition) retained.push(message);
+                        if (
+                            position > boundaryPosition ||
+                            (position === boundaryPosition &&
+                                isPartialCompartmentEnd(options.db, options.sessionId, boundary))
+                        )
+                            retained.push(message);
                     }
                     if (liveOrderError) status = refuse(liveOrderError);
                     else {
@@ -3738,7 +3837,11 @@ function trimToPreparedPrefix(
         } else {
             const index = findBoundaryIndex(options.sessionId, options.messages, boundary);
             if (index >= 0) {
-                options.messages.splice(0, index + 1);
+                options.messages.splice(
+                    0,
+                    index +
+                        (isPartialCompartmentEnd(options.db, options.sessionId, boundary) ? 0 : 1),
+                );
                 resetPrefixTrimFallbackState(options.sessionId);
                 status = "applied";
             } else {
@@ -3843,6 +3946,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
         muralEnabled: options.muralEnabled,
         memoryInjectionBudgetTokens: options.memoryInjectionBudgetTokens,
         historyBudgetTokens: options.historyBudgetTokens,
+        historyBudgetPolicyIdentity: options.historyBudgetPolicyIdentity,
     });
     let rematerialized = false;
     let contentionExhausted = false;

@@ -2,14 +2,14 @@
 
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-
 import * as shared from "../../../shared";
 import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     getProjectEmbeddings,
     insertMemory,
@@ -48,7 +48,7 @@ function freshDb(): Database {
 }
 
 function tempProject(): string {
-    const dir = mkdtempSync(path.join(tmpdir(), "mc-verify-"));
+    const dir = createTestTempDirFromPath(path.join(tmpdir(), "mc-verify-"));
     tempDirs.push(dir);
     mkdirSync(path.join(dir, "src"), { recursive: true });
     writeFileSync(path.join(dir, "src", "old.ts"), "export const oldValue = 1;", "utf8");
@@ -58,8 +58,8 @@ function tempProject(): string {
 
 function gitProject(): string {
     const dir = tempProject();
-    execFileSync("git", ["init", "--quiet"], { cwd: dir, timeout: 10_000 });
-    execFileSync("git", ["add", "."], { cwd: dir, timeout: 10_000 });
+    execFileSync("git", ["init", "--quiet"], { windowsHide: true, cwd: dir, timeout: 10_000 });
+    execFileSync("git", ["add", "."], { windowsHide: true, cwd: dir, timeout: 10_000 });
     execFileSync(
         "git",
         [
@@ -73,6 +73,7 @@ function gitProject(): string {
             "Initial source",
         ],
         {
+            windowsHide: true,
             cwd: dir,
             timeout: 10_000,
             env: {
@@ -93,7 +94,7 @@ function verifyArgs(db: Database, sessionDirectory: string, projectIdentity: str
         db,
         client: {} as never,
         projectIdentity,
-        parentSessionId: undefined,
+        parentSessionId: "ses-parent",
         sessionDirectory,
         holderId,
         leaseKey,
@@ -236,132 +237,13 @@ test("production verification paths normalize tracked files in a real git projec
     expect(result.gitRoot).toBe(realpathSync.native(dir));
 });
 
-describe("verify authority applier", () => {
-    test("writes through memory.set_verification under MODULE authority without mutating the mirror", async () => {
-        const db = freshDb();
-        try {
-            const projectIdentity = "git:module-verify";
-            const dir = tempProject();
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "ARCHITECTURE",
-                content: "The module owns this verified memory.",
-            });
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, 202, ?)",
-            ).run(projectIdentity, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, 202, ?, ?)",
-            ).run(projectIdentity, memory.category, memory.normalizedHash);
-            const calls: Array<{ method: string; body: unknown }> = [];
-            const args = verifyArgs(db, dir, projectIdentity);
-            args.normalizeFiles = async (files) => [...files];
-            args.moduleRoute = {
-                moduleClient: {
-                    call: async (request) => {
-                        calls.push(request);
-                        return { accepted: [202], rejected: [] };
-                    },
-                },
-                moduleSessionId: "ses-module-verify",
-                moduleProjectRoot: dir,
-                moduleContextStoreUuid: "store-fixture",
-                moduleAuthorityGeneration: 9,
-                moduleCommandId: "verify-command",
-            };
-
-            expect(
-                await applyVerifyManifest(
-                    args,
-                    [
-                        {
-                            id: memory.id,
-                            category: memory.category,
-                            content: memory.content,
-                            mappedFiles: ["src/old.ts"],
-                        },
-                    ],
-                    `<verify><verified id="${memory.id}" files="src/old.ts"/></verify>`,
-                ),
-            ).toEqual({ verified: 1, updated: 0, archived: 0, skipped: 0, refused: 0 });
-            expect(calls).toHaveLength(1);
-            expect(calls[0]).toMatchObject({
-                method: "memory.set_verification",
-                body: {
-                    arguments: {
-                        memory_project: projectIdentity,
-                        authority_generation: 9,
-                        rows: [
-                            {
-                                memory_id: 202,
-                                content_hash_at_prompt: memory.normalizedHash,
-                                verification_status: "verified",
-                            },
-                        ],
-                    },
-                },
-            });
-            expect(getMemoryVerifications(db, [memory.id]).size).toBe(0);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("refuses a directive archive before the MODULE authority call", async () => {
-        const db = freshDb();
-        try {
-            const projectIdentity = "git:module-verify-directive";
-            const dir = tempProject();
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "PROJECT_RULES",
-                content: "Never archive workflow rules because a named file omits them.",
-            });
-            const calls: unknown[] = [];
-            const args = verifyArgs(db, dir, projectIdentity);
-            args.moduleRoute = {
-                moduleClient: {
-                    call: async (request) => {
-                        calls.push(request);
-                        return { accepted: [], rejected: [] };
-                    },
-                },
-                moduleSessionId: "ses-module-verify-directive",
-                moduleProjectRoot: dir,
-                moduleContextStoreUuid: "store-fixture",
-                moduleAuthorityGeneration: 10,
-                moduleCommandId: "verify-directive-command",
-            };
-
-            expect(
-                await applyVerifyManifest(
-                    args,
-                    [
-                        {
-                            id: memory.id,
-                            category: memory.category,
-                            content: memory.content,
-                            mappedFiles: ["src/old.ts"],
-                        },
-                    ],
-                    `<verify><archive id="${memory.id}" reason="file does not corroborate it"/></verify>`,
-                ),
-            ).toEqual({ verified: 0, updated: 0, archived: 0, skipped: 0, refused: 1 });
-            expect(calls).toEqual([]);
-            expect(getMemoryById(db, memory.id)?.status).toBe("active");
-        } finally {
-            closeQuietly(db);
-        }
-    });
-});
-
 describe("runVerify disposition", () => {
     test("banks a completed batch and reports the deadline remainder", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:verify-deadline";
             const dir = tempProject();
-            addMappedMemories(db, projectIdentity, 51);
+            addMappedMemories(db, projectIdentity, 21);
             const args = verifyArgs(db, dir, projectIdentity);
             args.forceBroad = true;
             args.client = successfulVerifyClient(() => {
@@ -370,7 +252,7 @@ describe("runVerify disposition", () => {
 
             const result = await runVerify(args);
 
-            expect(result.verified).toBe(50);
+            expect(result.verified).toBe(20);
             expect(result.remaining).toBe(1);
             expect(result.complete).toBe(false);
         } finally {
@@ -531,6 +413,15 @@ describe("runVerify disposition", () => {
             expect(firstRun).toMatchObject({ verified: 1, remaining: 1, complete: false });
             const afterFirst = getMemoryVerifications(db, [first.id, silent.id]);
             expect(afterFirst.get(first.id)?.verifiedAt).toBeGreaterThan(1_000);
+            const head = execFileSync("git", ["rev-parse", "HEAD"], {
+                cwd: dir,
+                encoding: "utf8",
+                windowsHide: true,
+            }).trim();
+            expect(JSON.parse(getMemoryById(db, first.id)?.metadataJson ?? "{}")).toMatchObject({
+                dreamerVerifiedAt: afterFirst.get(first.id)?.verifiedAt,
+                dreamerVerifiedCommit: head,
+            });
             expect(afterFirst.get(silent.id)?.verifiedAt).toBe(1_000);
 
             const resumed = scriptedVerifyClient((_call, ids) => {
@@ -631,7 +522,7 @@ describe("runVerify disposition", () => {
         try {
             const projectIdentity = "git:verify-broad-cycle";
             const dir = tempProject();
-            addMappedMemories(db, projectIdentity, 51);
+            addMappedMemories(db, projectIdentity, 21);
             seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
             const args = verifyArgs(db, dir, projectIdentity);
             args.forceBroad = true;
@@ -640,7 +531,7 @@ describe("runVerify disposition", () => {
             }) as never;
 
             const first = await runVerify(args);
-            expect(first.verified).toBe(50);
+            expect(first.verified).toBe(20);
             expect(first.remaining).toBe(1);
             expect(first.complete).toBe(false);
             const cycleStart = getTaskScheduleState(
@@ -743,7 +634,7 @@ describe("runVerify disposition", () => {
         try {
             const projectIdentity = "git:verify-provider-circuit";
             const dir = tempProject();
-            addMappedMemories(db, projectIdentity, 101);
+            addMappedMemories(db, projectIdentity, 41);
             seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
             const scripted = scriptedVerifyClient(() => ({
                 kind: "provider-failure",
@@ -765,7 +656,7 @@ describe("runVerify disposition", () => {
         try {
             const projectIdentity = "git:verify-provider-resume";
             const dir = tempProject();
-            addMappedMemories(db, projectIdentity, 51);
+            addMappedMemories(db, projectIdentity, 21);
             seedTaskScheduleState(db, projectIdentity, "verify-broad", null, null, "0 3 * * 0");
             const scripted = scriptedVerifyClient((promptCall) =>
                 promptCall === 1
@@ -808,7 +699,7 @@ describe("runVerify disposition", () => {
         try {
             const projectIdentity = "git:verify-below-floor";
             const dir = tempProject();
-            addMappedMemories(db, projectIdentity, 51);
+            addMappedMemories(db, projectIdentity, 21);
             const scripted = scriptedVerifyClient(() => ({ kind: "manifest" }));
             const args = verifyArgs(db, dir, projectIdentity);
             args.client = scripted.client as never;
@@ -818,7 +709,7 @@ describe("runVerify disposition", () => {
 
             expect(scripted.promptCalls()).toBe(0);
             expect(result.complete).toBe(false);
-            expect(result.remaining).toBe(51);
+            expect(result.remaining).toBe(21);
             expect(result.stopReason).toBe("deadline");
         } finally {
             closeQuietly(db);
@@ -841,8 +732,8 @@ describe("runVerify disposition", () => {
             const projectIdentity = "git:verify-floor-slice";
             const dir = tempProject();
             // Ten batches in a 20-minute run: an even split would be 120 s each,
-            // shorter than a 50-memory tool loop needs.
-            addMappedMemories(db, projectIdentity, 500);
+            // shorter than an agentic tool loop needs.
+            addMappedMemories(db, projectIdentity, 200);
             const args = verifyArgs(db, dir, projectIdentity);
             args.deadline = Date.now() + 20 * 60_000;
             args.client = successfulVerifyClient(() => {
@@ -853,7 +744,7 @@ describe("runVerify disposition", () => {
 
             expect(slices).toHaveLength(1);
             expect(slices[0]).toBeGreaterThanOrEqual(VERIFY_BATCH_FLOOR_MS);
-            expect(result.verified).toBe(50);
+            expect(result.verified).toBe(20);
             expect(result.complete).toBe(false);
         } finally {
             spy.mockRestore();
@@ -879,7 +770,7 @@ describe("runVerify disposition", () => {
             try {
                 const projectIdentity = `git:verify-batch-timeout-${label.replaceAll(" ", "-")}`;
                 const dir = tempProject();
-                addMappedMemories(db, projectIdentity, 150);
+                addMappedMemories(db, projectIdentity, 60);
                 let promptCalls = 0;
                 let manifest = "";
                 const aborted: string[] = [];
@@ -914,8 +805,8 @@ describe("runVerify disposition", () => {
                 // The timed-out batch does not end the run with a thrown failure, and
                 // the third batch is not started with the same doomed budget.
                 expect(promptCalls).toBe(2);
-                expect(result.verified).toBe(50);
-                expect(result.remaining).toBe(100);
+                expect(result.verified).toBe(20);
+                expect(result.remaining).toBe(40);
                 expect(result.complete).toBe(false);
                 expect(result.stopReason).toBe("batch-timeout");
                 // This double throws our slice message directly rather than letting a
@@ -1461,3 +1352,225 @@ describe("applyVerifyManifest", () => {
         }
     });
 });
+
+describe("verify module applier", () => {
+    test("writes through memory.set_verification using shared context row ids", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-verify";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "The module owns this verified memory.",
+            });
+            const calls: Array<{ method: string; body: unknown }> = [];
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.normalizeFiles = async (files) => [...files];
+            args.moduleRoute = {
+                moduleClient: {
+                    call: async (request) => {
+                        calls.push(request);
+                        return { accepted: [memory.id], rejected: [] };
+                    },
+                },
+                moduleSessionId: "ses-module-verify",
+                moduleProjectRoot: dir,
+                moduleCommandId: "verify-command",
+            };
+
+            expect(
+                await applyVerifyManifest(
+                    args,
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            mappedFiles: ["src/old.ts"],
+                        },
+                    ],
+                    `<verify><verified id="${memory.id}" files="src/old.ts"/></verify>`,
+                ),
+            ).toEqual({ verified: 1, updated: 0, archived: 0, skipped: 0, refused: 0 });
+            expect(calls).toHaveLength(1);
+            expect(calls[0]).toMatchObject({
+                method: "memory.set_verification",
+                body: {
+                    arguments: {
+                        memory_project: projectIdentity,
+                        rows: [
+                            {
+                                memory_id: memory.id,
+                                content_hash_at_prompt: memory.normalizedHash,
+                                verification_status: "verified",
+                            },
+                        ],
+                    },
+                },
+            });
+            expect(getMemoryVerifications(db, [memory.id]).size).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("refuses a directive archive before the MODULE authority call", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-verify-directive";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "PROJECT_RULES",
+                content: "Never archive workflow rules because a named file omits them.",
+            });
+            const calls: unknown[] = [];
+            const args = verifyArgs(db, dir, projectIdentity);
+            args.moduleRoute = {
+                moduleClient: {
+                    call: async (request) => {
+                        calls.push(request);
+                        return { accepted: [], rejected: [] };
+                    },
+                },
+                moduleSessionId: "ses-module-verify-directive",
+                moduleProjectRoot: dir,
+                moduleCommandId: "verify-directive-command",
+            };
+
+            expect(
+                await applyVerifyManifest(
+                    args,
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            mappedFiles: ["src/old.ts"],
+                        },
+                    ],
+                    `<verify><archive id="${memory.id}" reason="file does not corroborate it"/></verify>`,
+                ),
+            ).toEqual({ verified: 0, updated: 0, archived: 0, skipped: 0, refused: 1 });
+            expect(calls).toEqual([]);
+            expect(getMemoryById(db, memory.id)?.status).toBe("active");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+for (const budgeted of [true, false]) {
+    test(`${budgeted ? "budget-finalized verification banks" : "non-budget verification rejects"} a 2/22 manifest`, async () => {
+        const db = freshDb();
+        try {
+            const project = "git:budget-verify";
+            const dir = gitProject();
+            const items = Array.from({ length: 22 }, (_, index) =>
+                insertMemory(db, {
+                    projectPath: project,
+                    category: "ARCHITECTURE",
+                    content: `Verified fact ${index}.`,
+                }),
+            );
+            for (const item of items) recordMemoryVerifications(db, item.id, ["src/old.ts"], 1_000);
+            let coveredIds: number[] = [];
+            let manifest = "";
+            const args = verifyArgs(db, dir, project);
+            // Stop after the first batch so its omitted ids and the untouched tail
+            // can be observed before the next run.
+            args.onProgress = () => {
+                args.deadline = Date.now();
+            };
+            let sends = 0;
+            let aborted = false;
+            const messages: unknown[] = [];
+            args.tokenBudget = budgeted ? 100 : undefined;
+            args.client = {
+                session: {
+                    create: async () => ({ data: { id: "verify-budget-child" } }),
+                    abort: async () => {
+                        aborted = true;
+                        return { data: true };
+                    },
+                    messages: async () => ({ data: [...messages] }),
+                    status: async () => {
+                        if (budgeted && sends === 1 && !aborted) {
+                            if (messages.length === 1)
+                                messages.push({
+                                    info: {
+                                        id: "step",
+                                        role: "assistant",
+                                        finish: "tool-calls",
+                                        tokens: { input: 81 },
+                                        time: { created: 1, completed: 2 },
+                                    },
+                                    parts: [{ type: "tool" }],
+                                });
+                            return { data: { "verify-budget-child": { type: "busy" } } };
+                        }
+                        if (messages.length === (budgeted ? 3 : 1))
+                            messages.push({
+                                info: {
+                                    id: "final",
+                                    role: "assistant",
+                                    finish: "stop",
+                                    tokens: { input: 25 },
+                                    time: { created: 3, completed: 4 },
+                                },
+                                parts: [{ type: "text", text: manifest }],
+                            });
+                        return { data: {} };
+                    },
+                    promptAsync: async (request: { body: { parts: Array<{ text: string }> } }) => {
+                        sends++;
+                        if (sends === 1) {
+                            coveredIds = [...request.body.parts[0].text.matchAll(/^\[(\d+)\]/gm)]
+                                .slice(0, 2)
+                                .map((match) => Number(match[1]));
+                            manifest = `<verify>${coveredIds.map((id) => `<verified id="${id}" files="src/old.ts"/>`).join("")}</verify>`;
+                        }
+                        messages.push({
+                            info: { id: `user-${sends}`, role: "user" },
+                            parts: request.body.parts,
+                        });
+                        return { data: undefined };
+                    },
+                    delete: async () => ({}),
+                },
+            } as never;
+            const result = await runVerify(args);
+            expect(sends).toBe(budgeted ? 2 : 1);
+            expect(result.verified).toBe(budgeted ? 2 : 0);
+            expect(result.remaining).toBe(budgeted ? 20 : 22);
+            const stored = getMemoryVerifications(
+                db,
+                items.map((item) => item.id),
+            );
+            expect(coveredIds).toHaveLength(2);
+            for (const item of items) {
+                if (budgeted && coveredIds.includes(item.id))
+                    expect(stored.get(item.id)?.verifiedAt).toBeGreaterThan(1_000);
+                else expect(stored.get(item.id)?.verifiedAt).toBe(1_000);
+            }
+            if (budgeted) {
+                const resumed = scriptedVerifyClient((_call, ids) => {
+                    expect([...ids].sort((a, b) => a - b)).toEqual(
+                        items
+                            .filter((item) => !coveredIds.includes(item.id))
+                            .map((item) => item.id)
+                            .sort((a, b) => a - b),
+                    );
+                    return { kind: "manifest" };
+                });
+                args.client = resumed.client as never;
+                args.tokenBudget = undefined;
+                args.deadline = Date.now() + VERIFY_BATCH_FLOOR_MS + 60_000;
+                expect((await runVerify(args)).verified).toBe(20);
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+}

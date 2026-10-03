@@ -1,3 +1,4 @@
+import type { RawMessageOrdinalAnchor } from "../hooks/magic-context/read-session-raw";
 import {
     assertOpenCodeStoreGeneration,
     resolveOpenCodeDbPath,
@@ -136,6 +137,21 @@ export interface V2MessageOrdinalAnchor {
 export interface V2MessageOrdinalEntry extends V2MessageOrdinalAnchor {
     contributesOrdinal: boolean;
     hasValidInfo: boolean;
+}
+
+/** Where an OpenCode 2 fork was cut from its parent (`session_v2.fork_boundary`). */
+export interface V2ForkOrigin {
+    parentSessionID: string;
+    /** `before`: rows strictly before the message were copied; `through`: up to and including it. */
+    boundary: { type: "before" | "through"; messageID: string };
+}
+
+/** The identity columns of one `session_message` row. */
+export interface V2RowStamp {
+    id: string;
+    type: MessageType;
+    seq: number;
+    time_created: number;
 }
 
 const debugSymbol = Symbol.for(V2_STORE_READER_DEBUG_COUNTER_KEY);
@@ -345,6 +361,7 @@ export class V2StoreReader {
         afterOrdinal: number,
         limit: number,
         finalWatermark: number,
+        after?: RawMessageOrdinalAnchor,
     ): StoreRow[] {
         return trackDecodeOperation("messagePage", () => {
             if (!Number.isSafeInteger(afterOrdinal) || afterOrdinal < 0)
@@ -355,6 +372,22 @@ export class V2StoreReader {
                 throw new Error("Invalid raw-message watermark");
             const pageSize = Math.min(limit, finalWatermark - afterOrdinal);
             if (pageSize <= 0) return [];
+            // A carried row id maps to seq with a point lookup, not another
+            // ordinal OFFSET. The remaining ordinal count bounds the watermark.
+            if (after) {
+                const anchor = this.db
+                    .prepare("SELECT seq FROM session_message WHERE session_id = ? AND id = ?")
+                    .get(sessionID, after.id) as { seq: number } | undefined;
+                if (anchor) {
+                    return (
+                        this.db
+                            .prepare(`SELECT id, session_id, type, seq, time_created, data
+                        FROM session_message WHERE session_id = ? AND seq > ?
+                        AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS}) ORDER BY seq ASC LIMIT ?`)
+                            .all(sessionID, anchor.seq, ...RAW_MESSAGE_TYPES, pageSize) as RawRow[]
+                    ).map(decode);
+                }
+            }
             const maximumSeq = Number.MAX_SAFE_INTEGER;
             const rows = this.db
                 .prepare(V2_MESSAGE_PAGE_SQL)
@@ -404,6 +437,13 @@ export class V2StoreReader {
             )
             .all(afterSessionID ?? "", limit) as Array<{ id: string; directory: string }>;
         return rows.map((row) => ({ sessionId: row.id, directory: row.directory }));
+    }
+
+    latestMessageTime(sessionID: string): number | undefined {
+        const row = this.db
+            .prepare("SELECT MAX(time_created) AS time FROM session_message WHERE session_id = ?")
+            .get(sessionID) as { time: number | null } | undefined;
+        return row?.time ?? undefined;
     }
 
     storedMessageCount(sessionID: string): number {
@@ -591,6 +631,63 @@ export class V2StoreReader {
         return typeof row?.seq === "number" ? row.seq : undefined;
     }
 
+    /**
+     * The session this one was forked from and where the fork was cut, as the
+     * host recorded them (`session_v2.fork_session_id` and `fork_boundary`).
+     * Null for a session that is not a fork, a store without the columns, or a
+     * boundary that does not parse.
+     */
+    forkOrigin(sessionID: string): V2ForkOrigin | null {
+        const columns = new Set(
+            (this.db.prepare("PRAGMA table_info(session_v2)").all() as Array<{ name: string }>).map(
+                (column) => column.name,
+            ),
+        );
+        if (!columns.has("fork_session_id") || !columns.has("fork_boundary")) return null;
+        const row = this.db
+            .prepare("SELECT fork_session_id, fork_boundary FROM session_v2 WHERE id = ?")
+            .get(sessionID) as
+            | { fork_session_id: string | null; fork_boundary: string | null }
+            | undefined;
+        if (!row?.fork_session_id || !row.fork_boundary) return null;
+        try {
+            const boundary = JSON.parse(row.fork_boundary) as {
+                type?: unknown;
+                messageID?: unknown;
+            };
+            if (
+                (boundary.type !== "before" && boundary.type !== "through") ||
+                typeof boundary.messageID !== "string" ||
+                boundary.messageID.length === 0
+            )
+                return null;
+            return {
+                parentSessionID: row.fork_session_id,
+                boundary: { type: boundary.type, messageID: boundary.messageID },
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    /** Whether the host still has a session row for this id. */
+    sessionExists(sessionID: string): boolean {
+        return this.db.prepare("SELECT 1 FROM session_v2 WHERE id = ?").get(sessionID) != null;
+    }
+
+    /**
+     * Identity columns of every row of a session up to and including `throughSeq`,
+     * in seq order, without decoding any message body.
+     */
+    rowStampsThrough(sessionID: string, throughSeq: number): V2RowStamp[] {
+        return this.db
+            .prepare(
+                `SELECT id, type, seq, time_created FROM session_message
+                 WHERE session_id = ? AND seq <= ? ORDER BY seq ASC`,
+            )
+            .all(sessionID, throughSeq) as V2RowStamp[];
+    }
+
     latestSequenceForIds(sessionID: string, ids: readonly string[]): number {
         let latest = -1;
         for (let offset = 0; offset < ids.length; offset += 500) {
@@ -654,6 +751,17 @@ export class V2StoreReader {
         return typeof row?.seq === "number" ? row.seq : -1;
     }
 
+    assistantSince(sessionID: string, afterSeq: number): StoreRow<"assistant">[] {
+        return trackDecodeOperation("assistantSince", () => {
+            const rows = this.db
+                .prepare(`SELECT id, session_id, type, seq, time_created, data FROM session_message
+                    WHERE session_id = ? AND type = 'assistant' AND seq > ?
+                    ORDER BY seq ASC`)
+                .all(sessionID, afterSeq) as RawRow[];
+            return rows.map((row) => decode(row) as StoreRow<"assistant">);
+        });
+    }
+
     latestAssistant(sessionID: string): StoreRow<"assistant"> | undefined {
         return trackDecodeOperation("latestAssistant", () => {
             const row = this.db
@@ -679,10 +787,12 @@ export class V2StoreReader {
     /** Include the completed checkpoint itself, matching the host history cut. */
     window(sessionID: string): StoreRow[] {
         return trackDecodeOperation("window", () =>
-            this.db.transaction(() => {
-                const cut = this.latestCompaction(sessionID);
-                return this.all(sessionID, cut ? cut.seq - 1 : -1);
-            })(),
+            this.db
+                .transaction(() => {
+                    const cut = this.latestCompaction(sessionID);
+                    return this.all(sessionID, cut ? cut.seq - 1 : -1);
+                })
+                .deferred(),
         );
     }
 

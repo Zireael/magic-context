@@ -141,6 +141,77 @@ describe("unifiedSearch", () => {
         }
     });
 
+    it("recovers identifier-bearing questions without embeddings while preserving exact-hit output", async () => {
+        const memory = insertMemory(db, {
+            projectPath: "git:recall",
+            category: "CONSTRAINTS",
+            content: "Set cache_timeout in src/config.json for worker retries",
+        });
+        rawMessagesBySession.set("ses-recall", [
+            {
+                ordinal: 1,
+                id: "m-recall",
+                role: "assistant",
+                parts: [
+                    {
+                        type: "text",
+                        text: "cache_timeout in src/config.json controls worker retries",
+                    },
+                ],
+            },
+            {
+                ordinal: 2,
+                id: "m-other",
+                role: "assistant",
+                parts: [{ type: "text", text: "unrelated orange banana" }],
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-recall", readMessages);
+        const options: UnifiedSearchOptions = {
+            sources: ["memory", "message"],
+            limit: 50,
+            embeddingEnabled: false,
+            explicitSearch: true,
+            isEmbeddingRuntimeEnabled: () => false,
+            countRetrievals: false,
+            measurementDisabled: true,
+        };
+        const exact = await unifiedSearch(
+            db,
+            "ses-recall",
+            "git:recall",
+            "cache_timeout config.json",
+            options,
+        );
+        expect(exact.map((hit) => ({ source: hit.source, content: hit.content }))).toEqual([
+            {
+                source: "message",
+                content: "cache_timeout in src/config.json controls worker retries",
+            },
+            {
+                source: "memory",
+                content: "Set cache_timeout in src/config.json for worker retries",
+            },
+        ]);
+        const question = await unifiedSearch(
+            db,
+            "ses-recall",
+            "git:recall",
+            "Where does cache_timeout get configured in src/config.json when embeddings are offline?",
+            options,
+        );
+        expect(question.map((hit) => hit.source)).toEqual(["message", "memory"]);
+        expect(question.some((hit) => hit.source === "memory" && hit.memoryId === memory.id)).toBe(
+            true,
+        );
+        expect(
+            question.some((hit) => hit.source === "message" && hit.messageId === "m-recall"),
+        ).toBe(true);
+        expect(
+            question.some((hit) => hit.source === "message" && hit.messageId === "m-other"),
+        ).toBe(false);
+    });
+
     it("returns ranked results across memories and messages (no facts)", async () => {
         const memory = insertMemory(db, {
             projectPath: "/repo/project",
@@ -165,7 +236,12 @@ describe("unifiedSearch", () => {
                 ordinal: 1,
                 id: "m1",
                 role: "user",
-                parts: [{ type: "text", text: "Can you add ranked search across the history?" }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "Can you add ranked search across the history?",
+                    },
+                ],
             },
             {
                 ordinal: 2,
@@ -380,7 +456,12 @@ describe("unifiedSearch", () => {
                 ordinal: 1,
                 id: "m1",
                 role: "user",
-                parts: [{ type: "text", text: "delete all entries in the ranked_search table" }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "delete all entries in the ranked_search table",
+                    },
+                ],
             },
             {
                 ordinal: 2,
@@ -460,6 +541,93 @@ describe("unifiedSearch", () => {
                 )
                 .get("ses-dated"),
         ).toEqual({ message_time_ms: null });
+    });
+
+    it("matches message text only, never the indexed role column", async () => {
+        rawMessagesBySession.set("ses-role", [
+            {
+                ordinal: 1,
+                id: "role-only",
+                role: "user",
+                parts: [{ type: "text", text: "login keeps failing on staging" }],
+                createdAt: 2_000,
+            },
+            {
+                ordinal: 2,
+                id: "content-match",
+                role: "assistant",
+                parts: [{ type: "text", text: "the users login flow now retries" }],
+                createdAt: 2_000,
+            },
+            {
+                ordinal: 3,
+                id: "live-tail",
+                role: "user",
+                parts: [{ type: "text", text: "login again please" }],
+                createdAt: 2_000,
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-role", readMessages);
+        const search = async (query: string, extra: Partial<UnifiedSearchOptions> = {}) => {
+            const results = await unifiedSearch(db, "ses-role", "git:test", query, {
+                sources: ["message"],
+                embeddingEnabled: false,
+                limit: 10,
+                measurementDisabled: true,
+                countRetrievals: false,
+                ...extra,
+            });
+            return results.flatMap((result) =>
+                result.source === "message" ? [result.messageId] : [],
+            );
+        };
+        const diagnostics = {
+            suppressedVisibleMemoryIds: [],
+            suppressedLiveMessageMatches: 0,
+            gitCommitUnavailable: null,
+        };
+
+        // Each variant reaches a different prepared statement: plain, ordinal
+        // cutoff, cutoff with the live-tail diagnostic count, and date range.
+        expect(await search("users login")).toEqual(["content-match"]);
+        expect(await search("users login", { maxMessageOrdinal: 2 })).toEqual(["content-match"]);
+        expect(await search("users login", { maxMessageOrdinal: 2, diagnostics })).toEqual([
+            "content-match",
+        ]);
+        expect(diagnostics.suppressedLiveMessageMatches).toBe(0);
+        expect(await search("users login", { from: 1_000, to: 3_000 })).toEqual(["content-match"]);
+        expect(await search("assistant")).toEqual([]);
+    });
+
+    it("treats a NUL byte in the query as a word break instead of throwing", async () => {
+        createPrimer(db, {
+            projectPath: "git:test",
+            question: "How does the nulprobe cache work?",
+            answer: "It stays stable.",
+            totalSupport: 2,
+            lastObservedAt: 1_000,
+            sourceCandidateIds: [],
+        });
+        rawMessagesBySession.set("ses-nul", [
+            {
+                ordinal: 1,
+                id: "nul-hit",
+                role: "assistant",
+                parts: [{ type: "text", text: "nulprobe cache warmed" }],
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-nul", readMessages);
+
+        const results = await unifiedSearch(db, "ses-nul", "git:test", "nulprobe\0cache", {
+            sources: ["message", "primer"],
+            embeddingEnabled: false,
+            explicitSearch: true,
+            limit: 10,
+            measurementDisabled: true,
+            countRetrievals: false,
+        });
+
+        expect(results.map((result) => result.source).sort()).toEqual(["message", "primer"]);
     });
 
     it("keeps undated search output byte-identical when both bounds are absent", async () => {
@@ -1118,7 +1286,12 @@ describe("unifiedSearch", () => {
                 ordinal: 2,
                 id: "m2",
                 role: "user",
-                parts: [{ type: "text", text: "unrelated chatter about something else entirely" }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "unrelated chatter about something else entirely",
+                    },
+                ],
             },
         ]);
         ensureMessagesIndexed(db, "ses-probe", readMessages);
@@ -1249,7 +1422,12 @@ describe("unifiedSearch", () => {
             ordinal: i + 1,
             id: `f${i}`,
             role: "assistant",
-            parts: [{ type: "text", text: `CommonTerm appears here in filler message ${i}` }],
+            parts: [
+                {
+                    type: "text",
+                    text: `CommonTerm appears here in filler message ${i}`,
+                },
+            ],
         }));
         const rare = {
             ordinal: 31,
@@ -1341,7 +1519,12 @@ describe("unifiedSearch", () => {
                 ordinal: 4,
                 id: "a2",
                 role: "assistant",
-                parts: [{ type: "text", text: "The indexed ticket search now supports history." }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "The indexed ticket search now supports history.",
+                    },
+                ],
             },
         ]);
         ensureMessagesIndexed(db, "ses-2", readMessages);
@@ -1417,6 +1600,41 @@ describe("unifiedSearch", () => {
         expect(memoryResults).toHaveLength(1);
         expect(memoryResults[0]?.memoryId).toBe(memory.id);
         expect(memoryResults[0]?.matchType).toBe("semantic");
+    });
+
+    it("keeps semantic-only memories alongside FTS hits when the embedding cache is cold", async () => {
+        const snapshot = registerEmbeddingProject(db, "/repo/project");
+        const ftsHit = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "coldneedle lexical match",
+        });
+        const semanticTarget = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "durable vector neighbour",
+        });
+        saveEmbedding(db, ftsHit.id, new Float32Array([0, 1]), snapshot.modelId);
+        saveEmbedding(db, semanticTarget.id, new Float32Array([1, 0]), snapshot.modelId);
+        queryEmbedding = new Float32Array([1, 0]);
+        // Nothing has loaded the project's vectors yet, as after the cache TTL.
+        resetEmbeddingCacheForTests();
+
+        const results = await unifiedSearch(db, "ses-cold", "/repo/project", "coldneedle", {
+            limit: 5,
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            readMessages,
+            embedQuery,
+            isEmbeddingRuntimeEnabled,
+            sources: ["memory"],
+        });
+
+        const memoryHits = results.flatMap((result) =>
+            result.source === "memory" ? [[result.memoryId, result.matchType]] : [],
+        );
+        expect(memoryHits).toContainEqual([semanticTarget.id, "semantic"]);
+        expect(memoryHits).toContainEqual([ftsHit.id, "hybrid"]);
     });
 
     /**
@@ -1542,7 +1760,10 @@ describe("unifiedSearch", () => {
 
         expect(results.some((result) => result.source === "message")).toBe(false);
         const compartment = results.find((result) => result.source === "compartment");
-        expect(compartment).toMatchObject({ source: "compartment", matchType: "hybrid" });
+        expect(compartment).toMatchObject({
+            source: "compartment",
+            matchType: "hybrid",
+        });
         expect(compartment && "snippet" in compartment ? compartment.snippet : "").toContain(
             "bounded drains",
         );
@@ -1552,8 +1773,18 @@ describe("unifiedSearch", () => {
     // keeps the compartment lane; only turning embedding off removes it.
     it("respects message watermark cutoff for compartment chunks and ignores memory.enabled", async () => {
         rawMessagesBySession.set("ses-cutoff", [
-            { ordinal: 1, id: "u1", role: "user", parts: [{ type: "text", text: "first" }] },
-            { ordinal: 2, id: "a2", role: "assistant", parts: [{ type: "text", text: "second" }] },
+            {
+                ordinal: 1,
+                id: "u1",
+                role: "user",
+                parts: [{ type: "text", text: "first" }],
+            },
+            {
+                ordinal: 2,
+                id: "a2",
+                role: "assistant",
+                parts: [{ type: "text", text: "second" }],
+            },
         ]);
         ensureMessagesIndexed(db, "ses-cutoff", readMessages);
         seedCompartmentChunkEmbedding(db, "ses-cutoff", "/repo/cutoff", new Float32Array([0, 1]));

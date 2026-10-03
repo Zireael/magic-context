@@ -7,7 +7,7 @@ import { getObservedEpochFloor } from "../../features/magic-context/storage-meta
 import { setCtxReduceRegisteredGlobally } from "../../hooks/magic-context/ctx-reduce-availability";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
-import type { Database } from "../../shared/sqlite";
+import { type Database, withAsyncPrivilegedWriter } from "../../shared/sqlite";
 import { createCtxExpandTools } from "../../tools/ctx-expand";
 import { createCtxMemoryListTools, createCtxMemoryTools } from "../../tools/ctx-memory";
 import { createCtxNoteTools } from "../../tools/ctx-note";
@@ -80,8 +80,22 @@ export async function registerTools(
                 input: tool.schema.toJSONSchema(tool.schema.object(definition.args)),
                 options: { codemode: false },
                 async execute(input, call) {
+                    // Admit write tools asynchronously before their synchronous storage helpers run.
+                    if (name === "ctx_memory" || name === "ctx_note" || name === "ctx_reduce")
+                        await withAsyncPrivilegedWriter(db, () => undefined);
+                    // Parse like OpenCode 1 does: keep unknown keys and fall back to
+                    // the raw input on a type error. Each tool validates its own
+                    // arguments and needs `reduced`/`summary` to recover a call whose
+                    // real arguments arrived wrapped; a strict parse stripped them
+                    // and threw on a wrongly typed field before the tool saw it.
+                    const parsedInput = tool.schema
+                        .object(definition.args)
+                        .passthrough()
+                        .safeParse(input);
                     const result = await definition.execute(
-                        tool.schema.object(definition.args).parse(input),
+                        (parsedInput.success ? parsedInput.data : input) as Parameters<
+                            typeof definition.execute
+                        >[0],
                         {
                             sessionID: call.sessionID,
                             messageID: call.messageID,

@@ -1,16 +1,19 @@
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
+import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
 import {
     detectOverflow,
     detectThinkingBindingMismatch,
     isPrefixBoundThinkingModel,
 } from "../../features/magic-context/overflow-detection";
+import { observeSessionActivity } from "../../features/magic-context/session-activity";
+import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
+import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
     armThinkingBindingRecovery,
     clearDetectedContextLimit,
     clearHistorianFailureState,
     clearPendingCompactionMarkerStateIf,
-    clearSession,
     deleteIndexedMessage,
     deleteTagsByMessageId,
     getHistorianFailureState,
@@ -33,6 +36,7 @@ import {
     getChannel2NudgeState,
     getPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { clearSession } from "../../features/magic-context/storage-meta-session";
 import type { Tagger } from "../../features/magic-context/tagger";
 import {
     clearTransformDecisionSession,
@@ -46,6 +50,7 @@ import {
     refreshModelLimitsAfterAuthOnce,
     refreshModelLimitsFromApi,
 } from "../../shared/models-dev-cache";
+import { recordPromptSessionError } from "../../shared/prompt-async-transport";
 import { hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { removeCompactionMarkerForSession } from "./compaction-marker-manager";
@@ -59,7 +64,6 @@ import {
     getSessionProperties,
 } from "./event-payloads";
 import {
-    resolveCacheTtl,
     resolveContextLimit,
     resolveContextWindowGeometry,
     resolveModelKey,
@@ -111,6 +115,7 @@ export interface EventHandlerDeps {
     onRustWireInvalidated?: (sessionId: string) => void;
     onSessionDeleted?: (sessionId: string) => Promise<void> | void;
     rustSessionCleanup?: boolean;
+    allowHomeProject?: boolean;
     config: {
         clear_reasoning_age?: number;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
@@ -309,10 +314,23 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             try {
+                // The host's creation directory also covers children that never run a transform.
+                if (info.directory) {
+                    recordSessionProjectIdentity(
+                        deps.db,
+                        info.id,
+                        resolveProjectIdentityForSession(info.directory, deps.allowHomeProject),
+                    );
+                }
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
                 updateSessionMeta(deps.db, info.id, {
                     isSubagent: info.parentID.length > 0,
-                    cacheTtl: resolveCacheTtl(deps.config.cache_ttl, modelKey),
+                    cacheTtl: resolveSessionCacheTtl(
+                        deps.db,
+                        info.id,
+                        deps.config.cache_ttl,
+                        modelKey,
+                    ).value,
                 });
             } catch (error) {
                 sessionLog(info.id, "event session.created persistence failed:", error);
@@ -325,6 +343,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
             if (!errInfo) {
                 return;
             }
+            recordPromptSessionError(errInfo.sessionID, errInfo.error);
             try {
                 const bindingMismatch = detectThinkingBindingMismatch(errInfo.error);
                 if (bindingMismatch.isBindingMismatch) {
@@ -432,6 +451,24 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     detection.reportedLimitProvenance,
                     detection.reportedInputTokens,
                 );
+                if (detection.reportedInputTokens) {
+                    const provenLimit = getOverflowState(
+                        deps.db,
+                        errInfo.sessionID,
+                        overflowModelKey,
+                    ).detectedContextLimit;
+                    deps.contextUsageMap.set(errInfo.sessionID, {
+                        usage: {
+                            inputTokens: detection.reportedInputTokens,
+                            percentage:
+                                provenLimit > 0
+                                    ? (detection.reportedInputTokens / provenLimit) * 100
+                                    : 100,
+                        },
+                        hasUsageTokens: true,
+                        updatedAt: Date.now(),
+                    });
+                }
                 sessionLog(
                     errInfo.sessionID,
                     `overflow detected via session.error: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} (previousRecovery=${existing.needsEmergencyRecovery})`,
@@ -444,6 +481,27 @@ export function createEventHandler(deps: EventHandlerDeps) {
         }
 
         if (input.event.type === "message.updated") {
+            const message = getMessageUpdatedInfo(input.event.properties);
+            if (message?.sessionID) {
+                try {
+                    const rawInfo = properties?.info;
+                    const time =
+                        rawInfo && typeof rawInfo === "object" && "time" in rawInfo
+                            ? (rawInfo.time as { created?: unknown } | undefined)?.created
+                            : undefined;
+                    observeSessionActivity(
+                        deps.db,
+                        message.sessionID,
+                        typeof time === "number" ? time : Date.now(),
+                    );
+                } catch (error) {
+                    sessionLog(
+                        message.sessionID,
+                        "event message.updated activity persistence failed:",
+                        error,
+                    );
+                }
+            }
             const info = getMessageUpdatedAssistantInfo(input.event.properties);
             if (!info) {
                 const genericInfo = getMessageUpdatedInfo(input.event.properties);
@@ -587,6 +645,25 @@ export function createEventHandler(deps: EventHandlerDeps) {
                                 detection.reportedLimitProvenance,
                                 detection.reportedInputTokens,
                             );
+                            if (detection.reportedInputTokens) {
+                                const provenLimit = getOverflowState(
+                                    deps.db,
+                                    info.sessionID,
+                                    overflowModelKey,
+                                ).detectedContextLimit;
+                                deps.contextUsageMap.set(info.sessionID, {
+                                    usage: {
+                                        inputTokens: detection.reportedInputTokens,
+                                        percentage:
+                                            provenLimit > 0
+                                                ? (detection.reportedInputTokens / provenLimit) *
+                                                  100
+                                                : 100,
+                                    },
+                                    hasUsageTokens: true,
+                                    updatedAt: Date.now(),
+                                });
+                            }
                             sessionLog(
                                 info.sessionID,
                                 `overflow detected via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"}`,
@@ -660,9 +737,19 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
 
                 if (typeof deps.config.cache_ttl === "string") {
-                    updates.cacheTtl = resolveCacheTtl(deps.config.cache_ttl, modelKey);
+                    updates.cacheTtl = resolveSessionCacheTtl(
+                        deps.db,
+                        info.sessionID,
+                        deps.config.cache_ttl,
+                        modelKey,
+                    ).value;
                 } else if (modelKey) {
-                    updates.cacheTtl = resolveCacheTtl(deps.config.cache_ttl, modelKey);
+                    updates.cacheTtl = resolveSessionCacheTtl(
+                        deps.db,
+                        info.sessionID,
+                        deps.config.cache_ttl,
+                        modelKey,
+                    ).value;
                 }
 
                 const totalInputTokens =

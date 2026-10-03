@@ -22,6 +22,7 @@ Keys listed below apply from the next historian or dreamer run (or dream-timer t
 <!-- LIVE-CONFIG-KEYS-START -->
 - `commit_cluster_trigger.enabled`
 - `commit_cluster_trigger.min_clusters`
+- `dreamer.maxTokens`
 - `dreamer.omp.fallback_models`
 - `dreamer.omp.model`
 - `dreamer.omp.tasks`
@@ -38,8 +39,8 @@ Keys listed below apply from the next historian or dreamer run (or dream-timer t
 - `dreamer.tasks.compress-cues.schedule`
 - `dreamer.tasks.curate.schedule`
 - `dreamer.tasks.evaluate-smart-notes.schedule`
-- `dreamer.tasks.maintain-docs.schedule`
 - `dreamer.tasks.maintain-docs.max_tokens` (default 12000; combined proposed docs budget)
+- `dreamer.tasks.maintain-docs.schedule`
 - `dreamer.tasks.map-memories.schedule`
 - `dreamer.tasks.promote-primers.promotion_threshold`
 - `dreamer.tasks.promote-primers.schedule`
@@ -50,6 +51,7 @@ Keys listed below apply from the next historian or dreamer run (or dream-timer t
 - `dreamer.tasks.review-user-memories.schedule`
 - `dreamer.tasks.verify-broad.schedule`
 - `dreamer.tasks.verify.schedule`
+- `historian.maxTokens`
 - `historian.omp.fallback_models`
 - `historian.omp.model`
 - `historian.omp.thinking_level`
@@ -133,7 +135,7 @@ Both plugins write to the same SQLite database at `~/.local/share/cortexkit/magi
 
 Project memories therefore flow across OpenCode, Pi, and OMP, while per-session state remains scoped to the OpenCode, Pi, or OMP runtime.
 
-> **OpenCode 2 hidden runs:** historian and text-only Dreamer work runs on the resolved `historian.opencode` / `dreamer.opencode` model chain in reusable unparented sessions. This keeps the user's session model and token accounting untouched while preserving the calibrated system/user prompt and request options. OpenCode 2 currently exposes no plugin removal API, so one root titled **Magic Context historian** and, when needed, one titled **Magic Context dreamer** remain visible per project. Failed and incompatible-host-generation roots can also remain. List them with `npx @cortexkit/magic-context@latest doctor list-hidden-sessions`; remove unwanted roots manually in OpenCode. Magic Context never deletes them.
+> **OpenCode 2 hidden runs:** OpenCode 2.0.22 or newer is required. Each historian and Dreamer run gets a fresh child session on the resolved `historian.opencode` / `dreamer.opencode` model chain, preserving the calibrated prompt and keeping the user's model and token accounting untouched. Children are parented to the user's session when one exists and removed through the native session API when their run ends. On upgrade, recorded legacy children are removed in bounded, resumable boot batches.
 
 For semantic search to work cross-harness, every host resolves embedding config per project identity on each retrieval path. Keep the effective `embedding` block consistent across OpenCode, Pi, and OMP for the same project.
 
@@ -235,7 +237,7 @@ Magic Context uses the runtime's built-in SQLite: `bun:sqlite` under Bun (OpenCo
 
 LLM providers cache conversation prefixes server-side. The cache window depends on your provider and subscription tier — Claude Pro offers 5 minutes, Max offers 1 hour, and pricing for cached vs. uncached tokens differs between API and subscription usage.
 
-Magic Context defers all mutations until the cached prefix expires. `cache_ttl` is how long Magic Context *assumes* a provider's cached prefix stays valid — it is MC's own deferral gate, not a control over the provider's cache. It does not change the provider's actual cache lifetime. The default `"5m"` matches Anthropic's default TTL. You can tune it:
+Magic Context defers all mutations until the cached prefix expires. `cache_ttl` is how long Magic Context *assumes* a provider's cached prefix stays valid — it is MC's own deferral gate, not a control over the provider's cache. It does not change the provider's actual cache lifetime. The generic fallback is `"5m"`. GPT-5.6 and later (including every `gpt-6*` model) instead default to **30m**, including through `openai/`, `openai-codex/`, `openrouter/openai/`, and `azure/` prefixes. [OpenAI documents](https://developers.openai.com/api/docs/guides/prompt-caching) at least 30 minutes since the latest write or reuse (see “Cache lifetime” and “Summary of model differences”). Earlier models retain the generic fallback. You can tune it:
 
 ```jsonc
 {
@@ -256,6 +258,8 @@ Per-model overrides for mixed-model workflows:
 ```
 
 Keys are matched from most to least specific: the exact `provider/model`, the bare model ID, progressively shorter dash-prefixes of the model ID (`claude-opus-4-6` also matches a `claude-opus-4` entry), then the provider wildcard `provider/*`, then `default`. A more specific entry always wins over a wildcard, so the example above keeps `60m` for Opus 4.6 and applies `never` to every other Anthropic model. Harness provider aliases resolve to the canonical name first, so one entry covers the same model on OpenCode, Pi and OMP.
+
+Precedence: explicit per-model entry → built-in known-model lifetime → object `default` → `"5m"`. For the global string form, unset or `"5m"` means defaults (so GPT-6 gets 30m); any other string, such as `"10m"`, is an explicit policy and wins over built-ins. To force 5m on GPT-6, use a per-model entry. The policy is frozen per session and survives restarts; model switches resolve against the frozen policy rather than live config. `/ctx-status` shows the effective TTL and its source.
 
 Supported formats: `"30s"`, `"5m"`, `"1h"`.
 
@@ -294,7 +298,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `compaction.enabled` | `boolean` | `true` | When `false`, use compaction-off mode: keep Magic Context's knowledge layer and let native compaction (or nothing) own the context window. Boot-resolved; restart after changing it. See below. |
 | `commit_cluster_trigger` | `object` | See below | Controls the commit-cluster historian trigger. |
 | `system_prompt_injection` | `object` | See below | Controls whether and where Magic Context augments the system prompt; lets you opt specific agents out. |
-| `keep_subagents` | `boolean` | `false` | Debug option: keep every settled Magic Context child session instead of deleting it after success: historian, all Dreamer tasks, smart-note evaluation and compilation, user-memory review, and memory migration. Kept Dreamer children can contain memory-pool text and user messages from other sessions of the same operator; their full transcript stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect. On OpenCode 2 each project keeps one reusable hidden session per role (historian, Dreamer), so its runs accumulate in that session. With this option on, a retired hidden session is kept by the same rule as OpenCode 1: a session that ever completed a settled run is kept for either role, whatever its latest run did, a historian session is always kept, and only a Dreamer session none of whose runs ever settled is still deleted. Kept sessions stay listed as hidden, and turning the option off lets the next start delete them. With it off, a hidden session retired after a failed or interrupted run, or replaced by a new host version, is deleted through the host's own session-delete API when the host that created it registered itself as a service (`service.json` under `$XDG_STATE_HOME/opencode`, written by `opencode serve --service`). A host that registers no service (a plain `opencode serve` or `--standalone`) gives Magic Context no way to delete them, so retired sessions are kept, reported as `MC-H02`, and retried by a later process; use `doctor list-hidden-sessions` to find them and remove unwanted ones manually. |
+| `keep_subagents` | `boolean` | `false` | Debug option: keep every settled Magic Context child session instead of deleting it after success: historian, all Dreamer tasks, smart-note evaluation and compilation, user-memory review, and memory migration. Kept Dreamer children can contain memory-pool text and user messages from other sessions of the same operator; their full transcript stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect. On OpenCode 2.0.22 or newer, every run uses a fresh child, parented when there is a user session. With this option on, settled children and historian children remain inspectable; unsettled Dreamer children are removed. With it off, each run's child is removed through the native session API, whether or not the host runs as a service. |
 | `todowrite` | `object` | See below | **Pi only.** Controls Magic Context's built-in `todowrite` tool and persistent task overlay. OpenCode has its own built-in `todowrite`, so this setting has no effect there. |
 | `sqlite` | `object` | See below | Per-connection SQLite tuning for Magic Context's own `context.db`. |
 | `storage.enforce_private_permissions` | `boolean` | `true` | User-config-only. Keep owner-only `0700` directories and `0600` files. Set `false` only for an externally managed trusted-group deployment; Magic Context will never re-tighten storage permissions. |
@@ -381,12 +385,12 @@ Controls whether and where Magic Context augments the system prompt (its guidanc
 
 ### `todowrite` (Pi only)
 
-Pi does not ship a built-in `todowrite` tool, so Magic Context registers an OpenCode-parity task-list tool by default. Disable it if another Pi extension already provides todo UX:
+Pi does not ship a built-in `todowrite` tool. Magic Context's task-list tool is off by default; enable it to use the tool, `/todos` command, and optional overlay:
 
 ```jsonc
 {
   "todowrite": {
-    "enabled": true,  // default: true
+    "enabled": true,  // default: false (opt in to Pi todowrite)
     "overlay": true   // default: true
   }
 }
@@ -394,7 +398,7 @@ Pi does not ship a built-in `todowrite` tool, so Magic Context registers an Open
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | Register Magic Context's Pi `todowrite` tool and `/todos` command. Set `false` when using another todo extension. |
+| `enabled` | `boolean` | `false` | Set `true` to register Magic Context's Pi `todowrite` tool and `/todos` command. |
 | `overlay` | `boolean` | `true` | Show the persistent todo overlay above the editor while tasks are active. |
 
 Pi registers tools, slash commands, and widgets once at extension boot. If you `/cd` into a project with a different `todowrite.enabled` value, run `/reload` or restart Pi for the tool surface to change.

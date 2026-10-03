@@ -1,3 +1,7 @@
+import {
+    createDreamTokenBudget,
+    DreamTokenBudgetExceeded,
+} from "../features/magic-context/dreamer/token-budget";
 import type {
     HiddenCompletion,
     HiddenCompletionExecutor,
@@ -7,129 +11,46 @@ import type {
 import { HiddenCompletionRefusal } from "../hooks/magic-context/compartment-runner-types";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import { recordHiddenVariantWarning } from "../shared/hidden-variant-warnings";
-import { declareHostLimitation } from "../shared/host-limitations";
 import { log } from "../shared/logger";
 import type { PromptArgs } from "../shared/model-suggestion-retry";
 import { parseProviderModel, toModelEntry } from "../shared/resolve-fallbacks";
+import { runTokenLog } from "../shared/run-token-log";
 import type { Database } from "../shared/sqlite";
+import { createNativeHiddenChildren } from "./hidden-child-native";
+import {
+    assistantOutcome,
+    errorText,
+    type HiddenChildHost,
+    type HiddenChildLifecycle,
+    type HiddenChildModel,
+    type HiddenChildRole,
+    type HiddenChildRows,
+    type PersistedHiddenChild,
+    withReader,
+} from "./hidden-child-record";
 import {
     HIDDEN_CURATE_AGENT,
-    HIDDEN_DREAMER_AGENT,
-    HIDDEN_HISTORIAN_AGENT,
     HiddenAgentStepLimit,
     type HiddenChildAttempt,
     type HiddenChildHook,
-    hiddenAgentFor,
     hiddenToolLoop,
 } from "./hooks/hidden-child";
-import { type HostServiceOwner, HostServiceUnavailable, hostServiceOwner } from "./host-service";
 import type { StoreRow } from "./store-reader";
 
-interface Model {
-    providerID: string;
-    modelID: string;
-    variant?: string;
-}
+export type { HiddenChildHost, HiddenChildRows } from "./hidden-child-record";
 
-type AssistantOutcome = "succeeded" | "failed" | "interrupted";
-
-type HiddenChildRole = "historian" | "dreamer" | "dreamer-curate";
-
-interface PersistedHiddenChild {
-    id: string;
-    role: HiddenChildRole;
-    generation: string;
-    title: string;
-    model: Model;
-    created_at: number;
-    title_reasserted: boolean;
-    /**
-     * The host service registration that owned this child when it was created, or absent when the
-     * creating host had registered none (and for rows written before this was recorded). Deletion
-     * goes through this and nothing else, so an absent binding means the child's session can only
-     * be left behind and reported.
-     */
-    owner?: HostServiceOwner;
-    /**
-     * True once any run in this child has completed with a settled reply. A child is reused across
-     * many runs, so this stays true whatever a later run does, and it is carried onto the retired
-     * entry. Absent on rows written before this was recorded, which count as never settled.
-     */
-    ever_settled?: boolean;
-}
-
-interface RetiredHiddenChild extends PersistedHiddenChild {
-    retired_at: number;
-    reason: string;
-}
-
-/** The parts of a retired child that deleting its session needs. */
-type RetirableChild = Pick<PersistedHiddenChild, "id" | "owner">;
-
-/** The parts of a retired child that the `keep_subagents` retention rule looks at. */
-type RetentionFacts = Pick<PersistedHiddenChild, "role" | "ever_settled">;
-
-interface HiddenChildrenMeta {
-    version: 1;
-    active: Partial<Record<HiddenChildRole, PersistedHiddenChild>>;
-    retired_children: RetiredHiddenChild[];
-}
-
-export interface HiddenChildHost {
-    create(input: {
-        title: string;
-        agent: string;
-        model: { providerID: string; id: string; variant?: string };
-        location: { directory: string };
-        metadata: { magic_context: "hidden-run"; role: HiddenChildRole };
-    }): Promise<{ id: string }>;
-    get(input: { sessionID: string }): Promise<{
-        model?: { providerID: string; id: string; variant?: string };
-        /** Returned only when the host exposes an error for the terminal session. */
-        error?: unknown;
-    }>;
-    /** Optional event-backed error lookup for hosts that do not retain the reason on session.get. */
-    terminalError?(input: { sessionID: string }): Promise<unknown>;
-    switchModel(input: {
-        sessionID: string;
-        model: { providerID: string; id: string; variant?: string };
-    }): Promise<void>;
-    prompt(input: { sessionID: string; text: string }): Promise<unknown>;
-    wait(input: { sessionID: string }): Promise<void>;
-    interrupt(input: { sessionID: string }): Promise<{ interrupted: boolean }>;
-    update(input: { sessionID: string; title: string }): Promise<void>;
-    /**
-     * Deletes a session and everything hanging off it, through the host that created it. Optional
-     * because the host surface this adapter is handed does not always carry it; when it is missing,
-     * a retired child keeps its entry in the retired list and the next boot sweep tries again.
-     */
-    remove?(input: { sessionID: string; owner?: HostServiceOwner }): Promise<void>;
-}
-
-export interface HiddenChildRows {
-    latestSequence(sessionID: string): number;
-    latestAssistant(sessionID: string): StoreRow<"assistant"> | undefined;
-    latestIdle(sessionID: string): StoreRow<"idle"> | undefined;
-}
+type Model = HiddenChildModel;
 
 export interface V2HiddenCompletionOptions {
     db: Database;
     projectIdentity: string;
+    directory: string;
     hook: HiddenChildHook;
     openReader: () => HiddenChildRows & { close?: () => void };
     ensureAgent?(): Promise<void>;
     generation?: string;
-    /**
-     * Gap left between two session removals. Deleting a session walks its children one at a time
-     * inside the host and publishes an event per deletion, so a backlog is drained slowly on
-     * purpose rather than fired off in parallel.
-     */
-    removalSpacingMs?: number;
-    /**
-     * Which host service registration, if any, owns the children this process creates. Called once
-     * per created child so a host that starts serving later still binds correctly.
-     */
-    resolveOwner?: () => HostServiceOwner | undefined;
+    /** Maximum time shutdown waits for the host to remove a child. */
+    removalTimeoutMs?: number;
     /**
      * The user's `keep_subagents` setting. When true, retired children that the OpenCode 1 lane
      * would keep are left in the host instead of deleted (see `keptUnderRetention`).
@@ -142,6 +63,7 @@ export interface V2HiddenCompletionOptions {
 
 interface RunState {
     identity: HiddenRunIdentity;
+    budget?: ReturnType<typeof createDreamTokenBudget>;
     role: HiddenChildRole;
     child: PersistedHiddenChild;
     releaseRole: () => void;
@@ -152,193 +74,7 @@ interface RunState {
     retired: boolean;
 }
 
-const META_PREFIX = "opencode2_hidden_children:";
 const POLL_INTERVAL_MS = 200;
-const REMOVAL_SPACING_MS = 250;
-/**
- * Ceiling on remembered retired children. Entries leave this list as their sessions are deleted, so
- * it only grows while deletion is failing or unavailable; the cap keeps a long outage from growing
- * the project's metadata row without limit. The oldest entries are dropped first because the sweep
- * drains oldest first, so anything still at the front after a full pass is what deletion keeps
- * refusing; those sessions are then left behind in the host rather than retried forever. Children
- * kept under `keep_subagents` also stay listed (so every boot still recognises them as hidden
- * children) and count toward the same cap; evicting one only forgets it, its session stays.
- */
-const RETIRED_CHILDREN_LIMIT = 200;
-
-export function hiddenChildrenMetaKey(projectIdentity: string): string {
-    return `${META_PREFIX}${projectIdentity}`;
-}
-
-function emptyMeta(): HiddenChildrenMeta {
-    return { version: 1, active: {}, retired_children: [] };
-}
-
-function isModel(value: unknown): value is Model {
-    if (!value || typeof value !== "object") return false;
-    const model = value as Partial<Model>;
-    return typeof model.providerID === "string" && typeof model.modelID === "string";
-}
-
-function isRole(value: unknown): value is HiddenChildRole {
-    return value === "historian" || value === "dreamer" || value === "dreamer-curate";
-}
-
-function isOwner(value: unknown): value is HostServiceOwner {
-    if (!value || typeof value !== "object") return false;
-    const owner = value as Partial<HostServiceOwner>;
-    return (
-        typeof owner.registration === "string" &&
-        owner.registration.length > 0 &&
-        typeof owner.pid === "number" &&
-        (owner.serviceID === undefined || typeof owner.serviceID === "string")
-    );
-}
-
-function isPersistedChild(value: unknown): value is PersistedHiddenChild {
-    if (!value || typeof value !== "object") return false;
-    const child = value as Partial<PersistedHiddenChild>;
-    return (
-        typeof child.id === "string" &&
-        isRole(child.role) &&
-        typeof child.generation === "string" &&
-        typeof child.title === "string" &&
-        isModel(child.model) &&
-        typeof child.created_at === "number" &&
-        typeof child.title_reasserted === "boolean" &&
-        (child.ever_settled === undefined || typeof child.ever_settled === "boolean") &&
-        (child.owner === undefined || isOwner(child.owner))
-    );
-}
-
-function parseMeta(value: string | null): HiddenChildrenMeta {
-    if (value === null) return emptyMeta();
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(value);
-    } catch (error) {
-        throw new Error("Invalid OpenCode 2 hidden-child metadata JSON", { cause: error });
-    }
-    if (!parsed || typeof parsed !== "object") {
-        throw new Error("Invalid OpenCode 2 hidden-child metadata");
-    }
-    const candidate = parsed as Partial<HiddenChildrenMeta>;
-    if (candidate.version !== 1 || !candidate.active || !candidate.retired_children) {
-        throw new Error("Unsupported OpenCode 2 hidden-child metadata version");
-    }
-    const active: HiddenChildrenMeta["active"] = {};
-    for (const role of ["historian", "dreamer"] as const) {
-        const child = candidate.active[role];
-        if (child !== undefined) {
-            if (!isPersistedChild(child) || child.role !== role) {
-                throw new Error(`Invalid OpenCode 2 ${role} child metadata`);
-            }
-            active[role] = child;
-        }
-    }
-    const retired = candidate.retired_children;
-    if (
-        !Array.isArray(retired) ||
-        retired.some(
-            (child) =>
-                !isPersistedChild(child) ||
-                typeof (child as Partial<RetiredHiddenChild>).retired_at !== "number" ||
-                typeof (child as Partial<RetiredHiddenChild>).reason !== "string",
-        )
-    ) {
-        throw new Error("Invalid OpenCode 2 retired-child metadata");
-    }
-    return { version: 1, active, retired_children: retired as RetiredHiddenChild[] };
-}
-
-class HiddenChildStateStore {
-    private readonly key: string;
-
-    constructor(
-        private readonly db: Database,
-        projectIdentity: string,
-    ) {
-        this.key = hiddenChildrenMetaKey(projectIdentity);
-    }
-
-    read(): HiddenChildrenMeta {
-        const row = this.db
-            .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
-            .get(this.key) as { value: string } | undefined;
-        return parseMeta(row?.value ?? null);
-    }
-
-    mutate<T>(change: (state: HiddenChildrenMeta) => T): T {
-        return this.db
-            .transaction(() => {
-                const state = this.read();
-                const result = change(state);
-                this.db
-                    .prepare(
-                        `INSERT INTO schema_migrations_meta (key, value) VALUES (?, ?)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-                    )
-                    .run(this.key, JSON.stringify(state));
-                return result;
-            })
-            .immediate();
-    }
-
-    put(child: PersistedHiddenChild): void {
-        this.mutate((state) => {
-            state.active[child.role] = child;
-        });
-    }
-
-    updateModel(child: PersistedHiddenChild, model: Model): PersistedHiddenChild {
-        return this.mutate((state) => {
-            const active = state.active[child.role];
-            if (!active || active.id !== child.id) return { ...child, model };
-            active.model = model;
-            return { ...active };
-        });
-    }
-
-    markTitleReasserted(child: PersistedHiddenChild): PersistedHiddenChild {
-        return this.mutate((state) => {
-            const active = state.active[child.role];
-            if (!active || active.id !== child.id) return { ...child, title_reasserted: true };
-            active.title_reasserted = true;
-            return { ...active };
-        });
-    }
-
-    markEverSettled(child: PersistedHiddenChild): PersistedHiddenChild {
-        return this.mutate((state) => {
-            const active = state.active[child.role];
-            if (!active || active.id !== child.id) return { ...child, ever_settled: true };
-            active.ever_settled = true;
-            return { ...active };
-        });
-    }
-
-    retire(child: PersistedHiddenChild, reason: string): void {
-        this.mutate((state) => {
-            const active = state.active[child.role];
-            if (!active || active.id !== child.id) return;
-            state.retired_children.push({
-                ...active,
-                retired_at: Date.now(),
-                reason,
-            });
-            const excess = state.retired_children.length - RETIRED_CHILDREN_LIMIT;
-            if (excess > 0) state.retired_children.splice(0, excess);
-            delete state.active[child.role];
-        });
-    }
-
-    /** Forgets one retired child, called once its session is gone from the host. */
-    prune(id: string): void {
-        this.mutate((state) => {
-            state.retired_children = state.retired_children.filter((child) => child.id !== id);
-        });
-    }
-}
 
 function modelKey(model: Model): string {
     return `${model.providerID}/${model.modelID}`;
@@ -361,15 +97,6 @@ function configuredHead(identity: HiddenRunIdentity): Model | undefined {
 function roleFor(identity: HiddenRunIdentity): HiddenChildRole {
     if (identity.kind !== "dreamer-task") return "historian";
     return identity.agent === HIDDEN_CURATE_AGENT ? "dreamer-curate" : "dreamer";
-}
-
-function roleTitle(role: HiddenChildRole): string {
-    return role === "historian" ? "Magic Context historian" : "Magic Context dreamer";
-}
-
-function roleAgent(role: HiddenChildRole): string {
-    if (role === "historian") return HIDDEN_HISTORIAN_AGENT;
-    return role === "dreamer-curate" ? HIDDEN_CURATE_AGENT : HIDDEN_DREAMER_AGENT;
 }
 
 function promptText(request: PromptArgs): string {
@@ -395,22 +122,6 @@ function meter(system: string, prompt: string, text: string) {
         cacheRead: 0,
         cacheWrite: 0,
     };
-}
-
-function assistantOutcome(row: StoreRow<"assistant"> | undefined): AssistantOutcome | undefined {
-    const outcome = row?.data.outcome;
-    return outcome === "succeeded" || outcome === "failed" || outcome === "interrupted"
-        ? outcome
-        : undefined;
-}
-
-function successfulReusableAssistant(row: StoreRow<"assistant"> | undefined): boolean {
-    return (
-        row !== undefined &&
-        (typeof row.data.finish === "string" || assistantOutcome(row) === "succeeded") &&
-        row.data.error === undefined &&
-        row.data.tokens !== undefined
-    );
 }
 
 function toolLoopMessages(attempt: HiddenChildAttempt): unknown[] {
@@ -446,6 +157,15 @@ function toolLoopMessages(attempt: HiddenChildAttempt): unknown[] {
     });
 }
 
+function assistantReasoning(row: StoreRow<"assistant">): string | null {
+    const reasoning = (row.data.content ?? [])
+        .flatMap((part) =>
+            part.type === "reasoning" && typeof part.text === "string" ? [part.text] : [],
+        )
+        .join("\n");
+    return reasoning.length > 0 ? reasoning : null;
+}
+
 function assistantText(row: StoreRow<"assistant">): string | null {
     const text = (row.data.content ?? [])
         .flatMap((part) =>
@@ -471,16 +191,6 @@ export class HiddenProviderError extends Error {
     }
 }
 
-function errorText(value: unknown): string {
-    if (value instanceof Error) return value.message;
-    if (typeof value === "string") return value;
-    try {
-        return JSON.stringify(value);
-    } catch {
-        return String(value);
-    }
-}
-
 function requestModel(request: PromptArgs, current: Model): Model {
     const requested = request.body.model;
     if (
@@ -495,18 +205,6 @@ function requestModel(request: PromptArgs, current: Model): Model {
         };
     }
     return current;
-}
-
-function withReader<T>(
-    openReader: () => HiddenChildRows & { close?: () => void },
-    read: (reader: HiddenChildRows) => T,
-): T {
-    const reader = openReader();
-    try {
-        return read(reader);
-    } finally {
-        reader.close?.();
-    }
 }
 
 async function sleepUntilPoll(signal: AbortSignal | undefined, deadline: number): Promise<void> {
@@ -526,6 +224,15 @@ async function sleepUntilPoll(signal: AbortSignal | undefined, deadline: number)
                 signal?.removeEventListener("abort", abort);
             }, delay);
     });
+}
+
+function isProviderFailure(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const type = (error as { type?: unknown }).type;
+    return (
+        typeof type === "string" &&
+        (type.startsWith("provider.") || type.toLowerCase().includes("provider"))
+    );
 }
 
 async function awaitAssistantRow(
@@ -555,10 +262,8 @@ async function awaitAssistantRow(
                     `terminal_row=${errorText(newIdle)}`,
                     `session_error=${sessionError === undefined ? "unavailable" : errorText(sessionError)}`,
                 ];
-                throw sessionError === undefined
-                    ? new Error(
-                          `Hidden completion failed without a provider error: ${details.join("; ")}`,
-                      )
+                throw sessionError === undefined || !isProviderFailure(sessionError)
+                    ? new Error(`Hidden completion failed: ${details.join("; ")}`)
                     : new HiddenProviderError(details.join("; "));
             }
             if (outcome === "succeeded" && newAssistant) return newAssistant;
@@ -572,10 +277,8 @@ async function awaitAssistantRow(
                     `terminal_row=${errorText(newAssistant)}`,
                     `session_error=${sessionError === undefined ? "unavailable" : errorText(sessionError)}`,
                 ];
-                throw sessionError === undefined
-                    ? new Error(
-                          `Hidden completion failed without a provider error: ${details.join("; ")}`,
-                      )
+                throw sessionError === undefined || !isProviderFailure(sessionError)
+                    ? new Error(`Hidden completion failed: ${details.join("; ")}`)
                     : new HiddenProviderError(details.join("; "));
             }
             if (newAssistant.data.error !== undefined) {
@@ -632,140 +335,23 @@ export async function createV2HiddenCompletionExecutor(
     options: V2HiddenCompletionOptions,
 ): Promise<HiddenCompletionExecutor> {
     const runs = new WeakMap<HiddenRunHandle, RunState>();
-    const store = new HiddenChildStateStore(options.db, options.projectIdentity);
     const generation = options.generation ?? "opencode2";
     const roleTails = new Map<HiddenChildRole, Promise<void>>();
-
-    const persisted = store.read();
-    for (const child of [...Object.values(persisted.active), ...persisted.retired_children]) {
-        if (child) options.hook.registerChild(child.id);
-    }
-
-    const spacing = options.removalSpacingMs ?? REMOVAL_SPACING_MS;
-    const resolveOwner = options.resolveOwner ?? hostServiceOwner;
     const note = options.log ?? log;
-    const queued = new Set<string>();
-    // One chain, so removals never overlap however many retirements land at once.
-    let removals: Promise<void> = Promise.resolve();
 
-    const pause = (ms: number) =>
-        new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, ms);
-            // Draining leftovers must never be the reason a host process stays alive.
-            (timer as unknown as { unref?: () => void }).unref?.();
-        });
-
-    const removeChildSession = async (child: RetirableChild): Promise<void> => {
-        const remove = host.remove;
-        if (!remove) return;
-        try {
-            await remove({
-                sessionID: child.id,
-                ...(child.owner === undefined ? {} : { owner: child.owner }),
-            });
-        } catch (error) {
-            // The host was unreachable, refused, or is not the one that created this child. Keep
-            // the entry so a later sweep retries it; cleanup is never allowed to fail the hidden
-            // run that triggered it.
-            if (error instanceof HostServiceUnavailable) {
-                // Nothing in this process can delete it. Say so once, everywhere the user looks,
-                // rather than repeating an unactionable line in the log on every sweep.
-                if (declareHostLimitation("hidden_cleanup_unbound")) {
-                    note(
-                        `[magic-context] hidden child ${child.id} has no owner-bound deletion route and stays recorded for retry: ${errorText(error)}`,
-                    );
-                }
-                return;
-            }
-            note(
-                `[magic-context] hidden child ${child.id} could not be deleted, left for a later sweep: ${errorText(error)}`,
-            );
-            return;
-        }
-        try {
-            store.prune(child.id);
-        } catch (error) {
-            note(
-                `[magic-context] hidden child ${child.id} was deleted but not forgotten: ${errorText(error)}`,
-            );
-        }
-    };
-
-    /**
-     * Queues a retired child's session for deletion. Returns immediately: a caller in the middle of
-     * a hidden run must not wait on host cleanup.
-     */
-    const scheduleRemoval = (child: RetirableChild): void => {
-        if (!host.remove || queued.has(child.id)) return;
-        queued.add(child.id);
-        removals = removals
-            .then(() => pause(spacing))
-            .then(() => removeChildSession(child))
-            .catch(() => {})
-            .finally(() => {
-                queued.delete(child.id);
-            });
-    };
-
-    /**
-     * The `keep_subagents` rule of the OpenCode 1 lane, applied to a retired child. There, a child
-     * whose prompt settled is kept, and an unsettled one is left to the age-gated orphan sweep,
-     * which under `keep_subagents` still retains historian children but deletes the
-     * privacy-sensitive dreamer ones. Here one child holds many runs, so it counts as settled once
-     * any of its runs settled: deleting it for a later unsettled run would throw away every
-     * settled run it kept, which OpenCode 1 never does. Without the setting every retired child
-     * is deleted.
-     */
-    const keptUnderRetention = (child: RetentionFacts): boolean =>
-        options.keepSubagents === true &&
-        (child.ever_settled === true || child.role === "historian");
-
-    const retireChild = (child: PersistedHiddenChild, reason: string): void => {
-        store.retire(child, reason);
-        if (!keptUnderRetention(child)) scheduleRemoval(child);
-    };
-
-    const createChild = async (
-        identity: HiddenRunIdentity,
-        role: HiddenChildRole,
-        model: Model,
-    ): Promise<PersistedHiddenChild> => {
-        const title = roleTitle(role);
-        const created = await host.create({
-            title,
-            agent: hiddenToolLoop(identity) ? hiddenAgentFor(identity) : roleAgent(role),
-            model: {
-                providerID: model.providerID,
-                id: model.modelID,
-                ...(model.variant ? { variant: model.variant } : {}),
-            },
-            location: { directory: identity.directory },
-            metadata: { magic_context: "hidden-run", role },
-        });
-        if (!created.id) throw new Error("OpenCode 2 did not return a child session id");
-        const owner = resolveOwner();
-        const child: PersistedHiddenChild = {
-            id: created.id,
-            role,
+    const removeSession = host.removeSession;
+    if (!removeSession) throw new Error("Magic Context requires OpenCode 2.0.22 session.remove");
+    const lifecycle: HiddenChildLifecycle = createNativeHiddenChildren(
+        host,
+        (input) => removeSession.call(host, input),
+        {
+            hook: options.hook,
             generation,
-            title,
-            model,
-            created_at: Date.now(),
-            title_reasserted: false,
-            ...(owner === undefined ? {} : { owner }),
-        };
-        store.put(child);
-        options.hook.registerChild(child.id);
-        return child;
-    };
-
-    // Boot sweep. Anything left over from an earlier process — including the backlog built up
-    // before retirement deleted anything — is drained here, spaced like every other removal.
-    // Children the current setting keeps are skipped; turning `keep_subagents` off later lets the
-    // next boot delete them, as the OpenCode 1 sweep does.
-    for (const child of persisted.retired_children) {
-        if (!keptUnderRetention(child)) scheduleRemoval(child);
-    }
+            keepSubagents: options.keepSubagents === true,
+            log: note,
+            removalTimeoutMs: options.removalTimeoutMs,
+        },
+    );
 
     const acquireRole = async (role: HiddenChildRole): Promise<() => void> => {
         const previous = roleTails.get(role) ?? Promise.resolve();
@@ -856,12 +442,12 @@ export async function createV2HiddenCompletionExecutor(
                 ...(requested.variant ? { variant: requested.variant } : {}),
             },
         });
-        run.child = store.updateModel(run.child, requested);
+        run.child = lifecycle.updateModel(run.child, requested);
     };
 
     const retire = (run: RunState, reason: string): void => {
         if (run.retired) return;
-        retireChild(run.child, reason);
+        lifecycle.retire(run.child, reason);
         run.retired = true;
     };
 
@@ -882,43 +468,15 @@ export async function createV2HiddenCompletionExecutor(
             try {
                 await options.ensureAgent?.();
                 const head = await resolveHead(identity);
-                let active = store.read().active[role];
-                if (active && hiddenToolLoop(identity)) {
-                    retireChild(active, "fresh-tool-loop-run");
-                    active = undefined;
-                }
-                if (active && active.generation !== generation) {
-                    retireChild(active, "host-generation-changed");
-                    active = undefined;
-                }
-                if (active) {
-                    const activeID = active.id;
-                    const latest = withReader(options.openReader, (reader) => ({
-                        assistant: reader.latestAssistant(activeID),
-                        idle: reader.latestIdle(activeID),
-                    }));
-                    const idleIsNewest =
-                        latest.idle !== undefined &&
-                        (latest.assistant === undefined || latest.idle.seq > latest.assistant.seq);
-                    const idleOutcome = idleIsNewest ? latest.idle?.data.outcome : undefined;
-                    const reusable =
-                        (idleOutcome === undefined || idleOutcome === "succeeded") &&
-                        successfulReusableAssistant(latest.assistant);
-                    if (!reusable) {
-                        retireChild(active, "newest-assistant-not-reusable");
-                        active = undefined;
-                    }
-                }
-                if (!active) {
-                    // Bind the child to the host that is creating it, now, while that host is
-                    // demonstrably this process. Deleting it later goes through this binding and
-                    // nothing else.
-                    active = await createChild(identity, role, head);
-                }
+                const active = await lifecycle.open(identity, role, head);
                 openedChild = active;
                 const handle = { id: active.id, childSessionId: active.id };
+                const tokenBudget = identity.metadata?.tokenBudget;
                 const run: RunState = {
                     identity,
+                    ...(hiddenToolLoop(identity) && typeof tokenBudget === "number"
+                        ? { budget: createDreamTokenBudget(tokenBudget) }
+                        : {}),
                     role,
                     child: active,
                     releaseRole,
@@ -930,7 +488,7 @@ export async function createV2HiddenCompletionExecutor(
                 await switchChildModel(run, head);
                 return handle;
             } catch (error) {
-                if (openedChild) retireChild(openedChild, "hidden-run-open-failed");
+                if (openedChild) lifecycle.retire(openedChild, "hidden-run-open-failed");
                 releaseRole();
                 throw error;
             }
@@ -948,7 +506,7 @@ export async function createV2HiddenCompletionExecutor(
                 // Fallback retries share the original handle. A terminal provider failure has
                 // already retired its child, so give the retry a fresh carrier instead of
                 // prompting a session that is queued for deletion.
-                run.child = await createChild(run.identity, run.role, requested);
+                run.child = await lifecycle.create(run.identity, run.role, requested);
                 run.failed = false;
                 run.unsettledFailure = false;
                 run.retired = false;
@@ -969,6 +527,66 @@ export async function createV2HiddenCompletionExecutor(
             };
             options.hook.registerAttempt(marker, attempt);
             const deadline = Date.now() + run.identity.timeoutMs;
+            const budget = run.budget;
+            if (budget?.snapshot().finalizeFired) {
+                throw new DreamTokenBudgetExceeded(run.child.id, budget.snapshot().spent);
+            }
+            let usageSeq = baseline;
+            let budgetPoll: ReturnType<typeof setInterval> | undefined;
+            let budgetReject!: (error: Error) => void;
+            const budgetStopped = new Promise<never>((_resolve, reject) => {
+                budgetReject = reject;
+            });
+            if (budget) {
+                budgetPoll = setInterval(() => {
+                    try {
+                        const fresh = withReader(
+                            options.openReader,
+                            (reader) =>
+                                reader.assistantSince?.(run.child.id, usageSeq) ??
+                                (() => {
+                                    const latest = reader.latestAssistant(run.child.id);
+                                    return latest ? [latest] : [];
+                                })(),
+                        );
+                        for (const row of fresh) {
+                            if (row.seq <= usageSeq) continue;
+                            usageSeq = row.seq;
+                            const tokens = row.data.tokens;
+                            const decision = budget.charge(
+                                Math.max(0, tokens?.input ?? 0),
+                                Math.max(0, tokens?.cache?.read ?? 0),
+                                Math.max(0, tokens?.cache?.write ?? 0),
+                                row.data.finish === "stop" &&
+                                    !(row.data.content ?? []).some(
+                                        (part) => part.type === "tool-call",
+                                    ),
+                                false,
+                            );
+                            const onBudgetUpdate = run.identity.metadata?.onBudgetUpdate;
+                            if (typeof onBudgetUpdate === "function")
+                                onBudgetUpdate({ ...budget.snapshot(), sessionId: run.child.id });
+                            if (decision !== "continue") {
+                                if (budgetPoll) clearInterval(budgetPoll);
+                                // This host exposes context shaping but no pre-tool execution
+                                // hook for hidden children. Stop at the soft threshold instead
+                                // of allowing another investigation call to execute.
+                                attempt.budgetExceeded = new DreamTokenBudgetExceeded(
+                                    run.child.id,
+                                    budget.snapshot().spent,
+                                );
+                                void interruptAndRetire(run, "token-budget").finally(() =>
+                                    budgetReject(attempt.budgetExceeded as Error),
+                                );
+                                return;
+                            }
+                        }
+                    } catch (error) {
+                        if (budgetPoll) clearInterval(budgetPoll);
+                        budgetReject(error instanceof Error ? error : new Error(String(error)));
+                    }
+                }, POLL_INTERVAL_MS);
+            }
             let abortReject!: (error: Error) => void;
             const aborted = new Promise<never>((_resolve, reject) => {
                 abortReject = reject;
@@ -991,8 +609,13 @@ export async function createV2HiddenCompletionExecutor(
                 await Promise.race([
                     host.prompt({ sessionID: run.child.id, text: marker }),
                     aborted,
+                    ...(budget ? [budgetStopped] : []),
                 ]);
-                await Promise.race([host.wait({ sessionID: run.child.id }), aborted]);
+                await Promise.race([
+                    host.wait({ sessionID: run.child.id }),
+                    aborted,
+                    ...(budget ? [budgetStopped] : []),
+                ]);
                 const row = await Promise.race([
                     awaitAssistantRow(
                         options.openReader,
@@ -1014,6 +637,7 @@ export async function createV2HiddenCompletionExecutor(
                         request.signal,
                     ),
                     aborted,
+                    ...(budget ? [budgetStopped] : []),
                 ]);
                 if (!attempt.shaped) {
                     throw new HiddenCompletionRefusal(
@@ -1021,10 +645,6 @@ export async function createV2HiddenCompletionExecutor(
                         "Host did not dispatch the hidden child context hook",
                         true,
                     );
-                }
-                if (!run.child.title_reasserted) {
-                    await host.update({ sessionID: run.child.id, title: run.child.title });
-                    run.child = store.markTitleReasserted(run.child);
                 }
                 const text = assistantText(row);
                 const system =
@@ -1048,10 +668,11 @@ export async function createV2HiddenCompletionExecutor(
                 }
                 run.completion = {
                     text,
+                    tokenLog: runTokenLog(tokens, run.identity.maxOutputTokens, row.data.finish),
                     ...(hiddenToolLoop(run.identity)
                         ? { messages: toolLoopMessages(attempt) }
                         : {}),
-                    reasoning: null,
+                    reasoning: text ? null : assistantReasoning(row),
                     // If either side is numeric, retain the provider's partial usage
                     // and floor omitted components to zero. With no numeric usage,
                     // use the local meter so budget accounting remains finite.
@@ -1069,9 +690,9 @@ export async function createV2HiddenCompletionExecutor(
                     modelId: row.data.model?.id ?? requested.modelID,
                 };
                 // Recorded for `keep_subagents` retention: this child now holds a settled run.
-                if (!run.child.ever_settled) run.child = store.markEverSettled(run.child);
+                if (!run.child.ever_settled) run.child = lifecycle.markEverSettled(run.child);
             } catch (caught) {
-                const error = attempt.stepLimit ?? caught;
+                const error = attempt.budgetExceeded ?? attempt.stepLimit ?? caught;
                 run.failed = true;
                 if (!(error instanceof HiddenProviderError)) {
                     run.unsettledFailure = true;
@@ -1103,6 +724,7 @@ export async function createV2HiddenCompletionExecutor(
                 throw error;
             } finally {
                 clearTimeout(deadlineTimer);
+                if (budgetPoll) clearInterval(budgetPoll);
                 request.signal?.removeEventListener("abort", onAbort);
                 options.hook.releaseAttempt(marker);
             }
@@ -1137,6 +759,7 @@ export async function createV2HiddenCompletionExecutor(
                 runs.delete(handle);
                 run.releaseRole();
             }
+            await lifecycle.finish(run.child, run.retired);
         },
     };
 }

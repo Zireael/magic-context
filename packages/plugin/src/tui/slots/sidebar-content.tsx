@@ -11,6 +11,7 @@ import {
     type SidebarTone,
     type SidebarViewRow,
 } from "../../shared/sidebar-view"
+import { directoryForSession } from "../data/session-directory"
 import {
     computeEffectiveOrder,
     DEFAULT_SLOT_ORDER,
@@ -277,7 +278,10 @@ const SidebarContent = (props: {
         const sid = props.sessionID()
         if (!sid) return
         const sequence = ++snapshotRequestSequence
-        const directory = props.api.state.path.directory ?? ""
+        const directory = directoryForSession(
+            props.api.state.session?.get?.(sid)?.directory,
+            props.api.state.path.directory ?? "",
+        )
         void loadSidebarSnapshot(sid, directory)
             .then((data) => {
                 // Guard against a session switch while this load was in flight:
@@ -343,7 +347,10 @@ const SidebarContent = (props: {
             return
         }
         const sequence = ++snapshotRequestSequence
-        const directory = props.api.state.path.directory ?? ""
+        const directory = directoryForSession(
+            props.api.state.session?.get?.(sid)?.directory,
+            props.api.state.path.directory ?? "",
+        )
         void loadSidebarSnapshot(sid, directory)
             .then((data) => {
                 if (

@@ -1,22 +1,28 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+    __resetProjectIdentityForTests,
+    __setProjectIdentityTestHooks,
+} from "../../features/magic-context/memory/project-identity";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { V2StoreReader } from "../store-reader";
 import { runV2SessionProjectBackfill } from "./session-project-backfill";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => {
     _resetHarnessForTesting();
+    __resetProjectIdentityForTests();
     for (const step of cleanup.splice(0)) step();
 });
 
 function tempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
     return dir;
 }
@@ -58,4 +64,26 @@ test("binds existing OpenCode 2 sessions to their project from session_v2", asyn
     ]);
     expect(rows[0]!.project_path).toMatch(/^dir:[0-9a-f]{12}$/);
     expect(rows[1]!.project_path).toBe(rows[0]!.project_path);
+});
+
+test("OpenCode 2 backfill never binds Windows home spellings", async () => {
+    setHarness("opencode2");
+    __setProjectIdentityTestHooks({ homeDirectory: () => "C:\\Users\\Phoenix" });
+    const db = new Database(":memory:");
+    cleanup.unshift(() => db.close());
+    initializeDatabase(db);
+    runMigrations(db);
+    const result = await runV2SessionProjectBackfill(db, () => ({
+        sessionDirectoryPage: (after) =>
+            after
+                ? []
+                : [
+                      { sessionId: "a", directory: "c:/Users/Phoenix" },
+                      { sessionId: "b", directory: "\\\\?\\C:\\Users\\Phoenix" },
+                  ],
+        close: () => {},
+    }));
+    expect(result.backfilledSessions).toBe(0);
+    expect(result.skippedEmptyDirectories).toBe(2);
+    expect(db.prepare("SELECT * FROM session_projects").all()).toEqual([]);
 });

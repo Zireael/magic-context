@@ -53,6 +53,7 @@ export function hasCurrentDocsProposal(projectDir: string): boolean {
 
 function git(projectDir: string, args: string[]): string {
     return execFileSync("git", args, {
+        windowsHide: true,
         cwd: projectDir,
         encoding: "utf8",
         timeout: 10000,
@@ -60,10 +61,35 @@ function git(projectDir: string, args: string[]): string {
     }).trim();
 }
 
+/**
+ * Like git(), but returns the output read so far when it outgrows the buffer.
+ * Callers keep only a bounded prefix of these outputs, so a truncated read is
+ * enough; throwing instead would make maintain-docs fail on the same diff every
+ * run while its anchor stays put and the diff keeps growing.
+ */
+function gitOutputPrefix(projectDir: string, args: string[]): string {
+    try {
+        return git(projectDir, args);
+    } catch (error) {
+        const { code, stdout } = error as { code?: unknown; stdout?: unknown };
+        if (code !== "ENOBUFS") throw error;
+        if (typeof stdout === "string") return stdout.trim();
+        if (Buffer.isBuffer(stdout)) return stdout.toString("utf8").trim();
+        throw error;
+    }
+}
+
+/**
+ * Pathspec bytes allowed on one git command line. macOS caps arguments plus
+ * environment at 1 MiB and Linux usually at 2 MiB; beyond this the changed-file
+ * list is summarised instead of passed to git, which would fail with E2BIG.
+ */
+const MAX_PATHSPEC_BYTES = 256_000;
+
 export function docsChangeSet(
     projectDir: string,
     storedAnchor?: string,
-): { head: string; text: string } | null {
+): { head: string; text: string; unchanged: boolean; relevant: boolean } | null {
     try {
         if (
             realpathSync(git(projectDir, ["rev-parse", "--show-toplevel"])) !==
@@ -71,14 +97,94 @@ export function docsChangeSet(
         )
             return null;
         const head = git(projectDir, ["rev-parse", "HEAD"]);
+        const recorded = Boolean(storedAnchor);
         let anchor = storedAnchor;
         if (
-            !anchor ||
-            !/^[a-f0-9]{40}$/.test(anchor) ||
-            !git(projectDir, ["cat-file", "-t", anchor]).includes("commit")
+            anchor &&
+            (!/^[a-f0-9]{40}$/.test(anchor) ||
+                git(projectDir, ["cat-file", "-t", anchor]) !== "commit")
         )
-            anchor = git(projectDir, ["log", "-1", "--format=%H", "--", ...FILES]);
+            throw new Error("maintain-docs checkpoint is not a git commit");
+        if (!anchor) anchor = git(projectDir, ["log", "-1", "--format=%H", "--", ...FILES]);
         if (!anchor) return null;
+        if (recorded && anchor === head)
+            return { head, text: "", unchanged: true, relevant: false };
+        if (recorded) {
+            const changed = git(projectDir, [
+                "diff",
+                "-M",
+                "--name-status",
+                `${anchor}..HEAD`,
+                "--",
+                ".",
+            ])
+                .split("\n")
+                .filter(Boolean)
+                .map((line) => line.split("\t").slice(1));
+            const files = [
+                ...new Set(
+                    changed
+                        .flat()
+                        .filter(
+                            (file) =>
+                                file !== "ARCHITECTURE.md" &&
+                                file !== "STRUCTURE.md" &&
+                                !/(?:^|[./-])(test|spec)(?:[./-]|$)/.test(file) &&
+                                !file.endsWith(".lock"),
+                        ),
+                ),
+            ];
+            const docs = FILES.map((file) =>
+                existsSync(join(projectDir, file))
+                    ? readFileSync(join(projectDir, file), "utf8")
+                    : "",
+            ).join("\n");
+            const relevant = files.some((file) => {
+                const directory = file.split("/").slice(0, -1).join("/");
+                return docs.includes(file) || (directory.length > 2 && docs.includes(directory));
+            });
+            if (!relevant) return { head, text: "", unchanged: false, relevant: false };
+            const budget = 32000;
+            const pathspecBytes = files.reduce((sum, file) => sum + Buffer.byteLength(file) + 1, 0);
+            if (pathspecBytes > MAX_PATHSPEC_BYTES) {
+                return {
+                    head,
+                    unchanged: false,
+                    relevant: true,
+                    text: `Changed files (too many to include a diff):\n${files.join("\n").slice(0, budget)}`,
+                };
+            }
+            const stat = git(projectDir, [
+                "diff",
+                "-M",
+                "--stat",
+                `${anchor}..HEAD`,
+                "--",
+                ...files,
+            ]);
+            const patch = gitOutputPrefix(projectDir, [
+                "diff",
+                "-M",
+                "--unified=3",
+                `${anchor}..HEAD`,
+                "--",
+                ...files,
+            ]);
+            const text = `Changed files:\n${files.join("\n")}\n\nStat:\n${stat}\n\nHunks:\n${patch}`;
+            if (text.length <= budget) return { head, text, unchanged: false, relevant: true };
+            const ranges = [...patch.matchAll(/^\+\+\+ b\/(.+)$|^@@ .* \+(\d+)(?:,(\d+))? @@/gm)];
+            return {
+                head,
+                unchanged: false,
+                relevant: true,
+                text: `Changed files and ranges (diff exceeds prompt budget):\n${files.join("\n")}\n${ranges
+                    .map((match) =>
+                        match[1] ? `file: ${match[1]}` : `line: ${match[2]} +${match[3] ?? 1}`,
+                    )
+                    .join("\n")
+                    .slice(0, budget)}\n\nStat:\n${stat}`,
+            };
+        }
         const excluded = [
             "ARCHITECTURE.md",
             "STRUCTURE.md",
@@ -90,7 +196,7 @@ export function docsChangeSet(
             "dist",
             "*generated*",
         ];
-        const raw = git(projectDir, [
+        const raw = gitOutputPrefix(projectDir, [
             "log",
             "--format=commit %h %s",
             "--stat",
@@ -107,9 +213,12 @@ export function docsChangeSet(
         const text = raw.slice(0, 24000);
         return {
             head,
+            unchanged: false,
+            relevant: true,
             text: `${text}${raw.length > text.length ? `\n[cut ${raw.length - text.length} bytes]` : ""}${commits.length > 201 ? "\n[cut commits beyond newest 200]" : ""}`,
         };
-    } catch {
+    } catch (error) {
+        if (storedAnchor) throw error;
         return null;
     }
 }
@@ -152,7 +261,7 @@ function diff(name: string, before: string, after: string): string {
             return execFileSync(
                 "git",
                 ["diff", "--no-index", "--", join(dir, "before"), join(dir, "after")],
-                { encoding: "utf8" },
+                { windowsHide: true, encoding: "utf8" },
             );
         } catch (error) {
             return (

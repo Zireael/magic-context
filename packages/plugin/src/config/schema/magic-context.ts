@@ -484,14 +484,27 @@ const CronScheduleSchema = z
 const DreamTaskBaseConfigSchema = z
     .object({
         schedule: CronScheduleSchema.default(""),
+        token_budget: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe(
+                "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+            ),
     })
     .strict();
+
+export const DREAM_TASK_PROMOTION_DEFAULTS = {
+    "review-user-memories": 3,
+    "promote-primers": 2,
+} as const;
 
 const PromotionThresholdSchema = z
     .number()
     .min(2)
     .max(20)
-    .optional()
+    .default(DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"])
     .describe(
         "review-user-memories: min candidate observations before promotion is considered (default: 3)",
     );
@@ -499,7 +512,7 @@ const PrimerPromotionThresholdSchema = z
     .number()
     .min(2)
     .max(20)
-    .optional()
+    .default(DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"])
     .describe(
         "promote-primers: min recurring source days before promotion is considered (default: 2)",
     );
@@ -548,8 +561,10 @@ const DEFAULT_TASK_SCHEDULES: Record<DreamTaskName, string> = {
 
 function defaultTaskConfig(task: DreamTaskName): z.input<typeof DreamTaskConfigSchema> {
     const base: z.input<typeof DreamTaskConfigSchema> = { schedule: DEFAULT_TASK_SCHEDULES[task] };
-    if (task === "review-user-memories") base.promotion_threshold = 3;
-    if (task === "promote-primers") base.promotion_threshold = 2;
+    if (task === "review-user-memories")
+        base.promotion_threshold = DREAM_TASK_PROMOTION_DEFAULTS["review-user-memories"];
+    if (task === "promote-primers")
+        base.promotion_threshold = DREAM_TASK_PROMOTION_DEFAULTS["promote-primers"];
     return base;
 }
 
@@ -680,7 +695,7 @@ export const HistorianConfigSchema = AgentMetadataSchema.extend({
         .array(z.enum(["*", "read", "aft_outline", "aft_zoom", "aft_search"]))
         .default([])
         .describe(
-            'OpenCode only. Tools to REMOVE from the historian\'s default allow-list [read, aft_outline, aft_zoom, aft_search]. Applies to both historian and historian-editor agents. Use ["*"] to strip all tool definitions from the model request — this prevents weak instruction-following models (e.g. mistral-small-latest) from entering tool-calling loops. Individual tool names remove just that tool. Note: a user-supplied historian.permission override can re-allow a tool that disallowed_tools removed — disallowed_tools sets the baseline, permission overrides take precedence. (default: [])',
+            "Legacy compatibility setting. Historians, recomp and editor passes always run with zero tools and locked permissions; this list no longer changes their tool surface. (default: [])",
         ),
 }).optional();
 export type HistorianConfig = NonNullable<z.infer<typeof HistorianConfigSchema>>;
@@ -756,7 +771,7 @@ const BaseEmbeddingConfigSchema = z
             .enum(["auto", "native", "wasm"])
             .default("auto")
             .describe(
-                "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Set 'native' only to prefer speed while accepting that pre-1.4.0 Bun crash risk, or 'wasm' to avoid loading the native addon.",
+                "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too.",
             ),
         local_dtype: z
             .enum([
@@ -888,7 +903,7 @@ export interface MuralConfig {
 
 export interface MagicContextConfig {
     enabled: boolean;
-    /** User-level setting that lets a session started exactly in the canonical home directory use a deterministic directory identity. */
+    /** User-level setting that lets a session in the canonical home directory use project memory. */
     allow_home_project: boolean;
     mural: MuralConfig;
     /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
@@ -1074,7 +1089,7 @@ export const MagicContextConfigSchema = z
             .boolean()
             .default(false)
             .describe(
-                "Allow Magic Context sessions launched from the exact canonical home directory. The home session uses its deterministic dir: identity so pre-gate memories reconnect. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
+                "Allow Magic Context sessions launched from the exact canonical home directory. A non-git home uses its deterministic dir: identity; a home repository uses its git: identity. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
             ),
         mural: z
             .object({
@@ -1156,7 +1171,7 @@ export const MagicContextConfigSchema = z
             .union([z.string(), z.object({ default: z.string() }).catchall(z.string())])
             .default("5m")
             .describe(
-                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
+                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard). Explicit per-model entries win; otherwise GPT-5.6 and later (including gpt-6*, through any provider prefix) use a built-in 30m lifetime before the object default or 5m fallback. An unset or global "5m" opts into built-in defaults; any other global string is an explicit policy and wins. Policy is frozen per session, including across restarts; a model switch resolves against that frozen policy. /ctx-status shows the effective value and source. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
             ),
         prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe(
             "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow the default preset). OpenCode 2 rewrites the five ctx_* descriptions per request from the draft model.",
@@ -1388,9 +1403,9 @@ export const MagicContextConfigSchema = z
             .object({
                 enabled: z
                     .boolean()
-                    .default(true)
+                    .default(false)
                     .describe(
-                        "Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there.",
+                        "Pi only: off by default. Set todowrite.enabled=true to register Magic Context's todowrite task-list tool and /todos command. OpenCode ships its own built-in todowrite; this setting has no effect there.",
                     ),
                 overlay: z
                     .boolean()
@@ -1399,7 +1414,7 @@ export const MagicContextConfigSchema = z
                         "Pi only: show the persistent todo overlay above the editor while tasks are active.",
                     ),
             })
-            .default({ enabled: true, overlay: true })
+            .default({ enabled: false, overlay: true })
             .describe(
                 "Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart.",
             ),
@@ -1552,10 +1567,12 @@ export const LIVE_RELOAD_CONFIG_PATHS = [
     "historian.omp.fallback_models",
     "historian.omp.thinking_level",
     "historian.two_pass",
+    "historian.maxTokens",
     "historian_timeout_ms",
     "commit_cluster_trigger.enabled",
     "commit_cluster_trigger.min_clusters",
     "memory.auto_promote",
+    "dreamer.maxTokens",
     "dreamer.opencode.model",
     "dreamer.opencode.fallback_models",
     "dreamer.opencode.variant",

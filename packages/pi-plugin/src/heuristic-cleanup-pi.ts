@@ -68,10 +68,21 @@ import { sessionLog } from "@magic-context/core/shared/logger";
  * are wasted context. Anything mutating (write/edit/bash/etc.) is
  * intentionally excluded because two identical calls may have
  * different semantics in different positions of the conversation.
+ * Pi names its built-in tools bare (`read`, `grep`), so the bare names
+ * are what match; the `mcp_` forms cover MCP servers using that prefix.
  */
 export const PI_CTX_REDUCE_KEEP = 3;
 
 const DEDUP_SAFE_TOOLS = new Set([
+	"grep",
+	"read",
+	"glob",
+	"ast_grep_search",
+	"lsp_diagnostics",
+	"lsp_symbols",
+	"lsp_find_references",
+	"lsp_goto_definition",
+	"lsp_prepare_rename",
 	"mcp_grep",
 	"mcp_read",
 	"mcp_glob",
@@ -104,6 +115,8 @@ export interface PiHeuristicCleanupConfig {
 		currentTotalInputTokens: number;
 		ceilingTokens: number;
 		usagePercentage?: number;
+		/** Another mutation already rewrites the cached prefix on this pass. */
+		passAlreadyPriced?: boolean;
 	};
 	/**
 	 * Age-tier caveman text compression settings. Caller is responsible
@@ -407,6 +420,7 @@ export function applyPiHeuristicCleanup(
 			usagePercentage: emergency.usagePercentage,
 			priorInputSample,
 			hasPriorDrop: priorInputSample > 0,
+			passAlreadyPriced: emergency.passAlreadyPriced === true,
 		});
 		if (plan.shouldDrop) {
 			const toDrop = new Set(plan.tagNumbers);
@@ -478,6 +492,7 @@ export function applyPiHeuristicCleanup(
 					: staleReduce.bareCallIds.has(tag.messageId);
 				if (!matched) continue;
 				const target = targets.get(tag.tagNumber);
+				if (target?.canDrop?.() === false) continue;
 				const { result, mode } = applyNewToolDrop(target, { inWindow: false });
 				if (result === "incomplete") continue;
 				updateTagDropMode(db, sessionId, tag.tagNumber, mode);
@@ -564,10 +579,13 @@ export function applyPiHeuristicCleanup(
 			}
 		}
 
+		// Protected tags join their group so a protected newest copy still anchors
+		// it; they are never dropped themselves (below). Leaving them out kept one
+		// unprotected copy alive beside the protected one.
 		const fingerprintGroups = new Map<string, TagEntry[]>();
 		for (const [compositeKey, fingerprint] of toolFingerprints) {
 			const tag = tagsByCompositeKey.get(compositeKey);
-			if (!tag || tag.tagNumber > protectedCutoff) continue;
+			if (!tag) continue;
 			const group = fingerprintGroups.get(fingerprint) ?? [];
 			group.push(tag);
 			fingerprintGroups.set(fingerprint, group);
@@ -580,7 +598,9 @@ export function applyPiHeuristicCleanup(
 				// Keep the newest, drop the rest.
 				for (let i = 0; i < group.length - 1; i++) {
 					const tag = group[i];
+					if (tag.tagNumber > protectedCutoff) continue;
 					const target = targets.get(tag.tagNumber);
+					if (target?.canDrop?.() === false) continue;
 					// Deduplication stays full-drop; only emergency recent arcs keep
 					// skeletons. A call that cannot be removed keeps real arguments.
 					const { result, mode } = applyNewToolDrop(target, {
@@ -617,11 +637,23 @@ export function applyPiHeuristicCleanup(
 	let compressedTextTags = 0;
 	let mutatedTextTags = 0;
 	if (routine && config.caveman?.enabled) {
-		const cavemanResult = applyCavemanCleanup(sessionId, db, targets, tags, {
-			enabled: true,
-			minChars: config.caveman.minChars,
-			protectedCutoff,
-		});
+		// System-injection cleanup above drops tags but keeps their pristine source.
+		// Reload active rows so compression skips tags dropped during this request.
+		// Otherwise compression restores a dropped injection now, and the persisted
+		// drop takes effect only on the next request, causing a second cache rebuild.
+		const cavemanTags = getActiveTagsBySession(db, sessionId);
+		const cavemanResult = applyCavemanCleanup(
+			sessionId,
+			db,
+			targets,
+			cavemanTags,
+			{
+				enabled: true,
+				minChars: config.caveman.minChars,
+				wordRules: config.caveman.wordRules,
+				protectedCutoff,
+			},
+		);
 		compressedTextTags =
 			cavemanResult.compressedToLite +
 			cavemanResult.compressedToFull +

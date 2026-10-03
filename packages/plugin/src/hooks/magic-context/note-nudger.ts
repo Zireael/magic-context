@@ -36,24 +36,49 @@ export type NoteNudgeTrigger = "historian_complete" | "commit_detected" | "todos
 
 const NOTE_NUDGE_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
 
-// In-memory delivery timestamp per session. Doesn't need to survive restart —
-// if the app restarts, cooldown resets, which is acceptable.
+// In-memory delivery timestamp per session. Deliberately not persisted: after
+// a restart the cooldown resets, which can at worst re-surface the nudge once
+// early. Entries are useless once the cooldown has passed, so they are pruned
+// then; without that the map kept one entry for every session that ever got a
+// nudge for the life of the process.
 const lastDeliveredAt = new Map<string, number>();
 
-function getPersistedNoteNudgeDeliveredAt(_db: unknown, sessionId: string): number {
-    return lastDeliveredAt.get(sessionId) ?? 0;
+function isCoolingDown(deliveredAt: number, now: number): boolean {
+    return now - deliveredAt < NOTE_NUDGE_COOLDOWN_MS;
+}
+
+function getNoteNudgeDeliveredAt(sessionId: string): number {
+    const deliveredAt = lastDeliveredAt.get(sessionId);
+    if (deliveredAt === undefined) return 0;
+    if (!isCoolingDown(deliveredAt, Date.now())) {
+        lastDeliveredAt.delete(sessionId);
+        return 0;
+    }
+    return deliveredAt;
 }
 
 export function recordNoteNudgeDeliveryTime(sessionId: string): void {
-    lastDeliveredAt.set(sessionId, Date.now());
+    const now = Date.now();
+    for (const [otherSessionId, deliveredAt] of lastDeliveredAt) {
+        if (!isCoolingDown(deliveredAt, now)) lastDeliveredAt.delete(otherSessionId);
+    }
+    lastDeliveredAt.set(sessionId, now);
+}
+
+/** Number of sessions holding a cooldown entry; for tests. */
+export function getNoteNudgeCooldownCountForTest(): number {
+    return lastDeliveredAt.size;
 }
 
 /**
  * Signal that a trigger event occurred. Call from hook layer when any of the 3 triggers fire.
  */
 export function onNoteTrigger(db: Database, sessionId: string, trigger: NoteNudgeTrigger): void {
-    const transactionStartedAt = performance.now();
-    setPersistedNoteNudgeTrigger(db, sessionId);
+    let transactionStartedAt = 0;
+    db.transaction(() => {
+        transactionStartedAt = performance.now();
+        setPersistedNoteNudgeTrigger(db, sessionId);
+    }).immediate();
     logSlowWriteTransaction("note_nudge_trigger", transactionStartedAt);
     sessionLog(sessionId, `note-nudge: trigger fired (${trigger}), triggerPending=true`);
 }
@@ -115,8 +140,8 @@ export function peekNoteNudgeText(
     // in quick succession during active work.
     // Check unconditionally — a new trigger clears sticky fields, so gating on
     // stickyText presence would let triggers bypass the cooldown window.
-    const deliveredAt = getPersistedNoteNudgeDeliveredAt(db, sessionId);
-    if (deliveredAt > 0 && Date.now() - deliveredAt < NOTE_NUDGE_COOLDOWN_MS) {
+    const deliveredAt = getNoteNudgeDeliveredAt(sessionId);
+    if (deliveredAt > 0) {
         sessionLog(
             sessionId,
             `note-nudge: suppressing — last delivered ${Math.round((Date.now() - deliveredAt) / 1000)}s ago (cooldown ${NOTE_NUDGE_COOLDOWN_MS / 60000}m)`,
@@ -173,6 +198,15 @@ export function peekNoteNudgeText(
             clearNoteNudgeTriggerOnly(db, sessionId);
             return null;
         }
+    }
+
+    const failureNotice = notes.find((note) =>
+        /^Smart note #\d+ cannot be checked\.\nCondition: /.test(note.content),
+    );
+    if (failureNotice) {
+        const reason =
+            failureNotice.content.split("\nReason: ")[1]?.split("\n")[0] ?? "check unavailable";
+        return `Smart note check unavailable: ${reason}. Read ctx_note #${failureNotice.id} for the condition and repair instructions; this is NOT evidence that the condition is met.`;
     }
 
     const parts: string[] = [];
@@ -265,7 +299,26 @@ export function markNoteNudgeDelivered(
         return { ok: true, kind: "already-present" };
     }
 
-    const outcome = deliverNoteNudgeAtomic(db, sessionId, messageId, text);
+    const outcome = db
+        .transaction(() => {
+            const delivered = deliverNoteNudgeAtomic(db, sessionId, messageId, text);
+            const noticeId = text?.match(
+                /^Smart note check unavailable: [\s\S]*Read ctx_note #(\d+) for the condition/,
+            );
+            if (delivered.ok && noticeId) {
+                // A persisted anchor is the receipt. Acknowledge the separate failure
+                // notice, never the pending smart note whose condition is still unmet.
+                db.prepare(`UPDATE notes SET status = 'dismissed', updated_at = ?
+                WHERE id = ? AND type = 'session' AND session_id = ?
+                  AND content LIKE 'Smart note #% cannot be checked.%'`).run(
+                    Date.now(),
+                    Number(noticeId[1]),
+                    sessionId,
+                );
+            }
+            return delivered;
+        })
+        .immediate();
     if (outcome.ok) {
         recordNoteNudgeDeliveryTime(sessionId);
     }

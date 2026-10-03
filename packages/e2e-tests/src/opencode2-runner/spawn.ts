@@ -1,10 +1,10 @@
+import { createE2ETempDir, cleanupE2ETempDir } from "../temp-dir";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	closeSync,
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	openSync,
 	readdirSync,
 	readFileSync,
@@ -13,7 +13,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { hostExtractCache } from '../host-extract-cache';
 import { pinMockAgents } from "../mock-routing";
@@ -81,7 +81,7 @@ function killGroup(pid: number): void {
 		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
 	}
 }
-process.once("exit", () => {
+process.prependOnceListener("exit", () => {
 	for (const pid of groups) killGroup(pid);
 });
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
@@ -99,7 +99,7 @@ export interface OpenCode2Isolation {
 }
 
 export function isolation(): OpenCode2Isolation {
-	const root = realpathSync(mkdtempSync(join(tmpdir(), "mc-opencode2-")));
+	const root = createE2ETempDir("mc-opencode2-");
 	const env: NodeJS.ProcessEnv = {
 		PATH: process.env.PATH,
 		OPENCODE_DB: "opencode2.db",
@@ -113,7 +113,34 @@ export function isolation(): OpenCode2Isolation {
 	const cwd = join(root, "work");
 	mkdirSync(cwd);
 	env.MAGIC_CONTEXT_STORAGE_DIR = join(env.XDG_DATA_HOME!, "cortexkit", "magic-context");
+	// Magic Context writes its diagnostics to this file and never to the host's
+	// stderr, so a test that checks a diagnostic reads it here (see readPluginLog).
+	env.MAGIC_CONTEXT_LOG_PATH = join(root, "magic-context.log");
 	return { root, env, cwd };
+}
+
+/** The Magic Context log of a host spawned with this isolation, or "" before the first flush. */
+export function readPluginLog(env: NodeJS.ProcessEnv): string {
+	const path = env.MAGIC_CONTEXT_LOG_PATH;
+	return path && existsSync(path) ? readFileSync(path, "utf8") : "";
+}
+
+/**
+ * Wait for a line to reach the Magic Context log. The plugin buffers log
+ * writes for up to half a second, so a line logged during the turn a test just
+ * awaited may not be on disk yet.
+ */
+export async function waitForPluginLog(
+	env: NodeJS.ProcessEnv,
+	text: string,
+	timeoutMs = 5_000,
+): Promise<string> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const content = readPluginLog(env);
+		if (content.includes(text) || Date.now() >= deadline) return content;
+		await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+	}
 }
 export function assertIsolation(root: string, env: NodeJS.ProcessEnv): void {
 	if (!OPENCODE2_NO_BACKGROUND_SERVICE_FLAG.trim())
@@ -229,6 +256,10 @@ export async function waitForPluginActive(
 
 
 export interface OpenCode2SpawnOptions {
+    /** Explicit host binary for a same-store upgrade scenario. */
+    cli?: string;
+    /** Built plugin snapshot used before a same-store upgrade. */
+    magicContextPlugin?: string;
 	probePlugin?: string;
 	providerID?: string;
 	probeStandalone?: boolean;
@@ -267,211 +298,220 @@ export interface OpenCode2SpawnOptions {
 export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 	const providerID = options.providerID ?? "openai";
 	const fixture = options.existingIsolation ?? isolation();
-	assertIsolation(fixture.root, fixture.env);
-	const references = isolateStoreDirectories(fixture.root, join(fixture.env.XDG_DATA_HOME!, "opencode", fixture.env.OPENCODE_DB!), join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR ?? join(fixture.env.XDG_DATA_HOME!, "cortexkit", "magic-context"), "context.db"));
-	fixture.referencedDirectories = [...new Set([...(fixture.referencedDirectories ?? []), ...references])];
-	const fence = snapshotWriteFence(fixture.referencedDirectories);
-	// Do not open the operator's live database, even for a read-only snapshot.
-	// Check the host's writable descriptors and protected directory metadata instead.
-	if (options.prepareContextDatabase !== false)
-		prepareContextDatabase(fixture.env.XDG_DATA_HOME!);
-	if (
-		options.includeMagicContext !== false &&
-		!existsSync(join(PLUGIN, "dist/v2/server.js"))
-	) {
-		throw new Error("Build the plugin before booting v2");
-	}
-	const mock = options.existingMock?.mock ?? new MockProvider();
-	const provider = options.existingMock ?? await mock.start(); // Existing mock explicitly binds 127.0.0.1 and captures parsed wire bodies.
-	// 2.0.5 title generation hits the mock on session.create, before tests
-	// install matchers, and uses a host title model rather than mock-model.
-    if (!options.existingMock) {
-        mock.setDefault({
-            text: "fixture reply",
-            usage: { input_tokens: 100, output_tokens: 10 },
-        });
-        if (options.mockResponse) mock.setDefault(options.mockResponse);
-    }
-	const schemaTrace = join(fixture.root, "llm-schema-guard.jsonl");
-	fixture.env.MC_E2E_SCHEMA_TRACE_PATH = schemaTrace;
-	const defaultModelID = options.defaultModelID ?? "mock-model";
-	const modelIDs = new Set([
-		defaultModelID,
-		...(options.additionalModelIDs ?? []),
-		...(options.historianModel ? [options.historianModel.id] : []),
-	]);
-	writeFileSync(
-		join(fixture.cwd, "opencode.json"),
-		JSON.stringify({
-			...options.extraConfig,
-			plugins: [
-				...(options.includeMagicContext === false ? [] : [PLUGIN]),
-				...(options.probePlugin ? [options.probePlugin] : []),
-				SCHEMA_GUARD,
-			],
-			model: `${providerID}/${defaultModelID}`,
-			compaction: { auto: options.compactionAuto ?? true, buffer: 1024, keep: { tokens: 1024 } },
-			providers: {
-				[providerID]: {
-					settings: { baseURL: provider.baseURL, apiKey: "mock-key" },
-					models: Object.fromEntries(
-						[...modelIDs].map((id) => [
-							id,
-							{
-								name: id,
-                                ...(options.visionModel ? { modalities: { input: ["text", "image"], output: ["text"] } } : {}),
-								limit: {
-									// 2.0.5 required() is unchanged, but 16k minus a 32k output
-									// makes the first-request ceiling negative. Ordinary turns
-									// stay large; fold scenarios pass 16k/1024 explicitly.
-									context:
-										id === options.historianModel?.id
-											? options.historianModel.contextLimit
-											: (options.modelContextLimit ?? 200_000),
-									output: options.modelOutputLimit ?? 32768,
-								},
-							},
-						]),
-					),
-				},
-			},
-		}),
-	);
-	if (options.magicContextConfig !== undefined) {
-		const configDir = join(fixture.env.XDG_CONFIG_HOME!, "cortexkit");
-		mkdirSync(configDir, { recursive: true });
-		writeFileSync(
-			join(configDir, "magic-context.jsonc"),
-			JSON.stringify(
-				{
-					auto_update: false,
-					execute_threshold_percentage: 40,
-					history_budget_percentage: 0.15,
-					embedding: { provider: "off" },
-					...pinMockAgents(
-						options.magicContextConfig,
-						`${providerID}/${defaultModelID}`,
-						// Both OpenCode host generations use the `agents.*.opencode` config block.
-						"opencode",
-						options.historianModel
-							? { historian: `${providerID}/${options.historianModel.id}` }
-							: {},
-					),
-				},
-				null,
-				2,
-			),
-		);
-	}
-	// serve owns its server directly; --standalone is a TUI/run flag, not a serve option.
-	const child = spawn(
-		CLI,
-		[
-			"serve",
-			"--hostname",
-			"127.0.0.1",
-			"--port",
-			"0",
-			...(options.probeStandalone
-				? [OPENCODE2_NO_BACKGROUND_SERVICE_FLAG]
-				: []),
-			...(options.serviceMode ? ["--service"] : []),
-			"--print-logs",
-		],
-		{
-			cwd: fixture.cwd,
-			env: fixture.env,
-			detached: true,
-			stdio: ["ignore", "pipe", "pipe"],
-		},
-	);
-	if (child.pid) groups.add(child.pid);
-	let stdout = "";
-	let stderr = "";
-	const exited = new Promise<void>((resolveExit) =>
-		child.once("close", () => resolveExit()),
-	);
-	let hostStopped = false;
-	const stopHost = async () => {
-		if (hostStopped) return;
-		hostStopped = true;
-		let safetyError: unknown;
-		try {
-			if (child.pid && child.exitCode === null && child.signalCode === null)
-				inspectOpenFiles(child.pid, fixture.root, fixture.env);
-		} catch (error) {
-			safetyError = error;
-		}
-		if (child.pid) killGroup(child.pid);
-		await exited;
-		if (child.pid) groups.delete(child.pid);
-		assertWriteFenceUnchanged(fence);
-		if (safetyError) throw safetyError;
-		if (existsSync(schemaTrace)) {
-			const failures = readFileSync(schemaTrace, "utf8").split("\n").filter((line) => line.startsWith("FAIL "));
-			if (failures.length) throw new Error(`OC2 LLM schema guard rejected returned drafts:\n${failures.join("\n")}`);
-		}
-	};
-	const stop = async () => {
-		try {
-			await stopHost();
-		} finally {
-			await mock.stop();
-		}
-	};
 	try {
-		const ready = await new Promise<{ url: string; password: string }>(
-			(resolveReady, reject) => {
-				const timer = setTimeout(
-					() => reject(new Error(`v2 handoff timed out\n${stdout}\n${stderr}`)),
-					30000,
-				);
-				let poll: ReturnType<typeof setInterval> | undefined;
-				const finish = (error?: Error) => {
-					clearTimeout(timer);
-					if (poll) clearInterval(poll);
-					if (error) reject(error);
-				};
-				if (options.serviceMode) {
-					poll = setInterval(() => {
-						const value = serviceHandoff(fixture.env);
-						if (!value) return;
-						finish();
-						resolveReady(value);
-					}, 25);
-				}
-				child.stdout.on("data", (chunk) => {
-					stdout += chunk.toString();
-					if (options.serviceMode) return;
-					const value = handoff(stdout);
-					if (value) {
-						finish();
-						resolveReady(value);
-					}
-				});
-				child.stderr.on("data", (chunk) => {
-					stderr += chunk.toString();
-				});
-				child.once("error", (error) => finish(error));
-				child.once("close", (code) =>
-					finish(new Error(`v2 exited ${code}\n${stdout}\n${stderr}`)),
-				);
+		assertIsolation(fixture.root, fixture.env);
+		const references = isolateStoreDirectories(fixture.root, join(fixture.env.XDG_DATA_HOME!, "opencode", fixture.env.OPENCODE_DB!), join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR ?? join(fixture.env.XDG_DATA_HOME!, "cortexkit", "magic-context"), "context.db"));
+		fixture.referencedDirectories = [...new Set([...(fixture.referencedDirectories ?? []), ...references])];
+		const fence = snapshotWriteFence(fixture.referencedDirectories);
+		// Do not open the operator's live database, even for a read-only snapshot.
+		// Check the host's writable descriptors and protected directory metadata instead.
+		if (options.prepareContextDatabase !== false)
+			prepareContextDatabase(fixture.env.XDG_DATA_HOME!);
+		if (
+			options.includeMagicContext !== false &&
+			!existsSync(join(PLUGIN, "dist/v2/server.js"))
+		) {
+			throw new Error("Build the plugin before booting v2");
+		}
+		const mock = options.existingMock?.mock ?? new MockProvider();
+		const provider = options.existingMock ?? await mock.start(); // Existing mock explicitly binds 127.0.0.1 and captures parsed wire bodies.
+		// 2.0.5 title generation hits the mock on session.create, before tests
+		// install matchers, and uses a host title model rather than mock-model.
+	    if (!options.existingMock) {
+	        mock.setDefault({
+	            text: "fixture reply",
+	            usage: { input_tokens: 100, output_tokens: 10 },
+	        });
+	        if (options.mockResponse) mock.setDefault(options.mockResponse);
+	    }
+		const schemaTrace = join(fixture.root, "llm-schema-guard.jsonl");
+		fixture.env.MC_E2E_SCHEMA_TRACE_PATH = schemaTrace;
+		const defaultModelID = options.defaultModelID ?? "mock-model";
+		const modelIDs = new Set([
+			defaultModelID,
+			...(options.additionalModelIDs ?? []),
+			...(options.historianModel ? [options.historianModel.id] : []),
+		]);
+		writeFileSync(
+			join(fixture.cwd, "opencode.json"),
+			JSON.stringify({
+				...options.extraConfig,
+				plugins: [
+					...(options.includeMagicContext === false ? [] : [options.magicContextPlugin ?? PLUGIN]),
+					...(options.probePlugin ? [options.probePlugin] : []),
+					SCHEMA_GUARD,
+				],
+				model: `${providerID}/${defaultModelID}`,
+				compaction: { auto: options.compactionAuto ?? true, buffer: 1024, keep: { tokens: 1024 } },
+				providers: {
+					[providerID]: {
+						settings: { baseURL: provider.baseURL, apiKey: "mock-key" },
+						models: Object.fromEntries(
+							[...modelIDs].map((id) => [
+								id,
+								{
+									name: id,
+	                                ...(options.visionModel ? { modalities: { input: ["text", "image"], output: ["text"] } } : {}),
+									limit: {
+										// 2.0.5 required() is unchanged, but 16k minus a 32k output
+										// makes the first-request ceiling negative. Ordinary turns
+										// stay large; fold scenarios pass 16k/1024 explicitly.
+										context:
+											id === options.historianModel?.id
+												? options.historianModel.contextLimit
+												: (options.modelContextLimit ?? 200_000),
+										output: options.modelOutputLimit ?? 32768,
+									},
+								},
+							]),
+						),
+					},
+				},
+			}),
+		);
+		if (options.magicContextConfig !== undefined) {
+			const configDir = join(fixture.env.XDG_CONFIG_HOME!, "cortexkit");
+			mkdirSync(configDir, { recursive: true });
+			writeFileSync(
+				join(configDir, "magic-context.jsonc"),
+				JSON.stringify(
+					{
+						auto_update: false,
+						execute_threshold_percentage: 40,
+						history_budget_percentage: 0.15,
+						embedding: { provider: "off" },
+						...pinMockAgents(
+							options.magicContextConfig,
+							`${providerID}/${defaultModelID}`,
+							// Both OpenCode host generations use the `agents.*.opencode` config block.
+							"opencode",
+							options.historianModel
+								? { historian: `${providerID}/${options.historianModel.id}` }
+								: {},
+						),
+					},
+					null,
+					2,
+				),
+			);
+		}
+		// serve owns its server directly; --standalone is a TUI/run flag, not a serve option.
+		const child = spawn(
+			options.cli ?? CLI,
+			[
+				"serve",
+				"--hostname",
+				"127.0.0.1",
+				"--port",
+				"0",
+				...(options.probeStandalone
+					? [OPENCODE2_NO_BACKGROUND_SERVICE_FLAG]
+					: []),
+				...(options.serviceMode ? ["--service"] : []),
+				"--print-logs",
+			],
+			{
+				cwd: fixture.cwd,
+				env: fixture.env,
+				detached: true,
+				windowsHide: true,
+				stdio: ["ignore", "pipe", "pipe"],
 			},
 		);
-		if (child.pid) inspectOpenFiles(child.pid, fixture.root, fixture.env);
-		return {
-			...ready,
-			...fixture,
-			pid: child.pid,
-			mock,
-			mockBaseURL: provider.baseURL,
-			stopHost,
-			stop,
-			stdout: () => stdout,
-			stderr: () => stderr,
+		if (child.pid) groups.add(child.pid);
+		let stdout = "";
+		let stderr = "";
+		const exited = new Promise<void>((resolveExit) =>
+			child.once("close", () => resolveExit()),
+		);
+		let hostStopped = false;
+		const stopHost = async () => {
+			if (hostStopped) return;
+			hostStopped = true;
+			let safetyError: unknown;
+			try {
+				if (child.pid && child.exitCode === null && child.signalCode === null)
+					inspectOpenFiles(child.pid, fixture.root, fixture.env);
+			} catch (error) {
+				safetyError = error;
+			}
+			if (child.pid) killGroup(child.pid);
+			await exited;
+			if (child.pid) groups.delete(child.pid);
+			assertWriteFenceUnchanged(fence);
+			if (safetyError) throw safetyError;
+			if (existsSync(schemaTrace)) {
+				const failures = readFileSync(schemaTrace, "utf8").split("\n").filter((line) => line.startsWith("FAIL "));
+				if (failures.length) throw new Error(`OC2 LLM schema guard rejected returned drafts:\n${failures.join("\n")}`);
+			}
 		};
+		const stop = async () => {
+			try {
+				await stopHost();
+			} finally {
+				try { await mock.stop(); } finally {
+	            if (!options.existingIsolation) cleanupE2ETempDir(fixture.root);
+	        }
+			}
+		};
+		try {
+			const ready = await new Promise<{ url: string; password: string }>(
+				(resolveReady, reject) => {
+					const timer = setTimeout(
+						() => reject(new Error(`v2 handoff timed out\n${stdout}\n${stderr}`)),
+						30000,
+					);
+					let poll: ReturnType<typeof setInterval> | undefined;
+					const finish = (error?: Error) => {
+						clearTimeout(timer);
+						if (poll) clearInterval(poll);
+						if (error) reject(error);
+					};
+					if (options.serviceMode) {
+						poll = setInterval(() => {
+							const value = serviceHandoff(fixture.env);
+							if (!value) return;
+							finish();
+							resolveReady(value);
+						}, 25);
+					}
+					child.stdout.on("data", (chunk) => {
+						stdout += chunk.toString();
+						if (options.serviceMode) return;
+						const value = handoff(stdout);
+						if (value) {
+							finish();
+							resolveReady(value);
+						}
+					});
+					child.stderr.on("data", (chunk) => {
+						stderr += chunk.toString();
+					});
+					child.once("error", (error) => finish(error));
+					child.once("close", (code) =>
+						finish(new Error(`v2 exited ${code}\n${stdout}\n${stderr}`)),
+					);
+				},
+			);
+			if (child.pid) inspectOpenFiles(child.pid, fixture.root, fixture.env);
+			return {
+				...ready,
+				...fixture,
+				pid: child.pid,
+				mock,
+				mockBaseURL: provider.baseURL,
+				stopHost,
+				stop,
+				stdout: () => stdout,
+				stderr: () => stderr,
+				pluginLog: () => readPluginLog(fixture.env),
+			};
+		} catch (error) {
+			await stop();
+			throw error;
+		}
 	} catch (error) {
-		await stop();
+		if (!options.existingIsolation) cleanupE2ETempDir(fixture.root);
 		throw error;
 	}
 }
@@ -511,25 +551,34 @@ export function assertOpenPaths(
 	}
 }
 
+/** Retry only lsof's transient partial-inventory status, without treating it as success. */
+export function resampleTransientInventory<T extends { status: number | null }>(sample: () => T): T {
+    let result = sample();
+    for (let retry = 0; result.status === 1 && retry < 2; retry++) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+        result = sample();
+    }
+    return result;
+}
+
 /** Sample the whole child process group, not an unrelated operator process's writes. */
 export function inspectOpenFiles(
 	pid: number,
 	root: string,
 	env: NodeJS.ProcessEnv,
 ): string[] {
-	const ps = spawnSync("ps", ["-axo", "pid=,pgid="], { encoding: "utf8" });
-	if (ps.status !== 0) throw new Error("Cannot inspect v2 process group");
-	const pids = ps.stdout
-		.trim()
-		.split("\n")
-		.map((line) => line.trim().split(/\s+/))
-		.filter(([, group]) => Number(group) === pid)
-		.map(([id]) => id);
-	if (!pids.length)
-		throw new Error("v2 process group disappeared before fd inspection");
-	const result = spawnSync("lsof", ["-p", pids.join(","), "-Fin"], {
-		encoding: "utf8",
-	});
+	const sample = () => {
+		const ps = spawnSync("ps", ["-axo", "pid=,pgid="], { encoding: "utf8" });
+		if (ps.status !== 0) throw new Error("Cannot inspect v2 process group");
+		const pids = ps.stdout.trim().split("\n")
+			.map((line) => line.trim().split(/\s+/))
+			.filter(([, group]) => Number(group) === pid).map(([id]) => id);
+		if (!pids.length) throw new Error("v2 process group disappeared before fd inspection");
+		return spawnSync("lsof", ["-p", pids.join(","), "-Fin"], { encoding: "utf8" });
+	};
+	// A short-lived group member can exit between ps and lsof. Resample the whole
+	// live group, but still require a successful inventory and the database inode.
+	const result = resampleTransientInventory(sample);
 	if (result.status !== 0)
 		throw new Error(`Cannot inspect v2 open files: ${result.stderr}`);
 	let fd = "";

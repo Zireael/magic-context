@@ -1,7 +1,9 @@
 import { isRecord } from "../../shared/record-type-guard";
+import { toolPartHasUserAnswer } from "../../shared/user-answer";
 import { droppedInputMarker } from "./dropped-input-guard";
 import { applyEditMarkerToInput } from "./edit-marker";
 import { estimateMessageTokens } from "./final-wire-token-estimate";
+import { neutralizeDroppedReasoningPart } from "./sentinel";
 import { stripTagPrefix } from "./tag-content-primitives";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
 import { toolInputStringBytes } from "./tool-input-size";
@@ -246,11 +248,13 @@ export function hasMeaningfulPart(part: unknown): boolean {
     return true;
 }
 
+/**
+ * A drop invalidates the reasoning that led to the dropped call. Take it off
+ * the wire whole (see neutralizeDroppedReasoningPart); never rewrite its text,
+ * which would leave a signature, opaque payload or encrypted content behind.
+ */
 function clearThinkingParts(thinkingParts: ThinkingLikePart[]): void {
-    for (const part of thinkingParts) {
-        if (part.thinking !== undefined) part.thinking = "[cleared]";
-        if (part.text !== undefined) part.text = "[cleared]";
-    }
+    for (const part of thinkingParts) neutralizeDroppedReasoningPart(part);
 }
 
 function messageHasNativeReasoning(message: MessageLike): boolean {
@@ -639,7 +643,12 @@ export function createToolDropTarget(
         },
         canDrop: (): boolean => {
             const entry = index.get(compositeKey);
-            return !!entry && entry.occurrences.length > 0 && entry.hasResult;
+            return (
+                !!entry &&
+                entry.occurrences.length > 0 &&
+                entry.hasResult &&
+                !entry.occurrences.some((occurrence) => toolPartHasUserAnswer(occurrence.part))
+            );
         },
         requiresToolArcSkeleton:
             thinkingParts.length > 0 ||

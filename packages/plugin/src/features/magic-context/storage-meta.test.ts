@@ -7,6 +7,9 @@ import { clearSession, updateSessionMeta } from "./storage-meta";
 function createMockDb() {
     const prepare = mock((_sql: string) => ({
         all: mock((..._args: unknown[]) => []),
+        // No row: reads see a database whose one-time FTS rowid-map backfill
+        // has not finished yet.
+        get: mock((..._args: unknown[]) => undefined),
         run: mock((..._args: unknown[]) => {}),
     }));
 
@@ -85,11 +88,14 @@ describe("storage-meta", () => {
             clearSession(toDatabase(db), "session-1");
 
             //#then
-            // The shared deleter prepares and executes every table inside one
-            // encompassing transaction; message-index rows no longer need a
-            // separate nested cleanup transaction.
+            // clearSession deletes all owned tables inside one transaction.
+            // Retry marks are deleted before their compartment IDs disappear;
+            // the session activity mark is removed after the table rows.
+            // While the FTS rowid-map backfill is unfinished, two of the
+            // statements read its state and sweep the session's unmapped
+            // legacy FTS rows.
             expect(db.transaction).toHaveBeenCalledTimes(1);
-            expect(db.prepare).toHaveBeenCalledTimes(31);
+            expect(db.prepare).toHaveBeenCalledTimes(38);
         });
     });
 });

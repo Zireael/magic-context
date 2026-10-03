@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -63,6 +63,7 @@ import { resolvePromptSurface } from "@magic-context/core/shared/prompt-surface"
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
 import { clearAutoSearchForPiSession } from "./auto-search-pi";
 import {
@@ -107,7 +108,7 @@ describe("Pi context project identity cache", () => {
 	it("serves byte-identical output with cached identity and one host-usage read per context", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-project-identity-cache";
-		const project = mkdtempSync(join(tmpdir(), "mc-pi-project-"));
+		const project = createTestTempDirFromPath(join(tmpdir(), "mc-pi-project-"));
 		const fake = createFakePi();
 		let probes = 0;
 		let usageReads = 0;
@@ -137,9 +138,21 @@ describe("Pi context project identity cache", () => {
 			};
 
 			const firstHash = await pass();
+			const binding = () =>
+				db
+					.prepare(
+						"SELECT project_path, updated_at FROM session_projects WHERE session_id = ? AND harness = 'pi'",
+					)
+					.get(sessionId) as {
+					project_path: string;
+					updated_at: number;
+				} | null;
+			const firstBinding = binding();
+			expect(firstBinding?.project_path).toMatch(/^dir:[0-9a-f]{12}$/);
 			expect(probes).toBeGreaterThan(0);
 			probes = 0;
 			expect(await pass()).toBe(firstHash);
+			expect(binding()).toEqual(firstBinding);
 			expect(probes).toBe(0);
 			expect(usageReads).toBe(2);
 		} finally {
@@ -151,11 +164,58 @@ describe("Pi context project identity cache", () => {
 	});
 });
 
+describe("Pi project binding retry", () => {
+	it("retries a failed first write without adding steady-state writes", () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-retry-binding";
+		const schema = (
+			db
+				.prepare(
+					"SELECT sql FROM sqlite_master WHERE name = 'session_projects'",
+				)
+				.get() as { sql: string }
+		).sql;
+		try {
+			db.exec("DROP TABLE session_projects");
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:retry",
+				db,
+			);
+			db.exec(schema);
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:retry",
+				db,
+			);
+			const binding = () =>
+				db
+					.prepare(
+						"SELECT project_path, updated_at FROM session_projects WHERE session_id = ? AND harness = 'pi'",
+					)
+					.get(sessionId);
+			const first = binding();
+			expect(first).toMatchObject({ project_path: "git:retry" });
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:retry",
+				db,
+			);
+			expect(binding()).toEqual(first);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+});
+
 describe("Pi protected-token floor wiring", () => {
 	it("snapshots the derived floor instead of a project-only decrease", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-project-protected-floor";
-		const project = mkdtempSync(join(tmpdir(), "mc-pi-protected-floor-"));
+		const project = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-protected-floor-"),
+		);
 		const fake = createFakePi();
 		try {
 			registerPiContextHandler(fake.pi as never, {
@@ -794,7 +854,9 @@ describe("Pi fallback tag adoption", () => {
 	});
 
 	it("re-probes a stale negative after fingerprint construction before skipping adoption", () => {
-		const dir = mkdtempSync(join(tmpdir(), "mc-pi-fallback-race-"));
+		const dir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-fallback-race-"),
+		);
 		const dbPath = join(dir, "context.db");
 		const db = createTestDb(dbPath);
 		const siblingDb = createTestDb(dbPath);
@@ -2568,7 +2630,7 @@ describe("registerPiContextHandler", () => {
 	});
 
 	it("clears a stale unkeyed detected limit from the same database after restart", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "mc-pi-stale-limit-"));
+		const dir = createTestTempDirFromPath(join(tmpdir(), "mc-pi-stale-limit-"));
 		const path = join(dir, "context.db");
 		const sessionId = "ses-pi-stale-detected-restart";
 		let db = createTestDb(path);
@@ -3935,6 +3997,101 @@ describe("registerPiContextHandler", () => {
 			expect(getBranchCalls).toBe(1);
 		} finally {
 			clearContextHandlerSession("ses-pi-branch-once");
+			closeQuietly(db);
+		}
+	});
+
+	it("serves injection drops and caveman compression identically on the next defer pass", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-drop-caveman-same-pass";
+		const gates: Array<{
+			shouldRunHeuristics: boolean;
+			shouldRunReasoningCleanup: boolean;
+		}> = [];
+		const restoreObserver =
+			contextHandlerInternals.setMutationGateObserverForTests((snapshot) =>
+				gates.push(snapshot),
+			);
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTags: 0,
+				heuristics: {
+					caveman: { enabled: true, minChars: 20 },
+					clearReasoningAge: 1,
+				},
+				scheduler: { executeThresholdPercentage: 80 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] } | undefined>;
+			const runPass = async (percent: number) => {
+				const messages = [
+					userMessage(
+						"<system-reminder>\n[BACKGROUND BASH COMPLETED]\nThe task has been completed and the results are available.\n</system-reminder>",
+						1,
+					),
+					assistantMessage(
+						"The implementation has been completed <think>stale private thought</think> and the verification results are available for the reviewer.",
+						2,
+					),
+					userMessage(
+						"Continue with the implementation and review the results carefully.",
+						3,
+					),
+					assistantMessage("latest answer", 4),
+					userMessage("latest request", 5),
+				];
+				const result = await handler({ messages: messages as never[] }, {
+					...fakeContext(
+						sessionId,
+						process.cwd(),
+						messages.map((_, i) => `entry-${i}`),
+						messages as never,
+					),
+					getContextUsage: () => ({
+						tokens: percent * 1_000,
+						percent,
+						contextWindow: 100_000,
+					}),
+				} as never);
+				if (!result) throw new Error("expected transformed messages");
+				return result.messages;
+			};
+			const executed = await runPass(90);
+			const tags = getTagsBySession(db, sessionId);
+			expect(tags.some((tag) => tag.status === "dropped")).toBe(true);
+			expect(
+				tags.some((tag) => tag.status === "active" && tag.cavemanDepth > 0),
+			).toBe(true);
+			expect(
+				getOrCreateSessionMeta(db, sessionId).clearedReasoningThroughTag,
+			).toBeGreaterThan(0);
+			expect(JSON.stringify(executed)).not.toContain("stale private thought");
+			updateSessionMeta(db, sessionId, {
+				lastResponseTime: Date.now(),
+				cacheTtl: "59m",
+				lastContextPercentage: 1,
+				lastInputTokens: 1_000,
+			});
+			const deferred = await runPass(1);
+			expect(gates.map((gate) => gate.shouldRunHeuristics)).toEqual([
+				true,
+				false,
+			]);
+			expect(gates.map((gate) => gate.shouldRunReasoningCleanup)).toEqual([
+				true,
+				false,
+			]);
+			expect(JSON.stringify(deferred)).toBe(JSON.stringify(executed));
+			expect(JSON.stringify(executed)).not.toContain(
+				"BACKGROUND BASH COMPLETED",
+			);
+		} finally {
+			restoreObserver();
+			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
 		}
 	});
@@ -6415,7 +6572,9 @@ for (const withTools of [false, true]) {
 
 describe("Pi transform_decisions dropped_tokens telemetry", () => {
 	it("sums persisted output token counts for dropped tags and records dropped_tokens", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-dropped-tokens-sum-"));
+		const tempDir = createTestTempDirFromPath(
+			join(tmpdir(), "pi-dropped-tokens-sum-"),
+		);
 		const dbPath = join(tempDir, "context.db");
 		const db = openDatabase(dbPath);
 		const sessionId = "ses-pi-dropped-tokens-sum";
@@ -6515,7 +6674,9 @@ describe("Pi transform_decisions dropped_tokens telemetry", () => {
 	});
 
 	it("never sends a whole multi-megabyte message array to the exact tokenizer seam during drop pass", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-dropped-tokens-seam-"));
+		const tempDir = createTestTempDirFromPath(
+			join(tmpdir(), "pi-dropped-tokens-seam-"),
+		);
 		const dbPath = join(tempDir, "context.db");
 		const db = openDatabase(dbPath);
 		const sessionId = "ses-pi-tokenizer-seam";
@@ -6603,7 +6764,9 @@ describe("Pi transform_decisions dropped_tokens telemetry", () => {
 	});
 
 	it("keeps execute and following defer bytes pinned while draining the same operations", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-dropped-tokens-parity-"));
+		const tempDir = createTestTempDirFromPath(
+			join(tmpdir(), "pi-dropped-tokens-parity-"),
+		);
 		const dbPath = join(tempDir, "context.db");
 		const db = openDatabase(dbPath);
 		const sessionId = "ses-pi-wire-parity";
@@ -6690,7 +6853,9 @@ describe("Pi transform_decisions dropped_tokens telemetry", () => {
 	});
 
 	it("constant-mutation test: fails if writer records constant 0 across passes with different reduction masses", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-const-mutation-test-"));
+		const tempDir = createTestTempDirFromPath(
+			join(tmpdir(), "pi-const-mutation-test-"),
+		);
 		const dbPath = join(tempDir, "context.db");
 		const db = openDatabase(dbPath);
 		try {
@@ -7216,6 +7381,113 @@ describe("Pi proactive strip of invalidated thinking", () => {
 			expect(sha256(defer.slice(0, busting.length))).toBe(sha256(busting));
 			// Thinking produced after the strip is kept.
 			expect(thinkingIn(defer[5])).toBe(1);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	// Anthropic's "What counts as an edit" table
+	// (https://platform.claude.com/docs/en/build-with-claude/preserved-thinking):
+	// "Remove `thinking` blocks from the start of the history" is valid.
+	it('"Remove `thinking` blocks from the start of the history" is valid, so a trim-only busting pass keeps every newer signed block and the defer pass replays it', async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-trim-only";
+		const fake = createFakePi();
+		try {
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				heuristics: { clearReasoningAge: 4 },
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: unknown[] } | undefined>;
+			// The age clear empties a block (every Pi serializer then drops it); a
+			// strip removes it. Either way it leaves no thinking text.
+			const liveThinking = (message: unknown): number => {
+				const content = (message as { content?: unknown }).content;
+				if (!Array.isArray(content)) return 0;
+				return (content as { type?: string; thinking?: string }[]).filter(
+					(part) => part.type === "thinking" && part.thinking !== "",
+				).length;
+			};
+			const build = (turns: number) => {
+				const messages: Record<string, unknown>[] = [];
+				const entryIds: string[] = [];
+				for (let turn = 0; turn < turns; turn++) {
+					messages.push(userMessage(`request ${turn}`, turn * 2 + 1));
+					entryIds.push(`entry-u${turn}`);
+					messages.push(
+						opusAssistant(`thought ${turn}`, `answer ${turn}`, turn * 2 + 2),
+					);
+					entryIds.push(`entry-a${turn}`);
+				}
+				return { messages, entryIds };
+			};
+			const pass = async (turns: number, percent: number) => {
+				const { messages, entryIds } = build(turns);
+				const result = await handler({ messages: messages as never[] }, {
+					...fakeContext(sessionId, process.cwd(), entryIds, messages as never),
+					model: { provider: "anthropic", id: "claude-opus-5-5" },
+					getContextUsage: () => ({
+						tokens: percent * 1000,
+						percent,
+						contextWindow: 100_000,
+					}),
+				} as never);
+				return (result?.messages ?? messages) as unknown[];
+			};
+
+			// The first render busts and strips the two turns it serves.
+			await pass(2, 10);
+			// Eight newer turns arrive on defer passes and keep their thinking.
+			const served = await pass(10, 10);
+			expect(served.slice(4).map(liveThinking)).toEqual(
+				Array.from({ length: 16 }, (_, i) => i % 2),
+			);
+			const strippedBefore = getMergedReasoningStrippedIds(db, sessionId);
+
+			// A force-band pass whose only edit is the oldest-prefix thinking clear.
+			const trim = await pass(10, 96);
+			const cleared = trim.filter(
+				(message, index) =>
+					index % 2 === 1 && index >= 4 && liveThinking(message) === 0,
+			);
+			expect(cleared.length).toBeGreaterThan(0);
+			// Cleared thinking is a contiguous oldest prefix of the kept turns...
+			const kept = trim
+				.map((message, index) => ({ index, thinking: liveThinking(message) }))
+				.filter(({ index }) => index % 2 === 1 && index >= 4)
+				.map(({ thinking }) => thinking);
+			expect(kept).toEqual([...kept].sort((a, b) => a - b));
+			expect(kept.at(-1)).toBe(1);
+			// ...and nothing newer was stripped: the newer turns are byte-identical.
+			expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(
+				strippedBefore,
+			);
+			const firstKept = trim.findIndex(
+				(message, index) =>
+					index >= 4 && index % 2 === 1 && liveThinking(message) === 1,
+			);
+			expect(sha256(trim.slice(firstKept))).toBe(
+				sha256(served.slice(firstKept)),
+			);
+
+			const defer = await pass(10, 10);
+			expect(sha256(defer)).toBe(sha256(trim));
+
+			// "Clear or shorten an earlier `tool_result`" (or any earlier content)
+			// invalidates every later block: a pass that trims and renders a drop
+			// strips them all.
+			const dropped = getTagsBySession(db, sessionId).find(
+				(tag) => tag.messageId === "entry-u3:p0",
+			);
+			if (!dropped) throw new Error("missing tag for an older user message");
+			updateTagStatus(db, sessionId, dropped.tagNumber, "dropped");
+			signalPiPendingMaterialization(sessionId);
+			const dropPass = await pass(10, 96);
+			expect(dropPass.map(liveThinking)).toEqual(Array(20).fill(0));
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);

@@ -141,12 +141,27 @@ pub struct McModuleConfig {
     /// Per-model TTL overrides from the object config shape. Resolution uses the
     /// shared exact, bare, dash-stripped, provider-wildcard, then default walk.
     pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
-    /// Whether the module writes the host's context.db domain tables directly.
-    ///
-    /// User-tier only for the same reason the model chain is: it decides which database
-    /// file this process writes, and a cloned repository must not be able to redirect
-    /// that. `off` leaves the existing mirror as the only path.
-    pub single_store: crate::host_store::SingleStoreMode,
+    /// Settings only `tool.catalog` reads (`src/tool_catalog.rs`).
+    pub catalog: CatalogConfigInputs,
+}
+
+/// The configuration `tool.catalog` reads that nothing else in the module does.
+/// The plugin reads the same keys for its own prompt surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogConfigInputs {
+    /// `prompt_surface.default` (`full` or `light`); unset means full. The user
+    /// or the project tier may set it: it selects among shipped texts and adds none.
+    pub prompt_surface_default: Option<String>,
+    /// `prompt_surface.models`: model key to `full` or `light`. The user or the
+    /// project tier; a project entry replaces the user entry for the same key.
+    pub prompt_surface_models: std::collections::BTreeMap<String, String>,
+    /// `prompt_surface.tool_descriptions`: replacement tool descriptions.
+    /// USER-tier only, because a cloned repository must not be able to write
+    /// model-facing text.
+    pub tool_descriptions: std::collections::BTreeMap<String, String>,
+    /// Whether the dreamer can run: a `dreamer` block is configured in either
+    /// tier and `dreamer.disable` is not true (the plugin's `isDreamerRunnable`).
+    pub dreamer_runnable: bool,
 }
 
 impl Default for McModuleConfig {
@@ -178,7 +193,7 @@ impl Default for McModuleConfig {
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             cache_ttl_by_model: std::collections::BTreeMap::new(),
-            single_store: crate::host_store::SingleStoreMode::Off,
+            catalog: CatalogConfigInputs::default(),
         }
     }
 }
@@ -354,7 +369,7 @@ impl ConfigCache {
     }
 
     pub fn effective_for_paths(&mut self, user_path: &Path, project_root: &Path) -> McModuleConfig {
-        let project_path = project_root.join(".cortexkit").join("magic-context.jsonc");
+        let project_path = detect_config_file(&project_root.join(".cortexkit"));
         let user = read_tier_cached(&mut self.user, user_path.to_path_buf());
         let project = read_tier_cached(&mut self.project, project_path);
         let (mut effective, mut warnings) =
@@ -418,16 +433,57 @@ pub fn user_configured_runners_at(user_path: &Path) -> ConfiguredRunners {
 }
 
 fn user_config_path() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(xdg)
-            .join("cortexkit")
-            .join("magic-context.jsonc");
+    user_config_path_from(std::env::var_os("XDG_CONFIG_HOME"), user_home_dir())
+}
+
+/// The user config file, chosen the way the host chooses it (`configHome()` and
+/// `detectConfigFile` in the plugin): `XDG_CONFIG_HOME` counts only when it is an absolute
+/// path, otherwise `<home>/.config`; in that directory `magic-context.jsonc` wins and
+/// `magic-context.json` is read when only it exists. A relative or empty `XDG_CONFIG_HOME`
+/// would otherwise resolve against whatever directory the module happened to start in,
+/// and the module would read a different file than the host it serves.
+fn user_config_path_from(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    let config_home = xdg_config_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.unwrap_or_else(|| PathBuf::from(".")).join(".config"));
+    detect_config_file(&config_home.join("cortexkit"))
+}
+
+/// `magic-context.jsonc` in `directory`, or `magic-context.json` when only that exists,
+/// matching the host's `detectConfigFile`. When neither exists the `.jsonc` path is
+/// returned, which reads as "no file".
+fn detect_config_file(directory: &Path) -> PathBuf {
+    let jsonc = directory.join("magic-context.jsonc");
+    if jsonc.exists() {
+        return jsonc;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".config")
-        .join("cortexkit")
-        .join("magic-context.jsonc")
+    let json = directory.join("magic-context.json");
+    if json.exists() {
+        return json;
+    }
+    jsonc
+}
+
+/// The user's home directory the way Node's `os.homedir()` finds it, which is what the
+/// host uses: a non-empty `HOME` first (on Windows, `USERPROFILE` before it), then the
+/// platform's own answer (the password database, or the Windows profile directory).
+/// `None` only when no home can be found at all; callers must not substitute the current
+/// directory or `/`, which name somewhere unrelated to the user.
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    let non_empty = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    #[cfg(windows)]
+    if let Some(profile) = non_empty("USERPROFILE") {
+        return Some(profile);
+    }
+    non_empty("HOME").or_else(|| std::env::home_dir().filter(|home| !home.as_os_str().is_empty()))
 }
 
 fn read_tier_cached(cache: &mut TierConfig, path: PathBuf) -> Option<Value> {
@@ -438,10 +494,29 @@ fn read_tier_cached(cache: &mut TierConfig, path: PathBuf) -> Option<Value> {
     cache.path = path.clone();
     cache.mtime = mtime;
     cache.value = match fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&strip_jsonc(&raw)).ok(),
+        Ok(raw) => parse_config_text(&raw).map_or_else(
+            |error| {
+                // The host reports an unreadable file and uses defaults for it; say so here
+                // too, rather than silently running on defaults the user did not choose.
+                emit_warnings(vec![format!(
+                    "{}: {error}; using defaults for this file",
+                    path.display()
+                )]);
+                None
+            },
+            Some,
+        ),
         Err(_) => None,
     };
     cache.value.clone()
+}
+
+/// Parse one config file's text. A leading UTF-8 byte-order mark is dropped first:
+/// editors on Windows commonly write one, the host strips it before parsing, and
+/// `serde_json` rejects it.
+fn parse_config_text(raw: &str) -> Result<Value, serde_json::Error> {
+    let without_bom = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    serde_json::from_str(&strip_jsonc(without_bom))
 }
 
 #[cfg(test)]
@@ -582,16 +657,6 @@ fn merge_tiers_with_warnings(
                 }
             }
         }
-        if let Some(raw) = user.pointer("/single_store").and_then(Value::as_str) {
-            match crate::host_store::SingleStoreMode::parse(raw) {
-                Some(mode) => cfg.single_store = mode,
-                // A typo must not read as "off": that is the value a user would get
-                // silently, and it looks exactly like the feature simply not working.
-                None => warnings.push(format!(
-                    "ignoring single_store value {raw:?}; expected \"off\", \"shadow\", or \"on\""
-                )),
-            }
-        }
         if let Some(language) = user
             .pointer("/language")
             .and_then(Value::as_str)
@@ -728,7 +793,6 @@ fn merge_tiers_with_warnings(
         {
             cfg.temporal_awareness = enabled;
         }
-        warn_ignored_project_key(project, "/single_store", &mut warnings);
         warn_ignored_project_key(
             project,
             "/prompt_surface/guidance_override_text",
@@ -741,12 +805,72 @@ fn merge_tiers_with_warnings(
         );
     }
 
+    apply_catalog_config(&mut cfg.catalog, user, project);
+
     cfg.execute_threshold_user_config
         .get_or_insert(ExecuteThresholdConfig::Percentage(
             DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
         ));
     cfg.execute_threshold_percentage = cfg.resolve_execute_threshold(None).percentage;
     (cfg, warnings)
+}
+
+/// Read the settings only `tool.catalog` uses. Invalid entries are skipped, so a
+/// typo falls back to the default wording rather than refusing every catalog.
+fn apply_catalog_config(
+    catalog: &mut CatalogConfigInputs,
+    user: Option<&Value>,
+    project: Option<&Value>,
+) {
+    let is_surface = |value: &str| value == "full" || value == "light";
+    for tier in [user, project].into_iter().flatten() {
+        if let Some(default) = tier
+            .pointer("/prompt_surface/default")
+            .and_then(Value::as_str)
+            .filter(|value| is_surface(value))
+        {
+            catalog.prompt_surface_default = Some(default.to_string());
+        }
+        if let Some(models) = tier
+            .pointer("/prompt_surface/models")
+            .and_then(Value::as_object)
+        {
+            for (key, value) in models {
+                if let Some(surface) = value.as_str().filter(|value| is_surface(value)) {
+                    if !key.trim().is_empty() {
+                        catalog
+                            .prompt_surface_models
+                            .insert(key.clone(), surface.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(descriptions) = user
+        .and_then(|user| user.pointer("/prompt_surface/tool_descriptions"))
+        .and_then(Value::as_object)
+    {
+        for (tool, text) in descriptions {
+            if let Some(text) = text.as_str().filter(|text| !text.trim().is_empty()) {
+                if !tool.trim().is_empty() {
+                    catalog
+                        .tool_descriptions
+                        .insert(tool.clone(), text.to_string());
+                }
+            }
+        }
+    }
+    let configured = [user, project]
+        .into_iter()
+        .flatten()
+        .any(|tier| tier.pointer("/dreamer").is_some_and(Value::is_object));
+    // The project tier's `disable` takes precedence over the user tier's.
+    let disabled = [project, user]
+        .into_iter()
+        .flatten()
+        .find_map(|tier| tier.pointer("/dreamer/disable").and_then(Value::as_bool))
+        .unwrap_or(false);
+    catalog.dreamer_runnable = configured && !disabled;
 }
 
 fn warn_ignored_project_key(value: &Value, pointer: &str, warnings: &mut Vec<String>) {
@@ -1056,6 +1180,61 @@ mod cache_ttl_tests {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn catalog_settings_follow_the_tiers_the_plugin_allows() {
+        let unconfigured = merge_tiers(None, None).catalog;
+        assert_eq!(unconfigured, CatalogConfigInputs::default());
+        assert!(
+            !unconfigured.dreamer_runnable,
+            "no dreamer block, no dreamer"
+        );
+
+        let user = serde_json::json!({
+            "prompt_surface": {
+                "default": "light",
+                "models": {"anthropic/claude-haiku-4-5": "light", "openai/*": "full", "bad": "tiny"},
+                "tool_descriptions": {"ctx_search": "Search it.", "ctx_note": "  "},
+            },
+            "dreamer": {"runner": "host"},
+        });
+        let project = serde_json::json!({
+            "prompt_surface": {
+                "default": "full",
+                "models": {"openai/*": "light"},
+                "tool_descriptions": {"ctx_search": "repository-controlled text"},
+            },
+            "dreamer": {"disable": true},
+        });
+        let user_only = merge_tiers(Some(&user), None).catalog;
+        assert_eq!(user_only.prompt_surface_default.as_deref(), Some("light"));
+        assert!(user_only.dreamer_runnable);
+        assert_eq!(
+            user_only.tool_descriptions,
+            std::collections::BTreeMap::from([(
+                "ctx_search".to_string(),
+                "Search it.".to_string()
+            )]),
+            "blank descriptions are skipped"
+        );
+
+        let both = merge_tiers(Some(&user), Some(&project)).catalog;
+        // The project tier may pick among shipped wordings, but never write
+        // model-facing text, and its `dreamer.disable` takes precedence.
+        assert_eq!(both.prompt_surface_default.as_deref(), Some("full"));
+        assert_eq!(
+            both.prompt_surface_models,
+            std::collections::BTreeMap::from([
+                (
+                    "anthropic/claude-haiku-4-5".to_string(),
+                    "light".to_string()
+                ),
+                ("openai/*".to_string(), "light".to_string()),
+            ])
+        );
+        assert_eq!(both.tool_descriptions, user_only.tool_descriptions);
+        assert!(!both.dreamer_runnable);
+    }
 
     #[test]
     fn an_unconfigured_runner_is_left_to_the_harness_and_only_the_user_may_set_it() {
@@ -1495,39 +1674,6 @@ mod tests {
     }
 
     #[test]
-    fn single_store_is_user_tier_only_and_defaults_off() {
-        use crate::host_store::SingleStoreMode;
-
-        assert_eq!(merge_tiers(None, None).single_store, SingleStoreMode::Off);
-
-        let user = serde_json::json!({ "single_store": "shadow" });
-        let project = serde_json::json!({ "single_store": "on" });
-        let (cfg, warnings) = merge_tiers_with_warnings(Some(&user), Some(&project));
-        assert_eq!(cfg.single_store, SingleStoreMode::Shadow);
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("/single_store")),
-            "a project tier attempt must warn, not take effect: {warnings:?}"
-        );
-    }
-
-    #[test]
-    fn an_unrecognized_single_store_value_warns_instead_of_reading_as_off() {
-        use crate::host_store::SingleStoreMode;
-
-        let user = serde_json::json!({ "single_store": "enabled" });
-        let (cfg, warnings) = merge_tiers_with_warnings(Some(&user), None);
-        assert_eq!(cfg.single_store, SingleStoreMode::Off);
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("single_store") && warning.contains("enabled")),
-            "{warnings:?}"
-        );
-    }
-
-    #[test]
     fn historian_budget_derivation_clamps_at_both_bounds() {
         assert_eq!(derive_historian_chunk_tokens(1), 8_000);
         assert_eq!(derive_historian_chunk_tokens(32_000), 8_000);
@@ -1741,5 +1887,115 @@ mod tests {
         filetime::set_file_mtime(&user, newer).unwrap();
         let reloaded = cache.effective_for_paths(&user, &project);
         assert_eq!(reloaded.historian_temperature, Some(0.2));
+    }
+}
+
+#[cfg(test)]
+mod config_file_location_tests {
+    use super::*;
+
+    fn user_tier_temperature(path: &Path) -> Option<f64> {
+        let project = tempfile::tempdir().unwrap();
+        ConfigCache::default()
+            .effective_for_paths(path, project.path())
+            .historian_temperature
+    }
+
+    #[test]
+    fn a_config_with_a_byte_order_mark_is_read_not_replaced_by_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magic-context.jsonc");
+        std::fs::write(
+            &path,
+            "\u{feff}{ // user tier\n \"historian\": { \"temperature\": 0.3 } }",
+        )
+        .unwrap();
+        assert_eq!(user_tier_temperature(&path), Some(0.3));
+    }
+
+    #[test]
+    fn a_json_config_is_read_when_no_jsonc_exists_and_jsonc_wins_when_both_do() {
+        let home = tempfile::tempdir().unwrap();
+        let cortexkit = home.path().join(".config").join("cortexkit");
+        std::fs::create_dir_all(&cortexkit).unwrap();
+        let json = cortexkit.join("magic-context.json");
+        std::fs::write(&json, r#"{ "historian": { "temperature": 0.4 } }"#).unwrap();
+        let chosen = user_config_path_from(None, Some(home.path().to_path_buf()));
+        assert_eq!(chosen, json);
+        assert_eq!(user_tier_temperature(&chosen), Some(0.4));
+
+        let jsonc = cortexkit.join("magic-context.jsonc");
+        std::fs::write(&jsonc, r#"{ "historian": { "temperature": 0.5 } }"#).unwrap();
+        assert_eq!(
+            user_config_path_from(None, Some(home.path().to_path_buf())),
+            jsonc
+        );
+
+        // The project tier follows the same rule.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".cortexkit")).unwrap();
+        std::fs::write(
+            project.path().join(".cortexkit/magic-context.json"),
+            r#"{ "memory": { "enabled": false } }"#,
+        )
+        .unwrap();
+        let effective = ConfigCache::default()
+            .effective_for_paths(&home.path().join("absent.jsonc"), project.path());
+        assert!(!effective.memory_enabled);
+    }
+
+    #[test]
+    fn a_relative_or_empty_xdg_config_home_is_ignored_like_the_host_ignores_it() {
+        let home = PathBuf::from("/home/someone");
+        let expected = home
+            .join(".config")
+            .join("cortexkit")
+            .join("magic-context.jsonc");
+        for xdg in ["", "relative/config", "."] {
+            assert_eq!(
+                user_config_path_from(Some(xdg.into()), Some(home.clone())),
+                expected,
+                "XDG_CONFIG_HOME={xdg:?}"
+            );
+        }
+        assert_eq!(
+            user_config_path_from(Some("/etc/xdg".into()), Some(home)),
+            PathBuf::from("/etc/xdg/cortexkit/magic-context.jsonc")
+        );
+    }
+    /// With `HOME` empty (or unset, as it usually is on Windows) the paths must still be
+    /// under the user's real home, not relative to whatever directory the module started
+    /// in. Runs in a child process so changing the environment cannot race other tests.
+    #[test]
+    fn an_empty_home_falls_back_to_the_platform_home_not_the_current_directory() {
+        const CHILD: &str = "MC_TEST_EMPTY_HOME_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let home = user_home_dir().expect("the platform knows this user's home");
+            assert!(home.is_absolute(), "{home:?}");
+            assert!(user_config_path().is_absolute(), "{:?}", user_config_path());
+            let context_db = crate::host_store::resolve_context_db_path();
+            assert!(context_db.is_absolute(), "{context_db:?}");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::config_file_location_tests::an_empty_home_falls_back_to_the_platform_home_not_the_current_directory",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", "")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+            .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

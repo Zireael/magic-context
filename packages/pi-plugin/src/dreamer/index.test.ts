@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -26,10 +27,12 @@ import { getSubagentInvocations } from "@magic-context/core/features/magic-conte
 import * as logger from "@magic-context/core/shared/logger";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { __setPiHarnessKindForTesting } from "../pi-harness-kind";
 import { PiSubagentRunner } from "../subagent-runner";
 import {
 	__test,
+	abortInFlightDreamers,
 	awaitInFlightDreamers,
 	registerPiDreamerProject,
 	runPiDreamForProject,
@@ -156,6 +159,108 @@ afterEach(() => {
 });
 
 describe("Pi dreamer wiring", () => {
+	test("shutdown aborts an owner-bound dreamer child and ps finds no survivor", async () => {
+		db = createDb();
+		const owner = {};
+		const identity = "git:pi-dream-shutdown-child";
+		let client!: CapturedDreamClient;
+		let pid = 0;
+		__test.setStartDreamScheduleTimerFactory(async (registration) => {
+			client = registration.client as CapturedDreamClient;
+			return () => {};
+		});
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: ({ signal }: { signal: AbortSignal }) =>
+						new Promise((resolve) => {
+							const child = spawn(
+								process.execPath,
+								["-e", "setInterval(() => {}, 1000)"],
+								{ stdio: "ignore", windowsHide: true },
+							);
+							pid = child.pid ?? 0;
+							signal.addEventListener("abort", () => child.kill("SIGTERM"), {
+								once: true,
+							});
+							child.once("close", () =>
+								resolve({ ok: false, reason: "abort", error: "cancelled" }),
+							);
+						}),
+				}) as never,
+		);
+		registerPiDreamerProject(
+			dreamerOptions({
+				database: db,
+				projectIdentity: identity,
+				projectDir: process.cwd(),
+				registrationOwner: owner,
+				config: DreamerConfigSchema.parse({
+					pi: { model: "test/model" },
+					tasks: { curate: { schedule: "0 4 * * *" } },
+				}),
+			}),
+		);
+		await flushMicrotasks();
+		const session = (await client.session.create({})) as { id: string };
+		const prompt = client.session.prompt({
+			path: { id: session.id },
+			body: { parts: [{ text: "dream" }] },
+		});
+		await flushMicrotasks();
+		expect(pid).toBeGreaterThan(0);
+		abortInFlightDreamers(owner);
+		await expect(prompt).rejects.toThrow("abort");
+		await awaitInFlightDreamers(owner);
+		expect(() =>
+			execFileSync("ps", ["-p", String(pid), "-o", "pid="], {
+				windowsHide: true,
+			}),
+		).toThrow();
+	});
+	test("manual dreamer uses the cap sampled for each child run", async () => {
+		db = createDb();
+		const identity = "git:pi-live-dreamer-cap";
+		const owner = {};
+		const caps: Array<number | undefined> = [];
+		let liveCap = 4096;
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async (args: { maxOutputTokens?: number }) => {
+						caps.push(args.maxOutputTokens);
+						return { ok: true, assistantText: "curation complete" };
+					}),
+				}) as never,
+		);
+		const config = DreamerConfigSchema.parse({
+			maxTokens: 2048,
+			pi: { model: "test/model" },
+			tasks: { curate: { schedule: "0 4 * * *" } },
+		});
+		insertMemory(db, {
+			projectPath: identity,
+			category: "PROJECT_RULES",
+			content: "Keep run-local caps.",
+		});
+		registerPiDreamerProject({
+			...dreamerOptions({
+				database: db,
+				projectIdentity: identity,
+				projectDir: process.cwd(),
+				registrationOwner: owner,
+				config,
+			}),
+			sampleDreamRun: () => ({
+				dreamerConfig: { ...config, maxTokens: liveCap },
+			}),
+		});
+		await runPiDreamForProject(identity, "curate", owner);
+		liveCap = 8192;
+		await runPiDreamForProject(identity, "curate", owner);
+		expect(caps).toEqual([4096, 8192]);
+	});
 	test("drops an unknown fallback with a warning while the valid primary runs", async () => {
 		db = createDb();
 		const identity = "git:pi-model-validation";
@@ -215,6 +320,40 @@ describe("Pi dreamer wiring", () => {
 		}
 	});
 
+	test("defers OMP primary and fallback role validation to the host only", () => {
+		const find = mock((provider: string, model: string) =>
+			provider === "mock" && model === "known" ? {} : undefined,
+		);
+		const registry = { find };
+		const task = {
+			task: "classify-memories" as const,
+			schedule: "",
+			timeoutMinutes: 20,
+			model: "@dreamer",
+			fallbackModels: [
+				{ model: "@cheap", qualifier: "low" },
+				"mock/missing",
+				"mock/known",
+			],
+		};
+		expect(validatePiDreamerModels([task], registry, "omp")[0]).toMatchObject({
+			model: "@dreamer",
+			fallbackModels: [{ model: "@cheap", qualifier: "low" }, "mock/known"],
+			modelChainUnavailable: false,
+		});
+		expect(find.mock.calls).toEqual([
+			["mock", "missing"],
+			["mock", "known"],
+		]);
+		expect(validatePiDreamerModels([task], registry, "pi")[0]).toMatchObject({
+			model: "mock/known",
+			fallbackModels: [],
+		});
+		expect(validatePiDreamerModels([task], registry, "omp")[0].model).toBe(
+			"@dreamer",
+		);
+	});
+
 	test("marks a chain with no Pi-resolvable models unavailable", () => {
 		const tasks = validatePiDreamerModels(
 			[
@@ -247,6 +386,31 @@ describe("Pi dreamer wiring", () => {
 				}),
 			);
 		expect(starts).toBe(0);
+	});
+
+	// A directory the identity resolver refuses (the home directory, or a folder
+	// inside a dotfiles repository rooted at home) resolves to no identity. The
+	// empty string must never become a dreamer project key: every task would run
+	// against project "" and log "registered project " with a blank name.
+	test("does not register a project with an empty identity", () => {
+		db = createDb();
+		const dir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-dreamer-empty-identity-"),
+		);
+		try {
+			let starts = 0;
+			__test.setStartDreamScheduleTimerFactory(async () => {
+				starts++;
+				return () => {};
+			});
+			for (const projectIdentity of ["", "   "])
+				registerPiDreamerProject(
+					dreamerOptions({ database: db, projectIdentity, projectDir: dir }),
+				);
+			expect(starts).toBe(0);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 	test("classifies a provider refusal surfaced by a Pi child runner", async () => {
 		db = createDb();
@@ -446,6 +610,27 @@ describe("Pi dreamer wiring", () => {
 		expect(registration?.embeddingConfig?.provider).toBe("local");
 	});
 
+	// Pi schedules through the plugin's dream timer, which stops scheduling and
+	// deletes the schedule rows of a project whose `memory.enabled` is false. Pi
+	// must pass that setting through, not leave it unset (which means enabled).
+	test("threads a disabled project memory into scheduled maintenance", async () => {
+		db = createDb();
+		let registration: { memoryEnabled?: boolean } | undefined;
+		__test.setStartDreamScheduleTimerFactory(async (captured) => {
+			registration = captured;
+			return mock(() => {});
+		});
+		const opts = dreamerOptions({
+			database: db,
+			projectIdentity: "git:pi-memory-disabled",
+		});
+
+		registerPiDreamerProject({ ...opts, memoryEnabled: false });
+		await flushMicrotasks();
+
+		expect(registration?.memoryEnabled).toBe(false);
+	});
+
 	test("threads OMP identity into scheduled dreamer model resolution", async () => {
 		db = createDb();
 		let harness: string | undefined;
@@ -617,7 +802,7 @@ describe("Pi dreamer wiring", () => {
 	});
 
 	test("persists an OMP 18.1.11 dreamer task stream with tokens and task label", async () => {
-		const testDataDir = mkdtempSync(
+		const testDataDir = createTestTempDirFromPath(
 			join(tmpdir(), "mc-pi-dreamer-accounting-"),
 		);
 		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;

@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import { toolPartHasUserAnswer } from "../../shared/user-answer";
 import {
     getRawSessionStoredMessageCount,
     readRawSessionMessageOrdinalPage,
@@ -890,9 +891,15 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
                     ? info.timeCompleted
                     : undefined;
         const parts = Array.isArray(raw.parts) ? raw.parts : [];
+        const syntheticParts = parts.filter(
+            (part) =>
+                part === null ||
+                typeof part !== "object" ||
+                (part as Record<string, unknown>).type !== "compaction",
+        );
         const synthetic =
-            parts.length > 0 &&
-            parts.every(
+            syntheticParts.length > 0 &&
+            syntheticParts.every(
                 (part) =>
                     part !== null &&
                     typeof part === "object" &&
@@ -901,6 +908,7 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
             );
         const content: Record<string, unknown>[] = [];
         const recoveryToolTitles: Record<string, string> = {};
+        const userAnswerBlocks: number[] = [];
         for (const partValue of parts) {
             if (partValue === null || typeof partValue !== "object") continue;
             const part = partValue as Record<string, unknown>;
@@ -978,6 +986,7 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
                             : typeof state.error === "string"
                               ? state.error
                               : "";
+                    if (toolPartHasUserAnswer(part)) userAnswerBlocks.push(content.length);
                     content.push({
                         kind: {
                             type: "tool_result",
@@ -1011,10 +1020,17 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
             ck: {
                 role,
                 content,
-                ...(Object.keys(recoveryToolTitles).length > 0
+                ...(Object.keys(recoveryToolTitles).length > 0 || userAnswerBlocks.length > 0
                     ? {
                           provider_extras: {
-                              opencode: { ctx_expand_tool_titles: recoveryToolTitles },
+                              opencode: {
+                                  ...(Object.keys(recoveryToolTitles).length > 0
+                                      ? { ctx_expand_tool_titles: recoveryToolTitles }
+                                      : {}),
+                                  ...(userAnswerBlocks.length > 0
+                                      ? { user_answer_block_indices: userAnswerBlocks }
+                                      : {}),
+                              },
                           },
                       }
                     : {}),

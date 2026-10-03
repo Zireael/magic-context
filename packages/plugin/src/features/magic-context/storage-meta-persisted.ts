@@ -19,11 +19,11 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 import {
     isPersistedTrailingBlankDecision,
     type PersistedTrailingBlankDecision,
-    parseReplayDocument,
     ReplayDocumentError,
+    readAllTrailingBlankDecisions,
     readReplayDocument,
     readReplayTrailingBlankSubset,
-    updateReplayDocument,
+    updateTrailingBlankDecisions,
 } from "./storage-replay-document";
 
 export type { PersistedTrailingBlankDecision } from "./storage-replay-document";
@@ -184,6 +184,8 @@ export interface ProtectedTailDrainReservation {
     sessionId: string;
     runId: string;
     tokens: number;
+    /** Start of the drain window the tokens were charged to. */
+    windowStartedAt: number;
 }
 
 export interface ProtectedTailDrainBudgetState {
@@ -539,7 +541,6 @@ export function getWrapupInProgressState(
     const state = readRawWrapupState(db, sessionId);
     if (!state) return null;
     if (state.expiresAt > now) return state;
-    const transactionStartedAt = performance.now();
     try {
         db.exec("BEGIN IMMEDIATE");
     } catch {
@@ -548,6 +549,7 @@ export function getWrapupInProgressState(
         // reclaim the stale blob.
         return null;
     }
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         const current = readRawWrapupState(db, sessionId);
@@ -588,8 +590,8 @@ export function acquireWrapupInProgress(
         expiresAt: acquiredAt + WRAPUP_IN_PROGRESS_TTL_MS,
         updatedAt: acquiredAt,
     };
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         ensureSessionMetaRow(db, sessionId);
@@ -626,8 +628,8 @@ export function updateWrapupInProgress(
     updates: Partial<Omit<WrapupInProgressState, "holderId" | "acquiredAt">>,
     now = Date.now(),
 ): WrapupInProgressState | null {
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         const current = readRawWrapupState(db, sessionId);
@@ -663,8 +665,8 @@ export function updateWrapupInProgress(
 }
 
 export function releaseWrapupInProgress(db: Database, sessionId: string, holderId: string): void {
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         const current = readRawWrapupState(db, sessionId);
@@ -953,7 +955,12 @@ export function reserveProtectedTailDrainTokens(args: {
                 ok: true,
                 reservedTokens: reserved,
                 overQuotaBypass: bypass,
-                reservation: { sessionId: args.sessionId, runId: args.runId, tokens: reserved },
+                reservation: {
+                    sessionId: args.sessionId,
+                    runId: args.runId,
+                    tokens: reserved,
+                    windowStartedAt: activeWindowStartedAt,
+                },
                 budgetState: budgetState(meta.protectedTailDrainTokens + reserved),
             };
         })
@@ -994,6 +1001,13 @@ export function clearHistorianDrainFailure(db: Database, sessionId: string): voi
     }).immediate();
 }
 
+/**
+ * Give back the tokens of a run that did not spend them. The refund applies
+ * only while the window the tokens were charged to is still the current one:
+ * once the window has rolled over its counter already started again from zero,
+ * and subtracting the old reservation would hand a later run budget it never
+ * had.
+ */
 export function rollbackProtectedTailDrainReservation(
     db: Database,
     reservation: ProtectedTailDrainReservation | null,
@@ -1004,8 +1018,8 @@ export function rollbackProtectedTailDrainReservation(
         db.prepare(
             `UPDATE session_meta
              SET protected_tail_drain_tokens = MAX(0, COALESCE(protected_tail_drain_tokens, 0) - ?)
-             WHERE session_id = ?`,
-        ).run(reservation.tokens, reservation.sessionId);
+             WHERE session_id = ? AND protected_tail_drain_window_started_at = ?`,
+        ).run(reservation.tokens, reservation.sessionId, reservation.windowStartedAt);
     }).immediate();
 }
 
@@ -2355,12 +2369,14 @@ export function retireDeferredClearedCompactionMarkerState(db: Database, session
  */
 export const MAX_STRIPPED_PLACEHOLDER_IDS = 4096;
 
-interface StrippedPlaceholderState {
+export interface StrippedPlaceholderState {
     ids: string[];
     hiddenSeamIds: string[];
 }
 
-function parseStrippedPlaceholderState(raw: string | null | undefined): StrippedPlaceholderState {
+export function parseStrippedPlaceholderState(
+    raw: string | null | undefined,
+): StrippedPlaceholderState {
     if (!raw || raw.length === 0) return { ids: [], hiddenSeamIds: [] };
     try {
         const parsed = JSON.parse(raw) as unknown;
@@ -2401,7 +2417,7 @@ function parseStrippedBlob(raw: string | null | undefined): string[] {
     }
 }
 
-function serializeStrippedPlaceholderState(state: StrippedPlaceholderState): string {
+export function serializeStrippedPlaceholderState(state: StrippedPlaceholderState): string {
     if (state.ids.length === 0) return "";
     if (state.hiddenSeamIds.length === 0) return JSON.stringify(state.ids);
     return JSON.stringify(state);
@@ -2623,17 +2639,6 @@ export function addMergedReasoningStrippedIds(
 
 // ── Trailing assistant blank decisions (frozen replay map) ──
 
-function parseTrailingBlankDecisions(
-    raw: string | null | undefined,
-): Map<string, PersistedTrailingBlankDecision> {
-    try {
-        return new Map(Object.entries(parseReplayDocument(raw, "read").trailingBlank));
-    } catch (error) {
-        if (error instanceof ReplayDocumentError) return new Map();
-        throw error;
-    }
-}
-
 /**
  * Read each assistant's replay choice. A historical choice is immutable; the live
  * newest assistant may replace its choice until a later assistant freezes it.
@@ -2669,29 +2674,30 @@ export function addTrailingBlankDecisions(
         if (id.length === 0 || !isPersistedTrailingBlankDecision(decision)) return false;
     }
 
-    return updateReplayDocument(db, sessionId, (doc) => {
-        let changed = false;
-        for (const [id, decision] of add) {
-            const currentDecision = Object.hasOwn(doc.trailingBlank, id)
-                ? doc.trailingBlank[id]
-                : undefined;
-            if (
-                currentDecision === undefined ||
-                (id === options?.overwriteMessageId &&
-                    currentDecision !== decision &&
-                    currentDecision !== "strip")
-            ) {
-                Object.defineProperty(doc.trailingBlank, id, {
-                    value: decision,
-                    enumerable: true,
-                    writable: true,
-                    configurable: true,
-                });
-                changed = true;
+    return updateTrailingBlankDecisions(
+        db,
+        sessionId,
+        add.map(([id]) => id),
+        (current) => {
+            // Apply the additions in order, so a repeated id sees the decision an
+            // earlier entry in the same batch just recorded.
+            const working = new Map(current);
+            const changed = new Map<string, PersistedTrailingBlankDecision>();
+            for (const [id, decision] of add) {
+                const currentDecision = working.get(id);
+                if (
+                    currentDecision === undefined ||
+                    (id === options?.overwriteMessageId &&
+                        currentDecision !== decision &&
+                        currentDecision !== "strip")
+                ) {
+                    working.set(id, decision);
+                    changed.set(id, decision);
+                }
             }
-        }
-        return changed;
-    });
+            return changed;
+        },
+    );
 }
 
 /**
@@ -2711,18 +2717,17 @@ export function demoteTrailingBlankKeepDecisions(
     if (ids.size === 0) return [];
 
     let demotedIds: string[] = [];
-    const persisted = updateReplayDocument(db, sessionId, (doc) => {
+    const persisted = updateTrailingBlankDecisions(db, sessionId, ids, (current) => {
         demotedIds = [];
+        const changed = new Map<string, PersistedTrailingBlankDecision>();
         for (const id of ids) {
-            const decision = Object.hasOwn(doc.trailingBlank, id)
-                ? doc.trailingBlank[id]
-                : undefined;
+            const decision = current.get(id);
             if (decision === "keep" || decision?.startsWith("keep:") === true) {
-                doc.trailingBlank[id] = "strip";
+                changed.set(id, "strip");
                 demotedIds.push(id);
             }
         }
-        return demotedIds.length > 0;
+        return changed;
     });
     return persisted ? demotedIds : null;
 }
@@ -3035,7 +3040,13 @@ export function loadPostprocessReplaySnapshot(
             thinkingBindingRecoveryTarget.length > 0
                 ? thinkingBindingRecoveryTarget
                 : null,
-        trailingBlankDecisions: parseTrailingBlankDecisions(row?.trailing_blank_decisions),
+        // The decisions are rows of their own (storage-replay-document.ts),
+        // overlaid on whatever the column read above still carries.
+        trailingBlankDecisions: readAllTrailingBlankDecisions(
+            db,
+            sessionId,
+            row?.trailing_blank_decisions,
+        ),
     };
 }
 

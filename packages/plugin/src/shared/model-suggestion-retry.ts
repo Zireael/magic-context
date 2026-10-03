@@ -1,8 +1,10 @@
 import type { createOpencodeClient } from "@opencode-ai/sdk";
-
+import { DreamTokenBudgetExceeded } from "../features/magic-context/dreamer/token-budget";
 import { detectOverflow } from "../features/magic-context/overflow-detection";
 import { HiddenAgentStepLimit } from "../v2/hooks/hidden-child";
 import {
+    describeAssistantError,
+    describeAssistantSettlement,
     extractLatestAssistantFailure,
     extractLatestAssistantText,
 } from "./assistant-message-extractor";
@@ -115,6 +117,7 @@ export type PromptFailureClass =
     | "provider_timeout"
     | "provider_error"
     | "step_limit"
+    | "token_budget"
     | "empty_completion"
     | "no_models"
     | "child_aborted"
@@ -351,7 +354,12 @@ async function abortChildRun(client: Client, sessionId: string): Promise<void> {
  * different model.
  */
 function isNonRetryable(error: unknown, externalSignal?: AbortSignal): boolean {
-    if (externalSignal?.aborted || error instanceof HiddenAgentStepLimit) return true;
+    if (
+        externalSignal?.aborted ||
+        error instanceof HiddenAgentStepLimit ||
+        error instanceof DreamTokenBudgetExceeded
+    )
+        return true;
 
     if (error instanceof Error) {
         if (error.name === "AbortError") return true;
@@ -393,6 +401,7 @@ function classifyPromptFailure(
 ): PromptFailureClass {
     const message = extractMessage(error);
     if (error instanceof HiddenAgentStepLimit) return "step_limit";
+    if (error instanceof DreamTokenBudgetExceeded) return "token_budget";
     if (externalSignal?.aborted || message === "prompt aborted by external signal") {
         return "child_aborted";
     }
@@ -652,7 +661,7 @@ async function attemptAndValidate<TOutput, TValidated>(
             const assistantFailure = extractLatestAssistantFailure(output);
             if (assistantFailure) {
                 const error = new Error(
-                    `Host recorded assistant error: ${String(assistantFailure.error)}`,
+                    `Host recorded assistant error: ${describeAssistantError(assistantFailure.error)}`,
                 );
                 Object.assign(error, {
                     name: "DreamerProviderOutputFailureError",
@@ -664,6 +673,9 @@ async function attemptAndValidate<TOutput, TValidated>(
         const validated = await options.validateOutput(output, attempt);
         return { output, validated, attempt };
     } catch (error) {
+        if (error instanceof Error && /no (?:assistant )?output/i.test(error.message)) {
+            error.message += ` (${describeAssistantSettlement(output)})`;
+        }
         throw {
             error,
             failureClass: classifyPromptFailure(error, "validation", signal),

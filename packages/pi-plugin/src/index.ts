@@ -42,7 +42,6 @@ import type {
 	MagicContextConfig,
 } from "@magic-context/core/config/schema/magic-context";
 import {
-	buildDreamTaskRuntimeConfigs,
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
@@ -50,9 +49,13 @@ import {
 	type FailClosedReason,
 	formatFailClosedBlockingMessage,
 } from "@magic-context/core/features/magic-context/fail-closed-block";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
-import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
+import {
+	isUsableProjectIdentity,
+	resolveProjectIdentityForSession,
+	setHomeProjectPermission,
+} from "@magic-context/core/features/magic-context/memory/project-identity";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
+import { resolveSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -63,22 +66,24 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import {
 	applySqliteTuningPragmas,
+	closeDatabase,
 	openDatabaseAsync,
 	setSqlitePragmaConfig,
 } from "@magic-context/core/features/magic-context/storage-db";
 import {
 	clearDetectedContextLimit,
 	getOverflowState,
+	loadProtectedTailMeta,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { describeStorageUnavailability } from "@magic-context/core/features/magic-context/storage-unavailable-reason";
 import { runDeferredV22Backfill } from "@magic-context/core/features/magic-context/v22-deferred-backfill";
+import { cavemanWordRulesForLanguage } from "@magic-context/core/hooks/magic-context/caveman";
 import { setCtxReduceRegisteredGlobally } from "@magic-context/core/hooks/magic-context/ctx-reduce-availability";
 import {
 	deriveHistorianChunkTokens,
 	resolveHistorianContextLimit,
 	resolveKnownHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
-import { resolveCacheTtl } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import {
 	clearNoteNudgeTriggerAndCooldown,
 	onNoteTrigger,
@@ -102,6 +107,7 @@ import {
 	formatConfigParseNotice,
 } from "@magic-context/core/shared/config-diagnostics";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
+import { setEmbeddingSessionBusy } from "@magic-context/core/shared/embedding-activity";
 import { setHarness } from "@magic-context/core/shared/harness";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { setKeepSubagents } from "@magic-context/core/shared/keep-subagents";
@@ -116,7 +122,6 @@ import {
 	hasTrustedAbsoluteWall,
 	reloadWindowOverlay,
 } from "@magic-context/core/shared/window-geometry";
-
 import { handlePiCloneSessionStart } from "./clone-inheritance";
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
 import {
@@ -134,6 +139,7 @@ import {
 } from "./commands/pi-command-utils";
 import { loadPiConfig, loadPiConfigDetailed } from "./config";
 import {
+	abortInFlightHistorians,
 	awaitInFlightHistorians,
 	clearContextHandlerSession,
 	clearPiM0Cache,
@@ -157,16 +163,34 @@ import {
 	maybeChannel1ReminderForToolResult,
 	maybeDeliverChannel2Pi,
 } from "./ctx-reduce-nudge-pi";
+import { stopStatusDialogRefresh } from "./dialogs/status-dialog";
 import {
+	abortInFlightDreamers,
 	awaitInFlightDreamers,
 	registerPiDreamerProject,
 	unregisterPiDreamerProject,
 	validatePiDreamerModels,
 } from "./dreamer";
 import { loadDefaultPiSessionApi } from "./dreamer/pi-session-api";
+import {
+	backfillPiSessionActivity,
+	observePiMessageActivity,
+} from "./dreamer/session-activity-pi";
 import { registerPiDroppedInputGuard } from "./dropped-input-guard-pi";
-import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
+import {
+	ensureProjectRegisteredFromPiDirectory,
+	unregisterPiProjectEmbeddings,
+} from "./embedding-bootstrap";
 import { registerPiFailClosedSurface } from "./fail-closed-pi";
+import { schedulePiAssistantIndexOnMessageEnd } from "./message-end-index-pi";
+import {
+	describeInertEmergencyDrainLatch,
+	emptyPiModelChainsKey,
+	findEmptyPiModelChains,
+	formatEmptyPiModelChain,
+	formatEmptyPiModelChainsNotice,
+	type PiModelRegistryLike,
+} from "./model-chain-health";
 import { bootPiRuntimeWithDeadline } from "./pi-boot-deadline";
 import {
 	resolvePiUsableContextLimit,
@@ -176,13 +200,22 @@ import {
 	type PiHarnessKind,
 	resolvePiHarnessDetection,
 } from "./pi-harness-kind";
+import { notePiLkgProviderUsage } from "./pi-lkg";
 import {
 	computePiPressure,
 	extractAssistantUsage,
-	isPiLiveUsageRawBranchEstimate,
+	isPiContextUsageRawBranchEstimate,
 	notePiUsageReadingUsed,
 	noteRawBranchEstimateSetAside,
+	piMessageAnchorsLiveUsage,
+	recordPiLiveUsageClassification,
 } from "./pi-pressure";
+import {
+	piProvenFloorModelKey,
+	readPiProvenFloorRecord,
+	recordPiProvenFloorModel,
+	resolvePiProvenInputFloor,
+} from "./pi-proven-floor";
 import { abortInFlightRecomps, awaitInFlightRecomps } from "./pi-recomp-runner";
 import { handlePiProviderFailure } from "./provider-error-recovery-pi";
 import { readPiSessionMessages } from "./read-session-pi";
@@ -217,6 +250,8 @@ import {
 const PI_HARNESS_DETECTION = await resolvePiHarnessDetection();
 const PI_HARNESS_KIND = PI_HARNESS_DETECTION.kind;
 const PREFIX = `[magic-context][${PI_HARNESS_KIND}]`;
+let databaseExitHookRegistered = false;
+const activePiRuntimes = new Set<object>();
 const PI_BOOT_DEADLINE_MS = 15_000;
 
 // ---------------------------------------------------------------------------
@@ -372,7 +407,12 @@ export function persistPiMessageEndModelMeta(args: {
 	}
 	const modelKey = canonicalPiModelKey(msg.provider, msg.model);
 	if (!recordPiLiveModel(args.sessionId, modelKey, msg.timestamp)) return;
-	const cacheTtl = resolveCacheTtl(args.cacheTtlConfig, modelKey);
+	const cacheTtl = resolveSessionCacheTtl(
+		args.db,
+		args.sessionId,
+		args.cacheTtlConfig,
+		modelKey,
+	).value;
 	const currentMeta = getOrCreateSessionMeta(args.db, args.sessionId);
 	updateSessionMeta(args.db, args.sessionId, {
 		...(currentMeta.cacheTtl === cacheTtl ? {} : { cacheTtl }),
@@ -487,6 +527,24 @@ function warn(message: string, data?: unknown): void {
 	log(`${PREFIX} WARN ${message}`, data);
 }
 
+const loggedNoProjectIdentityDirs = new Set<string>();
+
+/**
+ * Say once per directory that it has no project identity. The resolver refuses
+ * the home directory (and folders inside a dotfiles repository rooted at home)
+ * unless `allow_home_project` is set; such a directory gets no memory, search,
+ * embeddings, or dreamer, and nothing is keyed by an empty project name.
+ */
+function logNoProjectIdentityOnce(directory: string): void {
+	if (loggedNoProjectIdentityDirs.has(directory)) return;
+	loggedNoProjectIdentityDirs.add(directory);
+	info(
+		`no project identity for ${directory}: it is not treated as a project, so memory, search, ` +
+			"embeddings and the dreamer stay off here. Start Pi inside a project folder, or set " +
+			"`allow_home_project: true` in the user-level magic-context.jsonc to give home sessions their own project.",
+	);
+}
+
 // Migrate config from the legacy per-harness locations to the shared CortexKit
 // location BEFORE any loadPiConfig. The loader prefers the shared CortexKit
 // paths and only falls back to Pi-owned legacy files when that base is absent.
@@ -540,6 +598,23 @@ export function claimProtectedTagsDeprecationNoticeOnce(): boolean {
 
 export function resetClaimedProtectedTagsDeprecationNoticeForTesting(): void {
 	protectedTagsDeprecationClaimed = false;
+}
+
+export function registerConfiguredTodoLifecycle(
+	pi: ExtensionAPI,
+	options: {
+		configured: boolean;
+		overlay: boolean;
+		readLastTodoState: (sessionId: string) => string | null | undefined;
+	},
+): TodoOverlayUpdater | undefined {
+	if (!options.configured) return undefined;
+	registerTodoStateLifecycle(pi, {
+		readLastTodoState: options.readLastTodoState,
+	});
+	return options.overlay
+		? registerTodoOverlay(pi, { readLastTodoState: options.readLastTodoState })
+		: undefined;
 }
 
 export const __test = {
@@ -655,6 +730,17 @@ export async function persistPiPressureFromMessageEnd(args: {
 	piTokensIsRawBranchEstimate?: boolean;
 	notifyIssue?: (message: string) => unknown | Promise<unknown>;
 }): Promise<void> {
+	// Pi emits message_end before it appends the message to the branch, so the
+	// branch read for the flag does not hold this message yet. A reply with
+	// provider usage becomes the anchor of Pi's live figure once appended.
+	if (piMessageAnchorsLiveUsage(args.message)) {
+		recordPiLiveUsageClassification(args.sessionId, false);
+	} else if (typeof args.piTokensIsRawBranchEstimate === "boolean") {
+		recordPiLiveUsageClassification(
+			args.sessionId,
+			args.piTokensIsRawBranchEstimate,
+		);
+	}
 	const { provider, model } = getPiMessageModel(args.message);
 	const activeModel = args.piModel ?? { provider, id: model };
 	const modelKey =
@@ -728,8 +814,15 @@ export async function persistPiPressureFromMessageEnd(args: {
 		}
 	}
 
+	// The floor is proof about the model that served it; see pi-proven-floor.ts.
+	// Resolved before the row is read, because an unkeyed floor is cleared here.
+	const floorModelKey = piProvenFloorModelKey(activeModel);
+	let observedSafeInputTokens = resolvePiProvenInputFloor({
+		db: args.db,
+		sessionId: args.sessionId,
+		modelKey: floorModelKey,
+	});
 	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
-	let observedSafeInputTokens = meta.observedSafeInputTokens ?? 0;
 	const updates: Partial<{
 		lastResponseTime: number;
 		lastContextPercentage: number;
@@ -858,6 +951,24 @@ export async function persistPiPressureFromMessageEnd(args: {
 	}
 
 	updateSessionMeta(args.db, args.sessionId, updates);
+	if (
+		floorModelKey !== undefined &&
+		typeof updates.observedSafeInputTokens === "number" &&
+		updates.observedSafeInputTokens > 0
+	) {
+		const recorded = readPiProvenFloorRecord(args.db, args.sessionId);
+		if (
+			recorded?.modelKey !== floorModelKey ||
+			recorded.tokens !== updates.observedSafeInputTokens
+		) {
+			recordPiProvenFloorModel(
+				args.db,
+				args.sessionId,
+				floorModelKey,
+				updates.observedSafeInputTokens,
+			);
+		}
+	}
 	if (cacheAlert !== undefined) {
 		await args.notifyIssue?.(cacheAlert);
 	}
@@ -876,6 +987,33 @@ const PLUGIN_VERSION: string = (() => {
 /** Lock the harness at module load. Safe to import this file in tests; the
  * lock is idempotent and will throw only on a conflicting reset. */
 setHarness(PI_HARNESS_KIND);
+
+// Model-chain reports already made in this process. Kept on globalThis so an
+// extension reload in the same Pi process does not repeat them.
+const PI_MODEL_CHAIN_REPORTS = Symbol.for(
+	"magic-context.pi.model-chain-reports",
+);
+function piModelChainReports(): {
+	notified: Set<string>;
+	logged: Set<string>;
+} {
+	const globals = globalThis as Record<symbol, unknown>;
+	const existing = globals[PI_MODEL_CHAIN_REPORTS] as
+		| { notified: Set<string>; logged: Set<string> }
+		| undefined;
+	if (existing) return existing;
+	const created = { notified: new Set<string>(), logged: new Set<string>() };
+	globals[PI_MODEL_CHAIN_REPORTS] = created;
+	return created;
+}
+const notifiedPiModelChainKeys = piModelChainReports().notified;
+const loggedPiModelChainLines = piModelChainReports().logged;
+
+/** Forget the model-chain reports made in this process (tests only). */
+export function resetPiModelChainReportsForTest(): void {
+	notifiedPiModelChainKeys.clear();
+	loggedPiModelChainLines.clear();
+}
 
 // ---------------------------------------------------------------------------
 // Config-driven resolvers
@@ -915,6 +1053,7 @@ export function resolveHistorianFromConfig(
 						},
 					],
 					modelRegistry,
+					harness,
 				)[0]
 			: undefined;
 	const primary = validated
@@ -1030,6 +1169,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const bootProjectDir = process.cwd();
 	ensureConfigLocationsMigrated(bootProjectDir);
 	const bootConfig = loadPiConfig({ cwd: bootProjectDir });
+	setHomeProjectPermission(bootConfig.config.allow_home_project);
 	if (!bootConfig.config.enabled) {
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;
@@ -1043,6 +1183,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		mmapSizeMb: bootConfig.config.sqlite.mmap_size_mb,
 	});
 
+	// The handle is shared by same-process sessions and /reload. Close it only
+	// when Pi actually exits, after extension shutdown has released its workers.
+	if (!databaseExitHookRegistered) {
+		process.once("exit", closeDatabase);
+		databaseExitHookRegistered = true;
+	}
 	const storageDir = getMagicContextStorageDir();
 	const dbPath = join(storageDir, "context.db");
 	let openFailureCause: string | null = null;
@@ -1176,6 +1322,19 @@ async function startPiMagicContextRuntime(
 							return sessions.slice(offset, offset + limit);
 						},
 					);
+					const api = await loadDefaultPiSessionApi();
+					const paths = new Map<string, string>();
+					for (const session of (await api.listSessions()) as Array<{
+						id?: unknown;
+						path?: unknown;
+					}>) {
+						if (
+							typeof session.id === "string" &&
+							typeof session.path === "string"
+						)
+							paths.set(session.id, session.path);
+					}
+					await backfillPiSessionActivity(database, PI_HARNESS_KIND, paths);
 				} catch (err) {
 					warn(`[session-projects] background runner failed: ${err}`);
 				}
@@ -1190,6 +1349,7 @@ async function startPiMagicContextRuntime(
 	const projectDir = process.cwd();
 	const seenDreamerProjectIdentities = new Set<string>();
 	const dreamerRegistrationOwner = {};
+	activePiRuntimes.add(dreamerRegistrationOwner);
 	const commandLifecycleController = new AbortController();
 	registerCtxStatusLifecycleSignal(pi, commandLifecycleController.signal);
 	let sessionShuttingDown = false;
@@ -1227,7 +1387,7 @@ async function startPiMagicContextRuntime(
 	if (projectIdentity) seenDreamerProjectIdentities.add(projectIdentity);
 	info(
 		`loaded v${PLUGIN_VERSION} | harness=${PI_HARNESS_KIND} (via ${PI_HARNESS_DETECTION.via}) | db=${dbPath} | ` +
-			`project=${projectIdentity} | dir=${projectDir}`,
+			`project=${projectIdentity || "(none)"} | dir=${projectDir}`,
 	);
 	// Pi tools are registered once per process, so this mode is intentionally
 	// boot-resolved rather than following later /cd project config changes.
@@ -1285,9 +1445,11 @@ async function startPiMagicContextRuntime(
 	}
 
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);
-	info(
-		`registered embedding config for project ${projectIdentity ?? "(no project identity; cwd is $HOME)"}`,
-	);
+	if (isUsableProjectIdentity(projectIdentity)) {
+		info(`registered embedding config for project ${projectIdentity}`);
+	} else {
+		logNoProjectIdentityOnce(projectDir);
+	}
 
 	type ResolvedPiProjectDeps = {
 		projectDir: string;
@@ -1345,6 +1507,7 @@ async function startPiMagicContextRuntime(
 		auto: PiAutoSearchHandlerOptions,
 	): PiContextHandlerOptions => ({
 		db: database,
+		cacheTtlConfig: cfg.cache_ttl,
 		smartDrops: cfg.smart_drops === true,
 		protectedTokens: cfg.protected_tokens,
 		protectedTokenTierOverrides: getProtectedTokensTierOverrides(cfg) ?? {},
@@ -1354,6 +1517,8 @@ async function startPiMagicContextRuntime(
 				? {
 						enabled: cfg.caveman_text_compression.enabled,
 						minChars: cfg.caveman_text_compression.min_chars,
+						// `language` is user-level only; a project config cannot set it.
+						wordRules: cavemanWordRulesForLanguage(cfg.language),
 					}
 				: undefined,
 			clearReasoningAge: cfg.clear_reasoning_age,
@@ -1373,6 +1538,7 @@ async function startPiMagicContextRuntime(
 		language: cfg.language,
 		autoSearch: auto,
 		resolveForProject: resolveContextOptionsForProject,
+		todowriteEnabled: cfg.todowrite.enabled,
 		compactionOff,
 		allowHomeProject: cfg.allow_home_project,
 		// Automatic history embedding: silent (no timeline messages) and not
@@ -1475,6 +1641,65 @@ async function startPiMagicContextRuntime(
 	let activeModelRegistry:
 		| { find(provider: string, modelId: string): unknown }
 		| undefined;
+
+	// Config generation last checked per project directory.
+	const modelChainsCheckedGeneration = new Map<string, number>();
+	/**
+	 * Validate the historian and dreamer chains against Pi's model registry:
+	 * log the historian chain that will actually run, and notify the session
+	 * once per process for each set of chains left empty (see
+	 * model-chain-health.ts). Runs at session start and after a config reload.
+	 */
+	function reportPiModelChains(
+		ctx: {
+			modelRegistry?: PiModelRegistryLike;
+			hasUI?: boolean;
+			ui?: { notify?: (message: string, level?: "warning") => unknown };
+		},
+		project: ResolvedPiProjectDeps,
+	): void {
+		const registry = ctx.modelRegistry;
+		if (!registry) return;
+		try {
+			const live = liveReaderFor(project.projectDir, project.config).poll();
+			modelChainsCheckedGeneration.set(project.projectDir, live.generation);
+			const checked = historianRunConfig(project.config, live.effective);
+			const historian = resolveHistorianFromConfig(
+				checked,
+				PI_HARNESS_KIND,
+				registry,
+			);
+			const empty = findEmptyPiModelChains({
+				config: checked,
+				registry,
+				harness: PI_HARNESS_KIND,
+			});
+			const emptyHistorian = empty.find((chain) => chain.owner === "historian");
+			const historianLine = historian
+				? `registered historian trigger (model=${historian.model}${historian.fallbackModels?.length ? `, fallbacks=${historian.fallbackModels.join(",")}` : ""}, executeThreshold=${formatExecuteThresholdForLog(historian.executeThresholdPercentage)})`
+				: emptyHistorian
+					? `registered historian trigger: DISABLED (no configured model is registered in Pi: ${formatEmptyPiModelChain(emptyHistorian)})`
+					: undefined;
+			if (historianLine && !loggedPiModelChainLines.has(historianLine)) {
+				loggedPiModelChainLines.add(historianLine);
+				info(historianLine);
+			}
+			if (empty.length === 0) return;
+			const key = emptyPiModelChainsKey(empty);
+			if (notifiedPiModelChainKeys.has(key)) return;
+			const notice = formatEmptyPiModelChainsNotice(empty);
+			if (!loggedPiModelChainLines.has(notice)) {
+				loggedPiModelChainLines.add(notice);
+				warn(notice);
+			}
+			if (ctx.hasUI && typeof ctx.ui?.notify === "function") {
+				notifiedPiModelChainKeys.add(key);
+				ctx.ui.notify(notice, "warning");
+			}
+		} catch (err) {
+			warn("model chain check failed:", err);
+		}
+	}
 	function resolveContextOptionsForProject(
 		dir: string,
 	): PiContextHandlerOptions {
@@ -1508,6 +1733,12 @@ async function startPiMagicContextRuntime(
 		modelRegistry?: { find(provider: string, modelId: string): unknown },
 	): void {
 		if (sessionShuttingDown) return;
+		// No identity means this directory is not a project (for example the home
+		// directory). Nothing is registered for it, so there is nothing to track.
+		if (!isUsableProjectIdentity(current.projectIdentity)) {
+			logNoProjectIdentityOnce(current.projectDir);
+			return;
+		}
 		seenDreamerProjectIdentities.add(current.projectIdentity);
 		if (!current.dreamerConfig) {
 			unregisterPiDreamerProject({
@@ -1548,9 +1779,9 @@ async function startPiMagicContextRuntime(
 		});
 	}
 	registerPiDroppedInputGuard(pi);
-	const todowriteEnabled = bootProjectDeps.config.todowrite.enabled !== false;
+	const todowriteEnabled = bootProjectDeps.config.todowrite.enabled;
 	const todowriteOverlayEnabled =
-		todowriteEnabled && bootProjectDeps.config.todowrite.overlay !== false;
+		todowriteEnabled && bootProjectDeps.config.todowrite.overlay;
 
 	// Register the agent-facing tools. Reuses the same business logic
 	// the OpenCode plugin uses (insertMemory, unifiedSearch, addNote, …)
@@ -1608,7 +1839,8 @@ async function startPiMagicContextRuntime(
 		projectDepsByDir.delete(ctx.cwd);
 		const current = resolveCurrentProjectDeps(ctx);
 		activeModelRegistry = ctx.modelRegistry;
-		syncDreamerProjectRegistration(current, ctx.modelRegistry);
+		reportPiModelChains(ctx, current);
+		if (ctx.hasUI) syncDreamerProjectRegistration(current, ctx.modelRegistry);
 		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
 
 		const failuresToShow = claimConfigParseFailuresOnce(
@@ -1643,16 +1875,23 @@ async function startPiMagicContextRuntime(
 		});
 	});
 
+	pi.on("agent_start", (_event, ctx) => {
+		setEmbeddingSessionBusy(ctx.sessionManager.getSessionId(), true);
+		// A config reload adopted since the last check gets the same report.
+		const current = resolveCurrentProjectDeps(ctx);
+		const generation = liveReaderFor(current.projectDir, current.config).poll()
+			.generation;
+		if (modelChainsCheckedGeneration.get(current.projectDir) !== generation) {
+			reportPiModelChains(ctx, current);
+		}
+	});
 	const readLastTodoState = (sessionId: string) =>
 		getOrCreateSessionMeta(db, sessionId).lastTodoState;
-	if (todowriteEnabled) {
-		registerTodoStateLifecycle(pi, { readLastTodoState });
-	}
-	const todoOverlay = todowriteOverlayEnabled
-		? registerTodoOverlay(pi, {
-				readLastTodoState,
-			})
-		: undefined;
+	const todoOverlay = registerConfiguredTodoLifecycle(pi, {
+		configured: todowriteEnabled,
+		overlay: bootProjectDeps.config.todowrite.overlay,
+		readLastTodoState,
+	});
 	info(
 		todowriteOverlayEnabled
 			? "registered todowrite overlay"
@@ -1663,11 +1902,15 @@ async function startPiMagicContextRuntime(
 	// parts via the shared Tagger and applies queued drops from
 	// `pending_ops` so /ctx-flush and ctx_reduce work against Pi sessions.
 	registerPiContextHandler(pi, bootProjectDeps.contextOptions);
-	info(
-		bootProjectDeps.historianConfig
-			? `registered historian trigger (model=${bootProjectDeps.historianConfig.model}, executeThreshold=${formatExecuteThresholdForLog(bootProjectDeps.historianConfig.executeThresholdPercentage)})`
-			: "registered historian trigger: DISABLED (configure the active harness's historian model in magic-context.jsonc)",
-	);
+	// Pi's model registry reaches the extension only with the first session
+	// context, so the chain the historian will actually use is logged by
+	// reportPiModelChains at session start. Logging the configured model here
+	// would name a model that registry validation may still drop.
+	if (!bootProjectDeps.historianConfig) {
+		info(
+			"registered historian trigger: DISABLED (configure the active harness's historian model in magic-context.jsonc)",
+		);
+	}
 	info(
 		bootProjectDeps.autoSearchConfig.enabled
 			? `registered auto-search hint (threshold=${bootProjectDeps.autoSearchConfig.scoreThreshold}, minChars=${bootProjectDeps.autoSearchConfig.minPromptChars})`
@@ -1691,7 +1934,13 @@ async function startPiMagicContextRuntime(
 	// The SAME dynamic status-dependency resolver drives /ctx-status and the
 	// cross-extension status producer (REQ-MC1-001): one definition, so the
 	// command surface and the published StatusView can never drift apart.
-	const resolveCtxStatusDeps = (ctx: { cwd: string }) => {
+	// /ctx-status hands over a bare cwd; the cross-extension producer passes the
+	// live ExtensionContext. The emergency-drain latch only needs a session id,
+	// so an absent sessionManager degrades to "no latch" rather than a throw.
+	type StatusDepsCtx = { cwd: string } & Partial<
+		Parameters<typeof resolveSessionId>[0]
+	>;
+	const resolveCtxStatusDeps = (ctx: StatusDepsCtx) => {
 		const current = resolveCurrentProjectDeps(ctx);
 		const live = liveReaderFor(current.projectDir, current.config);
 		const failure = live.lastFailure();
@@ -1716,30 +1965,27 @@ async function startPiMagicContextRuntime(
 			modelChainWarning: (() => {
 				const registry = activeModelRegistry;
 				if (!registry) return undefined;
-				const tasks = validatePiDreamerModels(
-					buildDreamTaskRuntimeConfigs(
-						current.config.dreamer,
-						PI_HARNESS_KIND,
-						current.config.language,
-						current.config.mural.model,
-					),
+				// Only chains that would run: unscheduled dreamer tasks are left out.
+				const empty = findEmptyPiModelChains({
+					config: current.config,
 					registry,
-				);
-				const empty: string[] = tasks
-					.filter((task) => task.modelChainUnavailable)
-					.map((task) => task.task);
-				if (
-					!resolveHistorianFromConfig(
-						current.config,
-						PI_HARNESS_KIND,
-						registry,
-					) &&
-					current.historianConfig
-				)
-					empty.push("historian");
-				return empty.length
-					? `Pi model chain empty (no model found): ${empty.join(", ")}`
-					: undefined;
+					harness: PI_HARNESS_KIND,
+				});
+				if (empty.length === 0) return undefined;
+				const parts = empty.map(formatEmptyPiModelChain);
+				if (empty.some((chain) => chain.owner === "historian")) {
+					const sessionManager = ctx.sessionManager;
+					const sessionId = sessionManager
+						? resolveSessionId({ sessionManager })
+						: undefined;
+					const latch = sessionId
+						? describeInertEmergencyDrainLatch(
+								loadProtectedTailMeta(db, sessionId).emergencyDrainActive,
+							)
+						: undefined;
+					if (latch) parts.push(latch);
+				}
+				return `Pi model chain empty (no model found): ${parts.join("; ")}`;
 			})(),
 			activeProfile: current.config.profile,
 			cacheTtlConfig: current.config.cache_ttl,
@@ -1840,6 +2086,7 @@ async function startPiMagicContextRuntime(
 	info("registered /ctx-recomp");
 
 	registerCtxWrapupCommand(pi, {
+		shutdownSignal: commandLifecycleController.signal,
 		db,
 		runner: wrapupRunner,
 		historianModel: bootProjectDeps.historianConfig?.model,
@@ -1912,11 +2159,13 @@ async function startPiMagicContextRuntime(
 		resolveDreamerEnabled: (ctx) =>
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		onProjectSeen: (identity) => seenDreamerProjectIdentities.add(identity),
-		ensureRegistered: (ctx) =>
-			syncDreamerProjectRegistration(
-				resolveCurrentProjectDeps(ctx),
-				ctx.modelRegistry,
-			),
+		ensureRegistered: (ctx) => {
+			if ((ctx as typeof ctx & { hasUI?: boolean }).hasUI)
+				syncDreamerProjectRegistration(
+					resolveCurrentProjectDeps(ctx),
+					ctx.modelRegistry,
+				);
+		},
 		registrationOwner: dreamerRegistrationOwner,
 	});
 	info("registered /ctx-dream");
@@ -1941,7 +2190,6 @@ async function startPiMagicContextRuntime(
 	// PiSubagentRunner to spawn child sessions for each task.
 	const dreamerConfig = bootProjectDeps.dreamerConfig;
 	if (dreamerConfig) {
-		syncDreamerProjectRegistration(bootProjectDeps);
 		info(`registered dreamer (${summarizeDreamSchedule(dreamerConfig)})`);
 	} else {
 		info(
@@ -2035,7 +2283,11 @@ async function startPiMagicContextRuntime(
 			// shared helper releases that ownership explicitly.
 			try {
 				activeModelRegistry = ctx.modelRegistry;
-				syncDreamerProjectRegistration(effectiveProjectDeps, ctx.modelRegistry);
+				if (ctx.hasUI)
+					syncDreamerProjectRegistration(
+						effectiveProjectDeps,
+						ctx.modelRegistry,
+					);
 			} catch (err) {
 				warn("before_agent_start: dreamer registration sync threw:", err);
 			}
@@ -2266,16 +2518,10 @@ async function startPiMagicContextRuntime(
 	//     next session start re-evaluates and either picks up where the
 	//     prior run left off or recovers from `historian_failure_count`.
 	//
-	// `pi --print` (single-turn, exits after agent_end) is the one mode
-	// where backgrounding is genuinely incompatible with subprocess
-	// lifetime — Pi's process exits and SIGKILLs the still-running
-	// historian. That tradeoff is intentional: print mode is for
-	// scripting / one-shot tasks where blocking the user's interactive
-	// shell on a 30s historian is also wrong, just in a different way.
-	// We let print mode skip the wait too. Users who want guaranteed
-	// historian completion in print mode should run interactive Pi
-	// instead.
+	// Headless Pi exits after agent_end. The context handler leaves eligible
+	// history queued rather than launching a child that would outlive Pi.
 	pi.on("agent_end", (event, ctx) => {
+		setEmbeddingSessionBusy(ctx.sessionManager.getSessionId(), false);
 		// Synchronous return — DO NOT await background work here.
 		// awaitInFlightHistorians()/awaitInFlightDreamers() are still
 		// invoked at session_shutdown where they belong (and where pi
@@ -2314,6 +2560,9 @@ async function startPiMagicContextRuntime(
 		} catch (err) {
 			log(`agent_end: channel2 delivery skipped: ${String(err)}`);
 		}
+		// Print mode never receives session_shutdown. Flush the buffered log now
+		// so its 500 ms logger timer does not keep a completed one-shot Pi alive.
+		if (!ctx.hasUI) flushLogger();
 	});
 
 	// Tool-execution-start hook: detect note-nudge triggers from
@@ -2478,6 +2727,23 @@ async function startPiMagicContextRuntime(
 	// see internal tag IDs at the start of every assistant turn.
 	pi.on("message_end", async (event, ctx) => {
 		try {
+			const leafId = ctx.sessionManager.getLeafId();
+			const leaf = leafId ? ctx.sessionManager.getEntry(leafId) : undefined;
+			// Pi normally appends after this event. Also accept runtimes that have
+			// already appended this exact reply and expose its explicit parent.
+			const parentId =
+				leaf?.type === "message" && leaf.message === event.message
+					? leaf.parentId
+					: leafId;
+			notePiLkgProviderUsage(
+				ctx.sessionManager.getSessionId(),
+				parentId,
+				event.message,
+			);
+		} catch {
+			/* Usage without a verifiable request boundary is not a replay basis. */
+		}
+		try {
 			const msg = event.message as unknown;
 			if (!compactionOff && msg !== null && typeof msg === "object") {
 				stripTagPrefixFromAssistantMessage(
@@ -2500,22 +2766,18 @@ async function startPiMagicContextRuntime(
 			const sessionId = sm?.getSessionId?.();
 			if (typeof sessionId !== "string" || sessionId.length === 0) return;
 			const endedMsg = event.message as unknown as {
-				id?: string;
-				role?: string;
+				timestamp?: number;
 			};
-			if (
-				endedMsg?.role === "assistant" &&
-				typeof endedMsg.id === "string" &&
-				endedMsg.id.length > 0
-			) {
-				const messageId = endedMsg.id;
-				scheduleIncrementalIndex(db, sessionId, messageId, () => {
-					const rawMessages = readPiSessionMessages(ctx);
-					return (
-						rawMessages.find((message) => message.id === messageId) ?? null
-					);
-				});
-			}
+			observePiMessageActivity(db, sessionId, endedMsg?.timestamp);
+			schedulePiAssistantIndexOnMessageEnd(db, sessionId, event.message, {
+				readBranch: () => {
+					const branch = (
+						ctx.sessionManager as { getBranch?: () => unknown[] } | undefined
+					)?.getBranch?.();
+					return Array.isArray(branch) ? branch : undefined;
+				},
+				readMessages: () => readPiSessionMessages(ctx),
+			});
 			persistPiMessageEndModelMeta({
 				db,
 				sessionId,
@@ -2553,16 +2815,9 @@ async function startPiMagicContextRuntime(
 					piUsage && typeof piUsage.tokens === "number"
 						? piUsage.tokens
 						: undefined,
-				piTokensIsRawBranchEstimate: (() => {
-					try {
-						const branch = (
-							ctx.sessionManager as { getBranch?: () => unknown[] }
-						).getBranch?.();
-						return isPiLiveUsageRawBranchEstimate(branch);
-					} catch {
-						return false;
-					}
-				})(),
+				piTokensIsRawBranchEstimate: isPiContextUsageRawBranchEstimate(
+					ctx.sessionManager,
+				),
 				notifyIssue: async (message) => {
 					const uiNotify = (
 						ctx as { ui?: { notify?: (message: string) => unknown } }
@@ -2645,17 +2900,13 @@ async function startPiMagicContextRuntime(
 	// export — without releasing them, the dreamer timer would hold a
 	// stale reference to the previous extension instance.
 	//
-	// IMPORTANT: We do NOT close the SQLite handle here. `openDatabase()`
-	// caches handles in a process-lifetime Map keyed by path; closing
-	// the handle invalidates the cache entry, but the Map still returns
-	// the closed handle on the next `openDatabase()` call after reload,
-	// causing every tool/hook to fail with "database is not open". The
-	// DB handle is intentionally process-lifetime — Pi's `/reload`
-	// re-runs the extension code but keeps the host process alive, so
-	// the cached handle is still valid across reload boundaries.
+	// Other sessions and /reload share the SQLite handle. The process exit
+	// hook closes it after every extension has finished shutdown.
 	pi.on("session_shutdown", async (_event, ctx) => {
+		setEmbeddingSessionBusy(ctx.sessionManager.getSessionId(), false);
 		sessionShuttingDown = true;
 		commandLifecycleController.abort();
+		stopStatusDialogRefresh();
 		// Bounded drain of in-flight historian / dreamer runs that were
 		// kicked off by recent turns. We moved the drain here from
 		// `agent_end` because Pi awaits agent_end handlers and was
@@ -2665,11 +2916,8 @@ async function startPiMagicContextRuntime(
 		// JSONL session state reach a consistent compartment boundary
 		// before that session's cleanup completes.
 		//
-		// 5-second cap per drain protects interactive shutdown from a hung
-		// subagent. In `pi --print` mode the process exits after
-		// agent_end before this handler fires anyway, so the cap
-		// doesn't help that mode (and we don't pretend it does — see
-		// the comment block on the agent_end handler above).
+		// A five-second cap protects interactive shutdown from a hung child.
+		// Headless runs do not launch background maintenance.
 		const SHUTDOWN_DRAIN_MS = 5_000;
 		const sessionId = resolveSessionId(ctx);
 		// Stop this owner from admitting new Dreamer runs before snapshotting its
@@ -2686,6 +2934,8 @@ async function startPiMagicContextRuntime(
 			warn("shutdown: unregisterPiDreamerProject threw:", err);
 		}
 		if (sessionId) {
+			abortInFlightHistorians(sessionId);
+			abortInFlightRecomps(sessionId);
 			try {
 				await withTimeout(
 					awaitInFlightHistorians(sessionId),
@@ -2699,10 +2949,10 @@ async function startPiMagicContextRuntime(
 			} catch (err) {
 				warn("shutdown: recomp drain threw:", err);
 			}
-			// Timeout only stops waiting. Fence and cancel any run still alive before
-			// this handler returns and Pi disposes its command context.
+			// Keep the cancellation idempotent if the drain timed out.
 			abortInFlightRecomps(sessionId);
 		}
+		abortInFlightDreamers(dreamerRegistrationOwner);
 		try {
 			await withTimeout(
 				awaitInFlightDreamers(dreamerRegistrationOwner),
@@ -2737,42 +2987,67 @@ async function startPiMagicContextRuntime(
 		} catch {
 			// best-effort cleanup
 		}
+		activePiRuntimes.delete(dreamerRegistrationOwner);
+		if (activePiRuntimes.size === 0) unregisterPiProjectEmbeddings(db);
 	});
 
-	// Pi has no `session_deleted` event, but `session_before_switch`
-	// fires when the user switches to a different session within the
-	// same Pi process. That's the right moment to drain caches keyed
-	// by the OUTGOING session id — without this, every session swap
-	// in a long-running Pi process leaks one entry per cache, and
-	// after dozens of swaps the maps balloon. Cleanup here mirrors
-	// OpenCode's `session.deleted` handler in `event-handler.ts`.
+	// Pi has no `session_deleted` event; a switch to another session within
+	// the same process is the moment to drain caches keyed by the OUTGOING
+	// session id, or every swap in a long-running process leaks one entry per
+	// cache. Cleanup mirrors OpenCode's `session.deleted` handler in
+	// `event-handler.ts`, minus the durable state (see below).
+	//
+	// `session_before_switch` only announces a switch: another extension can
+	// cancel it and opening the target can still fail, leaving the user in the
+	// current session. Clearing there would drop that session's pending refresh
+	// signals and warm caches. So it only records the outgoing id, and the
+	// drain runs once the switch has happened:
+	//   - stock Pi tears the outgoing runtime down with `session_shutdown`
+	//     (handled above);
+	//   - OMP keeps the runtime and emits `session_switch` instead.
+	//
+	// Only the in-memory per-session maps are cleared. The durable DB m[0]
+	// cache stays: a switch is reversible (the user can switch back), unlike
+	// OpenCode's session.deleted. It is bounded (one session_meta row per
+	// session) and self-invalidates via epoch/version/docs-hash checks in
+	// mustMaterializePi, so keeping it lets a switch-back reuse the cached
+	// prefix instead of forcing a full m[0] re-materialization (an avoidable
+	// prompt-cache bust).
+	let switchOutgoingSessionId: string | undefined;
+	const readSessionId = (ctx: unknown): string | undefined => {
+		const sm = (
+			ctx as {
+				sessionManager?: { getSessionId?: () => string | undefined };
+			}
+		).sessionManager;
+		const id =
+			typeof sm?.getSessionId === "function" ? sm.getSessionId() : undefined;
+		return typeof id === "string" && id.length > 0 ? id : undefined;
+	};
 	pi.on("session_before_switch", (_event, ctx) => {
 		try {
-			const sm = (
-				ctx as unknown as {
-					sessionManager?: { getSessionId?: () => string | undefined };
-				}
-			).sessionManager;
-			const outgoingSessionId =
-				typeof sm?.getSessionId === "function" ? sm.getSessionId() : undefined;
-			if (
-				typeof outgoingSessionId === "string" &&
-				outgoingSessionId.length > 0
-			) {
-				// Clear ONLY the in-memory per-session maps (the actual leak that
-				// grows one entry per swap). Do NOT clear the durable DB m[0] cache
-				// here: session_before_switch is REVERSIBLE (the user can switch
-				// back), unlike OpenCode's session.deleted. The DB cache is bounded
-				// (one session_meta row per session) and self-invalidates via
-				// epoch/version/docs-hash checks in mustMaterializePi, so preserving
-				// it lets a switch-back reuse the cached prefix instead of forcing a
-				// full m[0] re-materialization (an avoidable prompt-cache bust).
-				clearPiSystemPromptSession(outgoingSessionId);
-				promptSurfaceGuidanceEpochs.clear(outgoingSessionId);
-				clearContextHandlerSession(outgoingSessionId);
-			}
+			switchOutgoingSessionId = readSessionId(ctx);
 		} catch {
 			// best-effort — Pi proceeds with the switch regardless
+		}
+	});
+	// `session_switch` is OMP-only and absent from stock Pi's typed event map.
+	(
+		pi.on as (
+			event: string,
+			handler: (event: unknown, ctx: unknown) => void,
+		) => void
+	)("session_switch", (_event, ctx) => {
+		const outgoingSessionId = switchOutgoingSessionId;
+		switchOutgoingSessionId = undefined;
+		try {
+			if (!outgoingSessionId || outgoingSessionId === readSessionId(ctx))
+				return;
+			clearPiSystemPromptSession(outgoingSessionId);
+			promptSurfaceGuidanceEpochs.clear(outgoingSessionId);
+			clearContextHandlerSession(outgoingSessionId);
+		} catch {
+			// best-effort cleanup
 		}
 	});
 }

@@ -37,9 +37,10 @@ import {
 	type MagicContextSidebarView,
 } from "@magic-context/core/shared/sidebar-view";
 import {
-	buildStatusView as buildSharedStatusView,
+	buildStatusViewFor,
 	type StatusView,
 } from "@magic-context/core/shared/status-view";
+import { checkLocalStatusSource } from "@magic-context/core/shared/status-view-check";
 import {
 	readTuiPreferencesFileSync,
 	resolveMagicContextPrefs,
@@ -538,8 +539,11 @@ function buildAuthoritativeViews(
 		{ ...runtimeDeps, projectIdentity },
 		sessionId,
 	);
-	const statusView = buildSharedStatusView(
-		statusViewSourceFromPiDetail(detail),
+	// The published StatusView goes through the same check `/ctx-status` applies,
+	// so a payload this build cannot render becomes the shared "status
+	// unavailable" view instead of an exception out of the publish loop.
+	const statusView = buildStatusViewFor(
+		checkLocalStatusSource(statusViewSourceFromPiDetail(detail)),
 		{
 			version: packageJson.version,
 		},

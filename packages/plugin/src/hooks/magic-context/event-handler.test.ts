@@ -1,11 +1,13 @@
+import { promptAsyncAndWaitForIdle } from "../../shared/prompt-async-transport";
 import { drainNotifications } from "../../shared/rpc-notifications";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { recordMessageFtsRowid } from "../../features/magic-context/message-fts-rowid-map";
 import {
     __resetMessageIndexAsyncForTests,
@@ -99,7 +101,7 @@ afterEach(() => {
 });
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -213,6 +215,74 @@ const LIVE_BINDING_400_BODY = {
 };
 
 describe("createEventHandler", () => {
+    for (const [providerID, modelID] of [
+        ["google-vertex-anthropic", "claude-sonnet-5-5@20260930"],
+        ["amazon-bedrock", "anthropic.claude-opus-5-5-v1:0"],
+        ["vertex-eu-anthropic", "claude-fable-5-1"],
+    ]) {
+        it(`arms binding recovery via ${providerID}/${modelID}`, async () => {
+            useTempDataHome("context-event-cloud-binding-");
+            const deps = createDeps(new Map());
+            const handler = createEventHandler(deps);
+            await handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            id: "failed-shell",
+                            role: "assistant",
+                            sessionID: "ses-cloud-binding",
+                            providerID,
+                            modelID,
+                            error: {
+                                status: 400,
+                                data: { message: JSON.stringify(LIVE_BINDING_400_BODY) },
+                            },
+                        },
+                    },
+                },
+            });
+            expect(getThinkingBindingRecoveryTarget(deps.db, "ses-cloud-binding")).toBe(
+                "all_reasoning_bearing_assistants",
+            );
+        });
+    }
+
+    it("observes both user and assistant message events without a transform pass", async () => {
+        useTempDataHome("context-event-activity-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "user-1",
+                        role: "user",
+                        sessionID: "activity-user",
+                    },
+                },
+            },
+        });
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "assistant-1",
+                        role: "assistant",
+                        sessionID: "activity-assistant",
+                    },
+                },
+            },
+        });
+        const read = (id: string) =>
+            deps.db
+                .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(`retrospective_activity:${id}`) as { value: string } | undefined;
+        expect(Number(read("activity-user")?.value)).toBeGreaterThan(0);
+        expect(Number(read("activity-assistant")?.value)).toBeGreaterThan(0);
+    });
     it("arms documented Fable 5.1 binding mismatch recovery and ignores other models", async () => {
         useTempDataHome("context-event-thinking-binding-");
         const deps = createDeps(new Map());
@@ -575,6 +645,38 @@ describe("createEventHandler", () => {
         });
 
         expect(getOrCreateSessionMeta(openDatabase(), "ses-root").isSubagent).toBe(false);
+    });
+
+    it("binds host-created children without a transform and does not bind directoryless events", async () => {
+        useTempDataHome("context-event-binding-");
+        const handler = createEventHandler(createDeps(new Map()));
+        const directory = createTestTempDirFromPath(join(tmpdir(), "context-child-project-"));
+        tempDirs.push(directory);
+        for (const [id, parentID] of [
+            ["ses-parent", ""],
+            ["ses-child", "ses-parent"],
+        ]) {
+            await handler({
+                event: {
+                    type: "session.created",
+                    properties: { info: { id, parentID, directory } },
+                },
+            });
+        }
+        await handler({
+            event: {
+                type: "session.created",
+                properties: { info: { id: "ses-no-dir", parentID: "ses-parent" } },
+            },
+        });
+        const rows = openDatabase()
+            .prepare("SELECT session_id, project_path FROM session_projects ORDER BY session_id")
+            .all() as Array<{ session_id: string; project_path: string }>;
+        const identity = resolveProjectIdentityForSession(directory);
+        expect(rows).toEqual([
+            { session_id: "ses-child", project_path: identity },
+            { session_id: "ses-parent", project_path: identity },
+        ]);
     });
 
     it("marks child sessions as subagents", async () => {
@@ -2338,4 +2440,39 @@ describe("createEventHandler — usage is recorded before the model-limit refres
         expect(contextUsageMap.get(SESSION)?.usage.inputTokens).toBe(95_000);
         expect(getOrCreateSessionMeta(deps.db, SESSION).lastInputTokens).toBe(95_000);
     });
+});
+
+it("forwards an early dreamer model error into its active asynchronous wait", async () => {
+    useTempDataHome("context-dreamer-provider-error-");
+    const handler = createEventHandler(createDeps(new Map()));
+    const message =
+        "The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-v4-flash";
+    const client = {
+        session: {
+            messages: async () => ({ data: [] }),
+            status: async () => ({ data: {} }),
+            promptAsync: async () => {
+                await handler({
+                    event: {
+                        type: "session.error",
+                        properties: {
+                            sessionID: "ses-dreamer-error",
+                            error: { name: "APIError", data: { statusCode: 400, message } },
+                        },
+                    },
+                });
+                return {};
+            },
+        },
+    } as never;
+    await expect(
+        promptAsyncAndWaitForIdle(
+            client,
+            {
+                path: { id: "ses-dreamer-error" },
+                body: { parts: [{ type: "text", text: "map" }] },
+            },
+            { pollIntervalMs: 1, startGraceMs: 20 },
+        ),
+    ).rejects.toThrow(`${message} (status=400)`);
 });

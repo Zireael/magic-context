@@ -25,6 +25,7 @@ import {
     runV22BackfillCommands,
     type V22BackfillCommandArgs,
 } from "../lib/v22-backfill-commands";
+import { diagnoseIdentitySplits } from "./doctor-identity-splits";
 import { runDoctor as runOmpDoctor } from "./doctor-omp";
 import { runDoctor as runOpenCodeDoctor } from "./doctor-opencode";
 import { doctor as runPiDoctor } from "./doctor-pi";
@@ -81,6 +82,14 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
         if (result.handled) return result.exitCode;
     }
 
+    try {
+        for (const line of diagnoseIdentitySplits()) log.warn(line);
+    } catch (error) {
+        log.warn(
+            `Identity split check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
+
     // Reconcile interrupted cross-harness session migrations. The journal lives
     // in the SHARED cortexkit DB (harness-agnostic), so this runs exactly once
     // per doctor invocation — dispatching per adapter would reconcile the same
@@ -125,7 +134,10 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
     return anyFailure ? 1 : 0;
 }
 
-async function dispatchDoctor(adapter: HarnessAdapter, options: RunDoctorOptions): Promise<number> {
+export async function dispatchDoctor(
+    adapter: Pick<HarnessAdapter, "kind">,
+    options: RunDoctorOptions,
+): Promise<number> {
     switch (adapter.kind) {
         // v22 backfill flags are handled once in runDoctor (shared DB), so the
         // per-harness doctors below are NOT forwarded them — that's what
@@ -135,6 +147,7 @@ async function dispatchDoctor(adapter: HarnessAdapter, options: RunDoctorOptions
                 force: options.force,
                 fix: options.fix,
                 issue: options.issue,
+                report: options.report,
             });
         }
         case "pi": {
@@ -148,6 +161,7 @@ async function dispatchDoctor(adapter: HarnessAdapter, options: RunDoctorOptions
             return runOmpDoctor({
                 force: options.force,
                 issue: options.issue,
+                report: options.report,
             });
     }
 }

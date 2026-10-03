@@ -67,9 +67,11 @@ import {
 } from "../hooks/magic-context/tag-content-primitives";
 import type { TagTarget } from "../hooks/magic-context/tag-messages";
 import { toolInputStringBytes } from "../hooks/magic-context/tool-input-size";
+import { TEXT_TAG_IDENTITY_MARKER } from "./tag-owner-id";
 import type { Transcript, TranscriptMessage, TranscriptPart } from "./transcript";
 
-export const TEXT_TAG_IDENTITY_MARKER = ":mc-text-v1:";
+// Re-exported so existing importers keep one source for the marker.
+export { TEXT_TAG_IDENTITY_MARKER };
 
 export interface TagTranscriptOptions {
     /**
@@ -972,7 +974,14 @@ function applyTextPrefixAndTarget(args: TagTextPartArgs, tagId: number, text: st
     }
 
     const targetStart = args.timing ? performance.now() : 0;
-    args.targets.set(tagId, buildTextTarget(args.part, args.message));
+    args.targets.set(
+        tagId,
+        buildTextTarget(
+            args.part,
+            args.message,
+            args.skipPrefixInjection ? "" : prependTag(tagId, ""),
+        ),
+    );
     if (args.timing) args.timing.targets += performance.now() - targetStart;
 }
 
@@ -1275,7 +1284,7 @@ function buildAggregateTarget(
             return any ? "truncated" : "absent";
         },
         // Open invocations still belong to the current turn; only complete arcs reclaim.
-        canDrop: complete,
+        canDrop: () => complete() && !occurrences.some((occ) => occ.part.hasUserAnswer?.()),
         requiresToolArcSkeleton,
         // Non-mutating read of the invocation input (the tool_use occurrence
         // carries the arguments). Used by smart-drops supersession selection.
@@ -1307,8 +1316,10 @@ function buildAggregateTarget(
 function buildTextTarget(
     part: TranscriptPart,
     message: { info: { id?: string; role: string } },
+    textPrefix: string,
 ): TagTarget {
     return {
+        textPrefix,
         setContent(content: string): boolean {
             return part.setText(content);
         },
@@ -1375,6 +1386,9 @@ function buildToolTarget(
         // drop() replaces an invocation part's arguments with a marker, so a
         // new drop of one keeps its real arguments instead.
         cannotRemove: () => part.setToolInput !== undefined,
+        // Without a paired tool call, an answer marker can forbid automatic dropping,
+        // but must not make ordinary results newly eligible for automatic reclaim.
+        ...(part.hasUserAnswer?.() ? { canDrop: () => false } : {}),
         inputStringBytes(): number | null {
             return part.setToolInput ? toolInputStringBytes(part.getToolInput?.() ?? null) : 0;
         },

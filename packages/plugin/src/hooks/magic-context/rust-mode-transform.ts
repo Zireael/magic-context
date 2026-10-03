@@ -3,33 +3,20 @@ import { createHash, randomUUID } from "node:crypto";
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 
 import {
-    type AuthorityDrainResponse,
-    type AuthorityModuleClient,
-    type AuthorityStatus,
-    checksumAuthoritySeedRows,
-    drainAuthority,
-    ensureContextStoreUuid,
-    observeAuthorityRouting,
-    prepareAuthority,
-    pullMemoryMirrorOnce,
-    reconcileAuthorityProject,
-} from "../../features/magic-context/context-authority";
-import { reembedMirrorInvalidatedMemories } from "../../features/magic-context/memory/mirror-reembed";
-import {
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
 } from "../../features/magic-context/memory/project-identity";
 import { drainSingleStoreEmbeddingWatermarks } from "../../features/magic-context/memory/single-store-embedding-drain";
-import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import {
     modelKeyAcceptsImages,
     resolveMuralWire,
 } from "../../features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
-import { getMuralIdentity } from "../../features/magic-context/mural/storage-mural";
 import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
+import { parseCacheTtl } from "../../features/magic-context/scheduler";
+import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
-import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
+import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import {
     casChannel2NudgeState,
     clearEmergencyRecovery,
@@ -60,6 +47,14 @@ import { log, sessionLog } from "../../shared/logger";
 import { getSdkOutputLimit, getSdkWindowGeometry } from "../../shared/models-dev-cache";
 import { promptSurfaceConfigIdentity, resolvePromptSurface } from "../../shared/prompt-surface";
 import { createPromptSurfaceGuidanceEpochCache } from "../../shared/prompt-surface-runtime";
+import {
+    isTransientSqliteError,
+    withAsyncPrivilegedWriter,
+    withoutSqliteTransformPass,
+    withSqliteBackgroundWriter,
+    withSqliteTransformPass,
+} from "../../shared/sqlite";
+import { renderUserFacingFailure } from "../../shared/user-facing-codes";
 import type { WindowGeometryResult } from "../../shared/window-geometry";
 import {
     cachedToolPermissionDenied,
@@ -70,8 +65,12 @@ import {
     type ToolAvailabilityVerdict,
     todowritePermissionDenied,
 } from "./ctx-reduce-availability";
-import { resolveKnownHistorianContextLimit } from "./derive-budgets";
+import {
+    resolveHistorianProducerLimits,
+    resolveKnownHistorianContextLimit,
+} from "./derive-budgets";
 import { isEditTool } from "./edit-marker";
+import { invalidateAutoEmbedSession } from "./embed-session-state";
 import {
     EmergencyFailClosedError,
     ENGINE_RECONNECTING_USER_MESSAGE,
@@ -85,7 +84,18 @@ import {
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
 import { createHistorianHostRunner } from "./historian-host-runner";
 import { saveLkgSlotToDb } from "./lkg-persist";
-import { replayLkg, resolveLkgModelKeys } from "./lkg-replay";
+import {
+    coldStartRawServedIndex,
+    coldStartUncapturedReplay,
+    replayLkg,
+    resolveLkgModelKeys,
+} from "./lkg-replay";
+import {
+    lkgReplayFits,
+    lkgReplayLimit,
+    measureLkgReplay,
+    RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN,
+} from "./lkg-replay-fit";
 import {
     captureSlot,
     contentSnapshotValue,
@@ -113,12 +123,8 @@ import {
     visitMessageContentFields,
 } from "./lkg-slot";
 import {
-    clearCompartmentMirrorCursor,
-    type ModuleCompartmentMirrorResponse,
-    type ModuleCompartmentReader,
     type ModuleStateSyncClient,
     type ModuleStateSyncState,
-    mirrorModuleCompartments,
     syncModuleState,
 } from "./module-state-sync";
 import {
@@ -139,6 +145,14 @@ import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import {
+    nextRustPassStamp,
+    type RustLkgReplayParticipant,
+    registerRustLkgReplayParticipant,
+} from "./rust-lkg-freeze-registry";
+import { SharedCompartmentBoundaryError } from "./shared-compartment-boundaries";
+import { singleStoreMigrationRequiredFailure } from "./single-store-refusal";
+import { StorageBusyRefusalError } from "./storage-busy-refusal";
 import { STORE_AHEAD_OF_BINARY_CODE, storeAheadOfBinaryFailure } from "./store-ahead-refusal";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { computeSyntheticCallId, normalizeTodoStateJson } from "./todo-view";
@@ -151,20 +165,10 @@ import {
     applyRustModeDeferredCompactionMarker,
     replayRustModeBindingMismatchStrips,
     runRustModePostprocess,
+    rustModeServedKeyAfterPersistedStrips,
     type ThinkingBindingRecoveryApplication,
 } from "./transform-postprocess-phase";
 import { logTransformTiming } from "./transform-stage-logger";
-
-export class MemoryAuthorityUnavailableError extends Error {
-    readonly code = "MEMORY_AUTHORITY_UNAVAILABLE";
-
-    constructor(detail: string) {
-        super(
-            `rust memory authority unavailable; route ctx_memory through the Rust module: ${detail}`,
-        );
-        this.name = "MemoryAuthorityUnavailableError";
-    }
-}
 
 class RustTransformProtocolError extends Error {
     readonly code = "rust_transform_protocol_error";
@@ -174,6 +178,25 @@ class RustTransformProtocolError extends Error {
         this.name = "RustTransformProtocolError";
     }
 }
+
+/**
+ * A frozen replay is over the provider-proven context limit while emergency
+ * recovery is armed, and the module's output is over it too (or cannot be shown
+ * to fit). Neither array can be sent, so the pass refuses. The module itself is
+ * healthy, so this is not counted as a module failure.
+ */
+class FrozenReplayOverProvenLimitRefusal extends Error {
+    constructor(
+        readonly moduleFit: FrozenFit,
+        readonly limit: number,
+    ) {
+        super(`frozen replay and module output are over the provider-proven limit ${limit}`);
+        this.name = "FrozenReplayOverProvenLimitRefusal";
+    }
+}
+
+/** Where an array stands against a context limit; see `measureAgainstLimit` in `run`. */
+type FrozenFit = "under" | "over" | "unproven";
 
 export const RUST_FAILURE_PARK_THRESHOLD = 3;
 export const RUST_PARK_RETRY_INTERVAL = 5;
@@ -238,34 +261,6 @@ async function resolveCombinedTodowriteVerdict(
     }
     return !permissionDenied;
 }
-const RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN = 4;
-
-/**
- * Serialize the raw array message-by-message with a running byte sum, aborting
- * as soon as the sum proves the prompt is over the context limit. A refusal
- * then costs a fraction of the full serialization and never runs the
- * tokenizer; when the sum stays under the budget the total matches a
- * whole-array serialization up to array punctuation.
- */
-function rawFallbackSerializedBytes(
-    messages: readonly MessageLike[],
-    abortAboveBytes: number,
-): { bytes: number; aborted: boolean } | null {
-    let bytes = 0;
-    try {
-        for (const message of messages) {
-            const serialized = JSON.stringify(message);
-            if (typeof serialized !== "string") return null;
-            // +1 accounts for the separator between array entries.
-            bytes += Buffer.byteLength(serialized) + 1;
-            if (bytes > abortAboveBytes) return { bytes, aborted: true };
-        }
-    } catch {
-        // Serialization is itself required before these messages can reach a provider.
-        return null;
-    }
-    return { bytes: bytes + 1, aborted: false };
-}
 
 export interface RustModeModuleClient extends ModuleStateSyncClient {
     call(
@@ -273,41 +268,8 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
             onTimings?: (timings: import("./module-transport").ModuleCallTimings) => void;
         },
     ): Promise<unknown>;
-    authorityStatus?(args: {
-        context_store_uuid: string;
-        project: string;
-        /** Bound route root for this authority query. */
-        projectRoot?: string;
-        /** Existing OpenCode session route used by host tools. */
-        sessionId?: string;
-        domain: "memories" | "notes";
-    }): Promise<{ authority: AuthorityStatus | null }>;
-    authorityPrepare?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
-    authoritySeed?(
-        args: Record<string, unknown>,
-    ): Promise<{ seeded: number; module_row_ids?: number[] }>;
-    authorityDrain?(args: Record<string, unknown>): Promise<AuthorityDrainResponse>;
-    mirrorPull?(args: {
-        domain: "memories" | "notes";
-        cursor: number;
-        limit: number;
-        live_only?: boolean;
-        projectRoot?: string;
-    }): Promise<{ page: import("../../features/magic-context/context-authority").ChangefeedPage }>;
-    mirrorMemory?(args: { module_row_id: number; projectRoot?: string }): Promise<{
-        row: import("../../features/magic-context/context-authority").ChangefeedRow | null;
-    }>;
-    memoryIdentityAck?(args: {
-        project: string;
-        rows: Array<{ module_row_id: number; context_row_id: number }>;
-        projectRoot?: string;
-    }): Promise<{ acknowledged: number }>;
     deleteSession?(sessionId: string, projectRoot: string): Promise<void>;
     closeSession?(sessionId: string): void;
-    getCompartmentsAfter?(
-        sessionId: string,
-        afterSequence: number,
-    ): Promise<ModuleCompartmentMirrorResponse>;
 }
 
 interface RustLkgCapturePlan {
@@ -394,6 +356,10 @@ interface RustSessionState extends ModuleStateSyncState {
     baselineSystemHashOmitted: boolean;
     todoProbeIdentity?: string;
     todoProbeNextPass?: boolean;
+    /** Last seen compartment `max_sequence:count` for this session; a change re-arms auto-embed. */
+    autoEmbedCompartmentMark?: string;
+    /** Last transform-response compartment key; the compartment query runs only when it moves. */
+    autoEmbedCompartmentKey?: string;
     lastAppliedAtMs?: number;
     consecutiveFailures: number;
     passCount: number;
@@ -424,21 +390,13 @@ interface RustSessionState extends ModuleStateSyncState {
     syntheticTurnCount: number;
     lastObservedUserMessageId: string | null;
     syntheticLoopBreakerLogged: boolean;
-    memoryAuthorityProject: string | null;
-    memoryAuthorityRoot: string | null;
-    memoryAuthorityReady: boolean;
     recordedSessionProjectIdentity: string | null;
     recordedSessionDirectory: string | null;
     resolvedMemoryProjectDirectory: string | null;
     resolvedMemoryProjectPath: string | null;
     stateSyncInputSignature: string | null;
-    memoryMirrorProjectionKey: string | null;
-    compartmentMirrorProjectionKey: string | null;
-    mirrorProjectionInFlight: boolean;
-    muralCuePoolVersion: number;
-    muralGeneration: number;
     muralCache: { key: string; value: MuralWireOptions } | null;
-    authorityMemorySyncSkipLogged?: boolean;
+
     lkgCaptureSequence: number;
     /**
      * Capture sequence of the snapshot prepared from the array the previous pass
@@ -459,6 +417,13 @@ interface RustSessionState extends ModuleStateSyncState {
     lkgRepresentationFrozen: boolean;
     lkgFrozenHealthyPasses: number;
     lkgFrozenAtInputCount: number | null;
+    /**
+     * True until this process's first pass for the session applies module output.
+     * That pass checks whether the durable slot it inherited was captured from a
+     * frozen serve (a previous process froze and captured raw bytes) and, if so,
+     * resumes the freeze instead of adopting module output.
+     */
+    lkgColdStartCheckPending: boolean;
     /** Highest fold coverage ordinal this process has already armed the deferred-note
      * nudge for. Null until the first committed boundary of the process is observed. */
     noteNudgePublishedOrdinal: number | null;
@@ -473,21 +438,13 @@ export interface RustModeTransformOptions {
     /** Test-only page-size override for exercising multi-page control flow with small fixtures. */
     modulePageMaxBytes?: number;
     memorySyncRequestedSessions?: Set<string>;
-    /**
-     * Invoked with each project that reaches rust-mode authority preparation, so the
-     * host can lazily register per-project services (the smart-note evaluator bridge)
-     * for projects other than the plugin's launch directory.
-     */
-    onProjectPrepared?: (projectPath: string) => void;
-    /** Test-only escape hatch for transform-wire tests without an authority transport. */
-    allowAuthorityProtocolBypassForTests?: boolean;
     /** Override only for deterministic capture scheduling in tests. */
     scheduleLkgCapture?: (capture: () => void) => void;
     /** Override only to exercise a failure at the native-output installation boundary. */
     installNativeMessagesForTests?: (output: { messages: unknown[] }, messages: unknown[]) => void;
     /** Override only to exercise raw-fallback estimator failures in tests. */
     rawFallbackEstimatorForTests?: typeof estimateFinalWireInputTokens;
-    /** Override only to observe mural generation caching in tests. */
+    /** Override only to observe mural candidate resolution in tests. */
     muralResolverForTests?: typeof resolveMuralWire;
     /** Override only to observe session-identity caching in tests. */
     sessionProjectIdentityResolverForTests?: typeof resolveProjectIdentityForSession;
@@ -962,29 +919,20 @@ function responseValue(response: unknown): Record<string, unknown> {
     throw new Error("module transform returned a non-object response");
 }
 
-function mirrorProjectionKey(response: Record<string, unknown>): string | null {
-    const memoryMirrorHead = response.memory_mirror_head;
-    if (
-        typeof memoryMirrorHead === "number" &&
-        Number.isSafeInteger(memoryMirrorHead) &&
-        memoryMirrorHead >= 0
-    ) {
-        return JSON.stringify(["memory-feed", memoryMirrorHead]);
-    }
+/**
+ * Identity of the module's published compartment state as reported on a transform
+ * response. Returns null for a response without a usable row_version (older modules),
+ * which makes the caller check context.db on every pass instead of never.
+ */
+function moduleCompartmentProjectionKey(response: Record<string, unknown>): string | null {
     const rowVersion = response.row_version;
     if (typeof rowVersion !== "number" || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
         return null;
     }
-    const renderedMemoryIds = Array.isArray(response.rendered_memory_ids)
-        ? response.rendered_memory_ids
-        : [];
-    // Older modules do not publish the feed frontier. Keep their legacy projection trigger
-    // rather than polling on every pass; current modules use the exact feed sequence above.
     return JSON.stringify([
         rowVersion,
         response.boundary_id ?? null,
         response.coverage_ordinal ?? null,
-        renderedMemoryIds,
     ]);
 }
 
@@ -1104,21 +1052,13 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             syntheticTurnCount: 0,
             lastObservedUserMessageId: null,
             syntheticLoopBreakerLogged: false,
-            memoryAuthorityProject: null,
-            memoryAuthorityRoot: null,
-            memoryAuthorityReady: false,
             recordedSessionProjectIdentity: null,
             recordedSessionDirectory: null,
             resolvedMemoryProjectDirectory: null,
             resolvedMemoryProjectPath: null,
             stateSyncInputSignature: null,
-            memoryMirrorProjectionKey: null,
-            compartmentMirrorProjectionKey: null,
-            mirrorProjectionInFlight: false,
-            muralCuePoolVersion: 0,
-            muralGeneration: 0,
             muralCache: null,
-            authorityMemorySyncSkipLogged: false,
+
             lkgCaptureSequence: 0,
             lkgLastServedCaptureSequence: null,
             lkgLastCapturedRowVersion: 0,
@@ -1126,11 +1066,27 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             lkgRepresentationFrozen: false,
             lkgFrozenHealthyPasses: 0,
             lkgFrozenAtInputCount: null,
+            lkgColdStartCheckPending: true,
             noteNudgePublishedOrdinal: null,
         };
         states.set(sessionId, state);
     }
     return state;
+}
+
+/**
+ * Enter (or keep) the frozen representation after a last-known-good replay was
+ * served, whoever served it. From here on the provider holds the replayed bytes,
+ * so later healthy passes must keep serving them until a pass installs something
+ * else. The replay appended a raw tail the slot does not hold, so the slot is no
+ * longer provably the last-served array.
+ */
+function enterLkgReplayFreeze(state: RustSessionState, inputCount: number): void {
+    if (state.lkgFrozenAtInputCount === null) state.lkgFrozenAtInputCount = inputCount;
+    state.lkgRepresentationFrozen = true;
+    state.lkgFrozenHealthyPasses = 0;
+    state.forceFullWire = true;
+    state.lkgLastServedCaptureSequence = null;
 }
 
 function getSessionDirectory(
@@ -1208,6 +1164,53 @@ function transformGeometryForWire(
     };
 }
 
+/**
+ * Whether a Rust-mode pass for this session must fail closed: usage at or above
+ * `RUST_EMERGENCY_WALL_PCT` of a trusted hard wall, or a provider overflow that
+ * is proven (in this process, or persisted with provider proof). A pass that
+ * fails closed admits no last-known-good replay. `providerProvenEmergency` is the
+ * narrower case where the band is reached and the overflow is provider-proven.
+ */
+function rustEmergencyFailClosed(args: {
+    sessionId: string;
+    usage: ContextUsage;
+    geometry: TransformGeometryWire | undefined;
+    trustedContextLimit: number | undefined;
+    overflowState: ReturnType<typeof getOverflowState> | undefined;
+    modelKey: string | null;
+}): { emergencyFailClosed: boolean; providerProvenEmergency: boolean } {
+    const { sessionId, overflowState } = args;
+    const hasTrustedEmergencyWall = args.geometry
+        ? args.geometry.usable_hard > 0
+        : args.trustedContextLimit !== undefined && args.trustedContextLimit > 0;
+    const hardWallPercentage = hardWallUsagePercentage(args.usage, args.geometry);
+    const providerOverflowProven = isProviderOverflowFailClosedProven(sessionId);
+    let emergencyFailClosed =
+        providerOverflowProven ||
+        (hardWallPercentage >= RUST_EMERGENCY_WALL_PCT && hasTrustedEmergencyWall);
+    let providerProvenEmergency = false;
+    if (overflowState) {
+        const detectedLimitMatchesModel =
+            overflowState.detectedContextLimitModelKey === null ||
+            canonicalModelIdentity(overflowState.detectedContextLimitModelKey) ===
+                canonicalModelIdentity(args.modelKey ?? "");
+        const hasProviderProof =
+            (overflowState.detectedContextLimit > 0 && detectedLimitMatchesModel) ||
+            // An unknown persisted arm alone is not proof. A second provider rejection
+            // while that arm is durable records the process-local reconfirmation.
+            isProviderOverflowReconfirmed(sessionId);
+        const persistedProviderEmergency =
+            overflowState.needsEmergencyRecovery &&
+            overflowState.emergencyRecoveryOrigin === "provider_overflow" &&
+            hasProviderProof;
+        emergencyFailClosed ||= persistedProviderEmergency;
+        providerProvenEmergency =
+            hardWallPercentage >= RUST_EMERGENCY_WALL_PCT &&
+            (providerOverflowProven || persistedProviderEmergency);
+    }
+    return { emergencyFailClosed, providerProvenEmergency };
+}
+
 function hardWallUsagePercentage(
     usage: ContextUsage,
     geometry: TransformGeometryWire | undefined,
@@ -1257,247 +1260,6 @@ function directiveTextOf(response: Record<string, unknown>): string | undefined 
 
 function isNeedFullSync(response: Record<string, unknown>): boolean {
     return response.status === "need_full_sync" || response.action === "NEED_FULL_SYNC";
-}
-
-function canonicalizeForChecksum(value: unknown): unknown {
-    if (Array.isArray(value)) return value.map(canonicalizeForChecksum);
-    if (!isRecord(value)) return value;
-    return Object.fromEntries(
-        Object.keys(value)
-            .sort()
-            .map((key) => [key, canonicalizeForChecksum(value[key])]),
-    );
-}
-
-function checksumSeedRows(rows: readonly Record<string, unknown>[]): string {
-    return createHash("sha256")
-        .update(JSON.stringify(rows.map(canonicalizeForChecksum)))
-        .digest("hex");
-}
-
-function authoritySeedRows(
-    db: TransformDeps["db"],
-    projectPath: string,
-    domain: "memories" | "notes",
-): Record<string, unknown>[] {
-    const snapshots =
-        domain === "memories"
-            ? db
-                  .prepare("SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC")
-                  .all(projectPath)
-            : db
-                  .prepare(
-                      `SELECT n.*
-                         FROM notes n
-                        WHERE n.project_path = ?
-                           OR (n.project_path IS NULL AND EXISTS (
-                               SELECT 1 FROM session_projects sp
-                                WHERE sp.session_id = n.session_id AND sp.project_path = ?
-                           ))
-                        ORDER BY n.id ASC`,
-                  )
-                  .all(projectPath, projectPath);
-    const memoryRows = snapshots.filter(isRecord);
-    // A `superseded_by_memory_id` pointing outside this seed set can never resolve
-    // module-side: the store records it as a pending memory reference, and the
-    // resolution sweep only clears pendings whose target later appears in
-    // mc_memories. A target that is absent here is absent for good (its row was
-    // hard-deleted after an archive), so the pending would survive to
-    // authority_finish_prepare and permanently reject the memories-domain handoff.
-    // Dropping the dead link here keeps the gate meaningful for the case it exists
-    // to catch: a target the host DID send that the module failed to ingest.
-    const seededIds = new Set(memoryRows.map((row) => Number(row.id)));
-    const mappings =
-        domain === "memories"
-            ? getMemoryVerifications(
-                  db,
-                  memoryRows.map((row) => Number(row.id)),
-              )
-            : new Map<number, { files: string[]; hasSentinel: boolean; mappingOrigin: "mapper" }>();
-    return memoryRows.map((snapshot) => {
-        const id = Number(snapshot.id);
-        const mapping = mappings.get(id);
-        const resolvedSnapshot =
-            domain === "memories" &&
-            snapshot.superseded_by_memory_id != null &&
-            !seededIds.has(Number(snapshot.superseded_by_memory_id))
-                ? { ...snapshot, superseded_by_memory_id: null }
-                : snapshot;
-        const seededSnapshot =
-            domain === "memories" && mapping
-                ? {
-                      ...resolvedSnapshot,
-                      mapping: mapping.hasSentinel ? null : mapping.files,
-                      mapping_origin: mapping.mappingOrigin,
-                  }
-                : domain === "notes" && snapshot.project_path == null
-                  ? { ...resolvedSnapshot, project_path: projectPath }
-                  : resolvedSnapshot;
-        return { source_row_id: snapshot.id, snapshot: seededSnapshot };
-    });
-}
-
-async function prepareRustMemoryAuthority(args: {
-    db: TransformDeps["db"];
-    module: RustModeModuleClient;
-    projectPath: string;
-    projectRoot: string;
-    state: RustSessionState;
-    allowProtocolBypassForTests?: boolean;
-    /** Fires after authority is ready so hosts can register per-project services. */
-    onProjectPrepared?: (projectPath: string) => void;
-}): Promise<void> {
-    const { db, module, projectPath, projectRoot, state } = args;
-    if (
-        state.memoryAuthorityProject === projectPath &&
-        state.memoryAuthorityRoot === projectRoot &&
-        state.memoryAuthorityReady
-    ) {
-        return;
-    }
-    state.memoryAuthorityProject = projectPath;
-    state.memoryAuthorityRoot = projectRoot;
-    state.memoryAuthorityReady = false;
-    if (!module.authorityStatus || !module.authorityPrepare || !module.authoritySeed) {
-        if (args.allowProtocolBypassForTests === true) {
-            state.memoryAuthorityReady = true;
-            return;
-        }
-        throw new MemoryAuthorityUnavailableError(
-            "the module does not expose authority.status, authority.prepare, and authority.seed",
-        );
-    }
-
-    // Call through the module object on every invocation: these may be real class
-    // methods whose implementations depend on their instance, so detaching them into
-    // locals would sever `this` and only fail at runtime (test fakes are object
-    // literals and cannot catch the difference).
-    const authorityModule: AuthorityModuleClient = {
-        authorityStatus: (request) => {
-            const method = module.authorityStatus;
-            if (!method) throw new MemoryAuthorityUnavailableError("authority.status unavailable");
-            return method.call(module, { ...request, projectRoot });
-        },
-        authorityPrepare: (request) => {
-            const method = module.authorityPrepare;
-            if (!method) throw new MemoryAuthorityUnavailableError("authority.prepare unavailable");
-            return method.call(module, { ...request, projectRoot });
-        },
-        authoritySeed: (request) => {
-            const method = module.authoritySeed;
-            if (!method) throw new MemoryAuthorityUnavailableError("authority.seed unavailable");
-            return method.call(module, { ...request, projectRoot });
-        },
-        authorityDrain: module.authorityDrain
-            ? (request) => {
-                  const method = module.authorityDrain;
-                  if (!method)
-                      throw new MemoryAuthorityUnavailableError("authority.drain unavailable");
-                  return method.call(module, { ...request, projectRoot });
-              }
-            : undefined,
-        mirrorPull: module.mirrorPull
-            ? (request) => {
-                  const method = module.mirrorPull;
-                  if (!method) throw new MemoryAuthorityUnavailableError("mirror.pull unavailable");
-                  return method.call(module, { ...request, projectRoot });
-              }
-            : undefined,
-    };
-    const contextStoreUuid = ensureContextStoreUuid(db);
-    const domains = ["memories", "notes"] as const;
-    const statuses = new Map<
-        (typeof domains)[number],
-        Awaited<ReturnType<NonNullable<RustModeModuleClient["authorityStatus"]>>>["authority"]
-    >();
-    for (const domain of domains) {
-        const current = await authorityModule.authorityStatus({
-            context_store_uuid: contextStoreUuid,
-            project: projectPath,
-            domain,
-        });
-        statuses.set(domain, current.authority);
-    }
-
-    let resumedDrain = false;
-    for (const domain of domains) {
-        const current = statuses.get(domain);
-        if (current?.state !== "DRAINING") continue;
-        resumedDrain = true;
-        let drained: Awaited<ReturnType<typeof drainAuthority>> | undefined;
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-            drained = await drainAuthority({
-                db,
-                projectPath,
-                domain,
-                module: authorityModule,
-                checksum: () =>
-                    checksumSeedRows(
-                        db
-                            .prepare(
-                                `SELECT * FROM ${domain === "memories" ? "memories" : "notes"} WHERE project_path = ? ORDER BY id ASC`,
-                            )
-                            .all(projectPath)
-                            .filter(isRecord),
-                    ),
-            });
-            if (!("code" in drained)) break;
-        }
-        if (!drained) {
-            throw new MemoryAuthorityUnavailableError("authority drain did not return a result");
-        }
-        if ("code" in drained) {
-            throw new MemoryAuthorityUnavailableError(
-                `${drained.code}; the next scheduled transform will resume the drain`,
-            );
-        }
-        statuses.set(domain, null);
-    }
-
-    // Do not return before finishing authority restore: if some domains are still
-    // DRAINING and others MODULE, reinstall the on-disk authority_managed marker and
-    // re-apply write fences on remaining MODULE domains before any tools run.
-    if (!resumedDrain) {
-        for (const domain of domains) {
-            const current = statuses.get(domain);
-            if (current?.state !== "PREPARING") continue;
-            await authorityModule.authorityPrepare({
-                method: "authority.prepare",
-                phase: "abort",
-                context_store_uuid: contextStoreUuid,
-                project: projectPath,
-                domain,
-                generation: current.generation,
-            });
-            statuses.set(domain, null);
-        }
-        const preparing = domains.filter((domain) => statuses.get(domain)?.state !== "MODULE");
-        for (const domain of preparing) {
-            const stateName = statuses.get(domain)?.state;
-            if (stateName && stateName !== "TS") {
-                throw new Error(`${domain} authority cannot prepare from ${stateName}`);
-            }
-        }
-        if (preparing.length > 0) {
-            const prepared = await prepareAuthority({
-                db,
-                projectPath,
-                domains: preparing,
-                module: authorityModule,
-                seedPages: async (domain) => authoritySeedRows(db, projectPath, domain),
-                checksum: (_domain, rows) => checksumAuthoritySeedRows(rows),
-            });
-            for (const authority of prepared) statuses.set(authority.domain, authority);
-        }
-    }
-
-    await reconcileAuthorityProject({ db, projectPath, module: authorityModule });
-    observeAuthorityRouting(
-        projectPath,
-        domains.every((domain) => statuses.get(domain)?.state === "MODULE") ? "MODULE" : "TS",
-    );
-    state.memoryAuthorityReady = true;
-    args.onProjectPrepared?.(projectPath);
 }
 
 const TODO_HEAD_ANCHOR_ID = "__magic_context_todo_head__";
@@ -1622,31 +1384,56 @@ function resolvedHistorianModelChain(
 
 function resolvedHistorianModelLimits(
     chain: readonly string[],
-): Record<string, { context?: number; output?: number }> {
+): Record<string, { context?: number; input?: number; output?: number }> {
     return Object.fromEntries(
         chain.map((key) => {
             const [provider, ...parts] = key.split("/");
             const output =
                 provider && parts.length ? getSdkOutputLimit(provider, parts.join("/")) : undefined;
-            const known = resolveKnownHistorianContextLimit(key);
+            const producerLimits = resolveHistorianProducerLimits(key);
+            const known =
+                producerLimits.input === undefined
+                    ? resolveKnownHistorianContextLimit(key)
+                    : undefined;
             const learned =
                 provider && parts.length
                     ? getSdkWindowGeometry(provider, parts.join("/"))?.derivation.window
                     : undefined;
             const context =
-                known === undefined
+                producerLimits.context ??
+                (known === undefined
                     ? learned
                     : learned === undefined
                       ? known
-                      : Math.min(known, learned);
+                      : Math.min(known, learned));
             return [
                 key,
                 {
                     ...(context !== undefined ? { context } : {}),
+                    ...(producerLimits.input !== undefined ? { input: producerLimits.input } : {}),
                     ...(output !== undefined ? { output } : {}),
                 },
             ];
         }),
+    );
+}
+
+/** Over-approximate host-visible HARD opportunities: the module freezes mural bytes on all non-materializing passes. */
+function shouldRefreshMuralCandidate(args: {
+    initialized: boolean;
+    pressure: number;
+    threshold: number;
+    lastAppliedAtMs: number | undefined;
+    nowMs: number;
+    cacheTtl: string;
+    explicitMaterialization: boolean;
+}): boolean {
+    const ttlMs = args.cacheTtl === "1h" ? 3_600_000 : 300_000;
+    return (
+        !args.initialized ||
+        args.pressure >= args.threshold ||
+        args.explicitMaterialization ||
+        (args.lastAppliedAtMs !== undefined && args.nowMs - args.lastAppliedAtMs >= ttlMs)
     );
 }
 
@@ -1827,8 +1614,10 @@ export function createRustModeTransform(
     clearSession: (sessionId: string) => Promise<void>;
     invalidateWireState: (sessionId: string) => void;
     stopHostRunner: () => Promise<void>;
+    dispose: () => void;
     getState: (sessionId: string) => Readonly<RustSessionState>;
     getHeapStats: () => RustWireCacheHeapStats;
+    replayParticipant: RustLkgReplayParticipant;
 } {
     const states = new Map<string, RustSessionState>();
     const clock = options.clockForTests ?? { setTimeout, clearTimeout, now: Date.now };
@@ -1840,8 +1629,10 @@ export function createRustModeTransform(
     const promptSurfaceGuidanceEpochs = deps.promptSurfaceRuntime
         ? createPromptSurfaceGuidanceEpochCache(deps.promptSurfaceRuntime)
         : undefined;
-    const scheduleLkgCapture =
+    const captureScheduler =
         options.scheduleLkgCapture ?? ((capture: () => void) => setImmediate(capture));
+    const scheduleLkgCapture = (capture: () => void) =>
+        withoutSqliteTransformPass(() => captureScheduler(capture));
     const installNativeMessages = options.installNativeMessagesForTests ?? replaceMessagesInPlace;
     const rawFallbackEstimator =
         options.rawFallbackEstimatorForTests ?? estimateFinalWireInputTokens;
@@ -1906,32 +1697,15 @@ export function createRustModeTransform(
         projectIdentity: string | undefined,
         modelKey: string | undefined,
         budgetTokens: number | undefined,
+        refresh: boolean,
     ): MuralWireOptions => {
-        // SDK refreshes can correct image support without changing the model key.
-        // Cache the candidate mural for the next permitted HARD (prefix rebuild);
-        // the Rust module keeps already-served m0 prefix bytes frozen on passes
-        // without cache-bust permission.
-        // Reading only the mural's persisted identity avoids loading PNG bytes or rendering on
-        // the hot path, while detecting murals written outside this transform process so the
-        // cached candidate is invalidated.
-        const artifactIdentity = projectIdentity
-            ? getMuralIdentity(deps.db, projectIdentity)
-            : null;
-        const cacheKey = (artifact: typeof artifactIdentity): string =>
-            JSON.stringify([
-                state.muralGeneration,
-                state.muralCuePoolVersion,
-                projectIdentity ?? null,
-                modelKey ?? null,
-                budgetTokens ?? null,
-                modelKeyAcceptsImages(modelKey),
-                artifact?.contentHash ?? null,
-                artifact?.renderedAt ?? null,
-            ]);
-        const key = cacheKey(artifactIdentity);
-        if (options.disableHotPathIoCachesForTests !== true && state.muralCache?.key === key) {
-            return state.muralCache.value;
-        }
+        const key = JSON.stringify([
+            projectIdentity,
+            modelKey,
+            budgetTokens,
+            modelKeyAcceptsImages(modelKey),
+        ]);
+        if (!refresh && state.muralCache?.key === key) return state.muralCache.value;
         const value = (options.muralResolverForTests ?? resolveMuralWire)(
             deps.db,
             projectIdentity,
@@ -1939,10 +1713,7 @@ export function createRustModeTransform(
             true,
             budgetTokens,
         );
-        const resolvedArtifactIdentity = projectIdentity
-            ? getMuralIdentity(deps.db, projectIdentity)
-            : null;
-        state.muralCache = { key: cacheKey(resolvedArtifactIdentity), value };
+        state.muralCache = { key, value };
         return value;
     };
 
@@ -1969,6 +1740,7 @@ export function createRustModeTransform(
     const callModule = async (
         args: Parameters<RustModeModuleClient["call"]>[0],
         attemptTimeoutMs = args.timeoutMs ?? timeoutMs,
+        allowTimeoutRetry = true,
     ): Promise<unknown> => {
         const controller = new AbortController();
         const body = isRecord(args.body) ? args.body : {};
@@ -1987,14 +1759,62 @@ export function createRustModeTransform(
                       },
                   )
                 : new Error("rust module request timed out");
-        const timer = clock.setTimeout(() => controller.abort(timeoutError), attemptTimeoutMs);
+        let rejectDeadline!: (error: Error) => void;
+        const deadline = new Promise<never>((_resolve, reject) => {
+            rejectDeadline = reject;
+        });
+        const timer = clock.setTimeout(() => {
+            controller.abort(timeoutError);
+            rejectDeadline(timeoutError);
+        }, attemptTimeoutMs);
         try {
-            return await options.moduleClient.call({
-                ...args,
-                signal: controller.signal,
-                timeoutMs: attemptTimeoutMs,
-            });
+            return await Promise.race([
+                options.moduleClient.call({
+                    ...args,
+                    signal: controller.signal,
+                    timeoutMs: attemptTimeoutMs,
+                }),
+                deadline,
+            ]);
         } catch (error) {
+            const timedOut =
+                controller.signal.aborted ||
+                (error instanceof Error && /timed out|deadline/i.test(error.message));
+            if (
+                allowTimeoutRetry &&
+                options.moduleTimeoutMs === undefined &&
+                args.method === "transform" &&
+                body.transform_page_complete === true &&
+                timedOut
+            ) {
+                clock.clearTimeout(timer);
+                // Retry only the identical content-addressed final page. The module
+                // checks its generation and final digest and replays a completed result;
+                // no state-sync, page upload or host mutation is repeated here.
+                sessionLog(
+                    args.sessionId,
+                    "rust transform deadline: waiting up to 45000ms for identical final-page completion",
+                );
+                const completionDeadline = clock.now() + 45_000;
+                for (;;) {
+                    const remaining = completionDeadline - clock.now();
+                    if (remaining <= 0) throw timeoutError;
+                    try {
+                        return await callModule(args, remaining, false);
+                    } catch (retryError) {
+                        if (
+                            moduleFailureCode(retryError) !== "authority_transform_page_in_progress"
+                        )
+                            throw retryError;
+                        // The original execution is still applying. Re-submit only
+                        // its identical final page after yielding, until its cached
+                        // committed result is available or this one budget expires.
+                        const wait = Math.min(250, completionDeadline - clock.now());
+                        if (wait <= 0) throw timeoutError;
+                        await new Promise<void>((resolve) => clock.setTimeout(resolve, wait));
+                    }
+                }
+            }
             if (controller.signal.aborted) throw timeoutError;
             throw error;
         } finally {
@@ -2176,12 +1996,20 @@ export function createRustModeTransform(
             return false;
         }
         const keys = resolveLkgModelKeys(currentMessages);
+        const replayModel = resolveReplayModel(sessionId, currentMessages);
         const replay = replayLkg({
             sessionId,
             messages: currentMessages,
             modelKey: keys.modelKey,
             providerKey: keys.providerKey,
             entry,
+            prepareReplay: (messages) =>
+                replayRustModeBindingMismatchStrips({
+                    db: deps.db,
+                    sessionId,
+                    messages,
+                    resolvedProviderID: replayModel?.providerID,
+                }),
         });
         if (!replay.ok) {
             const state = states.get(sessionId);
@@ -2189,70 +2017,167 @@ export function createRustModeTransform(
             sessionLog(sessionId, replay.reason);
             return false;
         }
-        const replayModel =
-            modelFromMessages(currentMessages) ??
-            deps.liveModelBySession?.get(sessionId) ??
-            hostModelFallback(sessionId);
-        replayRustModeBindingMismatchStrips({
+        const fit = lkgReplayFits({
             db: deps.db,
             sessionId,
-            messages: replay.messages as MessageLike[],
-            resolvedProviderID: replayModel?.providerID,
+            messages: replay.messages,
+            model: replayModel,
+            modelKey: keys.modelKey,
+            systemPromptTokens,
+            agentName: deps.getNotificationParams?.(sessionId)?.agent,
+            estimator: rawFallbackEstimator,
         });
-        const trustedReplayLimit = replayModel
-            ? resolveTrustedContextLimit(replayModel.providerID, replayModel.modelID, {
-                  db: deps.db,
-                  sessionID: sessionId,
-              })
-            : undefined;
-        let detectedReplayLimit = 0;
-        try {
-            detectedReplayLimit = getOverflowState(
-                deps.db,
-                sessionId,
-                keys.modelKey,
-            ).detectedContextLimit;
-        } catch {
-            // A limit read failure cannot admit cached bytes whose size is now unknown.
-            return false;
-        }
-        const replayLimit =
-            trustedReplayLimit ?? (detectedReplayLimit > 0 ? detectedReplayLimit : undefined);
-        if (replayLimit !== undefined && replayLimit > 0) {
-            try {
-                const estimate = estimateFinalWireInputTokens({
-                    messages: replay.messages,
-                    systemPromptTokens,
-                    providerID: replayModel?.providerID,
-                    modelID: replayModel?.modelID,
-                    agentName: deps.getNotificationParams?.(sessionId)?.agent,
-                });
-                if (
-                    !estimate.trusted ||
-                    !Number.isFinite(estimate.tokens) ||
-                    estimate.tokens <= 0 ||
-                    estimate.tokens > replayLimit
-                ) {
-                    sessionLog(
-                        sessionId,
-                        `${!estimate.trusted ? "lkg_fit_untrusted" : "lkg_over_context_limit"} estimated=${estimate.tokens} limit=${replayLimit}`,
-                    );
-                    return false;
-                }
-            } catch {
-                return false;
-            }
-        } else {
+        if (!fit.fits) {
+            if (fit.detail) sessionLog(sessionId, fit.detail);
             return false;
         }
         replaceMessagesInPlace(output, replay.messages);
-        // This serve adds a raw tail the slot does not hold, so the slot stops being
-        // the last-served array even if this pass captured one before failing.
-        const replayState = states.get(sessionId);
-        if (replayState) replayState.lkgLastServedCaptureSequence = null;
+        // Every provider-visible replay enters the freeze here: the failure ladder,
+        // the parked shortcut and the parked health-probe failure alike.
+        enterLkgReplayFreeze(ensureState(states, sessionId), currentMessages.length);
         sessionLog(sessionId, "lkg_replay_served");
         return true;
     };
+
+    // The model a last-known-good replay is admitted and stripped for. The outer
+    // wrapper's replay goes through the registered participant below, which uses
+    // this same function, so both replays of one tail strip it identically.
+    const resolveReplayModel = (
+        sessionId: string,
+        messages: MessageLike[],
+    ): { providerID: string; modelID: string } | null | undefined =>
+        modelFromMessages(messages) ??
+        deps.liveModelBySession?.get(sessionId) ??
+        hostModelFallback(sessionId);
+
+    /**
+     * On this process's first applied pass for a session, find whether a previous
+     * process left a freeze behind. A frozen healthy pass captures the raw bytes it
+     * served, so a durable slot ending in messages exactly as the host sent them,
+     * one of which the module now renders differently, shows the provider last saw
+     * the frozen representation (see `coldStartRawServedIndex`): the result is
+     * `frozen_slot`, with the slot's messages, the first raw-served slot index and
+     * the raw-input index where the raw run begins.
+     *
+     * Otherwise, a previous process may have ended right after a last-known-good
+     * replay it never captured (see `coldStartUncapturedReplay`): the result is
+     * `uncaptured_replay`, with the array that replay most likely served, so the
+     * thinking strip can remove thinking produced against bytes the module now
+     * renders differently.
+     *
+     * Null when neither applies. Uses the module output from before postprocess,
+     * which has side effects a pass that ends in a frozen serve must not run.
+     */
+    const detectColdStartFrozenSlot = (
+        sessionId: string,
+        rawInput: MessageLike[],
+        moduleOutput: readonly unknown[],
+        providerID: string | undefined,
+    ):
+        | { kind: "frozen_slot"; slotMessages: unknown[]; index: number; rawRunStart: number }
+        | { kind: "uncaptured_replay"; lastServed: unknown[]; rawUserIndex: number }
+        | null => {
+        try {
+            const slotMessages = parseLastServedSnapshot(getSlot(sessionId)?.jsonPrefix);
+            if (!slotMessages) return null;
+            const key = rustModeServedKeyAfterPersistedStrips({
+                db: deps.db,
+                sessionId,
+                resolvedProviderID: providerID,
+            });
+            const frozen = coldStartRawServedIndex({ slotMessages, rawInput, moduleOutput, key });
+            if (frozen) return { kind: "frozen_slot", slotMessages, ...frozen };
+            const uncaptured = coldStartUncapturedReplay({
+                slotMessages,
+                rawInput,
+                moduleOutput,
+                key,
+            });
+            if (!uncaptured) return null;
+            // The uncaptured replay removed the session's persisted thinking strips from
+            // the raw tail before serving it; do the same here so the comparison matches.
+            const lastServed = structuredClone(uncaptured.lastServed) as MessageLike[];
+            replayRustModeBindingMismatchStrips({
+                db: deps.db,
+                sessionId,
+                messages: lastServed,
+                resolvedProviderID: providerID,
+            });
+            return {
+                kind: "uncaptured_replay",
+                lastServed,
+                rawUserIndex: uncaptured.rawUserIndex,
+            };
+        } catch (error) {
+            sessionLog(sessionId, "lkg cold-start freeze check failed (ignored):", error);
+            return null;
+        }
+    };
+
+    // When this adapter last started a pass for each session; the outer wrapper's
+    // replay registry uses it to find the adapter that currently runs a session.
+    const passStampBySession = new Map<string, number>();
+    const replayParticipant: RustLkgReplayParticipant = {
+        lastPassStamp: (sessionId) =>
+            states.has(sessionId) ? passStampBySession.get(sessionId) : undefined,
+        enterFreezeFromExternalServe: (sessionId, inputCount) =>
+            enterLkgReplayFreeze(ensureState(states, sessionId), inputCount),
+        replayFits: (sessionId, messages, inputMessages) => {
+            try {
+                const fit = lkgReplayFits({
+                    db: deps.db,
+                    sessionId,
+                    messages,
+                    model: resolveReplayModel(sessionId, inputMessages),
+                    modelKey: resolveLkgModelKeys(inputMessages).modelKey,
+                    systemPromptTokens: getOrCreateSessionMeta(deps.db, sessionId)
+                        .systemPromptTokens,
+                    agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                    estimator: rawFallbackEstimator,
+                });
+                if (!fit.fits && fit.detail) sessionLog(sessionId, fit.detail);
+                return fit.fits;
+            } catch (error) {
+                sessionLog(sessionId, "lkg wrapper replay fit check failed:", error);
+                return false;
+            }
+        },
+        emergencyFailClosed: (sessionId, inputMessages) => {
+            try {
+                const model = resolveReplayModel(sessionId, inputMessages) ?? undefined;
+                const modelKey = model
+                    ? canonicalModelIdentity(resolveModelKey(model.providerID, model.modelID) ?? "")
+                    : null;
+                const limits = { db: deps.db, sessionID: sessionId };
+                return rustEmergencyFailClosed({
+                    sessionId,
+                    usage: loadContextUsage(deps.contextUsageMap, deps.db, sessionId),
+                    geometry: transformGeometryForWire(
+                        model
+                            ? resolveContextWindowGeometry(model.providerID, model.modelID, limits)
+                            : undefined,
+                    ),
+                    trustedContextLimit: model
+                        ? resolveTrustedContextLimit(model.providerID, model.modelID, limits)
+                        : undefined,
+                    overflowState: getOverflowState(deps.db, sessionId, modelKey),
+                    modelKey,
+                }).emergencyFailClosed;
+            } catch (error) {
+                // Unknown pressure must not admit cached bytes.
+                sessionLog(sessionId, "lkg wrapper replay emergency check failed:", error);
+                return true;
+            }
+        },
+        stripPersistedReasoning: (sessionId, messages, inputMessages) =>
+            replayRustModeBindingMismatchStrips({
+                db: deps.db,
+                sessionId,
+                messages,
+                resolvedProviderID: resolveReplayModel(sessionId, inputMessages)?.providerID,
+            }),
+    };
+    const unregisterReplayParticipant = registerRustLkgReplayParticipant(replayParticipant);
 
     const prepareRustCapture = (
         state: RustSessionState,
@@ -2380,6 +2305,7 @@ export function createRustModeTransform(
             .find((message) => message.info.role === "assistant")?.info.id;
         const timings = emptyRustPassTimings();
         state.passCount += 1;
+        passStampBySession.set(sessionId, nextRustPassStamp());
         const syntheticTurn = observeSyntheticTurn(state, messages);
         const syntheticLoopBlocked = syntheticTurn && state.syntheticTurnCount >= 3;
         if (syntheticLoopBlocked && !state.syntheticLoopBreakerLogged) {
@@ -2434,6 +2360,16 @@ export function createRustModeTransform(
         const modelKey = model
             ? canonicalModelIdentity(resolveModelKey(model.providerID, model.modelID) ?? "")
             : null;
+        try {
+            sessionMeta.cacheTtl = resolveSessionCacheTtl(
+                deps.db,
+                sessionId,
+                deps.cacheTtlConfig,
+                modelKey ?? undefined,
+            ).value;
+        } catch (error) {
+            preflightError ??= error;
+        }
         let resolvedContextLimit: number | undefined;
         let resolvedWindowGeometry: WindowGeometryResult | undefined;
         if (model) {
@@ -2458,88 +2394,175 @@ export function createRustModeTransform(
             preflightError ??= error;
         }
         const transformGeometry = transformGeometryForWire(resolvedWindowGeometry);
-        const hasTrustedEmergencyWall = transformGeometry
-            ? transformGeometry.usable_hard > 0
-            : resolvedContextLimit !== undefined && resolvedContextLimit > 0;
-        const hardWallPercentage = hardWallUsagePercentage(passUsageSnapshot, transformGeometry);
-        const providerOverflowProven = isProviderOverflowFailClosedProven(sessionId);
-        emergencyFailClosed =
-            providerOverflowProven ||
-            (hardWallPercentage >= RUST_EMERGENCY_WALL_PCT && hasTrustedEmergencyWall);
-        if (overflowState) {
-            const detectedLimitMatchesModel =
-                overflowState.detectedContextLimitModelKey === null ||
-                canonicalModelIdentity(overflowState.detectedContextLimitModelKey) ===
-                    canonicalModelIdentity(modelKey ?? "");
-            const hasProviderProof =
-                (overflowState.detectedContextLimit > 0 && detectedLimitMatchesModel) ||
-                // An unknown persisted arm alone is not proof. A second provider rejection
-                // while that arm is durable records the process-local reconfirmation.
-                isProviderOverflowReconfirmed(sessionId);
-            const persistedProviderEmergency =
-                overflowState.needsEmergencyRecovery &&
-                overflowState.emergencyRecoveryOrigin === "provider_overflow" &&
-                hasProviderProof;
-            emergencyFailClosed ||= persistedProviderEmergency;
-            providerProvenEmergency =
-                hardWallPercentage >= RUST_EMERGENCY_WALL_PCT &&
-                (providerOverflowProven || persistedProviderEmergency);
-        }
+        ({ emergencyFailClosed, providerProvenEmergency } = rustEmergencyFailClosed({
+            sessionId,
+            usage: passUsageSnapshot,
+            geometry: transformGeometry,
+            trustedContextLimit: resolvedContextLimit,
+            overflowState,
+            modelKey,
+        }));
         const serveRawFallback = (cause?: unknown): void => {
-            const contextLimit =
-                transformGeometry?.usable_hard ??
-                resolvedContextLimit ??
-                (overflowState && overflowState.detectedContextLimit > 0
-                    ? overflowState.detectedContextLimit
-                    : undefined);
+            servedFrom = "refused";
+            // A lost transform reply cannot authorize unmanaged history, even when
+            // compaction is disabled; only a verified last-good replay may continue.
+            if (moduleFailureCode(cause) === "transform_transport_interrupted") {
+                throw new EmergencyFailClosedError(ENGINE_RECONNECTING_USER_MESSAGE, { cause });
+            }
+            if (!deps.compactionOff && isTransientSqliteError(cause)) {
+                throw new StorageBusyRefusalError(cause, "rust-mode-transform");
+            }
+            // The raw full history is admitted exactly like a last-known-good replay:
+            // against the trusted limit, never the larger usable hard limit (some
+            // providers enforce their declared prompt limit), measured on what the
+            // request carries, and only when a trusted estimate is under the limit.
+            let contextLimit: number | undefined;
+            try {
+                contextLimit = lkgReplayLimit({
+                    db: deps.db,
+                    sessionId,
+                    model,
+                    modelKey: resolveLkgModelKeys(messages).modelKey,
+                });
+            } catch {
+                contextLimit = undefined;
+            }
             if (contextLimit !== undefined) {
-                // The local tokenizer is telemetry-grade and can materially undercount a new
-                // provider tokenizer. Four serialized bytes per context token is an independent,
-                // conservative risk budget for a raw full-history fallback.
-                const proxyBudgetBytes = contextLimit * RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN;
-                // Byte proxy first: once the running serialized sum crosses the budget,
-                // the refusal is proven and the tokenizer pass — seconds on giant
-                // histories — is skipped entirely on the failure path.
-                const proxy = rawFallbackSerializedBytes(messages, proxyBudgetBytes);
-                const proxyTokens =
-                    proxy === null
-                        ? contextLimit + 1
-                        : Math.ceil(proxy.bytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN);
-                let estimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
-                let estimatorRan = false;
-                if (proxy !== null && !proxy.aborted) {
-                    try {
-                        estimate = rawFallbackEstimator({
+                // The wire byte proxy runs first: once its running sum crosses the
+                // budget the refusal is proven and the tokenizer pass, seconds on giant
+                // histories, is skipped on the failure path.
+                const measure = measureLkgReplay({
+                    messages,
+                    limit: contextLimit,
+                    estimate: () =>
+                        rawFallbackEstimator({
                             messages,
                             systemPromptTokens: sessionMeta.systemPromptTokens,
                             providerID: model?.providerID,
                             modelID: model?.modelID,
                             agentName: deps.getNotificationParams?.(sessionId)?.agent,
-                        });
-                        estimatorRan = true;
-                    } catch {
-                        // The byte proxy above remains available when tokenization does not.
-                    }
-                }
-                const refusalTokens =
-                    estimate?.trusted && Number.isFinite(estimate.tokens) && estimate.tokens > 0
-                        ? Math.max(estimate.tokens, proxyTokens)
-                        : Number.POSITIVE_INFINITY;
-                if (refusalTokens > contextLimit) {
+                        }),
+                });
+                if (measure.fit !== "under") {
+                    const proxyTokens = measure.proxy
+                        ? Math.ceil(measure.proxy.bytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN)
+                        : null;
+                    const refusalTokens =
+                        measure.trusted && measure.tokens !== null && measure.tokens > 0
+                            ? Math.max(measure.tokens, proxyTokens ?? 0)
+                            : Number.POSITIVE_INFINITY;
                     sessionLog(
                         sessionId,
-                        `raw_fallback_over_context_limit estimated=${estimate?.tokens ?? (estimatorRan ? "unavailable" : "skipped")} ` +
-                            `proxy_bytes=${proxy?.bytes ?? "unavailable"} proxy_tokens=${proxyTokens} limit=${contextLimit}` +
-                            (proxy?.aborted === true ? " early_abort=true" : ""),
+                        `raw_fallback_over_context_limit estimated=${measure.tokens ?? (measure.estimatorRan ? "unavailable" : "skipped")} trusted=${measure.trusted} ` +
+                            `proxy_bytes=${measure.proxy?.bytes ?? "unavailable"} proxy_tokens=${proxyTokens ?? "unavailable"} limit=${contextLimit}` +
+                            (measure.proxy?.aborted === true ? " early_abort=true" : ""),
                     );
                     throw new RawFallbackContextLimitError(refusalTokens, contextLimit, { cause });
                 }
             } else {
                 throw new RawFallbackContextLimitError(Number.POSITIVE_INFINITY, 0, { cause });
             }
+            if (!deps.compactionOff) {
+                servedFrom = "refused";
+                throw new EmergencyFailClosedError(ENGINE_RECONNECTING_USER_MESSAGE, { cause });
+            }
             replaceMessagesInPlace(output, messages);
+            servedFrom = "raw";
+            // The provider now sees the raw input instead of the frozen array, so there is
+            // no frozen representation left to keep byte-identical.
+            state.lkgRepresentationFrozen = false;
+            state.lkgFrozenHealthyPasses = 0;
+            state.lkgFrozenAtInputCount = null;
+        };
+        // The measurement every last-known-good replay is admitted with (see
+        // `measureLkgReplay`), here with this pass's model and estimator.
+        const measureAgainstLimit = (candidate: readonly unknown[], limit: number): FrozenFit =>
+            measureLkgReplay({
+                messages: candidate as MessageLike[],
+                limit,
+                estimate: () =>
+                    rawFallbackEstimator({
+                        messages: candidate as MessageLike[],
+                        systemPromptTokens: sessionMeta.systemPromptTokens,
+                        providerID: model?.providerID,
+                        modelID: model?.modelID,
+                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                    }),
+            }).fit;
+        /**
+         * Admission for a healthy pass that would serve the frozen replay `candidate`
+         * instead of `moduleOutput`. Returns a release reason when the frozen bytes no
+         * longer fit but the module's output does, null to keep serving the freeze, and
+         * throws `FrozenReplayOverProvenLimitRefusal` when emergency recovery is armed
+         * and neither array fits the provider-proven limit. An unproven measurement
+         * never releases: adopting module output on a guess would bust the cache of
+         * every frozen session on a model whose estimate is incomplete.
+         */
+        const frozenReplayAdmission = (
+            candidate: readonly unknown[],
+            moduleOutput: readonly unknown[],
+        ): string | null => {
+            const emergency =
+                isEmergencyRecoveryArmed(sessionId) || overflowState?.needsEmergencyRecovery;
+            if (emergency) {
+                const provenLimit =
+                    overflowState &&
+                    overflowState.detectedContextLimit > 0 &&
+                    (overflowState.detectedContextLimitModelKey === null ||
+                        canonicalModelIdentity(overflowState.detectedContextLimitModelKey) ===
+                            canonicalModelIdentity(modelKey ?? ""))
+                        ? overflowState.detectedContextLimit
+                        : undefined;
+                if (provenLimit !== undefined) {
+                    const frozenFit = measureAgainstLimit(candidate, provenLimit);
+                    if (frozenFit === "over") {
+                        const moduleFit = measureAgainstLimit(moduleOutput, provenLimit);
+                        if (moduleFit === "under") return "frozen_over_proven_limit";
+                        throw new FrozenReplayOverProvenLimitRefusal(moduleFit, provenLimit);
+                    }
+                    if (frozenFit === "unproven") {
+                        sessionLog(sessionId, `frozen_emergency_fit_unproven limit=${provenLimit}`);
+                    }
+                } else {
+                    sessionLog(sessionId, "frozen_emergency_limit_unknown");
+                }
+            }
+            // The same limit the failure and wrapper replays are admitted against.
+            let limit: number | undefined;
+            try {
+                limit = lkgReplayLimit({
+                    db: deps.db,
+                    sessionId,
+                    model,
+                    modelKey: resolveLkgModelKeys(messages).modelKey,
+                });
+            } catch {
+                limit = undefined;
+            }
+            if (limit === undefined) {
+                sessionLog(sessionId, "frozen_fit_unproven limit=unknown");
+                return null;
+            }
+            const frozenFit = measureAgainstLimit(candidate, limit);
+            if (frozenFit === "unproven") {
+                sessionLog(sessionId, `frozen_fit_unproven limit=${limit}`);
+                return null;
+            }
+            if (frozenFit === "under") return null;
+            const moduleFit = measureAgainstLimit(moduleOutput, limit);
+            if (moduleFit === "under") return "frozen_over_context_limit";
+            sessionLog(
+                sessionId,
+                moduleFit === "over"
+                    ? `frozen_fit_both_over limit=${limit}`
+                    : `frozen_fit_unproven module=unproven limit=${limit}`,
+            );
+            return null;
         };
         const finishPass = (applied: boolean, served = true): void => {
+            // A pass that serves nothing leaves the provider's last-seen array unchanged,
+            // so the proof that the slot holds that array must survive the refusal.
+            if (!served) state.lkgLastServedCaptureSequence = lastServedCaptureSequence;
             const elapsedAt = applied && appliedAt !== undefined ? appliedAt : performance.now();
             const elapsedMs = Math.max(0, elapsedAt - passStartedAt);
             sessionLog(
@@ -2697,17 +2720,56 @@ export function createRustModeTransform(
                 );
                 if (replayed) {
                     servedFrom = "lkg";
-                } else {
-                    servedFrom = "raw";
-                    try {
-                        serveRawFallback();
-                    } catch (error) {
-                        finishPass(false, false);
-                        throw error;
-                    }
+                    finishPass(false);
+                    return;
                 }
-                finishPass(false);
-                return;
+                // Parking only saves work when a safe cached prompt can serve.
+                // With no LKG, try the module now instead of refusing four turns
+                // out of five even after it has recovered.
+                decision = "pending";
+            }
+            // A parked session without a usable replay should recover immediately
+            // when the module is alive, but must not spend another full transform
+            // deadline discovering an unresponsive module on every user turn.
+            try {
+                await callModule(
+                    {
+                        sessionId,
+                        projectRoot: recoveryProjectRoot,
+                        method: "session.status",
+                        body: { method: "session.status", v: 1, session_id: sessionId },
+                        bypassSessionLane: true,
+                    },
+                    options.healthProbeTimeoutMsForTests ?? RUST_HEALTH_PROBE_TIMEOUT_MS,
+                    false,
+                );
+            } catch (error) {
+                decision = "parked";
+                if (replayLastGood(sessionId, messages, output, sessionMeta.systemPromptTokens)) {
+                    servedFrom = "lkg";
+                    finishPass(false);
+                    return;
+                }
+                if (deps.compactionOff) {
+                    try {
+                        serveRawFallback(error);
+                    } catch (rawFallbackError) {
+                        finishPass(false, false);
+                        throw rawFallbackError;
+                    }
+                    finishPass(false);
+                    return;
+                }
+                servedFrom = "refused";
+                sessionLog(
+                    sessionId,
+                    "rust parked health probe failed; refusing without a full request",
+                    error,
+                );
+                finishPass(false, false);
+                throw new EmergencyFailClosedError(ENGINE_RECONNECTING_USER_MESSAGE, {
+                    cause: error,
+                });
             }
         }
         timings.preflight = performance.now() - passStartedAt;
@@ -2814,6 +2876,13 @@ export function createRustModeTransform(
                 promptSurfaceGuidance ??
                 resolvePromptSurface(deps.promptSurface, modelKey ?? undefined);
             logStage(sessionId, "promptSurface", promptSurfaceStartedAt, timings);
+            const protectionFloorCacheBustingPass =
+                schedulerDecision === "execute" ||
+                deps.historyRefreshSessions.has(sessionId) ||
+                deps.pendingMaterializationSessions.has(sessionId) ||
+                deps.deferredHistoryRefreshSessions?.has(sessionId) === true ||
+                deps.deferredMaterializationSessions?.has(sessionId) === true;
+            // A module-driven HARD on a host-defer pass may use the previous candidate; cue-only changes wait for the next host bust opportunity.
             const muralResolveStartedAt = performance.now();
             const resolvedMural =
                 !sessionMeta.isSubagent && deps.muralEnabled === true
@@ -2822,16 +2891,19 @@ export function createRustModeTransform(
                           deps.projectPath,
                           modelKey ?? undefined,
                           deps.memoryConfig?.injectionBudgetTokens,
+                          shouldRefreshMuralCandidate({
+                              initialized: state.initialized,
+                              pressure: usage.percentage,
+                              threshold,
+                              lastAppliedAtMs: state.lastAppliedAtMs,
+                              nowMs: passObservedAtMs,
+                              cacheTtl: sessionMeta.cacheTtl,
+                              explicitMaterialization: protectionFloorCacheBustingPass,
+                          }),
                       )
                     : undefined;
             const mural = muralInputForWire(resolvedMural);
             logStage(sessionId, "muralResolve", muralResolveStartedAt, timings);
-            const protectionFloorCacheBustingPass =
-                schedulerDecision === "execute" ||
-                deps.historyRefreshSessions.has(sessionId) ||
-                deps.pendingMaterializationSessions.has(sessionId) ||
-                deps.deferredHistoryRefreshSessions?.has(sessionId) === true ||
-                deps.deferredMaterializationSessions?.has(sessionId) === true;
             const protectionFloorResolution = resolveEpochFloorForPass(deps.db, sessionId, {
                 configuredOverride: deps.protectedTokens,
                 tierOverrides: deps.protectedTokenTierOverrides,
@@ -2868,6 +2940,9 @@ export function createRustModeTransform(
             });
             const passInputs: Record<string, unknown> = {
                 historian_model_limits: resolvedHistorianModelLimits(historianChain),
+                historian_max_output_tokens: historianRun
+                    ? historianRun.maxOutputTokens
+                    : deps.historianMaxOutputTokens,
                 now_ms: requestObservedAtMs,
                 model_key: modelKey,
                 provider_id: model?.providerID ?? null,
@@ -3096,14 +3171,17 @@ export function createRustModeTransform(
                 getProjectState(deps.db, GLOBAL_USER_PROFILE_PROJECT_PATH),
                 passInputs.upgrade_state,
                 promptSurfaceConfigIdentity(deps.promptSurface),
-                state.muralCuePoolVersion,
-                state.muralGeneration,
                 mural,
                 effectiveFloor,
                 deps.clearReasoningAge,
                 deps.cavemanTextCompression,
             ]);
-            const idleBudgetMs = sessionMeta.cacheTtl === "1h" ? 3_600_000 : 300_000;
+            let idleBudgetMs = 300_000;
+            try {
+                idleBudgetMs = parseCacheTtl(sessionMeta.cacheTtl);
+            } catch {
+                // Invalid TTLs use the same five-minute fallback as the scheduler.
+            }
             // Synthetic todo bytes are re-decided only on a bust. Observe every
             // adapter-visible bust signal rather than polling host permissions on
             // an unchanged defer pass; unexpected module busts remain observable.
@@ -3148,28 +3226,6 @@ export function createRustModeTransform(
             let stateSyncRetryBusy = false;
             const stateSyncStartedAt = performance.now();
             try {
-                await prepareRustMemoryAuthority({
-                    db: deps.db,
-                    module: options.moduleClient,
-                    projectPath: memoryProjectPath ?? projectRoot,
-                    projectRoot,
-                    state,
-                    allowProtocolBypassForTests: options.allowAuthorityProtocolBypassForTests,
-                    onProjectPrepared: options.onProjectPrepared,
-                });
-                if (memorySyncRequested) {
-                    // A memory tool call can complete after the prior authority pass has
-                    // acknowledged its watermarks. Rewind only memory watermarks so the
-                    // next pass ships the mutation delta without reseeding compartments.
-                    const watermarks = state.lastAckedWatermarks;
-                    if (watermarks) {
-                        state.lastAckedWatermarks = {
-                            ...watermarks,
-                            memory_id: 0,
-                            memory_mutation_id: 0,
-                        };
-                    }
-                }
                 const getCachedStateSyncCapabilities =
                     options.moduleClient.getCachedStateSyncCapabilities;
                 const stateSyncCapabilities = options.moduleClient.stateSyncCapabilities;
@@ -3190,7 +3246,6 @@ export function createRustModeTransform(
                     force: !state.initialized,
                     options: {
                         authority: true,
-                        authorityState: state.memoryAuthorityReady ? "MODULE" : undefined,
                         authoritySeqAdoption,
                         knownWatermarksUnchanged,
                     },
@@ -3342,6 +3397,9 @@ export function createRustModeTransform(
                 detail = "",
             ): Promise<TransformSeriesResult> => {
                 const pagingStartedAt = performance.now();
+                // Classify the payload being sent, not the original pass: need_full_sync
+                // replaces a cheap tail delta with a potentially large full-array request.
+                const fullWire = !isRecord(payload.tail_delta);
                 // A one-page content-addressed envelope lets the module replay a completed
                 // request when only its response was lost, without executing the transform twice.
                 const pages = buildPagedModuleTransformPayloads(
@@ -3374,7 +3432,16 @@ export function createRustModeTransform(
                         const attemptTimeoutMs =
                             options.moduleTimeoutMs ??
                             (attemptClass === "transform_series_execute"
-                                ? transformColdStartExecuteTimeoutMs(seedMessageCount)
+                                ? Math.max(
+                                      fullWire
+                                          ? transformColdStartExecuteTimeoutMs(seedMessageCount)
+                                          : timeoutMs,
+                                      protectionFloorCacheBustingPass ||
+                                          fullWire ||
+                                          passInputs.emergency_recovery_armed === true
+                                          ? 45_000
+                                          : timeoutMs,
+                                  )
                                 : attemptClass === "transform_page_upload"
                                   ? TRANSFORM_PAGE_UPLOAD_TIMEOUT_MS
                                   : timeoutMs);
@@ -3476,7 +3543,14 @@ export function createRustModeTransform(
                     // rows, which the module's missing delta base says nothing about. Clearing
                     // it here made the retry (or the next pass) re-read every stored row of
                     // the session before dispatch, 57 s on a 124k-row session.
-                    sessionLog(sessionId, "need_full_sync retry=full ordinal_memo=kept");
+                    sessionLog(
+                        sessionId,
+                        `need_full_sync retry=full ordinal_memo=kept reason=${
+                            typeof response.need_full_sync_reason === "string"
+                                ? response.need_full_sync_reason
+                                : "unknown"
+                        }`,
+                    );
                 } else {
                     sessionLog(
                         sessionId,
@@ -3654,6 +3728,9 @@ export function createRustModeTransform(
             // pass priced, but it changes bytes only from the first message the freeze
             // served raw, so it is not a permission to rewrite from the start.
             const moduleDecisionBusts = cacheBustingPass;
+            // Read the freeze flag before the deferred m0/m1 divergence below can set it, so
+            // `passStartedFrozen` records only a freeze an earlier pass entered.
+            const passStartedFrozen = state.lkgRepresentationFrozen;
             let frozenReleaseLastServed: FrozenReleaseLastServed = {
                 messages: null,
                 proven: false,
@@ -3703,25 +3780,98 @@ export function createRustModeTransform(
                 );
                 let appliedMessages = moduleMessages;
                 let replayedFrozenRepresentation = false;
+                // The slot a previous process captured from a frozen serve, when this is
+                // this process's first applied pass and that pass is a module bust: the
+                // bust replaces messages the provider last saw raw, so the thinking strip
+                // needs that array exactly as a bust of a freeze in this process would.
+                let coldStartLastServed: FrozenReleaseLastServed | null = null;
+                if (state.lkgColdStartCheckPending) {
+                    state.lkgColdStartCheckPending = false;
+                    const coldStart =
+                        !state.lkgRepresentationFrozen && state.lkgAcceptedCapture === undefined
+                            ? detectColdStartFrozenSlot(
+                                  sessionId,
+                                  messages,
+                                  moduleMessages,
+                                  model?.providerID,
+                              )
+                            : null;
+                    if (coldStart?.kind === "uncaptured_replay") {
+                        // The module now renders differently a message the previous
+                        // process's uncaptured replay served raw. Nothing proves the
+                        // reconstructed array is exact, so it is unproven: the strip
+                        // starts at its first change or at its end.
+                        coldStartLastServed = { messages: coldStart.lastServed, proven: false };
+                        sessionLog(
+                            sessionId,
+                            `lkg_cold_start_uncaptured_replay raw_user_index=${coldStart.rawUserIndex}`,
+                        );
+                    } else if (coldStart && !cacheBustingPass) {
+                        state.lkgRepresentationFrozen = true;
+                        state.forceFullWire = true;
+                        // Count raw tail growth from the first message the freeze served
+                        // raw, not from this pass, so a restart does not reset the budget
+                        // that ends a freeze. That start can sit a message or two before
+                        // the original freeze's input count, which only ends it sooner.
+                        state.lkgFrozenAtInputCount =
+                            coldStart.rawRunStart >= 0 ? coldStart.rawRunStart : inputCount;
+                        sessionLog(
+                            sessionId,
+                            `lkg_cold_start_frozen_slot_resumed raw_served_index=${coldStart.index}`,
+                        );
+                    } else if (coldStart) {
+                        // Nothing in this process proves the slot is the very last array
+                        // served (an uncaptured replay may have followed), so it is
+                        // unproven: the strip covers the first change or the slot's end.
+                        coldStartLastServed = { messages: coldStart.slotMessages, proven: false };
+                        sessionLog(
+                            sessionId,
+                            `lkg_cold_start_frozen_slot_busted raw_served_index=${coldStart.index}`,
+                        );
+                    }
+                }
+                // While frozen, the last-known-good slot holds the array the last pass served
+                // (or its prefix). Read it before any replay, because a replay that fails
+                // validation drops the slot, and also on a module-busting pass: that bust
+                // replaces messages the freeze served raw, and the thinking strip in
+                // postprocess compares against this array to find the first changed message.
+                const lastServedSlot = state.lkgRepresentationFrozen
+                    ? getSlot(sessionId)
+                    : undefined;
+                const lastServedSnapshot = (): FrozenReleaseLastServed => ({
+                    messages: parseLastServedSnapshot(lastServedSlot?.jsonPrefix),
+                    proven:
+                        lastServedSlot !== undefined &&
+                        lastServedCaptureSequence !== null &&
+                        lastServedSlot.captureSequence === lastServedCaptureSequence,
+                });
+                if (passStartedFrozen && cacheBustingPass) {
+                    frozenReleaseLastServed = lastServedSnapshot();
+                } else if (coldStartLastServed) {
+                    frozenReleaseLastServed = coldStartLastServed;
+                }
                 if (state.lkgRepresentationFrozen && !cacheBustingPass) {
                     if (state.lkgFrozenAtInputCount === null) {
                         state.lkgFrozenAtInputCount = inputCount;
                     }
                     const keys = resolveLkgModelKeys(messages);
-                    // Read before the replay: a replay that fails validation drops the slot.
-                    const lastServedSlot = getSlot(sessionId);
-                    const lastServedSnapshot = (): FrozenReleaseLastServed => ({
-                        messages: parseLastServedSnapshot(lastServedSlot?.jsonPrefix),
-                        proven:
-                            lastServedSlot !== undefined &&
-                            lastServedCaptureSequence !== null &&
-                            lastServedSlot.captureSequence === lastServedCaptureSequence,
-                    });
                     const frozen = replayLkg({
                         sessionId,
                         messages,
                         modelKey: keys.modelKey,
                         providerKey: keys.providerKey,
+                        // The stored prefix already carries the binding-mismatch strips;
+                        // the replayed tail comes from the raw input, so apply the
+                        // persisted set there too, before validation, so the array that
+                        // is validated is the array that is served. A removed thinking
+                        // block must not return on a replayed pass.
+                        prepareReplay: (replayed) =>
+                            replayRustModeBindingMismatchStrips({
+                                db: deps.db,
+                                sessionId,
+                                messages: replayed,
+                                resolvedProviderID: model?.providerID,
+                            }),
                     });
                     if (!frozen.ok) {
                         cacheBustingPass = true;
@@ -3731,28 +3881,19 @@ export function createRustModeTransform(
                         frozenHealthyPassesAfterApply = state.lkgFrozenHealthyPasses + 1;
                         const rawTailGrowth = Math.max(0, inputCount - state.lkgFrozenAtInputCount);
                         const releaseReason =
-                            rawTailGrowth >= RUST_LKG_FROZEN_RAW_TAIL_GROWTH_LIMIT
+                            frozenReplayAdmission(frozen.messages, moduleMessages) ??
+                            (rawTailGrowth >= RUST_LKG_FROZEN_RAW_TAIL_GROWTH_LIMIT
                                 ? "raw_tail_growth_limit"
                                 : frozenHealthyPassesAfterApply >=
                                     RUST_LKG_FROZEN_HEALTHY_PASS_LIMIT
                                   ? "healthy_pass_limit"
-                                  : null;
+                                  : null);
                         if (releaseReason) {
                             cacheBustingPass = true;
                             frozenReleaseReason = releaseReason;
                             frozenReleaseLastServed = lastServedSnapshot();
                         } else {
                             appliedMessages = frozen.messages;
-                            // The stored prefix already carries the binding-mismatch
-                            // strips; the replayed tail comes from the raw input, so
-                            // apply the persisted set there too. A removed thinking
-                            // block must not return on a replayed pass.
-                            replayRustModeBindingMismatchStrips({
-                                db: deps.db,
-                                sessionId,
-                                messages: appliedMessages as MessageLike[],
-                                resolvedProviderID: model?.providerID,
-                            });
                             replayedFrozenRepresentation = true;
                             servedFrom = "lkg_frozen";
                             sessionLog(sessionId, "lkg_frozen_replay_served");
@@ -3771,6 +3912,15 @@ export function createRustModeTransform(
                 // LKG captures postprocessed output, so running postprocess again would stop the
                 // fallback artifact from being an exact replay.
                 if (!replayedFrozenRepresentation) {
+                    if (materializedBoundary && !deps.compactionOff) {
+                        try {
+                            await withAsyncPrivilegedWriter(deps.db, () => undefined);
+                        } catch (error) {
+                            // Postprocess can still serve a safe SOFT replay when its
+                            // optional host-store marker cannot acquire the writer.
+                            if (!isTransientSqliteError(error)) throw error;
+                        }
+                    }
                     const postprocess = runRustModePostprocess({
                         db: deps.db,
                         sessionId,
@@ -3787,7 +3937,17 @@ export function createRustModeTransform(
                             model?.modelID,
                         ),
                         cacheBustingPass: moduleDecisionBusts,
-                        ...(frozenReleaseReason ? { frozenReleaseLastServed } : {}),
+                        moduleReasoningTrimOnly: response.reasoning_trim_only === true,
+                        // A frozen session hands the strip gate the last-served array on
+                        // every pass that reaches postprocess. That includes a module bust
+                        // whose own edit only trims the oldest reasoning: it still replaces
+                        // the raw tail the freeze served with tagged module output, and a
+                        // signed thinking block is valid only while every byte before it is
+                        // unchanged, so thinking after the first changed message must be
+                        // stripped.
+                        ...(passStartedFrozen || frozenReleaseReason || coldStartLastServed
+                            ? { frozenReleaseLastServed }
+                            : {}),
                         trailingBlankSourceDecisions,
                         trailingBlankNewestAssistantId:
                             typeof trailingBlankNewestAssistantId === "string"
@@ -4059,103 +4219,71 @@ export function createRustModeTransform(
             heapHolder.wireCaches.set(sessionId, pendingWireCache);
             timings.bookkeeping += performance.now() - bookkeepingStartedAt - timings.delivery;
             appliedAt = performance.now();
-            // Stable transform projections cannot have new module-owned mirror rows. A changed
-            // row/boundary/manifest marker schedules one ordered background pull; old modules that
-            // omit row_version keep the compatibility behavior of polling after every pass.
-            const projectionKey =
-                options.disableHotPathIoCachesForTests === true
-                    ? null
-                    : mirrorProjectionKey(response);
-            const getCompartmentsAfter = options.moduleClient.getCompartmentsAfter;
-            const memoryMirrorDue =
-                options.moduleClient.mirrorPull !== undefined &&
-                (memorySyncRequested ||
-                    projectionKey === null ||
-                    state.memoryMirrorProjectionKey !== projectionKey);
-            const compartmentMirrorDue =
-                getCompartmentsAfter !== undefined &&
-                (projectionKey === null || state.compartmentMirrorProjectionKey !== projectionKey);
-            if ((memoryMirrorDue || compartmentMirrorDue) && !state.mirrorProjectionInFlight) {
-                state.mirrorProjectionInFlight = true;
-                void (async () => {
-                    if (memoryMirrorDue) {
-                        const mirrorPullStartedAt = performance.now();
-                        try {
-                            const mirrorDrain = await pullMemoryMirrorOnce({
-                                db: deps.db,
-                                module: options.moduleClient,
-                            });
-                            if (mirrorDrain.cuePoolVersion !== state.muralCuePoolVersion) {
-                                state.muralCuePoolVersion = mirrorDrain.cuePoolVersion;
-                                state.muralCache = null;
-                            }
-                            // A module-side edit arrives here as changed content, and
-                            // the mirror drops the row's now-stale embedding. Put a
-                            // fresh one back while the module still holds authority,
-                            // so an edited memory does not quietly fall out of scored
-                            // recall for the rest of the session.
-                            if (mirrorDrain.rowsApplied > 0) {
-                                await reembedMirrorInvalidatedMemories(deps.db);
-                            }
-                            // Memories the module wrote straight into context.db never
-                            // pass through the mirror, so the invalidation set above
-                            // cannot know about them. Their high-water mark can.
-                            await drainSingleStoreEmbeddingWatermarks(deps.db);
-                            if (mirrorDrain.complete) {
-                                state.memoryMirrorProjectionKey = projectionKey;
-                            } else if (mirrorDrain.budgetExhausted) {
-                                sessionLog(
-                                    sessionId,
-                                    `rust memory mirror backlog deferred: rows_applied=${mirrorDrain.rowsApplied} backlog_remaining=true pages=${mirrorDrain.pagesPulled}`,
-                                );
-                            }
-                        } catch (error) {
-                            sessionLog(
-                                sessionId,
-                                "rust memory mirror-back failed (ignored):",
-                                error,
-                            );
-                        } finally {
-                            logStage(sessionId, "mirrorPull", mirrorPullStartedAt, timings);
-                        }
+            // The module writes compartments straight into context.db, so the TS
+            // compartment writers that re-arm the once-per-session auto-embed latch
+            // never run for them. A module publish moves row_version, the boundary or
+            // the coverage ordinal, so only a changed key pays for the compartment
+            // query that decides whether to re-arm; stable passes read nothing.
+            const compartmentKey = moduleCompartmentProjectionKey(response);
+            const compartmentCheckDue =
+                compartmentKey === null || state.autoEmbedCompartmentKey !== compartmentKey;
+            state.autoEmbedCompartmentKey = compartmentKey ?? undefined;
+            // Embedding work is background maintenance, not a foreground transform writer.
+            void withoutSqliteTransformPass(async () => {
+                if (compartmentCheckDue) {
+                    const compartmentRow = deps.db
+                        .prepare(
+                            "SELECT COALESCE(MAX(sequence), -1) AS max_sequence, COUNT(*) AS count FROM compartments WHERE session_id = ?",
+                        )
+                        .get(sessionId) as { max_sequence?: number; count?: number } | undefined;
+                    const compartmentMark = `${compartmentRow?.max_sequence ?? -1}:${compartmentRow?.count ?? 0}`;
+                    if (
+                        state.autoEmbedCompartmentMark !== undefined &&
+                        state.autoEmbedCompartmentMark !== compartmentMark
+                    ) {
+                        invalidateAutoEmbedSession(sessionId);
                     }
-                    if (compartmentMirrorDue && getCompartmentsAfter) {
-                        const compartmentMirrorStartedAt = performance.now();
-                        try {
-                            await mirrorModuleCompartments({
-                                db: deps.db,
-                                sessionId,
-                                reader: {
-                                    getCompartmentsAfter: (mirroredSessionId, afterSequence) =>
-                                        getCompartmentsAfter.call(
-                                            options.moduleClient,
-                                            mirroredSessionId,
-                                            afterSequence,
-                                        ),
-                                } satisfies ModuleCompartmentReader,
-                            });
-                            state.compartmentMirrorProjectionKey = projectionKey;
-                        } catch (error) {
-                            sessionLog(
-                                sessionId,
-                                "rust compartment mirror-back failed (ignored):",
-                                error,
-                            );
-                        } finally {
-                            logStage(
-                                sessionId,
-                                "compartmentMirror",
-                                compartmentMirrorStartedAt,
-                                timings,
-                            );
-                        }
-                    }
-                })().finally(() => {
-                    state.mirrorProjectionInFlight = false;
-                });
-            }
+                    state.autoEmbedCompartmentMark = compartmentMark;
+                }
+                await withSqliteBackgroundWriter(() =>
+                    drainSingleStoreEmbeddingWatermarks(deps.db),
+                );
+            }).catch((error) => {
+                sessionLog(sessionId, "single-store embedding drain failed (ignored):", error);
+            });
             finishPass(true);
         } catch (error) {
+            if (error instanceof FrozenReplayOverProvenLimitRefusal) {
+                decision = "error";
+                materializeReason = "frozen_over_proven_limit";
+                sessionLog(
+                    sessionId,
+                    `mc_rust_emergency_refusal frozen_over_proven_limit module=${error.moduleFit} limit=${error.limit}`,
+                );
+                finishPass(false, false);
+                // The module is healthy, so "reconnecting" would be wrong. The freeze
+                // stays (the provider still holds the frozen bytes) and ends on the
+                // first pass whose module output fits (a release) or that the module
+                // busts, which /ctx-flush requests.
+                throw new EmergencyFailClosedError(
+                    renderUserFacingFailure("frozen_history_over_window", "plain"),
+                    { cause: error },
+                );
+            }
+            if (error instanceof SharedCompartmentBoundaryError) {
+                decision = "error";
+                materializeReason = error.code;
+                finishPass(false, false);
+                throw new EmergencyFailClosedError(error.message, { cause: error });
+            }
+            const migration = singleStoreMigrationRequiredFailure(error);
+            if (migration) {
+                decision = "error";
+                materializeReason = migration.code;
+                sessionLog(sessionId, `mc_rust_single_store_refusal reason=${migration.code}`);
+                finishPass(false, false);
+                throw new EmergencyFailClosedError(migration.message, { cause: migration });
+            }
             const storeAhead = storeAheadOfBinaryFailure(error);
             if (storeAhead) {
                 // The module refuses every request until ck-mc is updated or both databases
@@ -4184,6 +4312,10 @@ export function createRustModeTransform(
                 );
             }
             if (emergencyFailClosed) {
+                if (!deps.compactionOff && isTransientSqliteError(error)) {
+                    finishPass(false, false);
+                    throw new StorageBusyRefusalError(error, "rust-mode-emergency");
+                }
                 // At 95% of a trusted limit, or while provider overflow recovery is armed,
                 // any adapter failure aborts. Parking controls retry cadence, not fallback admission.
                 sessionLog(sessionId, "mc_rust_emergency_refusal before_lkg");
@@ -4220,18 +4352,10 @@ export function createRustModeTransform(
                 output,
                 sessionMeta.systemPromptTokens,
             );
-            if (replayed) {
-                if (!state.lkgRepresentationFrozen) {
-                    state.lkgFrozenAtInputCount = inputCount;
-                }
-                state.lkgRepresentationFrozen = true;
-                state.lkgFrozenHealthyPasses = 0;
-                state.forceFullWire = true;
-            } else {
-                state.lkgRepresentationFrozen = false;
-                state.lkgFrozenHealthyPasses = 0;
-                state.lkgFrozenAtInputCount = null;
-            }
+            // A served replay entered the freeze inside replayLastGood. One that cannot
+            // serve leaves the freeze alone: either the raw fallback below serves the raw
+            // input and clears it, or the pass refuses and the provider still holds the
+            // frozen bytes the next pass must keep serving.
             servedFrom = replayed ? "lkg" : "raw";
             if (decision.toLowerCase() !== "need_full_sync") decision = "error";
             materializeReason = moduleFailureCode(error) ?? "none";
@@ -4249,7 +4373,7 @@ export function createRustModeTransform(
         }
     };
 
-    return {
+    const adapter = {
         run: async (
             sessionId: string,
             messages: MessageLike[],
@@ -4257,24 +4381,24 @@ export function createRustModeTransform(
             sessionMeta: ReturnType<typeof getOrCreateSessionMeta>,
         ): Promise<void> => {
             try {
-                await run(sessionId, messages, output, sessionMeta);
+                await withSqliteTransformPass(() => run(sessionId, messages, output, sessionMeta));
             } finally {
                 // The pass is the loop's clock. A run can only be queued by a pass, so
                 // looking right after one is when there is most likely something to
                 // take. Never awaited: the fold the loop picks up takes minutes and the
                 // response this pass just built is already correct without it.
-                void resolveHostRunner()?.pump(sessionId);
+                void withoutSqliteTransformPass(() => resolveHostRunner()?.pump(sessionId));
             }
         },
         async clearSession(sessionId: string): Promise<void> {
             const projectRoot =
-                states.get(sessionId)?.memoryAuthorityRoot ?? options.projectRoot ?? null;
+                states.get(sessionId)?.recordedSessionDirectory ?? options.projectRoot ?? null;
             const clearLocalState = () => {
                 dropSlot(sessionId, "session-deleted");
                 states.delete(sessionId);
+                passStampBySession.delete(sessionId);
                 heapHolder.wireCaches.delete(sessionId);
                 promptSurfaceGuidanceEpochs?.clear(sessionId);
-                clearCompartmentMirrorCursor(sessionId);
             };
             clearLocalState();
             try {
@@ -4295,6 +4419,14 @@ export function createRustModeTransform(
         invalidateWireState,
         async stopHostRunner(): Promise<void> {
             await (hostRunner ?? undefined)?.stop();
+        },
+        /**
+         * The host disposed the instance that owns this adapter. Stop offering it
+         * to the outer wrapper's replay registry; the registry holds it weakly, so
+         * this only makes the removal immediate instead of waiting for collection.
+         */
+        dispose(): void {
+            unregisterReplayParticipant();
         },
         getState(sessionId: string): Readonly<RustSessionState> {
             return {
@@ -4320,7 +4452,12 @@ export function createRustModeTransform(
                 sessions,
             };
         },
+        // What the outer messages-transform wrapper of this adapter's own instance
+        // uses to replay and freeze. Holding it here also keeps the replay registry's
+        // weak reference alive exactly as long as the adapter is.
+        replayParticipant,
     };
+    return adapter;
 }
 
 export async function runRustModeTransform(
@@ -4335,7 +4472,6 @@ export async function runRustModeTransform(
 
 export const __rustModeTransformTest = {
     applyNativeMessagesVerbatim,
-    authoritySeedRows,
     contentSnapshotsFor,
     rustCaptureDigests,
     snapshotTags: {
@@ -4362,5 +4498,4 @@ export const __rustModeTransformTest = {
     shouldDisarmRustEmergencyRecovery,
     createRustModeTransform,
     directiveTextOf,
-    prepareRustMemoryAuthority,
 };

@@ -1,8 +1,33 @@
 import type { createOpencodeClient } from "@opencode-ai/sdk";
-
+import {
+    createDreamTokenBudget,
+    DreamTokenBudgetExceeded,
+    registerBudgetFinalizeChild,
+    releaseBudgetFinalizeChild,
+    TOKEN_BUDGET_FINALIZE_MESSAGE,
+} from "../features/magic-context/dreamer/token-budget";
+import { sumTokensFromChildMessages } from "../features/magic-context/subagent-token-capture";
+import { describeAssistantError } from "./assistant-message-extractor";
+import { sessionLog } from "./logger";
 import type { PromptArgs, PromptTransport } from "./model-suggestion-retry";
 
 type Client = ReturnType<typeof createOpencodeClient> | undefined;
+
+const activeSessionErrors = new Map<string, unknown>();
+const budgetAbortedSessions = new Set<string>();
+
+/** Feed host errors only to active background waits, not ordinary user sessions. */
+export function recordPromptSessionError(sessionId: string, error: unknown): void {
+    // The finalize nudge intentionally aborts the previous generation. Its late
+    // event must not poison the replacement turn; other provider errors still count.
+    if (
+        budgetAbortedSessions.has(sessionId) &&
+        describeAssistantError(error).startsWith("MessageAbortedError")
+    )
+        return;
+    if (activeSessionErrors.has(sessionId) && activeSessionErrors.get(sessionId) === undefined)
+        activeSessionErrors.set(sessionId, error);
+}
 
 /**
  * Why this exists: a synchronous `session.prompt` keeps one HTTP request open
@@ -21,21 +46,42 @@ const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const DEFAULT_START_GRACE_MS = 30_000;
 /** The wait only looks at the newest messages: the ones this send appended and
  * the ones just before it. The host returns the most recent `limit` messages. */
-const MESSAGE_WINDOW = 20;
+const MESSAGE_WINDOW = 100;
 
 export interface PromptAsyncWaitOptions {
     pollIntervalMs?: number;
     startGraceMs?: number;
+    tokenBudget?: number;
+    /** Shared across retries of one child session. */
+    budgetGuard?: ReturnType<typeof createDreamTokenBudget>;
+    onBudgetUpdate?: (
+        state: ReturnType<ReturnType<typeof createDreamTokenBudget>["snapshot"]> & {
+            sessionId: string;
+        },
+    ) => void;
 }
 
 type SessionApi = {
     promptAsync?: (options: unknown) => Promise<unknown>;
     status?: (options?: unknown) => Promise<unknown>;
     messages?: (options: unknown) => Promise<unknown>;
+    abort?: (options: unknown) => Promise<unknown>;
 };
 
 function sessionApi(client: Client): SessionApi | undefined {
     return (client as { session?: SessionApi } | undefined)?.session;
+}
+
+/** Marks the error the wait throws when the host reported a session error for the child. */
+const HOST_SESSION_ERROR = Symbol("promptAsyncHostSessionError");
+
+/** True for the error the wait throws when the host recorded a session error for the child. */
+export function isHostSessionError(error: unknown): boolean {
+    return (
+        error !== null &&
+        typeof error === "object" &&
+        (error as { [HOST_SESSION_ERROR]?: unknown })[HOST_SESSION_ERROR] === true
+    );
 }
 
 /** True when the host client can send without waiting and report session status. */
@@ -59,8 +105,12 @@ export function createPromptAsyncTransport(
     options: PromptAsyncWaitOptions = {},
 ): PromptTransport | undefined {
     if (!supportsPromptAsync(client)) return undefined;
+    const budgetGuard = options.tokenBudget
+        ? createDreamTokenBudget(options.tokenBudget)
+        : undefined;
     return Object.assign(
-        (request: PromptArgs) => promptAsyncAndWaitForIdle(client, request, options),
+        (request: PromptArgs) =>
+            promptAsyncAndWaitForIdle(client, request, { ...options, budgetGuard }),
         { childSessionId },
     );
 }
@@ -88,6 +138,23 @@ function isSettledAssistant(message: unknown): boolean {
     const info = infoOf(message);
     if (info.role !== "assistant") return false;
     return info.time?.completed != null || info.error != null || info.finish != null;
+}
+
+function isTerminalAssistant(message: unknown): boolean {
+    const info = infoOf(message);
+    return (
+        isSettledAssistant(message) &&
+        info.finish !== "tool-calls" &&
+        info.finish !== "tool_use" &&
+        !(
+            message &&
+            typeof message === "object" &&
+            Array.isArray((message as { parts?: unknown[] }).parts) &&
+            (message as { parts: Array<{ type?: string }> }).parts.some(
+                (part) => part.type === "tool",
+            )
+        )
+    );
 }
 
 function unwrapData(response: unknown): unknown {
@@ -169,13 +236,6 @@ async function readStatus(
     }
 }
 
-/**
- * Send one prompt with `prompt_async`, then poll until the child session is idle
- * and its newest message is a finished assistant reply from this send. Returns
- * without judging that reply: the caller's output validation reads it. Rejects
- * when the caller's signal aborts, and when the host accepted the send but never
- * started a run within the start grace.
- */
 export async function promptAsyncAndWaitForIdle(
     client: Client,
     request: PromptArgs,
@@ -191,52 +251,161 @@ export async function promptAsyncAndWaitForIdle(
     const signal = request.signal;
     const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const startGraceMs = options.startGraceMs ?? DEFAULT_START_GRACE_MS;
-
-    // A fallback attempt reuses the child session, so an earlier attempt's final
-    // reply must not be mistaken for this send's reply.
-    const baseline = new Set(
+    const budget =
+        options.budgetGuard ??
+        (options.tokenBudget ? createDreamTokenBudget(options.tokenBudget) : undefined);
+    if (budget && (budget.snapshot().finalizeFired || budget.snapshot().hardStopped))
+        throw new DreamTokenBudgetExceeded(sessionId, budget.snapshot().spent);
+    const seenUsage = new Set<string>();
+    let finalizing = false;
+    let completionBaseline = new Set(
         (await readMessages(session, sessionId, dir, signal))
             .map(messageId)
             .filter((id): id is string => id !== null),
     );
-
-    const sent = await session.promptAsync?.(request);
-    if (sent && typeof sent === "object" && "error" in sent) {
-        const rejection = (sent as { error?: unknown }).error;
-        if (rejection)
-            throw new Error(`prompt_async was rejected: ${describeRejection(rejection)}`);
-    }
-    const sentAt = Date.now();
-    let sawBusy = false;
-
-    for (;;) {
-        await sleep(pollIntervalMs, signal);
-        const status = await readStatus(session, sessionId, dir, signal);
-        if (status === "busy" || status === "retry") {
-            sawBusy = true;
-            continue;
+    const initialBaseline = new Set(completionBaseline);
+    // Dispatch can fail before an assistant row exists. The plugin event hook
+    // retains that provider/model error while this child is actively awaited.
+    activeSessionErrors.set(sessionId, undefined);
+    try {
+        const sent = await session.promptAsync?.(request);
+        if (sent && typeof sent === "object" && "error" in sent) {
+            const rejection = (sent as { error?: unknown }).error;
+            if (rejection) {
+                throw new Error(`prompt_async was rejected: ${describeRejection(rejection)}`);
+            }
         }
-        // An unreadable status says nothing about the run; keep waiting under the
-        // caller's timer rather than guessing.
-        if (status === null) continue;
+        let sentAt = Date.now();
+        let sawBusy = false;
 
-        const messages = await readMessages(session, sessionId, dir, signal);
-        const last = messages.at(-1);
-        const lastId = messageId(last);
-        if (last && lastId !== null && !baseline.has(lastId) && isSettledAssistant(last)) return;
-
-        const fresh = messages.some((message) => {
-            const id = messageId(message);
-            return id !== null && !baseline.has(id);
-        });
-        // The loop ran and ended without a final reply (for example it failed
-        // before writing one). Output validation reports what is missing.
-        if (sawBusy && fresh) return;
-        if (Date.now() - sentAt >= startGraceMs) {
-            if (fresh) return;
-            throw new Error(
-                `prompt_async did not start a run in child session ${sessionId} within ${startGraceMs}ms`,
-            );
+        for (;;) {
+            await sleep(pollIntervalMs, signal);
+            const hostError = activeSessionErrors.get(sessionId);
+            if (hostError !== undefined) {
+                const error = new Error(
+                    `Host recorded session error: ${describeAssistantError(hostError)}`,
+                );
+                Object.assign(error, {
+                    name: "DreamerProviderOutputFailureError",
+                    transient: true,
+                    [HOST_SESSION_ERROR]: true,
+                });
+                throw error;
+            }
+            const status = await readStatus(session, sessionId, dir, signal);
+            const messages = await readMessages(session, sessionId, dir, signal);
+            if (budget) {
+                const latest = messages.at(-1);
+                const latestId = messageId(latest);
+                const completedAnswer =
+                    latestId !== null &&
+                    !completionBaseline.has(latestId) &&
+                    isTerminalAssistant(latest) &&
+                    infoOf(latest).error == null;
+                for (const message of messages) {
+                    const id = messageId(message);
+                    if (!id || seenUsage.has(id) || infoOf(message).role !== "assistant") continue;
+                    // The initial baseline belongs to a previous child attempt.
+                    if (initialBaseline.has(id)) continue;
+                    const tokens = sumTokensFromChildMessages([message]);
+                    if (tokens.input + tokens.cacheRead + tokens.cacheWrite === 0) continue;
+                    seenUsage.add(id);
+                    const decision = budget.charge(
+                        tokens.input,
+                        tokens.cacheRead,
+                        tokens.cacheWrite,
+                        // A poll can receive several usage rows together. Charge
+                        // all of them, but never abort an answer already completed.
+                        completedAnswer ||
+                            (isTerminalAssistant(message) && infoOf(message).error == null),
+                    );
+                    options.onBudgetUpdate?.({ ...budget.snapshot(), sessionId });
+                    if (decision === "stop") {
+                        await session.abort?.({ path: { id: sessionId } });
+                        throw new DreamTokenBudgetExceeded(sessionId, budget.snapshot().spent);
+                    }
+                    if (decision === "finalize") {
+                        finalizing = true;
+                        sessionLog(
+                            sessionId,
+                            "dreamer token budget: finalize fired",
+                            budget.snapshot(),
+                        );
+                        budgetAbortedSessions.add(sessionId);
+                        registerBudgetFinalizeChild(sessionId, budget);
+                        if (!session.abort)
+                            throw new DreamTokenBudgetExceeded(sessionId, budget.snapshot().spent);
+                        await session.abort({ path: { id: sessionId } });
+                        // Wait for the cancelled generation to become idle before
+                        // submitting a new user turn in the same session.
+                        const abortDeadline = Date.now() + startGraceMs;
+                        while (Date.now() < abortDeadline) {
+                            const state = await readStatus(session, sessionId, dir, signal);
+                            if (state === "idle") break;
+                            await sleep(pollIntervalMs, signal);
+                        }
+                        if ((await readStatus(session, sessionId, dir, signal)) !== "idle") {
+                            throw new DreamTokenBudgetExceeded(sessionId, budget.snapshot().spent);
+                        }
+                        // An aborted assistant is not the answer to the new user turn.
+                        completionBaseline = new Set(
+                            (await readMessages(session, sessionId, dir, signal))
+                                .map(messageId)
+                                .filter((value): value is string => value !== null),
+                        );
+                        const finalizeResponse = await session.promptAsync?.({
+                            ...request,
+                            body: {
+                                ...request.body,
+                                parts: [{ type: "text", text: TOKEN_BUDGET_FINALIZE_MESSAGE }],
+                            },
+                        });
+                        if (
+                            finalizeResponse &&
+                            typeof finalizeResponse === "object" &&
+                            "error" in finalizeResponse &&
+                            finalizeResponse.error
+                        ) {
+                            throw new DreamTokenBudgetExceeded(sessionId, budget.snapshot().spent);
+                        }
+                        sentAt = Date.now();
+                        sawBusy = false;
+                        break;
+                    }
+                }
+                if (budget.snapshot().hardStopped && !completedAnswer) {
+                    await session.abort?.({ path: { id: sessionId } });
+                    throw new DreamTokenBudgetExceeded(sessionId, budget.snapshot().spent);
+                }
+            }
+            if (status === "busy" || status === "retry") {
+                sawBusy = true;
+                continue;
+            }
+            if (status === null) continue;
+            const current = finalizing
+                ? await readMessages(session, sessionId, dir, signal)
+                : messages;
+            const last = current.at(-1);
+            const lastId = messageId(last);
+            if (
+                last &&
+                lastId !== null &&
+                !completionBaseline.has(lastId) &&
+                isSettledAssistant(last)
+            )
+                return;
+            // An accepted user message is not a completion. A host-side rejection
+            // can leave only that row behind while the session remains idle.
+            if (Date.now() - sentAt >= startGraceMs) {
+                throw new Error(
+                    `prompt_async did not start a run with a settled assistant in child session ${sessionId} within ${startGraceMs}ms (observed_busy=${sawBusy})`,
+                );
+            }
         }
+    } finally {
+        activeSessionErrors.delete(sessionId);
+        budgetAbortedSessions.delete(sessionId);
+        if (budget) releaseBudgetFinalizeChild(sessionId);
     }
 }

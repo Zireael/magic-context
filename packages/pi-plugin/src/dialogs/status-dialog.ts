@@ -38,6 +38,7 @@ import {
 	readEpochFloorSnapshot,
 } from "@magic-context/core/features/magic-context/protection-window";
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
+import { readSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
 import {
@@ -63,7 +64,7 @@ import type {
 } from "@magic-context/core/shared/rpc-types";
 import { renderUserStatusSummary } from "@magic-context/core/shared/status-summary";
 import {
-	buildStatusView,
+	buildStatusViewFor,
 	distributeBarWidths,
 	STATUS_COLUMN_GAP,
 	type StatusBarSegment,
@@ -74,6 +75,7 @@ import {
 	type StatusViewSource,
 	statusColumnsFor,
 } from "@magic-context/core/shared/status-view";
+import { checkLocalStatusSource } from "@magic-context/core/shared/status-view-check";
 import { resolveTailHygieneStatus } from "@magic-context/core/shared/tail-hygiene-status";
 import type { UserFacingFailureKey } from "@magic-context/core/shared/user-facing-codes";
 import type { WindowGeometryResult } from "@magic-context/core/shared/window-geometry";
@@ -81,7 +83,7 @@ import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
 import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
 import { resolvePiWindowGeometry } from "../pi-context-limit";
-import { resolvePiPressureSnapshot } from "../pi-pressure";
+import { resolvePiStatusPressureSnapshot } from "../pi-pressure";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 
 /** Refresh cadence while dialog is open. */
@@ -144,7 +146,7 @@ export interface StatusDialogDetail {
 	historianLastFailureAt: number | null;
 	historianLastError: string | null;
 	cacheTtl: string;
-	cacheTtlSource: "config" | "session" | "default";
+	cacheTtlSource: import("@magic-context/core/shared/cache-ttl-display").CacheTtlDisplaySource;
 	cacheTtlModelKey?: string;
 	configParseFailures: ConfigParseFailure[];
 	lastResponseTime: number;
@@ -252,6 +254,12 @@ interface StatusDialogProps {
  *  - rebuilds detail and re-renders on a 1s timer so live values stay current
  *  - cleans up timer on close
  */
+const openStatusDialogs = new Set<StatusDialogComponent>();
+
+export function stopStatusDialogRefresh(): void {
+	for (const dialog of openStatusDialogs) dialog.close();
+}
+
 class StatusDialogComponent implements Component {
 	private readonly props: StatusDialogProps;
 	private detail: StatusDialogDetail;
@@ -266,6 +274,7 @@ class StatusDialogComponent implements Component {
 			props.deps,
 			props.sessionId,
 		);
+		openStatusDialogs.add(this);
 		this.refreshTimer = setInterval(() => {
 			if (this.closed) return;
 			try {
@@ -292,13 +301,9 @@ class StatusDialogComponent implements Component {
 		}
 	}
 
-	private close(): void {
+	close(): void {
 		if (this.closed) return;
-		this.closed = true;
-		if (this.refreshTimer) {
-			clearInterval(this.refreshTimer);
-			this.refreshTimer = null;
-		}
+		this.dispose();
 		this.props.done(undefined);
 	}
 
@@ -321,6 +326,8 @@ class StatusDialogComponent implements Component {
 	}
 
 	dispose(): void {
+		this.closed = true;
+		openStatusDialogs.delete(this);
 		if (this.refreshTimer) {
 			clearInterval(this.refreshTimer);
 			this.refreshTimer = null;
@@ -496,8 +503,12 @@ export function renderPiStatusOverlay(
 ): string[] {
 	// Which rows exist, their labels, order and colours come from the shared
 	// model, so this overlay and the OpenCode dialog cannot drift apart. Only
-	// the drawing is Pi's own.
-	const view = buildStatusView(statusViewSourceFromPiDetail(s), {
+	// the drawing is Pi's own. The snapshot passes the same check the OpenCode
+	// dialog applies to its RPC reply; one the model cannot draw becomes the
+	// "status unavailable" view naming the missing fields instead of an
+	// exception thrown out of Pi's render loop.
+	const status = checkLocalStatusSource(statusViewSourceFromPiDetail(s));
+	const view = buildStatusViewFor(status, {
 		version: packageJson.version,
 	});
 	const lines: string[] = [];
@@ -544,17 +555,20 @@ export function renderPiStatusOverlay(
 	// pre-v2 layout have nowhere else to surface. This is live run state
 	// rather than status content, which is why it is not one of the shared
 	// sections.
-	const upgrade: StatusRow | null = s.recompInFlight
-		? { label: "Recomp", value: "running…", tone: "warning" }
-		: s.upgradeNeededCount > 0
-			? {
-					label: "Recomp",
-					value: `${s.upgradeNeededCount} compartment${
-						s.upgradeNeededCount === 1 ? "" : "s"
-					} in the old layout · run /ctx-recomp`,
-					tone: "warning",
-				}
-			: null;
+	const upgrade: StatusRow | null =
+		status.state !== "ready"
+			? null
+			: s.recompInFlight
+				? { label: "Recomp", value: "running…", tone: "warning" }
+				: s.upgradeNeededCount > 0
+					? {
+							label: "Recomp",
+							value: `${s.upgradeNeededCount} compartment${
+								s.upgradeNeededCount === 1 ? "" : "s"
+							} in the old layout · run /ctx-recomp`,
+							tone: "warning",
+						}
+					: null;
 	if (upgrade) lines.push(renderStatusRow(upgrade, 9, innerWidth, theme));
 
 	// The shared model decides whether the sections fit in two columns at this
@@ -645,7 +659,8 @@ export function buildPiStatusDetail(
 		persistedInputTokens: meta.lastInputTokens,
 		persistedPercentage: meta.lastContextPercentage,
 	});
-	const pressure = resolvePiPressureSnapshot({
+	const pressure = resolvePiStatusPressureSnapshot({
+		sessionId,
 		persistedPercentage: meta.lastContextPercentage,
 		persistedInputTokens: meta.lastInputTokens,
 		liveInputTokens: usage?.tokens,
@@ -771,6 +786,7 @@ export function buildPiStatusDetail(
 		},
 	);
 	const cacheTtlDisplay = resolveCacheTtlDisplay({
+		frozen: readSessionCacheTtl(deps.db, sessionId),
 		configured: deps.cacheTtlConfig ?? "5m",
 		configuredExplicitly: deps.cacheTtlConfigured === true,
 		modelKey,

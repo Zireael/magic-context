@@ -188,6 +188,20 @@ export interface RunnerStatus {
 }
 
 export interface StatusDetail extends SidebarSnapshot {
+    /**
+     * Version of the Magic Context package the answering server runs. The TUI
+     * compares it with its own so the status dialog can say when the two differ
+     * (OpenCode keeps the server it started with until it restarts). Absent from
+     * servers older than this field, which the dialog reports as "older than
+     * this UI". Also sent on the `{ disabled: true }` replies.
+     */
+    pluginVersion?: string;
+    /**
+     * Set when this server migrated the shared store at startup while another
+     * OpenCode server's RPC record named a PID it could not check. If that PID
+     * was an older build still running, it now runs against a newer store.
+     */
+    unconfirmedMigrationHolders?: { pids: number[]; fromVersion: number; toVersion: number };
     /** OpenCode 2 hidden-run model variants dropped because the host catalog did not declare them. */
     hiddenVariantWarnings?: string[];
     /** Runner refusal provenance reported by the Rust historian, including received text. */
@@ -280,7 +294,7 @@ export interface StatusDetail extends SidebarSnapshot {
     cacheExpired: boolean;
     /** Reports whether the displayed TTL came from config, persisted session metadata,
      *  or the default; cache scheduling still uses the TTL stored in session metadata. */
-    cacheTtlSource?: "config" | "session" | "default";
+    cacheTtlSource?: import("./cache-ttl-display").CacheTtlDisplaySource;
     cacheTtlModelKey?: string;
     configParseFailures?: ConfigParseFailure[];
     /** True when cacheTtl is "never" — the idle-TTL heuristic is disabled on

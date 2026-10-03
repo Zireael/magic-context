@@ -55,12 +55,13 @@ use crate::tail_hygiene::{
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
-    BlockIdentity, Channel1AppendRow, DeferredExecuteState, LineageAnchor, LineageConstituent,
-    LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow,
-    MemoryRevision, ModuleMeta, ModuleUsage, PassSchedulerObservation, PendingAgentDrop,
-    PendingChannel2Directive, PendingRewriteState, ServedBlockFingerprint, StoredCompartment,
-    TagCacheSummary, TagMintInput, TailHygieneBaseline, TailHygienePartKind, TemporalMarkInput,
-    TemporalMarkRow, TransformCommit, TransformOverlayBatch, UserHintDecisionInput, UserHintRow,
+    BlockIdentity, Channel1AppendRow, DeferredExecuteState, FrozenClear, LineageAnchor,
+    LineageConstituent, LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError,
+    McTagRow, MemoryRevision, ModuleMeta, ModuleUsage, PassSchedulerObservation, PendingAgentDrop,
+    PendingChannel2Directive, PendingRewriteState, SectionsCommit, ServedBlockFingerprint,
+    StoredCompartment, TagCacheSummary, TagMintInput, TailHygieneBaseline, TailHygienePartKind,
+    TemporalMarkInput, TemporalMarkRow, TransformCommit, TransformOverlayBatch,
+    UserHintDecisionInput, UserHintRow,
 };
 use mc_store::{CompartmentBoundary, RenderedCompartmentCoverage};
 use regex::Regex;
@@ -613,8 +614,27 @@ pub struct ProducerContext<'a> {
     /// is bounded by the 3,800-second `historian::MAX_WRAPUP_REQUEST_BUDGET` and is released on
     /// every terminal path, so a damaged row delayed by this signal becomes eligible afterward.
     pub wrapup_active: bool,
+    /// Whether caveman compression may use its English word rules, from the user-level
+    /// `language` setting (`caveman_english_word_rules`). New caveman units and new user-hint
+    /// fragments read it; frozen payloads keep the bytes they were minted with.
+    pub caveman_english_word_rules: bool,
     #[cfg(test)]
     pub injected_reductions: Vec<ReductionDecision>,
+}
+
+/// Whether caveman may use its English word rules for the user-level `language` setting: yes
+/// when it is unset, "en", "en-*", or not a resolvable code (the same values that produce no
+/// language directive); no for any other language. The TypeScript twin is
+/// `cavemanWordRulesForLanguage` in packages/plugin/src/hooks/magic-context/caveman.ts.
+pub(crate) fn caveman_english_word_rules(language: Option<&str>) -> bool {
+    let code = language
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if code == "en" || code.starts_with("en-") {
+        return true;
+    }
+    crate::content_language::resolve_language_name(Some(&code)).is_none()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -859,6 +879,8 @@ pub struct TransformRequest {
     /// Host-resolved per-attempt historian deadline; absent on older adapters.
     #[serde(default)]
     pub historian_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub historian_max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
     /// Composed fake-compaction edge delivered by the lineage owner. Missing fields retain
@@ -1079,6 +1101,8 @@ struct TransformRequestWire {
     #[serde(default)]
     historian_timeout_ms: Option<u64>,
     #[serde(default)]
+    historian_max_output_tokens: Option<u32>,
+    #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
     #[serde(default)]
     lineage_switched: bool,
@@ -1172,6 +1196,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             historian_model_chain: wire.historian_model_chain,
             historian_model_limits: wire.historian_model_limits,
             historian_timeout_ms: wire.historian_timeout_ms,
+            historian_max_output_tokens: wire.historian_max_output_tokens,
             declared_trim: wire.declared_trim,
             lineage_switched: wire.lineage_switched,
             descent_edge_id: wire.descent_edge_id,
@@ -1591,6 +1616,9 @@ pub struct TransformResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub native_reasoning_keep_mids: Vec<String>,
     pub status: TransformStatus,
+    /// Reason the request requires a full sync; omitted on success and by older modules.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub need_full_sync_reason: Option<String>,
     pub served_from: ServedFrom,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_array_fingerprint: Option<String>,
@@ -1616,6 +1644,13 @@ pub struct TransformResponse {
     /// excluding blocks added only at the end.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub first_divergence: Option<FirstDivergence>,
+    /// True on a prefix-bound OpenCode bust (Fable 5.1, Opus 5.5, Sonnet 5.5) whose only
+    /// edit before newer signed thinking is removing reasoning from a contiguous oldest
+    /// prefix. Removing thinking from the start of the history leaves every later block
+    /// valid, so the host keeps the newer blocks instead of stripping all of them. Omitted
+    /// (false) on every other pass and by older modules, which keeps the strip.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_trim_only: bool,
     /// Optional diagnostic timings. Omitted only by compatibility constructors and on old
     /// responses; normal module transform passes include this object.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1632,10 +1667,6 @@ pub struct TransformResponse {
     /// filter search results, using the module manifest rather than its TypeScript render cache.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rendered_memory_ids: Option<Vec<i64>>,
-    /// Newest memories changefeed sequence observed while producing this response. The host
-    /// folds it into its mirror projection key so unrendered memory changes still schedule a pull.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub memory_mirror_head: Option<i64>,
     /// Exact composed edge id consumed by observed durable state. Omitted on ordinary,
     /// subagent, defer-only protocol-error, and pending-build-skew responses.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1692,6 +1723,7 @@ impl TransformResponse {
         Self {
             native_reasoning_keep_mids: Vec::new(),
             status: TransformStatus::NeedFullSync,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
             action: "NEED_FULL_SYNC".to_string(),
@@ -1701,6 +1733,7 @@ impl TransformResponse {
             materialize_reason: None,
             identity_delta: Vec::new(),
             first_divergence: None,
+            reasoning_trim_only: false,
             timings: None,
             boundary_id: String::new(),
             reconcile_pending: false,
@@ -1710,7 +1743,6 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             rendered_memory_ids: None,
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -1731,6 +1763,7 @@ impl TransformResponse {
         Self {
             native_reasoning_keep_mids: Vec::new(),
             status: TransformStatus::Ok,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
             action: "PASSTHROUGH".to_string(),
@@ -1740,6 +1773,7 @@ impl TransformResponse {
             materialize_reason: None,
             identity_delta: Vec::new(),
             first_divergence: None,
+            reasoning_trim_only: false,
             timings: None,
             boundary_id: String::new(),
             reconcile_pending: false,
@@ -1749,7 +1783,6 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             rendered_memory_ids: None,
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -2023,6 +2056,8 @@ pub enum TransformError {
     /// A stored coverage range overlaps, or the live array proves a present raw message
     /// would be trimmed without being covered by any compartment. Fail loud.
     CoverageGap(String),
+    /// Internal retry: a priced pass must use the ingress synthetic classification.
+    SyntheticTreatmentBust,
     /// The lexical hint query failed before a durable decision could be written.
     Search(String),
     /// CK ingress rejected an unsupported or unpairable block before any partial projection.
@@ -2068,6 +2103,7 @@ impl std::fmt::Display for TransformError {
                 "decider re-supplied an already-frozen reduction target with different bytes"
             ),
             TransformError::CoverageGap(m) => write!(f, "{m}"),
+            TransformError::SyntheticTreatmentBust => write!(f, "synthetic treatment requires a priced retry"),
             TransformError::Search(m) => write!(f, "search: {m}"),
             TransformError::CkWire(e) => write!(f, "ck wire: {e}"),
             TransformError::DuplicateBlockId(id) => write!(f, "duplicate flattened block id: {id}"),
@@ -2336,6 +2372,56 @@ fn response_marker_ttl(
         })
 }
 
+// A persisted tag proves this user row was previously served as non-synthetic. Keep
+// that treatment while replaying a cached prefix; a priced pass retries with the
+// original ingress so coverage and historian liveness see the corrected classification.
+fn previously_tagged_synthetic_rows(
+    store: &McStore,
+    req: &TransformRequest,
+) -> Result<Option<TransformRequest>, TransformError> {
+    if !req.messages.iter().any(|message| {
+        message.ck.meta.synthetic && message.ck.role == "user" && !message.ck.content.is_empty()
+    }) {
+        return Ok(None);
+    }
+    let reclassified = store
+        .load_meta(&req.session_id)?
+        .meta
+        .reclassified_synthetic_mids;
+    let candidate_blocks: Vec<String> = req
+        .messages
+        .iter()
+        .filter(|message| {
+            message.ck.meta.synthetic
+                && message.ck.role == "user"
+                && !reclassified.contains(&message.mid)
+        })
+        .flat_map(|message| {
+            (0..message.ck.content.len()).map(|index| format!("{}#{index}", message.mid))
+        })
+        .collect();
+    if candidate_blocks.is_empty() {
+        return Ok(None);
+    }
+    let tagged = store.tagged_block_ids_among(&req.session_id, &candidate_blocks)?;
+    if tagged.is_empty() {
+        return Ok(None);
+    }
+    let mut legacy = req.clone();
+    let mut changed = false;
+    for message in &mut legacy.messages {
+        if message.ck.meta.synthetic
+            && !reclassified.contains(&message.mid)
+            && (0..message.ck.content.len())
+                .any(|index| tagged.contains(&format!("{}#{index}", message.mid)))
+        {
+            message.ck.meta.synthetic = false;
+            changed = true;
+        }
+    }
+    Ok(changed.then_some(legacy))
+}
+
 fn apply_once_with_estimator_and_projection(
     store: &McStore,
     req: &TransformRequest,
@@ -2348,19 +2434,49 @@ fn apply_once_with_estimator_and_projection(
     emit_protected_tags_deprecation_once(req);
     let mut attempt = 0;
     let mut boundary_divergence_retry = false;
+    let legacy_req = if ctx.compaction_enabled {
+        previously_tagged_synthetic_rows(store, req)?
+    } else {
+        None
+    };
+    let reclassified_on_bust: BTreeSet<String> = legacy_req
+        .as_ref()
+        .into_iter()
+        .flat_map(|legacy| legacy.messages.iter().zip(&req.messages))
+        .filter(|(legacy, ingress)| !legacy.ck.meta.synthetic && ingress.ck.meta.synthetic)
+        .map(|(_, ingress)| ingress.mid.clone())
+        .collect();
+    let mut replay_legacy_treatment = legacy_req.is_some();
     loop {
         let mut boundary_divergence_detected = false;
+        let pass_req = if replay_legacy_treatment {
+            legacy_req.as_ref().unwrap_or(req)
+        } else {
+            req
+        };
         match apply_once(
             store,
-            req,
+            pass_req,
             ctx,
             estimate_tokens,
             output_cache,
-            projection_cache,
+            if replay_legacy_treatment {
+                None
+            } else {
+                projection_cache
+            },
             boundary_divergence_retry,
             &mut boundary_divergence_detected,
             incremental_history,
+            replay_legacy_treatment,
+            &reclassified_on_bust,
         ) {
+            Err(TransformError::SyntheticTreatmentBust | TransformError::CoverageGap(_))
+                if replay_legacy_treatment =>
+            {
+                replay_legacy_treatment = false;
+                continue;
+            }
             Err(TransformError::Store(McStoreError::CasConflict { .. }))
                 if attempt < MAX_CAS_RETRIES =>
             {
@@ -2770,13 +2886,7 @@ fn compose_additive_m0(
         ctx.memory_budget_tokens,
         estimate_tokens,
     );
-    let host_backed_memory_ids = serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic);
-    let mut rendered_memories = selected_memories;
-    if host_backed_memory_ids {
-        for memory in &mut rendered_memories {
-            memory.id = memory.host_row_id.unwrap_or(0);
-        }
-    }
+    let rendered_memories = selected_memories;
     let source_name_by_id = membership
         .as_ref()
         .map(|value| workspace_source_names(&rendered_memories, value))
@@ -2993,22 +3103,36 @@ fn apply_additive_only(
         || hard_fold_requested;
     let m1_revision_changed =
         m1_signal.revision != applied_m1_revision || loaded.meta.soft_refresh_pending;
-    let plan = classify(&ClassifierInput {
-        initialized: loaded.meta.initialized && !loaded.meta.bootstrap_seed_fold_pending,
-        is_legacy_baseline: is_legacy_baseline(&loaded.core),
-        valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
-        cached_m1_missing: cached_m1_missing(&loaded.core),
-        render_config_changed,
-        hard_fold_requested,
-        // Compaction-off returns every raw request message, so refreshing m1 cannot trim
-        // messages at a stored coverage boundary and does not require a boundary anchor. It
-        // still requires a scheduler or config event that permits provider-visible bytes to change.
-        boundary_present: true,
-        reconcile_pending: false,
-        m1_revision_changed,
-        reductions_pending: false,
-        bust_opportunity,
-    });
+    // A stored frozen chunk or cache section that failed its digest (or its shape checks)
+    // decoded as empty. `classify` rejects an initialized session whose frozen list lacks its
+    // m0/m1 units, so without this override every later pass would fail and nothing would
+    // ever rewrite the chunks. Rebuild with a HARD pass instead, as `apply_once` does for
+    // compaction-on sessions. The commit below then rewrites every discarded value in full,
+    // and refuses if another writer changed the stored sections since this pass loaded them.
+    let cache_sections_discarded = loaded
+        .sections
+        .as_ref()
+        .is_some_and(mc_store::SectionsBase::any_discarded);
+    let plan = if cache_sections_discarded {
+        PassPlan::Hard
+    } else {
+        classify(&ClassifierInput {
+            initialized: loaded.meta.initialized && !loaded.meta.bootstrap_seed_fold_pending,
+            is_legacy_baseline: is_legacy_baseline(&loaded.core),
+            valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
+            cached_m1_missing: cached_m1_missing(&loaded.core),
+            render_config_changed,
+            hard_fold_requested,
+            // Compaction-off returns every raw request message, so refreshing m1 cannot trim
+            // messages at a stored coverage boundary and does not require a boundary anchor. It
+            // still requires a scheduler or config event that permits provider-visible bytes to change.
+            boundary_present: true,
+            reconcile_pending: false,
+            m1_revision_changed,
+            reductions_pending: false,
+            bust_opportunity,
+        })
+    };
     if let PassPlan::Reject(message) = plan {
         return Err(TransformError::UnknownShape(message));
     }
@@ -3121,6 +3245,8 @@ fn apply_additive_only(
             meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
             meta.m1_user_profile_version = meta.user_profile_version;
             meta.m1_external_revision = applied_m1_signal.external_revision;
+            meta.m1_history_revision = applied_m1_signal.history_revision;
+
             meta.project_memory_epoch_pending = false;
             meta.synthetic_todo = None;
             meta.m1_pending_since_ms = None;
@@ -3140,7 +3266,6 @@ fn apply_additive_only(
                 &additive_meta,
                 meta.expiry_cutoff_ms,
                 ctx.memory_enabled,
-                serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic),
                 ctx.memory_budget_tokens,
                 ctx.user_profile_budget_tokens,
                 ctx.temporal_awareness,
@@ -3246,7 +3371,9 @@ fn apply_additive_only(
     if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
     }
-    let commit_required = core != loaded.core || meta != loaded.meta;
+    // A discarded section is rewritten even when the rebuild reproduces the loaded state, so
+    // the next load trusts the stored rows again.
+    let commit_required = state_changed || cache_sections_discarded;
     let store_commit_started_at = Instant::now();
     let row_version = if commit_required {
         #[cfg(test)]
@@ -3257,6 +3384,12 @@ fn apply_additive_only(
                 expected: loaded.row_version,
                 core: &core,
                 meta: &meta,
+                // This path rebuilds the frozen list from the loaded one, so an empty result
+                // is its own, not an unloaded state.
+                sections: SectionsCommit {
+                    frozen_clear: FrozenClear::Explicit,
+                    ..SectionsCommit::over(loaded.sections.as_ref())
+                },
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
                 memory_revision: commit_memory_revision.as_ref(),
@@ -3290,7 +3423,9 @@ fn apply_additive_only(
     let action = action_str(&plan, &core).to_string();
     let materialize_reason = match plan {
         PassPlan::Hard | PassPlan::MigrateHard => Some(
-            if !loaded.meta.initialized || loaded.meta.bootstrap_seed_fold_pending {
+            if cache_sections_discarded {
+                "cache_sections_discarded"
+            } else if !loaded.meta.initialized || loaded.meta.bootstrap_seed_fold_pending {
                 "first_render"
             } else if is_legacy_baseline(&loaded.core) {
                 "legacy_migration"
@@ -3298,6 +3433,10 @@ fn apply_additive_only(
                 "epoch_change"
             } else if scheduler_outcome.idle_ttl_fired {
                 "ttl_expiry"
+            } else if external_revision_changed
+                && loaded.meta.m1_history_revision != m1_signal.history_revision
+            {
+                "compartment_history_revision"
             } else if external_revision_changed || project_memory_epoch_hard_due {
                 "project_memory_epoch"
             } else if cached_m1_missing(&loaded.core) {
@@ -3340,6 +3479,7 @@ fn apply_additive_only(
                 })
                 .collect(),
             status: TransformStatus::Ok,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: action.clone(),
@@ -3354,6 +3494,7 @@ fn apply_additive_only(
                 &meta.last_render_config,
             ),
             first_divergence: None,
+            reasoning_trim_only: false,
             timings: Some(timings),
             boundary_id: String::new(),
             reconcile_pending: false,
@@ -3363,7 +3504,6 @@ fn apply_additive_only(
             committed: commit_required,
             coverage_ordinal: None,
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -3389,6 +3529,8 @@ fn apply_once(
     boundary_divergence_retry: bool,
     boundary_divergence_detected: &mut bool,
     incremental_history: bool,
+    replay_legacy_treatment: bool,
+    reclassified_on_bust: &BTreeSet<String>,
 ) -> Result<TransformWithProjection, TransformError> {
     *boundary_divergence_detected = false;
     if !ctx.compaction_enabled {
@@ -3460,7 +3602,8 @@ fn apply_once(
                 initial_projection,
             ));
         }
-        let initial_state = store.load(&ingress_req.session_id)?;
+        // Only the CAS token is needed here; the descent decodes what it copies itself.
+        let initial_state = store.load_meta(&ingress_req.session_id)?;
         let anchor = continuation_summary_anchor(ingress_req, &initial_projection);
         let constituents = ingress_req
             .constituents
@@ -3563,6 +3706,30 @@ fn apply_once(
     timings.store_overlay_frontier = transform_snapshot.timings.overlay_frontier_ms;
     let loaded = transform_snapshot.loaded;
     let overlay_frontier = transform_snapshot.overlay_frontier;
+    // A stored frozen chunk or cache section that failed its digest (or its shape checks)
+    // decoded as empty. The prefix may have been built against the lost value, so the pass
+    // rebuilds it from the messages with a HARD pass, as a lineage descent that needs
+    // materializing does, instead of failing the pass or serving from a truncated list. The
+    // commit then rewrites every discarded value in full.
+    let cache_sections_discarded = loaded
+        .sections
+        .as_ref()
+        .is_some_and(mc_store::SectionsBase::any_discarded);
+    if cache_sections_discarded {
+        lineage_state.force_hard = true;
+    }
+    // Claude Code sessions are born on a fold-only profile; tail reducers never run there, so
+    // no frozen `red:*` units should exist when the fold is the sole reclaim path. Checked
+    // here because this pass holds the frozen list; historian bookkeeping no longer loads it.
+    debug_assert!(
+        serializer_profile.is_none_or(crate::healing::tail_reclaim)
+            || !loaded
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key.starts_with("red:")),
+        "fold-only profile must not carry frozen tail reductions"
+    );
     // Legacy sessions stored the CC latch before the generic surface latch existed.
     // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
     let persisted_tagging_surface_active =
@@ -3799,6 +3966,7 @@ fn apply_once(
                         expected: loaded.row_version,
                         core: &loaded.core,
                         meta: &next_meta,
+                        sections: SectionsCommit::over(loaded.sections.as_ref()),
                         consumed_drop_ids: &[],
                         first_applied_command_ids: &[],
                         memory_revision: None,
@@ -3915,6 +4083,7 @@ fn apply_once(
                 expected: loaded.row_version,
                 core: &core,
                 meta: &meta,
+                sections: SectionsCommit::over(loaded.sections.as_ref()),
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
                 memory_revision: None,
@@ -4420,7 +4589,11 @@ fn apply_once(
         >= scheduler::escalation_bands(ctx.execute_threshold_percentage)
             .force_materialize_percentage;
     let force_episode_available = force_band_active && !loaded.meta.has_prior_emergency_drop;
-    let supersession_ride_available = (prefix_materialization_enabled
+    // A rebuild that is not the emergency itself. It is the only thing that waives the
+    // emergency minimum: the force-band edge and the 95% backstop below permit a rewrite
+    // but do not pay for one. Both flags derive from this one expression so they cannot
+    // drift apart.
+    let independent_rebuild = (prefix_materialization_enabled
         && (!loaded.meta.initialized
             || render_config_changed
             || cached_m1_missing(&loaded.core)
@@ -4429,10 +4602,12 @@ fn apply_once(
             || lineage_state.force_hard
             || (scheduler_outcome.pass != scheduler::PassDecision::Defer
                 && current_m1_digest != applied_m1_revision)))
-        || force_episode_available
-        || scheduler_outcome.pass == scheduler::PassDecision::Emergency95
         || loaded.meta.soft_refresh_pending;
+    let supersession_ride_available = independent_rebuild
+        || force_episode_available
+        || scheduler_outcome.pass == scheduler::PassDecision::Emergency95;
     let pass_already_busting = supersession_ride_available;
+    let emergency_minimum_waived = independent_rebuild;
     let calibration_candidate = crate::decision_calibration::DecisionCalibration::freeze_for_model(
         req.model_key.as_deref(),
     );
@@ -4491,6 +4666,7 @@ fn apply_once(
     let mut tail_for_selection =
         tail_sel_items(&live, loaded.meta.coverage_ordinal, &tag_tokens_by_block);
     attach_edit_input_key_orders(&mut tail_for_selection, &req.tool_input_key_orders);
+    attach_user_answer_markers(&mut tail_for_selection, &req.messages);
     // Todo state is deferred work just like an m1 or reduction delta: it may ride an
     // independently scheduled bust, but it never authorizes provider-visible bytes by itself.
     // Compute only the call-id transition here; the complete pair is built after classification.
@@ -4594,6 +4770,7 @@ fn apply_once(
                 first_applied_agent_drop_ids,
                 pass_already_busting,
                 supersession_ride_available,
+                emergency_minimum_waived,
                 emergency_window_yields: scheduler_outcome.pass
                     == scheduler::PassDecision::Emergency95,
                 tag_window_protected_block_ids: tag_window_protected_block_ids.clone(),
@@ -4665,6 +4842,7 @@ fn apply_once(
         loaded.meta.coverage_ordinal,
         non_tool_bust_opportunity,
         planned_age_basis,
+        ctx.caveman_english_word_rules,
     );
     let planned_reasoning_cutoff = reasoning_clear_cutoff_with_tags(
         req,
@@ -4728,12 +4906,18 @@ fn apply_once(
     } else if lineage_state.force_hard {
         plan = PassPlan::Hard;
     }
+    if cache_sections_discarded {
+        plan = PassPlan::Hard;
+    }
     let mut materialize_reason = classify_materialize_reason(MaterializeReasonInputs {
         plan,
         bootstrap_due: !loaded.meta.initialized || loaded.meta.bootstrap_seed_fold_pending,
         legacy_baseline: is_legacy_baseline(&loaded.core),
         render_config_changed,
         profile_transition,
+        project_memory_epoch_due: external_revision_changed || project_memory_epoch_hard_due,
+        history_revision_due: external_revision_changed
+            && loaded.meta.m1_history_revision != m1_signal.history_revision,
         first_fold_due,
         ttl_expired: scheduler_outcome.idle_ttl_fired,
         coverage_fold_due: system_absorb_hard_due,
@@ -4748,6 +4932,9 @@ fn apply_once(
     }
     if lineage_state.force_hard {
         materialize_reason = Some("lineage_descent".to_string());
+    }
+    if cache_sections_discarded {
+        materialize_reason = Some("cache_sections_discarded".to_string());
     }
     if boundary_divergence_recut.is_some() {
         materialize_reason = Some("boundary_divergence_recut".to_string());
@@ -4821,6 +5008,10 @@ fn apply_once(
         meta.emergency_drop_assessment = Some(assessment);
     }
     let mut commit_expected = loaded.row_version;
+    // Row-version steps adopted from meta-only writers since `loaded` was read. The commit
+    // checks `commit_expected == loaded.row_version + meta_only_steps`, so the chunks it
+    // diffs against `loaded.sections` cannot silently come from another commit.
+    let mut meta_only_steps = 0u64;
     if clear_pending_rewrite_on_present {
         meta.pending_rewrite = None;
         meta.pending_rewrite_trip_count = meta.pending_rewrite_trip_count.saturating_add(1);
@@ -4875,6 +5066,13 @@ fn apply_once(
         PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
     ) && !marker_hard_serves_frozen_prefix;
     let is_bust_pass = !req.is_subagent && is_provider_prefix_mutation_pass;
+    if replay_legacy_treatment && is_provider_prefix_mutation_pass {
+        return Err(TransformError::SyntheticTreatmentBust);
+    }
+    if is_provider_prefix_mutation_pass {
+        meta.reclassified_synthetic_mids
+            .extend(reclassified_on_bust.iter().cloned());
+    }
     // A defer replays previously served provider bytes even in a subagent: its tool loop
     // has an Anthropic cached prefix too. Hold overlays first discovered on served blocks
     // until the scheduler selects a prefix mutation pass. Use the plan, not `is_bust_pass`,
@@ -4982,6 +5180,63 @@ fn apply_once(
         Vec::new()
     };
     timings.caveman = elapsed_ms(caveman_started_at);
+    // A prefix-bound OpenCode bust whose only edit before newer signed thinking is the
+    // oldest-prefix `reasoning_age` removal ("Remove `thinking` blocks from the start of
+    // the history" is a valid change in Anthropic's preserved-thinking table). The host
+    // then keeps the newer blocks instead of stripping them all. Each condition rules out
+    // an edit this pass could otherwise make; a pass that fails any of them, or that this
+    // list does not describe, reports false, and the host strips, the safe direction.
+    let served_tag_overlay_this_pass = {
+        let mint_end = pending_overlays
+            .tag_mint_start
+            .saturating_add(pending_overlays.tag_mint_count)
+            .min(tag_rows.len());
+        tag_rows[pending_overlays.tag_mint_start.min(mint_end)..mint_end]
+            .iter()
+            .any(|row| {
+                overlay_target_was_served(&loaded.meta.served_output_fingerprint, &row.block_id)
+            })
+    };
+    let served_user_hint_this_pass = pending_overlays.user_hint.as_ref().is_some_and(|hint| {
+        !hint.hint_text.is_empty() && user_hint_target_was_served(&loaded.meta, &hint.block_id)
+    });
+    let current_exempt_mid = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    // A bust releases the full native vector kept for an assistant that is no longer the
+    // newest, and the tag or hint overlays withheld from it then land on its text: an edit
+    // before newer thinking. Without active overlays its parts are unchanged.
+    let releases_native_reasoning_keep = (tagging_active || auto_search_active)
+        && loaded.core.frozen_units.iter().any(|unit| {
+            unit.key
+                .strip_prefix("strip:native_reasoning_keep:")
+                .is_some_and(|mid| Some(mid) != current_exempt_mid)
+        });
+    // A bust applies system-injection strips that earlier defers held back.
+    let applies_held_system_strip =
+        loaded.core.frozen_units.iter().any(|unit| {
+            unit.key.starts_with(SYSTEM_STRIP_BLOCK_PREFIX) && !unit.reset_rule.is_empty()
+        });
+    let reasoning_trim_only_candidate = is_bust_pass
+        && serializer_profile == Some(SerializerProfile::OpencodeAiSdk)
+        && is_prefix_bound_thinking_model(req.model_key.as_deref())
+        && matches!(plan, PassPlan::Soft)
+        && materialize_reason.as_deref() == Some("selection")
+        && !reductions_pending_now
+        && new_caveman_units.is_empty()
+        && new_strip_units
+            .iter()
+            .all(|unit| unit.key.starts_with("strip:reasoning_age:"))
+        && !todo_injection_pending
+        && !calibration_changed
+        && loaded.meta.pending_tag_block_ids.is_empty()
+        && loaded.meta.pending_user_hint_block_ids.is_empty()
+        && !served_tag_overlay_this_pass
+        && !served_user_hint_this_pass
+        && ctx
+            .guidance_date
+            .as_ref()
+            .is_none_or(|date| *date == loaded.meta.guidance_date)
+        && !releases_native_reasoning_keep
+        && !applies_held_system_strip;
     if loaded.meta.soft_refresh_pending && !prefix_replay_must_be_preserved {
         meta.soft_refresh_pending = false;
     }
@@ -5055,8 +5310,6 @@ fn apply_once(
                         ),
                         covered_system_messages: &covered_system_messages,
                         memory_enabled: ctx.memory_enabled,
-                        host_backed_memory_ids: serializer_profile
-                            != Some(SerializerProfile::ClaudeCodeAnthropic),
                         memory_budget_tokens: ctx.memory_budget_tokens,
                         user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                         inject_docs: ctx.inject_docs,
@@ -5126,6 +5379,11 @@ fn apply_once(
                                 keep_through_seq,
                                 commit_expected,
                             )?;
+                            // The truncate is meta-only: it steps the version by one when it
+                            // drops compartments and not at all when there is nothing to drop.
+                            if Some(outcome.row_version) != commit_expected {
+                                meta_only_steps += 1;
+                            }
                             commit_expected = Some(outcome.row_version);
                             meta.revert_epoch = outcome.revert_epoch;
                             meta.last_recut = outcome.last_recut;
@@ -5163,8 +5421,6 @@ fn apply_once(
                                         ),
                                     covered_system_messages: &recut_covered_system_messages,
                                     memory_enabled: ctx.memory_enabled,
-                                    host_backed_memory_ids: serializer_profile
-                                        != Some(SerializerProfile::ClaudeCodeAnthropic),
                                     memory_budget_tokens: ctx.memory_budget_tokens,
                                     user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                                     inject_docs: ctx.inject_docs,
@@ -5348,6 +5604,8 @@ fn apply_once(
                 meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
                 meta.m1_user_profile_version = loaded.meta.user_profile_version;
                 meta.m1_external_revision = applied_m1_signal.external_revision;
+                meta.m1_history_revision = applied_m1_signal.history_revision;
+
                 meta.project_memory_epoch_pending = false;
                 meta.m1_pending_since_ms = None;
             }
@@ -5376,7 +5634,6 @@ fn apply_once(
                     &meta,
                     meta.expiry_cutoff_ms,
                     ctx.memory_enabled,
-                    serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic),
                     ctx.memory_budget_tokens,
                     ctx.user_profile_budget_tokens,
                     ctx.temporal_awareness,
@@ -5424,8 +5681,6 @@ fn apply_once(
                             ),
                             covered_system_messages: &covered_system_messages,
                             memory_enabled: ctx.memory_enabled,
-                            host_backed_memory_ids: serializer_profile
-                                != Some(SerializerProfile::ClaudeCodeAnthropic),
                             memory_budget_tokens: ctx.memory_budget_tokens,
                             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                             inject_docs: ctx.inject_docs,
@@ -5569,6 +5824,8 @@ fn apply_once(
                     meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
                     meta.m1_user_profile_version = loaded.meta.user_profile_version;
                     meta.m1_external_revision = applied_m1_signal.external_revision;
+                    meta.m1_history_revision = applied_m1_signal.history_revision;
+
                     meta.project_memory_epoch_pending = false;
                     meta.m1_pending_since_ms = None;
                     commit_memory_revision = Some(comp.memory_revision);
@@ -5988,6 +6245,7 @@ fn apply_once(
         }
     }
     refresh_reasoning_clear_exemptions(&mut core, req, is_bust_pass, lineage_anchor_mid);
+    let frozen_units_before_reasoning_clear = core.frozen_units.len();
     core.frozen_units.extend(new_reasoning_clear_units(
         &core,
         &meta,
@@ -6001,6 +6259,8 @@ fn apply_once(
             projection: &projection,
         },
     ));
+    let minted_reasoning_clear_units =
+        core.frozen_units.len() != frozen_units_before_reasoning_clear;
     let legacy_adoption_complete =
         legacy_reasoning_adoption_complete(&loaded.meta, &core.frozen_units);
     if (is_bust_pass || legacy_adoption_complete)
@@ -6404,8 +6664,14 @@ fn apply_once(
     if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
     }
-    let commit_required =
-        state_changed || !consumed_drop_ids.is_empty() || !pending_overlays.is_empty();
+    // A discarded section must be rewritten even when the rebuild reproduces the loaded state
+    // (a subagent session holds no frozen units, so its rebuilt list is as empty as the
+    // discarded one). Skipping the commit would leave the stored rows untrusted, and every
+    // later pass would go HARD again.
+    let commit_required = state_changed
+        || cache_sections_discarded
+        || !consumed_drop_ids.is_empty()
+        || !pending_overlays.is_empty();
     let mut scheduler_observation = pass_scheduler_observation(
         scheduler_outcome.pass,
         scheduler_outcome.defer_reason,
@@ -6423,6 +6689,14 @@ fn apply_once(
                 expected: commit_expected,
                 core: &core,
                 meta: &meta,
+                // The core was derived from the loaded frozen list in this pass, so an empty
+                // list here is the pass's own result (a re-mint, a retired legacy unit), never
+                // an unloaded state.
+                sections: SectionsCommit {
+                    base: loaded.sections.as_ref(),
+                    meta_only_steps,
+                    frozen_clear: FrozenClear::Explicit,
+                },
                 consumed_drop_ids: &consumed_drop_ids,
                 first_applied_command_ids: &first_applied_command_ids,
                 memory_revision: commit_memory_revision.as_ref(),
@@ -6536,6 +6810,7 @@ fn apply_once(
                 })
                 .collect(),
             status: TransformStatus::Ok,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: result_action.clone(),
@@ -6550,6 +6825,9 @@ fn apply_once(
                 &meta.last_render_config,
             ),
             first_divergence,
+            reasoning_trim_only: reasoning_trim_only_candidate
+                && !minted_reasoning_clear_units
+                && healed_trailing_blank_ids.is_empty(),
             timings: Some(timings),
             boundary_id: core.boundary_id.clone(),
             reconcile_pending: core.reconcile_pending,
@@ -6559,7 +6837,6 @@ fn apply_once(
             committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
-            memory_mirror_head: None,
             lineage_switch_consumed_id: lineage_state.acknowledge_edge,
             lineage_descent_disposition: lineage_state.disposition.map(str::to_string),
             cache_ttl: None,
@@ -7413,6 +7690,7 @@ struct CavemanTagState<'a> {
     protection_cutoff: &'a TagNumberCutoffProjection,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_caveman_units(
     core: &CoreState,
     req: &TransformRequest,
@@ -7421,6 +7699,7 @@ fn new_caveman_units(
     coverage: Option<u64>,
     is_bust_pass: bool,
     age_basis_tag: u64,
+    english_word_rules: bool,
 ) -> Vec<FrozenUnit> {
     if !is_bust_pass || !req.caveman_enabled || req.is_subagent || age_basis_tag == 0 {
         return Vec::new();
@@ -7454,7 +7733,7 @@ fn new_caveman_units(
             {
                 return None;
             }
-            let source = String::from_utf8(row.source_bytes.clone()).ok()?;
+            let source = std::str::from_utf8(&row.source_bytes).ok()?.to_owned();
             (!source.is_empty()).then_some((tag_number, block.id.clone(), source))
         })
         .collect::<Vec<_>>();
@@ -7473,18 +7752,16 @@ fn new_caveman_units(
             continue;
         }
         let level = caveman_level(target_depth).expect("nonzero caveman depth has a level");
-        let compressed = crate::caveman::compress(&source, level);
+        let compressed = crate::caveman::compress_with(&source, level, english_word_rules);
         if compressed.is_empty() {
             continue;
         }
         let payload = if let Some(existing) = existing {
-            // A deeper tier is allowed to replace bytes only when it does not grow the frozen
-            // payload. Equal-size output still advances depth, matching TS's persisted depth
-            // behavior for text with no additional removable material.
-            assert!(
-                compressed.len() <= existing.frozen_payload.len(),
-                "caveman deeper tier grew frozen payload for {block_id}"
-            );
+            // A deeper tier replaces bytes only when it shrinks the frozen payload. The rules can
+            // change after a payload froze (a release that changes caveman output), so the deeper
+            // output may also come out longer; equal or longer output keeps the frozen bytes and
+            // still advances depth, matching TS's persisted depth for text with no additional
+            // removable material.
             if compressed.len() < existing.frozen_payload.len() {
                 compressed.as_str()
             } else {
@@ -8365,8 +8642,6 @@ fn compose_hard_fold_m0(
             ),
             covered_system_messages: &covered_system_messages,
             memory_enabled: ctx.memory_enabled,
-            host_backed_memory_ids: serializer_profile
-                != Some(SerializerProfile::ClaudeCodeAnthropic),
             memory_budget_tokens: ctx.memory_budget_tokens,
             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
             inject_docs: ctx.inject_docs,
@@ -8402,6 +8677,14 @@ fn synth_region(key: &str, payload: String) -> FrozenUnit {
 }
 
 fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usize>) -> SelItem {
+    sel_item_from_flat_with_estimator(block, tag_tokens_by_block, mc_tokenizer::estimate_tokens)
+}
+
+fn sel_item_from_flat_with_estimator(
+    block: &FlatBlock,
+    tag_tokens_by_block: &HashMap<&str, usize>,
+    estimate: impl FnOnce(&str) -> usize,
+) -> SelItem {
     let kind = match &block.wire.kind {
         ck_wire::CkKind::ToolCall { name, input, .. } => SelKind::ToolCall {
             name: name.clone(),
@@ -8417,12 +8700,16 @@ fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usi
         ck_wire::CkKind::Opaque(_) => SelKind::Opaque,
     };
     SelItem {
-        served_token_count: Some(
+        user_answer: false,
+        // Media and opaque carriers are excluded from calibrated floor accounting and
+        // cannot be tool reclaim candidates. Their token counts are never consumed;
+        // estimating them would repeatedly BPE-tokenize untagged image data on defers.
+        served_token_count: (!matches!(kind, SelKind::Media | SelKind::Opaque)).then(|| {
             tag_tokens_by_block
                 .get(block.id.as_str())
                 .copied()
-                .unwrap_or_else(|| mc_tokenizer::estimate_tokens(&block.bytes)),
-        ),
+                .unwrap_or_else(|| estimate(&block.bytes))
+        }),
         id: block.id.clone(),
         ordinal: block.ordinal,
         message_role: match block.role.as_str() {
@@ -9428,6 +9715,20 @@ fn tag_mint_frontier_cache() -> &'static Mutex<TagMintFrontierCache> {
     })
 }
 
+/// Append this pass's mints to the shared tag rows and return the index of the first mint.
+/// A pass with nothing to mint leaves the rows untouched: they are usually shared with the
+/// retained tag baseline, and requesting mutable access would copy every row to append nothing.
+fn append_minted_tag_rows(
+    tag_rows: &mut Arc<Vec<McTagRow>>,
+    tag_mints: Vec<TagMintInput>,
+    created_at_ms: i64,
+) -> usize {
+    if tag_mints.is_empty() {
+        return tag_rows.len();
+    }
+    append_tag_mint_rows(Arc::make_mut(tag_rows), tag_mints, created_at_ms)
+}
+
 fn append_tag_mint_rows(
     tag_rows: &mut Vec<McTagRow>,
     tag_mints: Vec<TagMintInput>,
@@ -9445,7 +9746,7 @@ fn append_tag_mint_rows(
                 kind: input.kind,
                 token_count: input.token_count.max(0),
                 created_at_ms,
-                source_bytes: input.source_bytes,
+                source_bytes: input.source_bytes.into(),
             }),
     );
     start
@@ -9566,6 +9867,7 @@ fn timestamp_temporal_marks(
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
 ) -> Vec<TemporalMarkInput> {
+    let first_text_blocks = first_text_block_by_message(projection);
     let mut previous = None;
     let mut marks = Vec::new();
     for message in &req.messages {
@@ -9585,14 +9887,10 @@ fn timestamp_temporal_marks(
                 )
             });
             if let Some(marker_text) = marker_text {
-                if let Some(block_id) = projection.blocks.iter().find_map(|block| {
-                    (block.mid == message.mid
-                        && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
-                    .then(|| block.id.clone())
-                }) {
+                if let Some(block_id) = first_text_blocks.get(message.mid.as_str()) {
                     marks.push(TemporalMarkInput {
                         ordinal: message.ordinal,
-                        block_id,
+                        block_id: (*block_id).to_string(),
                         marker_text,
                     });
                 }
@@ -9601,6 +9899,18 @@ fn timestamp_temporal_marks(
         previous = Some(message);
     }
     marks
+}
+
+/// The id of each message's first text block, in projection order. Equivalent to searching
+/// the projection from the front for a message's first text block, built in one pass.
+fn first_text_block_by_message(projection: &FlatProjection) -> HashMap<&str, &str> {
+    let mut first = HashMap::new();
+    for block in &projection.blocks {
+        if matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
+            first.entry(block.mid.as_str()).or_insert(block.id.as_str());
+        }
+    }
+    first
 }
 
 fn temporal_parity_transition_needed(
@@ -10037,6 +10347,84 @@ fn user_hint_target_was_served(meta: &ModuleMeta, block_id: &str) -> bool {
     overlay_target_was_served(&meta.served_output_fingerprint, block_id)
 }
 
+/// Each message's text blocks in projection order, so a message's blocks are found without
+/// scanning the whole projection.
+fn text_blocks_by_message_id(projection: &FlatProjection) -> HashMap<&str, Vec<&FlatBlock>> {
+    let mut by_message = HashMap::<&str, Vec<&FlatBlock>>::new();
+    for block in &projection.blocks {
+        if matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
+            by_message
+                .entry(block.mid.as_str())
+                .or_default()
+                .push(block);
+        }
+    }
+    by_message
+}
+
+/// The first of a message's text blocks (in projection order) that has a tag mint time, with
+/// that time.
+fn first_minted_text_block(
+    text_blocks: Option<&Vec<&FlatBlock>>,
+    mint_by_block: &HashMap<&str, i64>,
+) -> Option<(String, i64)> {
+    text_blocks.into_iter().flatten().find_map(|block| {
+        mint_by_block
+            .get(block.id.as_str())
+            .copied()
+            .map(|created_at| (block.id.clone(), created_at))
+    })
+}
+
+/// Reconcile the canonical timestamp marks with the stored temporal rows. A mark whose block
+/// already has a row keeps that row's text unless a temporal rewrite is in progress; a mark
+/// without a row is stored only when it is past the overlay frontier or a rewrite is in
+/// progress. Every existing mark is checked regardless of its age. Returns the marks this pass
+/// decided or rewrote, in canonical order.
+fn reconcile_canonical_temporal_marks(
+    temporal_rows: &mut Vec<TemporalMarkRow>,
+    canonical_marks: Vec<TemporalMarkInput>,
+    rewrite_temporal_marks: bool,
+    frontier: Option<u64>,
+    now_ms: i64,
+    decided_temporal: &mut HashSet<String>,
+) -> Vec<TemporalMarkInput> {
+    let mut temporal_marks = Vec::new();
+    // Position of the first stored row for each block, kept current as rows are appended, so
+    // each canonical mark finds the same row a front-to-back search would.
+    let mut temporal_row_by_block = HashMap::<String, usize>::with_capacity(temporal_rows.len());
+    for (index, row) in temporal_rows.iter().enumerate() {
+        temporal_row_by_block
+            .entry(row.block_id.clone())
+            .or_insert(index);
+    }
+    for mark in canonical_marks {
+        if let Some(&index) = temporal_row_by_block.get(mark.block_id.as_str()) {
+            let existing = &mut temporal_rows[index];
+            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
+                existing.marker_text = mark.marker_text.clone();
+                temporal_marks.push(mark);
+            }
+            continue;
+        }
+        let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
+        if !rewrite_temporal_marks && !is_new {
+            continue;
+        }
+        temporal_row_by_block
+            .entry(mark.block_id.clone())
+            .or_insert(temporal_rows.len());
+        temporal_rows.push(TemporalMarkRow {
+            block_id: mark.block_id.clone(),
+            marker_text: mark.marker_text.clone(),
+            created_at: now_ms,
+        });
+        decided_temporal.insert(mark.block_id.clone());
+        temporal_marks.push(mark);
+    }
+    temporal_marks
+}
+
 fn compute_active_overlay_decisions(
     input: OverlayComputation<'_, '_>,
 ) -> Result<PendingOverlayDecisions, TransformError> {
@@ -10097,8 +10485,7 @@ fn compute_active_overlay_decisions(
     let tag_mint_candidates = tag_mint_work.candidate_count;
     let tag_mint_tokenized_bytes = tag_mint_work.tokenized_bytes;
     let tag_mint_count = tag_mint_work.inputs.len();
-    let tag_mint_start =
-        append_tag_mint_rows(Arc::make_mut(tag_rows), tag_mint_work.inputs, ctx.now_ms);
+    let tag_mint_start = append_minted_tag_rows(tag_rows, tag_mint_work.inputs, ctx.now_ms);
     let tag_mint_ms = elapsed_ms(tag_mint_started_at);
     let temporal_started_at = Instant::now();
 
@@ -10119,34 +10506,20 @@ fn compute_active_overlay_decisions(
         .iter()
         .map(|row| row.block_id.clone())
         .collect::<HashSet<_>>();
-    let mut temporal_marks = Vec::new();
-    for mark in canonical_marks {
-        if let Some(existing) = temporal_rows
-            .iter_mut()
-            .find(|row| row.block_id == mark.block_id)
-        {
-            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
-                existing.marker_text = mark.marker_text.clone();
-                temporal_marks.push(mark);
-            }
-            continue;
-        }
-        let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
-        if !rewrite_temporal_marks && !is_new {
-            continue;
-        }
-        temporal_rows.push(TemporalMarkRow {
-            block_id: mark.block_id.clone(),
-            marker_text: mark.marker_text.clone(),
-            created_at: ctx.now_ms,
-        });
-        decided_temporal.insert(mark.block_id.clone());
-        temporal_marks.push(mark);
-    }
+    let mut temporal_marks = reconcile_canonical_temporal_marks(
+        temporal_rows,
+        canonical_marks,
+        rewrite_temporal_marks,
+        frontier,
+        ctx.now_ms,
+        &mut decided_temporal,
+    );
 
     // Timestamp-free callers retain the legacy first-sight basis for the live tail. OpenCode
     // supplies immutable per-message times, so its messages are already covered above.
     let authored_tail = eligible_authored_user_tail(req);
+    // Text blocks per message in projection order, built only if some message is new.
+    let mut text_blocks_by_message: Option<HashMap<&str, Vec<&FlatBlock>>> = None;
     let mut previous_new_user_mint = None;
     for message in req.messages.iter().filter(|message| {
         !message.ck.meta.synthetic
@@ -10161,20 +10534,10 @@ fn compute_active_overlay_decisions(
             previous_new_user_mint = None;
             continue;
         }
-        let Some((block_id, current_mint)) = projection
-            .blocks
-            .iter()
-            .filter(|block| block.mid == message.mid)
-            .find_map(|block| {
-                matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
-                    .then(|| {
-                        mint_by_block
-                            .get(block.id.as_str())
-                            .copied()
-                            .map(|created_at| (block.id.clone(), created_at))
-                    })
-                    .flatten()
-            })
+        let text_blocks =
+            text_blocks_by_message.get_or_insert_with(|| text_blocks_by_message_id(projection));
+        let Some((block_id, current_mint)) =
+            first_minted_text_block(text_blocks.get(message.mid.as_str()), &mint_by_block)
         else {
             previous_new_user_mint = None;
             continue;
@@ -10327,7 +10690,7 @@ fn maybe_decide_live_user_hint(
             req.auto_search_score_threshold,
             rendered_memory_ids,
         )?;
-        render_user_hint(&results).unwrap_or_default()
+        render_user_hint(&results, ctx.caveman_english_word_rules).unwrap_or_default()
     };
     Ok(Some(UserHintDecisionInput {
         ordinal: message.ordinal,
@@ -10336,20 +10699,47 @@ fn maybe_decide_live_user_hint(
     }))
 }
 
-fn lexical_tokens(text: &str) -> BTreeSet<String> {
+/// The distinct search terms of `text`, in order of first appearance.
+fn lexical_terms(text: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
         "and", "are", "but", "for", "from", "have", "into", "not", "that", "the", "this", "use",
         "was", "with", "you", "your",
     ];
     // Unicode normalization is intentionally out of scope. Case folding and provider text
     // token boundaries are sufficient for this conservative, non-semantic hint gate.
+    let mut seen = HashSet::new();
     text.to_lowercase()
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|token| token.chars().count() >= 3 && !STOPWORDS.contains(token))
+        .filter(|token| seen.insert(token.to_string()))
         .map(str::to_string)
-        .collect::<BTreeSet<_>>()
+        .collect()
+}
+
+/// Every distinct term of a candidate document. A document is not capped: dropping some
+/// of its words would make a query that names them miss it.
+fn lexical_tokens(text: &str) -> BTreeSet<String> {
+    lexical_terms(text).into_iter().collect()
+}
+
+/// The query terms the score is computed over, at most [`USER_HINT_TOKEN_CAP`] of them.
+/// A long prompt keeps the terms that can tell candidates apart: those found in the pool
+/// come first, rarest first, and terms no candidate contains fill any remaining places.
+/// Ties keep the prompt's own order. A prompt with no more terms than the cap keeps all
+/// of them, so its score is unchanged.
+fn select_query_tokens(
+    query_terms: Vec<String>,
+    document_frequency: &HashMap<String, usize>,
+) -> BTreeSet<String> {
+    let mut ranked = query_terms.into_iter().enumerate().collect::<Vec<_>>();
+    ranked.sort_by_key(|(position, term)| {
+        let frequency = document_frequency.get(term).copied().unwrap_or(0);
+        (frequency == 0, frequency, *position)
+    });
+    ranked
         .into_iter()
         .take(USER_HINT_TOKEN_CAP)
+        .map(|(_, term)| term)
         .collect()
 }
 
@@ -10371,8 +10761,8 @@ fn run_user_hint_lexical_search(
         recency: i64,
     }
 
-    let query_tokens = lexical_tokens(query);
-    if query_tokens.len() < USER_HINT_MIN_MATCHED_TOKENS {
+    let query_terms = lexical_terms(query);
+    if query_terms.len() < USER_HINT_MIN_MATCHED_TOKENS {
         return Ok(Vec::new());
     }
     let mut candidates = Vec::new();
@@ -10447,13 +10837,14 @@ fn run_user_hint_lexical_search(
     }
 
     let mut document_frequency = HashMap::new();
-    for token in &query_tokens {
+    for term in &query_terms {
         let count = candidates
             .iter()
-            .filter(|candidate| candidate.tokens.contains(token))
+            .filter(|candidate| candidate.tokens.contains(term))
             .count();
-        document_frequency.insert(token, count);
+        document_frequency.insert(term.clone(), count);
     }
+    let query_tokens = select_query_tokens(query_terms, &document_frequency);
     let pool_count = candidates.len();
     let pool_size = pool_count as f64;
     let total_query_weight = query_tokens
@@ -10723,7 +11114,10 @@ pub(crate) fn utf16_prefix(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
-fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Option<String> {
+fn render_user_hint(
+    results: &[crate::memory_tool::MemorySearchResult],
+    english_word_rules: bool,
+) -> Option<String> {
     if results.is_empty() {
         return None;
     }
@@ -10731,8 +11125,11 @@ fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Optio
         .iter()
         .take(USER_HINT_RESULT_LIMIT)
         .map(|result| {
-            let fragment =
-                crate::caveman::compress(&result.snippet, crate::caveman::CavemanLevel::Ultra);
+            let fragment = crate::caveman::compress_with(
+                &result.snippet,
+                crate::caveman::CavemanLevel::Ultra,
+                english_word_rules,
+            );
             format!(
                 "- {}",
                 one_line_fragment(&fragment, USER_HINT_FRAGMENT_CHAR_CAP)
@@ -10920,13 +11317,22 @@ fn tag_rows_for_hygiene(
         .iter()
         .map(|block| block.id.as_str())
         .collect::<HashSet<_>>();
+    // Hygiene reads tag identities (number, block, kind, token count), never the stored source
+    // payload, so the retained rows are copied without it.
     let mut rows = stored_rows
         .iter()
         .filter(|row| {
             !projected_ids.contains(row.block_id.as_str())
                 || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
         })
-        .cloned()
+        .map(|row| McTagRow {
+            tag_number: row.tag_number,
+            block_id: row.block_id.clone(),
+            kind: row.kind.clone(),
+            token_count: row.token_count,
+            created_at_ms: row.created_at_ms,
+            source_bytes: Default::default(),
+        })
         .collect::<Vec<_>>();
     let existing_ids = rows
         .iter()
@@ -10948,7 +11354,7 @@ fn tag_rows_for_hygiene(
             kind: kind.as_store_kind().to_string(),
             token_count: 0,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         });
     }
     if rows.is_empty() && derive_when_empty {
@@ -10967,7 +11373,7 @@ fn tag_rows_for_hygiene(
                     .to_string(),
                 token_count: 0,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
     }
@@ -12112,10 +12518,21 @@ fn is_ignored_block(block: &CkWireBlock) -> bool {
 }
 
 fn is_dropped_placeholder_text(text: &str) -> bool {
-    static DROPPED_PLACEHOLDERS: OnceLock<regex::Regex> = OnceLock::new();
-    DROPPED_PLACEHOLDERS
-        .get_or_init(|| regex::Regex::new(r"^(?:\s*\[dropped(?: §\d+§)?\])+\s*$").unwrap())
-        .is_match(text)
+    static MARKER_ONLY: OnceLock<regex::Regex> = OnceLock::new();
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && MARKER_ONLY
+            .get_or_init(|| {
+                // `\d` here is Unicode, so `§٣§` (Arabic-Indic digit) counts as a
+                // marker, unlike JavaScript's ASCII `\d` in the TypeScript twin.
+                // This check runs on every pass (it picks the kept reasoning block
+                // and the replay-exempt message), so switching to ASCII digits
+                // changes served bytes mid-session and needs a TAGGER_FEATURE_EPOCH
+                // bump to ride a rebuild.
+                regex::Regex::new(r"^(?:(?:§\d+§|\[dropped(?: §\d+§)?\]|\[cleared\])\s*)+$")
+                    .unwrap()
+            })
+            .is_match(trimmed)
 }
 
 fn tag_stripped_text(text: &str) -> &str {
@@ -12186,9 +12603,52 @@ fn directive_block_end(text: &str, body_start: usize) -> usize {
     text.len()
 }
 
+/// OpenCode up to 1.17.8 wrapped a user message sent while the agent was still running in this
+/// exact reminder before plugins saw it (1.17.9 removed the wrapper). The body is the user's own
+/// words, so it is never an injection: stripping it would empty the block and drop the user's
+/// instruction for good. The trailer anchors the match, so a reminder the user's text itself
+/// contains stays inside the preserved block. Twin of `STEERING_WRAPPER_REGEX` in
+/// `packages/plugin/src/hooks/magic-context/system-injection-stripper.ts`. The historian chunk
+/// reader uses it too, so a wrapped user message is not read as noise.
+pub(crate) fn steering_wrapper_regex() -> &'static regex::Regex {
+    static STEERING_WRAPPER: OnceLock<regex::Regex> = OnceLock::new();
+    STEERING_WRAPPER.get_or_init(|| {
+        regex::Regex::new(
+            r"(?s)<system-reminder>\nThe user sent the following message:\n.*?\n\nPlease address this message and continue with your tasks\.\n</system-reminder>",
+        )
+        .unwrap()
+    })
+}
+
 /// Remove known injected regions while retaining authored text around them. A returned empty
 /// string means the caller should preserve the message/block shape with its provider sentinel.
 fn strip_system_injection(text: &str) -> Option<String> {
+    let wrappers: Vec<regex::Match<'_>> = steering_wrapper_regex().find_iter(text).collect();
+    if wrappers.is_empty() {
+        return strip_injected_regions(text);
+    }
+    // Strip only the text between wrapped user messages; keep each wrapper verbatim.
+    let mut result = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut keep_or_strip =
+        |segment: &str, result: &mut String| match strip_injected_regions(segment) {
+            Some(stripped) => {
+                result.push_str(&stripped);
+                changed = true;
+            }
+            None => result.push_str(segment),
+        };
+    let mut cursor = 0;
+    for wrapper in wrappers {
+        keep_or_strip(&text[cursor..wrapper.start()], &mut result);
+        result.push_str(wrapper.as_str());
+        cursor = wrapper.end();
+    }
+    keep_or_strip(&text[cursor..], &mut result);
+    changed.then(|| result.trim().to_string())
+}
+
+fn strip_injected_regions(text: &str) -> Option<String> {
     let has_injection = SYSTEM_INJECTION_MARKERS
         .iter()
         .any(|marker| text.contains(marker))
@@ -12237,11 +12697,22 @@ fn is_dropped_placeholder_block(block: &CkWireBlock) -> bool {
     )
 }
 
-fn has_text_or_reasoning_block(block: &CkWireBlock) -> bool {
-    matches!(
-        &block.kind,
-        ck_wire::CkKind::Text { .. } | ck_wire::CkKind::Reasoning { .. }
-    )
+fn whole_marker_or_blank_message(blocks: &[CkWireBlock]) -> bool {
+    let mut has_content = false;
+    for block in blocks {
+        if is_ignored_block(block) || is_metadata_block(block) {
+            continue;
+        }
+        let text = match &block.kind {
+            ck_wire::CkKind::Text { text } | ck_wire::CkKind::Reasoning { text, .. } => text,
+            _ => return false,
+        };
+        has_content = true;
+        if !text.trim().is_empty() && !is_dropped_placeholder_block(block) {
+            return false;
+        }
+    }
+    has_content
 }
 
 fn whole_system_injected(blocks: &[CkWireBlock]) -> bool {
@@ -12390,12 +12861,25 @@ fn new_frozen_strip_units(
     let age_cutoff = tag_age_cutoff(req, tag_numbers);
     let reasoning_mutation_exempt_mid =
         latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
-    let cc_reasoning_cutoff = if SerializerProfile::parse(&req.serializer_profile)
-        == Some(SerializerProfile::ClaudeCodeAnthropic)
-    {
+    let profile = SerializerProfile::parse(&req.serializer_profile);
+    let cc_reasoning_cutoff = if profile == Some(SerializerProfile::ClaudeCodeAnthropic) {
         reasoning_clear_cutoff
     } else {
         None
+    };
+    // OpenCode on any provider other than canonical `anthropic` removes whole old reasoning
+    // blocks through the same frozen `reasoning_age` unit. Canonical Anthropic keeps its
+    // `reasoning_clear` empty-shell lane, which its adapter filters before the wire, except
+    // on prefix-bound models: that lane skips an ineligible message instead of stopping,
+    // so they use this lane's oldest-prefix walk on every route.
+    let opencode_removal_mids = if profile == Some(SerializerProfile::OpencodeAiSdk)
+        && req.serve_native
+        && (!request_accepts_empty_content(req)
+            || is_prefix_bound_thinking_model(req.model_key.as_deref()))
+    {
+        opencode_reasoning_removal_mids(req, tag_numbers, age_cutoff, &existing_keys)
+    } else {
+        HashSet::new()
     };
     let mut units = BTreeMap::<String, FrozenUnit>::new();
     let mut has_assistant_response = false;
@@ -12448,14 +12932,14 @@ fn new_frozen_strip_units(
             // then remove whole reasoning blocks at render time. The unit is first minted only on
             // this already-busting pass and replays unchanged on defers; selection.rs continues to
             // exclude every reasoning block from ReductionDecision targets.
-            if message.ck.role == "assistant"
+            let cc_aged = message.ck.role == "assistant"
                 && reasoning_mutation_exempt_mid != Some(message.mid.as_str())
                 && cc_reasoning_cutoff.is_some_and(|cutoff| {
                     let tag = message_tag_number(message, tag_numbers);
                     tag > 0 && tag <= cutoff
                 })
-                && blocks.iter().any(is_reasoning_block)
-            {
+                && blocks.iter().any(is_reasoning_block);
+            if cc_aged || opencode_removal_mids.contains(message.mid.as_str()) {
                 let unit = strip_unit("reasoning_age", &message.mid, "");
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
@@ -12470,14 +12954,7 @@ fn new_frozen_strip_units(
                     units.insert(unit.key.clone(), unit);
                 }
             }
-            if !blocks.is_empty()
-                && blocks.iter().all(|block| {
-                    is_ignored_block(block)
-                        || is_metadata_block(block)
-                        || is_dropped_placeholder_block(block)
-                })
-                && blocks.iter().any(has_text_or_reasoning_block)
-            {
+            if whole_marker_or_blank_message(blocks) {
                 let unit = strip_unit("placeholder", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
@@ -12526,6 +13003,114 @@ fn new_frozen_strip_units(
     units.into_values().collect()
 }
 
+/// True for Claude models whose signed thinking is bound to the request prefix, on any
+/// route. Mirrors TS `isPrefixBoundThinkingModel` and its `PREFIX_BOUND_THINKING_MODELS`
+/// (Fable 5.1, Opus 5.5, Sonnet 5.5); the provider is deliberately ignored.
+pub(crate) fn is_prefix_bound_thinking_model(model_key: Option<&str>) -> bool {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    let Some(key) = model_key else {
+        return false;
+    };
+    let model = key.split_once('/').map_or(key, |(_, model)| model);
+    PATTERN
+        .get_or_init(|| {
+            Regex::new(
+                r"(?i)(?:^|[-_.:/])(?:fable[-_.]?5[-_.]1|opus[-_.]?5[-_.]5|sonnet[-_.]?5[-_.]5)(?:$|[-_.:/@])",
+            )
+            .unwrap()
+        })
+        .is_match(model)
+}
+
+/// OpenCode assistant mids whose reasoning blocks are newly removed on this bust pass.
+/// Mirrors TS `selectReasoningRemovals`: tag at or below the age cutoff, a reasoning
+/// block present, not the newest assistant (nor the newest with replayable content), and
+/// some non-reasoning content left after removal.
+///
+/// On a prefix-bound model (Fable 5.1, Opus 5.5, Sonnet 5.5) only a contiguous oldest
+/// prefix is selected. Anthropic's preserved-thinking page ("What counts as an edit")
+/// lists "Remove `thinking` blocks from the start of the history, from the end, or all
+/// of them" as valid, and "Remove a `thinking` block from the middle of the history and
+/// keep later ones" as invalid for every later thinking block. The walk passes over
+/// messages already removed and stops at the first reasoning-bearing message it may not
+/// remove, so the removed set never has a gap.
+///
+/// Selects nothing when:
+/// - the provider is unresolved, since the session may be canonical Anthropic;
+/// - the route is OpenRouter, whose adapter also sends the reasoning as
+///   `reasoning_details` copied onto the tool calls. TS strips those copies; this lane
+///   does not, so it stays off rather than change bytes without shrinking the request.
+fn opencode_reasoning_removal_mids<'a>(
+    req: &'a TransformRequest,
+    tag_numbers: &BTreeMap<String, u64>,
+    age_cutoff: Option<u64>,
+    existing_keys: &HashSet<&str>,
+) -> HashSet<&'a str> {
+    let mut selected = HashSet::new();
+    let Some(cutoff) = age_cutoff.filter(|cutoff| *cutoff > 0) else {
+        return selected;
+    };
+    let provider = req
+        .provider_id
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if provider.is_empty() || provider.contains("openrouter") {
+        return selected;
+    }
+    let prefix_bound = is_prefix_bound_thinking_model(req.model_key.as_deref());
+    let newest = latest_assistant_mid(&req.messages);
+    let exempt = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    // `@openrouter/ai-sdk-provider` keeps copies of the reasoning as
+    // `metadata.openrouter.reasoning_details` on other parts of the message. This lane
+    // cannot strip those, so such messages are skipped whatever the provider id is.
+    let openrouter_shaped: HashSet<&str> = req
+        .native_messages
+        .iter()
+        .flatten()
+        .filter_map(|native| {
+            let id = native.get("info")?.get("id")?.as_str()?;
+            native
+                .get("parts")?
+                .as_array()?
+                .iter()
+                .any(|part| {
+                    part.pointer("/metadata/openrouter/reasoning_details")
+                        .is_some()
+                })
+                .then_some(id)
+        })
+        .collect();
+    for message in &req.messages {
+        if message.ck.meta.synthetic
+            || message.ck.role != "assistant"
+            || !message.ck.content.iter().any(is_reasoning_block)
+        {
+            continue;
+        }
+        let mid = message.mid.as_str();
+        if existing_keys.contains(format!("strip:reasoning_age:{mid}").as_str()) {
+            continue;
+        }
+        let tag = message_tag_number(message, tag_numbers);
+        let eligible = !mid.is_empty()
+            && !openrouter_shaped.contains(mid)
+            && Some(mid) != newest
+            && Some(mid) != exempt
+            && tag > 0
+            && tag <= cutoff
+            && message.ck.content.iter().any(has_meaningful_content);
+        if eligible {
+            selected.insert(mid);
+        } else if prefix_bound {
+            // A block left in place here would sit before every block removed after
+            // it: a removal from the middle.
+            break;
+        }
+    }
+    selected
+}
+
 struct ReasoningMutationPolicy {
     watermark: u64,
     exempt: bool,
@@ -12567,13 +13152,12 @@ fn apply_surface_strips(
 ) {
     replay_reasoning_clear(frozen_units, &message.mid, rebuilt);
     let sentinel = provider_sentinel_text(req);
-    let whole_strip = (!reasoning_policy.exempt)
-        .then(|| {
-            output_message_strip_unit(frozen_units, "placeholder", &message.mid).or_else(|| {
-                output_message_strip_unit(frozen_units, "system_injected", &message.mid)
-            })
-        })
-        .flatten();
+    let whole_strip =
+        output_message_strip_unit(frozen_units, "placeholder", &message.mid).or_else(|| {
+            (!reasoning_policy.exempt)
+                .then(|| output_message_strip_unit(frozen_units, "system_injected", &message.mid))
+                .flatten()
+        });
     if whole_strip.is_some() {
         rebuilt.content = vec![CkWireBlock::bare(ck_wire::CkKind::Text { text: sentinel })];
         rebuilt.mark_modified();
@@ -13501,7 +14085,7 @@ fn assert_no_orphaned_tool_arcs(messages: &[ServedMessage]) {
         let same_message_results = external_results(message);
         let next_message_results = messages
             .get(message_index + 1)
-            .map(&external_results)
+            .map(external_results)
             .unwrap_or_default();
         for id in calls {
             assert!(
@@ -14004,17 +14588,22 @@ fn heal_poisoned_trailing_blank_decisions(
         .filter(|message| message.role == "assistant")
         .filter_map(|message| message.meta.harness_id.as_deref())
         .collect::<HashSet<_>>();
+    // One index for the whole pass: looking each assistant up with a scan of every frozen
+    // unit made this quadratic in a long session. The index keeps the first unit per key,
+    // which is what the scan found.
+    let frozen = FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units));
     let mut healed_ids = source_decisions
         .iter()
         .filter(|&(mid, (decision, _))| {
             *decision == FrozenTrailingBlankDecision::Strip
                 && newest_assistant_mid != Some(mid.as_str())
                 && visible_assistant_ids.contains(mid.as_str())
-                && frozen_trailing_blank_decision(core, mid)
+                && output_trailing_blank_decision(&frozen, mid)
                     == Some(FrozenTrailingBlankDecision::Keep)
         })
         .map(|(mid, _)| mid.clone())
         .collect::<Vec<_>>();
+    drop(frozen);
     healed_ids.sort();
     if healed_ids.is_empty() {
         return healed_ids;
@@ -14054,6 +14643,9 @@ fn refresh_trailing_blank_decisions(
 
     let newest_assistant_mid = latest_assistant_mid(&req.messages);
     let mut updates = Vec::new();
+    // One index for the whole pass (first unit per key, as a scan finds it) instead of a
+    // scan of every frozen unit per rendered assistant, which was quadratic.
+    let frozen_units = FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units));
     for rendered in rendered_messages {
         let Some(mid) = rendered.meta.harness_id.as_deref() else {
             continue;
@@ -14064,10 +14656,10 @@ fn refresh_trailing_blank_decisions(
         let Some(&(decision, keep_count)) = source_decisions.get(mid) else {
             continue;
         };
-        let frozen = frozen_trailing_blank_decision(core, mid);
+        let frozen = output_trailing_blank_decision(&frozen_units, mid);
         let frozen_matches = frozen == Some(decision)
             && (decision == FrozenTrailingBlankDecision::Strip
-                || frozen_trailing_blank_keep_count(core, mid) == Some(keep_count));
+                || output_trailing_blank_keep_count(&frozen_units, mid) == Some(keep_count));
         // A strip is absorbing. If a harness blank arrives after the first serve, stripping it
         // forever makes streaming, completion, and historical projections suffix-monotonic.
         // A live keep may still change count or demote to strip when its source suffix disappears.
@@ -14081,6 +14673,7 @@ fn refresh_trailing_blank_decisions(
         }
         updates.push((mid.to_string(), decision, keep_count, frozen.is_some()));
     }
+    drop(frozen_units);
 
     let newest_replay_required = updates.iter().any(|(mid, decision, _, had_frozen)| {
         newest_assistant_mid == Some(mid.as_str())
@@ -14934,7 +15527,10 @@ fn reasoning_clear_cutoff_with_tags(
     is_bust_pass: bool,
     tag_numbers: &BTreeMap<String, u64>,
 ) -> Option<u64> {
-    if !is_bust_pass {
+    // Prefix-bound models never take this watermark lane: it skips an ineligible message
+    // instead of stopping there, so it could remove a block from the middle and invalidate
+    // every newer one. OpenCode serves them through the `reasoning_age` oldest-prefix walk.
+    if !is_bust_pass || is_prefix_bound_thinking_model(req.model_key.as_deref()) {
         return None;
     }
     let profile_supported = match profile {
@@ -15188,6 +15784,10 @@ struct MaterializeReasonInputs {
     legacy_baseline: bool,
     render_config_changed: bool,
     profile_transition: bool,
+    /// The external revision moved (workspace, project memory epoch, or an in-place
+    /// compartment rewrite by another writer), or a pending epoch was armed.
+    project_memory_epoch_due: bool,
+    history_revision_due: bool,
     first_fold_due: bool,
     ttl_expired: bool,
     coverage_fold_due: bool,
@@ -15205,6 +15805,8 @@ fn classify_materialize_reason(input: MaterializeReasonInputs) -> Option<String>
         legacy_baseline,
         render_config_changed,
         profile_transition,
+        project_memory_epoch_due,
+        history_revision_due,
         first_fold_due,
         ttl_expired,
         coverage_fold_due,
@@ -15224,6 +15826,10 @@ fn classify_materialize_reason(input: MaterializeReasonInputs) -> Option<String>
                 "profile_transition"
             } else if render_config_changed {
                 "epoch_change"
+            } else if history_revision_due {
+                "compartment_history_revision"
+            } else if project_memory_epoch_due {
+                "project_memory_epoch"
             } else if coverage_fold_due || first_fold_due {
                 "coverage_fold"
             } else if ttl_expired {
@@ -15272,6 +15878,23 @@ pub(crate) mod tests {
         InsertMemoryInput, McTagRow, ModuleDropSeedRow, ModuleStateSyncRequest, ModuleUsage,
         NoteCasOutcome, NoteEvaluationInput, NoteWriteInput, StoredCompartment,
     };
+
+    #[test]
+    fn historian_output_cap_is_scoped_to_each_transform_request() {
+        let request = |cap| {
+            serde_json::from_value::<TransformRequest>(serde_json::json!({
+                "session_id": "historian-cap",
+                "render_config": "{}",
+                "historian_model_chain": ["test/model"],
+                "historian_max_output_tokens": cap,
+            }))
+            .expect("valid historian request")
+        };
+        let first = request(4096);
+        let second = request(8192);
+        assert_eq!(first.historian_max_output_tokens, Some(4096));
+        assert_eq!(second.historian_max_output_tokens, Some(8192));
+    }
 
     fn resolve_test_cache_ttl(
         ctx: &mut ProducerContext<'_>,
@@ -15705,7 +16328,7 @@ pub(crate) mod tests {
     use serde_json::{json, Value};
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&StorageDescriptor {
+        McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
             storage_namespace: "mc_cache".to_string(),
             isolation: Isolation::Module,
@@ -15986,6 +16609,295 @@ pub(crate) mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Stage profile of a large real session, rebuilt with scrubbed content.
+    ///
+    /// Inputs (all read-only copies; the live store is never opened):
+    /// - `MC_PROFILE_STORE`: a `store.db` copy (`sqlite3 -readonly <live> "VACUUM INTO ..."`).
+    ///   It is copied again into a temporary directory before anything opens it.
+    /// - `MC_PROFILE_SESSION`: the session id.
+    /// - `MC_PROFILE_IDENTITIES`: `mid|identities-json` lines exported from that copy's
+    ///   `mc_block_identities`, giving every message's block kinds in order.
+    /// - `MC_PROFILE_SHAPE`: tab-separated `mid role created_ms completed_ms` lines exported
+    ///   from the host database in host order (roles and times only, no content). A line's
+    ///   position is the message ordinal, plus the optional `MC_PROFILE_ORDINAL_OFFSET`.
+    ///
+    /// Every block keeps its real id, kind and, when tagged, its stored source length; all text
+    /// is replaced by filler. The session's real tag rows stay in the store, so tag caching,
+    /// hygiene attribution and temporal marks run at production scale. Cache state and the
+    /// session's coverage rows are cleared so the first pass bootstraps deterministically and
+    /// the whole rebuilt array is live tail. Prints stage timings per pass and a
+    /// digest of each served array, so two builds can be compared for time and bytes.
+    #[test]
+    #[ignore = "requires scrubbed real-session inputs; see the doc comment"]
+    fn real_session_stage_profile() {
+        use mc_store::{
+            CkKind, CkOutputKind, CkToolOutput, HarnessMeta, MediaBlock, MediaKind, OpaqueBlock,
+            ProviderExtras,
+        };
+        use sha2::{Digest, Sha256};
+        let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} is required"));
+        let session = env("MC_PROFILE_SESSION");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(env("MC_PROFILE_STORE"), dir.path().join("store.db")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+            conn.execute("DELETE FROM mc_cache_state", []).unwrap();
+            // The rebuilt array cannot reproduce the host's exact ordinals, so stored coverage
+            // (compartments, roots, fingerprints, frontiers, queued drops) would claim positions
+            // the array cannot match. Clearing the session's rows except tags and the overlays
+            // keyed by block id makes the whole rebuilt array live tail, which keeps every
+            // tagged block in the projection.
+            const KEEP: [&str; 6] = [
+                "mc_tags",
+                "mc_tag_cache_generations",
+                "mc_temporal_marks",
+                "mc_user_hints",
+                "mc_channel1_appends",
+                "mc_notes",
+            ];
+            let tables = conn
+                .prepare(
+                    "SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS \
+                     (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'session_id')",
+                )
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for table in tables
+                .iter()
+                .filter(|table| !KEEP.contains(&table.as_str()))
+            {
+                conn.execute(
+                    &format!("DELETE FROM \"{table}\" WHERE session_id = ?1"),
+                    rusqlite::params![session],
+                )
+                .unwrap();
+            }
+            conn.execute("UPDATE cortexkit_fence SET epoch=1", [])
+                .unwrap();
+        }
+        let s = store(dir.path());
+        let tag_lengths = s
+            .load_tags_for_session(&session)
+            .unwrap()
+            .into_iter()
+            .map(|tag| (tag.block_id, tag.source_bytes.len()))
+            .collect::<HashMap<_, _>>();
+        let shape = std::fs::read_to_string(env("MC_PROFILE_SHAPE")).unwrap();
+        // Host ordinals can differ from the export's row position by a constant when the host
+        // skips rows; `MC_PROFILE_ORDINAL_OFFSET` corrects that so stored anchors line up.
+        let ordinal_offset = std::env::var("MC_PROFILE_ORDINAL_OFFSET")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let shape = shape
+            .lines()
+            .enumerate()
+            .filter_map(|(position, line)| {
+                let mut fields = line.split('\t');
+                let mid = fields.next()?;
+                let role = fields.next()?;
+                let created = fields.next().and_then(|v| v.parse::<i64>().ok());
+                let completed = fields.next().and_then(|v| v.parse::<i64>().ok());
+                Some((
+                    mid.to_string(),
+                    (
+                        role.to_string(),
+                        created,
+                        completed,
+                        (position as i64 + 1 + ordinal_offset).max(1) as u64,
+                    ),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let filler = |len: usize| {
+            let mut text = "scrubbed ".repeat(len / 9 + 1);
+            text.truncate(len.max(1));
+            text
+        };
+        let identities = std::fs::read_to_string(env("MC_PROFILE_IDENTITIES")).unwrap();
+        let mut messages = Vec::new();
+        let mut last_created = 0;
+        for line in identities.lines() {
+            let Some((mid, json_text)) = line.split_once('|') else {
+                continue;
+            };
+            let kinds: Vec<Value> = serde_json::from_str(json_text).unwrap();
+            // Real ordinals (host order) keep stored compartments and anchors consistent.
+            let (role, created, completed, ordinal) =
+                shape.get(mid).cloned().unwrap_or_else(|| {
+                    let after = messages.last().map_or(0, |m: &CkIngressMessage| m.ordinal);
+                    ("assistant".to_string(), None, None, after + 1)
+                });
+            let mut call_id = String::new();
+            let blocks = kinds
+                .iter()
+                .enumerate()
+                .map(|(index, identity)| {
+                    let len = tag_lengths
+                        .get(&format!("{mid}#{index}"))
+                        .copied()
+                        .unwrap_or(16);
+                    let kind = match identity["kind_tag"].as_str().unwrap_or("opaque") {
+                        "text" => CkKind::Text { text: filler(len) },
+                        "reasoning" => CkKind::Reasoning {
+                            text: filler(64),
+                            signature: Some(format!("sig-{mid}-{index}")),
+                        },
+                        "redacted_reasoning" => CkKind::RedactedReasoning { data: filler(32) },
+                        "tool_call" => {
+                            call_id = format!("call_{mid}_{index}");
+                            CkKind::ToolCall {
+                                id: call_id.clone(),
+                                name: "read".to_string(),
+                                input: json!({ "path": format!("file-{index}") }),
+                                provider_executed: false,
+                            }
+                        }
+                        "tool_result" => CkKind::ToolResult {
+                            id: call_id.clone(),
+                            tool_name: "read".to_string(),
+                            output: CkToolOutput::bare(CkOutputKind::Text { text: filler(len) }),
+                            provider_executed: false,
+                        },
+                        "media" => CkKind::Media(MediaBlock {
+                            kind: MediaKind::Image,
+                            media_type: "image/png".to_string(),
+                            filename: None,
+                            source: json!({ "type": "data_base64", "data": "aGVsbG8=" }),
+                        }),
+                        _ => CkKind::Opaque(OpaqueBlock {
+                            source: json!({ "type": "harness", "harness": "opencode" }),
+                            kind: "step-start".to_string(),
+                            raw: json!({ "type": "step-start" }),
+                            arc: None,
+                        }),
+                    };
+                    CkWireBlock::bare(kind)
+                })
+                .collect::<Vec<_>>();
+            // Keep block positions (and so block ids) stable while making every arc complete:
+            // an unanswered call becomes an opaque step, an unmatched result becomes text.
+            let answered = blocks
+                .iter()
+                .filter_map(|block| match &block.kind {
+                    CkKind::ToolResult { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let called = blocks
+                .iter()
+                .filter_map(|block| match &block.kind {
+                    CkKind::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let blocks = blocks
+                .into_iter()
+                .map(|block| match block.kind {
+                    CkKind::ToolCall { ref id, .. } if !answered.contains(id) => {
+                        CkWireBlock::bare(CkKind::Opaque(OpaqueBlock {
+                            source: json!({ "type": "harness", "harness": "opencode" }),
+                            kind: "step-start".to_string(),
+                            raw: json!({ "type": "step-start" }),
+                            arc: None,
+                        }))
+                    }
+                    CkKind::ToolResult {
+                        ref id, ref output, ..
+                    } if !called.contains(id) => {
+                        let text = match &output.kind {
+                            CkOutputKind::Text { text } => text.clone(),
+                            _ => String::new(),
+                        };
+                        CkWireBlock::bare(CkKind::Text { text })
+                    }
+                    _ => block,
+                })
+                .collect::<Vec<_>>();
+            let mut ck = CkWireMessage::from_parts(
+                &role,
+                blocks,
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            );
+            ck.meta.created_at_ms = created;
+            ck.meta.completed_at_ms = completed;
+            last_created = last_created.max(created.unwrap_or(0));
+            messages.push(CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck,
+            });
+        }
+        messages.sort_by_key(|message| message.ordinal);
+        let mut request = req(&session, "profile", messages);
+        request.serializer_profile = "opencode-aisdk".into();
+        // A host with the reduce tool, so tag minting and the tag overlay are active.
+        request.tool_present = true;
+        let dir_text = dir.path().to_str().unwrap().to_string();
+        let context = pctx("git:profile", &dir_text, last_created + 60_000);
+        let mut appended = request.clone();
+        let mut next = item(
+            "msg_zzzz_profile_append",
+            appended.messages.last().map_or(1, |m| m.ordinal + 1),
+            "one more question",
+        );
+        next.ck.meta.created_at_ms = Some(last_created + 30_000);
+        appended.messages.push(next);
+        eprintln!(
+            "real-profile session={session} messages={} tags={} tag_source_bytes={}",
+            request.messages.len(),
+            tag_lengths.len(),
+            tag_lengths.values().sum::<usize>()
+        );
+        for (name, pass_request) in [
+            ("A-bootstrap", &request),
+            ("B1-replay", &request),
+            ("B2-replay", &request),
+            ("B3-replay", &request),
+            ("C-append", &appended),
+            ("D-replay", &appended),
+        ] {
+            let started = Instant::now();
+            let output = apply_once_with_estimator_and_projection(
+                &s,
+                pass_request,
+                &context,
+                mc_tokenizer::estimate_tokens,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+            let execute_ms = elapsed_ms(started);
+            let mut digest = Sha256::new();
+            for message in output.response.messages() {
+                digest.update(serde_json::to_vec(&**message).unwrap());
+            }
+            let tags = s.load_tags_for_session(&session).unwrap();
+            let timings = output.response.timings.as_ref().unwrap();
+            eprintln!(
+                "real-profile pass={name} decision={} transform_execute={execute_ms:.1} planning={:.1} state_evolution={:.1} tag_overlay={:.1} temporal={:.1} caveman={:.1} build_output={:.1} total={:.1} served_messages={} tags={} max_tag={} served_sha256={:x}",
+                output.response.decision,
+                timings.planning,
+                timings.state_evolution,
+                timings.tag_overlay,
+                timings.temporal,
+                timings.caveman,
+                timings.build_output,
+                timings.total,
+                output.response.messages().len(),
+                tags.len(),
+                tags.last().map_or(0, |tag| tag.tag_number),
+                digest.finalize()
+            );
         }
     }
 
@@ -16480,6 +17392,524 @@ pub(crate) mod tests {
         }
     }
 
+    /// Byte-exact shape OpenCode 1.17.8 hands plugins for a user message sent mid-run.
+    fn steering_wrapped(user_text: &str) -> String {
+        format!(
+            "<system-reminder>\nThe user sent the following message:\n{user_text}\n\nPlease address this message and continue with your tasks.\n</system-reminder>"
+        )
+    }
+
+    #[test]
+    fn steering_wrapped_user_message_survives_injection_strip_on_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let wrapped = steering_wrapped("Stop and use the staging database instead.");
+        let mut messages = vec![wire_item("user", "steer", 1, &[wrapped.as_str()])];
+        messages.extend(
+            (2..=41).map(|ordinal| item(&format!("tail-{ordinal}"), ordinal, "authored tail")),
+        );
+        let request = req("steering-wrapper", "cfg0", messages);
+
+        let bust = run(&store, &request, &spine());
+        assert_eq!(bust.action, "HARD");
+        assert_eq!(tail_bytes(&bust, "steer"), wrapped);
+        let frozen = store.load("steering-wrapper").unwrap();
+        assert!(
+            !frozen
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key.contains("steer")),
+            "a wrapped user message must not freeze a strip unit"
+        );
+    }
+
+    #[test]
+    fn steering_wrapper_is_kept_while_harness_reminders_around_it_strip() {
+        let wrapped = steering_wrapped("use staging");
+        assert_eq!(strip_system_injection(&wrapped), None);
+        let nested = steering_wrapped("quote <system-reminder>x</system-reminder> then go");
+        assert_eq!(strip_system_injection(&nested), None);
+        let mixed =
+            format!("{wrapped}\n\n<system-reminder>\nPlan mode is active.\n</system-reminder>");
+        assert_eq!(
+            strip_system_injection(&mixed).as_deref(),
+            Some(wrapped.as_str())
+        );
+        assert_eq!(
+            strip_system_injection("<system-reminder>internal</system-reminder>").as_deref(),
+            Some("")
+        );
+    }
+
+    fn planning_carrier(id: &str, ordinal: u64, bytes: usize) -> CkIngressMessage {
+        let mut message = item(id, ordinal, "caption");
+        message
+            .ck
+            .content
+            .push(CkWireBlock::bare(ck_wire::CkKind::Media(
+                ck_wire::MediaBlock {
+                    kind: ck_wire::MediaKind::Image,
+                    media_type: "image/png".to_string(),
+                    filename: None,
+                    source: json!({"type": "data_base64", "data": "aB3+".repeat(bytes / 4)}),
+                },
+            )));
+        message
+    }
+
+    #[test]
+    fn planning_carrier_tokenization_cost_is_bounded() {
+        for (count, bytes) in [(1, 64), (64, 65_536)] {
+            let messages = (0..count)
+                .flat_map(|i| {
+                    [
+                        planning_carrier(&format!("carrier-{i}"), i as u64 + 1, bytes),
+                        opaque_result_carrier(&format!("opaque-{i}"), i as u64 + 1, "user"),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let projection = project_messages(&messages).unwrap();
+            let tags = projection
+                .blocks
+                .iter()
+                .filter(|block| matches!(block.wire.kind, ck_wire::CkKind::Text { .. }))
+                .map(|block| (block.id.as_str(), 3))
+                .collect::<HashMap<_, _>>();
+            let calls = std::cell::Cell::new(0);
+            for block in &projection.blocks {
+                sel_item_from_flat_with_estimator(block, &tags, |_| {
+                    calls.set(calls.get() + 1);
+                    99
+                });
+            }
+            assert_eq!(calls.get(), 0, "carrier count={count}, bytes={bytes}");
+        }
+    }
+
+    fn payload_tag(number: i64, block_id: &str, payload: &str) -> McTagRow {
+        McTagRow {
+            tag_number: number,
+            block_id: block_id.to_string(),
+            kind: "message".to_string(),
+            token_count: number * 3,
+            created_at_ms: number * 1_000,
+            source_bytes: payload.as_bytes().into(),
+        }
+    }
+
+    /// A pass that mints nothing must leave the tag rows shared with the retained baseline, and
+    /// a pass that mints must produce exactly the rows and start index the copying append did
+    /// while sharing every earlier row's stored payload instead of copying it.
+    #[test]
+    fn tag_mint_append_shares_rows_and_payloads() {
+        let baseline = Arc::new(vec![
+            payload_tag(4, "a#0", "alpha payload"),
+            payload_tag(9, "b#0", "beta payload"),
+            payload_tag(7, "c#0", "gamma payload"),
+        ]);
+        let mut rows = Arc::clone(&baseline);
+        assert_eq!(append_minted_tag_rows(&mut rows, Vec::new(), 5), 3);
+        assert!(
+            Arc::ptr_eq(&rows, &baseline),
+            "a no-mint pass copied the rows"
+        );
+
+        let mint = || {
+            vec![TagMintInput {
+                block_id: "d#0".to_string(),
+                kind: "tool_result".to_string(),
+                token_count: -2,
+                source_bytes: b"delta".to_vec(),
+            }]
+        };
+        let start = append_minted_tag_rows(&mut rows, mint(), 5);
+        let mut copying = (*baseline).clone();
+        let copying_start = append_tag_mint_rows(&mut copying, mint(), 5);
+        assert_eq!(
+            (start, rows.as_slice()),
+            (copying_start, copying.as_slice())
+        );
+        assert_eq!(rows[3].tag_number, 10);
+        assert_eq!(baseline.len(), 3, "the retained baseline is not mutated");
+        for (row, original) in rows.iter().zip(baseline.iter()) {
+            assert!(Arc::ptr_eq(&row.source_bytes, &original.source_bytes));
+        }
+    }
+
+    /// Hygiene preparation keeps exactly the rows, order and identities the cloning version
+    /// kept, but none of their stored payload bytes.
+    #[test]
+    fn hygiene_rows_are_identity_only_and_match_cloned_rows() {
+        let projection = project_messages(&[
+            item("live-a", 1, "first"),
+            item("live-b", 2, "second"),
+            item("live-c", 3, "third"),
+        ])
+        .unwrap();
+        let stored = vec![
+            payload_tag(1, "gone#0", &"historical ".repeat(500)),
+            payload_tag(2, "live-a#0", "first"),
+            payload_tag(3, "live-b#0", "second"),
+        ];
+        let overlay = TagOverlayState {
+            // live-a keeps its stored number, live-b was renumbered, live-c is a new mint.
+            tag_by_block_id: BTreeMap::from([
+                ("live-a#0".to_string(), 2),
+                ("live-b#0".to_string(), 30),
+                ("live-c#0".to_string(), 4),
+            ]),
+            ..Default::default()
+        };
+        for derive_when_empty in [false, true] {
+            let view = tag_rows_for_hygiene(&projection, &stored, &overlay, derive_when_empty);
+            assert!(view.iter().all(|row| row.source_bytes.is_empty()));
+            let identities = |rows: &[McTagRow]| {
+                rows.iter()
+                    .map(|row| {
+                        (
+                            row.tag_number,
+                            row.block_id.clone(),
+                            row.kind.clone(),
+                            row.token_count,
+                            row.created_at_ms,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            // The cloning version: surviving stored rows copied whole, then the same additions.
+            let projected = projection
+                .blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<HashSet<_>>();
+            let mut cloned = stored
+                .iter()
+                .filter(|row| {
+                    !projected.contains(row.block_id.as_str())
+                        || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            cloned.push(McTagRow {
+                tag_number: 4,
+                block_id: "live-c#0".to_string(),
+                kind: "message".to_string(),
+                token_count: 0,
+                created_at_ms: 0,
+                source_bytes: Default::default(),
+            });
+            cloned.push(McTagRow {
+                tag_number: 30,
+                block_id: "live-b#0".to_string(),
+                kind: "message".to_string(),
+                token_count: 0,
+                created_at_ms: 0,
+                source_bytes: Default::default(),
+            });
+            cloned.sort_by_key(|row| row.tag_number);
+            assert_eq!(identities(&view), identities(&cloned));
+        }
+    }
+
+    /// A timestamped conversation for the temporal differential: users with one or two text
+    /// blocks, assistants with and without completion times, gaps from seconds to days, and
+    /// one user repeated under the same id.
+    fn temporal_fixture(messages: usize) -> TransformRequest {
+        let mut created = 1_700_000_000_000i64;
+        let mut out = Vec::new();
+        for n in 0..messages {
+            let role = if n % 2 == 0 { "user" } else { "assistant" };
+            let texts: &[&str] = if n % 6 == 0 { &["a", "b"] } else { &["only"] };
+            let mid = if n == 40 {
+                "u0".to_string()
+            } else {
+                format!("u{n}")
+            };
+            let mut message = wire_item(role, &mid, n as u64 + 1, texts);
+            created += [1_000, 90_000, 4_000_000, 90_000_000, 7][n % 5];
+            message.ck.meta.created_at_ms = (n % 17 != 3).then_some(created);
+            message.ck.meta.completed_at_ms =
+                (role == "assistant" && n % 3 == 0).then_some(created + 500);
+            out.push(message);
+        }
+        req("temporal-diff", "cfg0", out)
+    }
+
+    /// `timestamp_temporal_marks` before the first-text-block index: a front-to-back
+    /// projection search per authored user. Kept only as the differential reference.
+    fn scanning_timestamp_temporal_marks(
+        req: &TransformRequest,
+        projection: &FlatProjection,
+        mutation_exempt_mid: Option<&str>,
+        lineage_anchor_mid: Option<&str>,
+    ) -> Vec<TemporalMarkInput> {
+        let mut previous = None;
+        let mut marks = Vec::new();
+        for message in &req.messages {
+            if is_authored_user_message(message)
+                && mutation_exempt_mid != Some(message.mid.as_str())
+                && lineage_anchor_mid != Some(message.mid.as_str())
+            {
+                let marker_text = previous.and_then(|prior: &CkIngressMessage| {
+                    let previous_created = prior.ck.meta.created_at_ms?;
+                    let current_created = message.ck.meta.created_at_ms?;
+                    let previous_end = prior.ck.meta.completed_at_ms.unwrap_or(previous_created);
+                    Some(
+                        current_created
+                            .checked_sub(previous_end)
+                            .and_then(temporal_gap_prefix)
+                            .unwrap_or_default(),
+                    )
+                });
+                if let Some(marker_text) = marker_text {
+                    if let Some(block_id) = projection.blocks.iter().find_map(|block| {
+                        (block.mid == message.mid
+                            && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
+                        .then(|| block.id.clone())
+                    }) {
+                        marks.push(TemporalMarkInput {
+                            ordinal: message.ordinal,
+                            block_id,
+                            marker_text,
+                        });
+                    }
+                }
+            }
+            previous = Some(message);
+        }
+        marks
+    }
+
+    /// The canonical-mark reconciliation before the row index: a front-to-back row search
+    /// per mark. Kept only as the differential reference.
+    fn scanning_reconcile_canonical_temporal_marks(
+        temporal_rows: &mut Vec<TemporalMarkRow>,
+        canonical_marks: Vec<TemporalMarkInput>,
+        rewrite_temporal_marks: bool,
+        frontier: Option<u64>,
+        now_ms: i64,
+        decided_temporal: &mut HashSet<String>,
+    ) -> Vec<TemporalMarkInput> {
+        let mut temporal_marks = Vec::new();
+        for mark in canonical_marks {
+            if let Some(existing) = temporal_rows
+                .iter_mut()
+                .find(|row| row.block_id == mark.block_id)
+            {
+                if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
+                    existing.marker_text = mark.marker_text.clone();
+                    temporal_marks.push(mark);
+                }
+                continue;
+            }
+            let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
+            if !rewrite_temporal_marks && !is_new {
+                continue;
+            }
+            temporal_rows.push(TemporalMarkRow {
+                block_id: mark.block_id.clone(),
+                marker_text: mark.marker_text.clone(),
+                created_at: now_ms,
+            });
+            decided_temporal.insert(mark.block_id.clone());
+            temporal_marks.push(mark);
+        }
+        temporal_marks
+    }
+
+    /// Indexed temporal overlays must reproduce the scanning implementation exactly: the
+    /// canonical marks, the reconciled rows (including rewrites of old marks far behind the
+    /// frontier, duplicate stored rows and rows for absent blocks), the decided set, and the
+    /// timestamp-free first-minted-text-block choice for every message.
+    #[test]
+    fn indexed_temporal_overlays_match_scanning_reference() {
+        let request = temporal_fixture(240);
+        let projection = project_messages(&request.messages).unwrap();
+        for (exempt, anchor) in [(None, None), (Some("u12"), Some("u30"))] {
+            let canonical = timestamp_temporal_marks(&request, &projection, exempt, anchor);
+            assert_eq!(
+                canonical,
+                scanning_timestamp_temporal_marks(&request, &projection, exempt, anchor)
+            );
+            assert!(canonical.iter().any(|mark| !mark.marker_text.is_empty()));
+            // Stored rows: some old marks with stale text, a duplicated block, an absent block.
+            let mut stored = Vec::new();
+            for (index, mark) in canonical.iter().enumerate().filter(|(i, _)| i % 3 == 0) {
+                stored.push(TemporalMarkRow {
+                    block_id: mark.block_id.clone(),
+                    marker_text: if index % 2 == 0 {
+                        mark.marker_text.clone()
+                    } else {
+                        "stale".to_string()
+                    },
+                    created_at: index as i64,
+                });
+            }
+            stored.push(stored[0].clone());
+            stored.push(TemporalMarkRow {
+                block_id: "absent#0".to_string(),
+                marker_text: String::new(),
+                created_at: 1,
+            });
+            for rewrite in [false, true] {
+                for frontier in [None, Some(0), Some(120), Some(10_000)] {
+                    let mut rows = stored.clone();
+                    let mut decided = rows.iter().map(|row| row.block_id.clone()).collect();
+                    let marks = reconcile_canonical_temporal_marks(
+                        &mut rows,
+                        canonical.clone(),
+                        rewrite,
+                        frontier,
+                        99,
+                        &mut decided,
+                    );
+                    let mut reference_rows = stored.clone();
+                    let mut reference_decided = reference_rows
+                        .iter()
+                        .map(|row| row.block_id.clone())
+                        .collect();
+                    let reference_marks = scanning_reconcile_canonical_temporal_marks(
+                        &mut reference_rows,
+                        canonical.clone(),
+                        rewrite,
+                        frontier,
+                        99,
+                        &mut reference_decided,
+                    );
+                    let case = format!("rewrite={rewrite} frontier={frontier:?}");
+                    assert_eq!(marks, reference_marks, "{case}");
+                    assert_eq!(rows, reference_rows, "{case}");
+                    assert_eq!(decided, reference_decided, "{case}");
+                }
+            }
+        }
+        // Timestamp-free path: the first minted text block per message.
+        let minted = projection
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 4 != 1)
+            .map(|(index, block)| (block.id.as_str(), index as i64))
+            .collect::<HashMap<_, _>>();
+        let text_blocks = text_blocks_by_message_id(&projection);
+        let mut found = 0;
+        for message in &request.messages {
+            let reference = projection
+                .blocks
+                .iter()
+                .filter(|block| block.mid == message.mid)
+                .find_map(|block| {
+                    matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
+                        .then(|| {
+                            minted
+                                .get(block.id.as_str())
+                                .copied()
+                                .map(|created_at| (block.id.clone(), created_at))
+                        })
+                        .flatten()
+                });
+            let indexed = first_minted_text_block(text_blocks.get(message.mid.as_str()), &minted);
+            found += usize::from(indexed.is_some());
+            assert_eq!(indexed, reference, "{}", message.mid);
+        }
+        assert!(found > 100);
+    }
+
+    #[test]
+    fn planning_text_still_estimates_and_respects_tags() {
+        let projection = project_messages(&[item("text", 1, "untagged prose")]).unwrap();
+        let block = &projection.blocks[0];
+        let calls = std::cell::Cell::new(0);
+        let selected = sel_item_from_flat_with_estimator(block, &HashMap::new(), |_| {
+            calls.set(calls.get() + 1);
+            99
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(selected.served_token_count, Some(99));
+        let selected = sel_item_from_flat_with_estimator(
+            block,
+            &HashMap::from([(block.id.as_str(), 7)]),
+            |_| panic!("persisted count must win"),
+        );
+        assert_eq!(selected.served_token_count, Some(7));
+    }
+
+    #[test]
+    #[ignore = "requires CEREB_MEDIA_FIXTURE pointing to a local JSON array of data URLs"]
+    fn planning_carrier_live_payload_timing() {
+        let urls: Vec<String> = serde_json::from_slice(
+            &std::fs::read(std::env::var("CEREB_MEDIA_FIXTURE").unwrap()).unwrap(),
+        )
+        .unwrap();
+        for count in 0..=urls.len() {
+            let messages = urls[..count]
+                .iter()
+                .enumerate()
+                .map(|(i, url)| {
+                    let mut message = planning_carrier(&format!("live-{i}"), i as u64 + 1, 0);
+                    let ck_wire::CkKind::Media(media) = &mut message.ck.content[1].kind else {
+                        unreachable!()
+                    };
+                    media.source = json!({"url": url});
+                    message
+                })
+                .collect::<Vec<_>>();
+            let projection = project_messages(&messages).unwrap();
+            let carriers = projection
+                .blocks
+                .iter()
+                .filter(|b| matches!(b.wire.kind, ck_wire::CkKind::Media(_)))
+                .collect::<Vec<_>>();
+            let bytes: usize = carriers.iter().map(|b| b.bytes.len()).sum();
+            let started = Instant::now();
+            for block in &carriers {
+                std::hint::black_box(mc_tokenizer::estimate_tokens(&block.bytes));
+            }
+            let before = elapsed_ms(started);
+            let started = Instant::now();
+            for block in &carriers {
+                std::hint::black_box(sel_item_from_flat(block, &HashMap::new()));
+            }
+            eprintln!(
+                "carrier timing count={count} bytes={bytes} legacy_ms={before:.3} fixed_ms={:.3}",
+                elapsed_ms(started)
+            );
+        }
+    }
+
+    #[test]
+    fn planning_carrier_replay_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut request = req(
+            "planning-carrier-replay",
+            "cfg0",
+            vec![
+                item("head", 1, "older history"),
+                planning_carrier("image-user", 2, 4096),
+            ],
+        );
+        request.serializer_profile = "opencode-aisdk".to_string();
+        let mut hashes = Vec::new();
+        for _ in 0..3 {
+            let response = run(&store, &request, &spine());
+            let bytes = serde_json::to_vec(&response.ck_messages).unwrap();
+            hashes.push(format!("{}:{:x}", response.action, Sha256::digest(&bytes)));
+        }
+        // This digest records CK response bytes with media token estimation still enabled,
+        // so removing the unused estimate must preserve bootstrap and replay output.
+        let digest = "116dd7f9afc3d7bef3de4f2520945161fa244ecb7e4134f5bc1187e377668083";
+        assert_eq!(
+            hashes,
+            [
+                format!("HARD:{digest}"),
+                format!("SOFT+:{digest}"),
+                format!("SOFT+:{digest}")
+            ]
+        );
+    }
+
     #[test]
     fn untagged_answered_image_strips_on_bust_and_replays() {
         let dir = tempfile::tempdir().unwrap();
@@ -16773,6 +18203,7 @@ pub(crate) mod tests {
             history_budget_tokens: None,
             historian_model_chain: None,
             historian_model_limits: Default::default(),
+            historian_max_output_tokens: None,
             historian_timeout_ms: None,
             declared_trim: None,
             lineage_switched: false,
@@ -16924,18 +18355,6 @@ pub(crate) mod tests {
         request
     }
 
-    fn acknowledge_test_host_memory(store: &McStore, project_path: &str, id: i64) {
-        store
-            .acknowledge_host_memory_ids(
-                project_path,
-                &[mc_store::HostMemoryIdentityAck {
-                    module_row_id: id,
-                    host_row_id: id,
-                }],
-            )
-            .unwrap();
-    }
-
     fn memory_input<'a>(
         project_path: &'a str,
         category: &'a str,
@@ -16983,6 +18402,7 @@ pub(crate) mod tests {
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
             historian_active: false,
             wrapup_active: false,
+            caveman_english_word_rules: true,
             injected_reductions: Vec::new(),
         }
     }
@@ -17726,6 +19146,7 @@ pub(crate) mod tests {
                         expected: seeded.row_version,
                         core: &seeded.core,
                         meta: &seeded.meta,
+                        sections: mc_store::SectionsCommit::default(),
                         consumed_drop_ids: &[],
                         first_applied_command_ids: &[],
                         memory_revision: None,
@@ -19167,7 +20588,7 @@ pub(crate) mod tests {
                 kind: kind.clone(),
                 token_count: *tokens,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
         // Coalesce assistant text and its following call under the same CC message id.
@@ -19219,6 +20640,7 @@ pub(crate) mod tests {
             // The observed pass was Force85, not the scheduler's Emergency95 backstop.
             pass_already_busting: true,
             supersession_ride_available: true,
+            emergency_minimum_waived: false,
             emergency_window_yields: false,
             tag_window_protected_block_ids: protected,
             exempt_message_protected_block_ids: HashSet::new(),
@@ -19285,7 +20707,7 @@ pub(crate) mod tests {
                 kind: "tool_result".into(),
                 token_count: 10_000,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
         ctx.tag_window_protected_block_ids =
@@ -19363,7 +20785,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
-        let huge = "x".repeat(50_000);
+        // Large enough that the force batch clears the emergency minimum achievable
+        // reclaim; this test is about when the producer gate runs.
+        let huge = "x".repeat(100_000);
         let force_messages = vec![
             item("a", 1, "raw"),
             assistant_tool_call("force_old", 2, "force_old_call"),
@@ -20598,6 +22022,70 @@ pub(crate) mod tests {
         assert!(s.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
+    /// At the 95% backstop with an earlier emergency drop already persisted, a selection
+    /// that reclaims less than the minimum is skipped. Neither the backstop nor the
+    /// force-band edge counts as an already-paid rewrite.
+    #[test]
+    fn emergency_backstop_skips_a_sub_minimum_selection_with_drops_already_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let context = smart_pctx();
+        let bash_call = |mid: &str, ordinal: u64| {
+            let mut call = assistant_tool_call(mid, ordinal, mid);
+            if let ck_wire::CkKind::ToolCall { name, .. } = &mut call.ck.content[0].kind {
+                *name = "bash".into();
+            }
+            call
+        };
+        let mut request = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    bash_call("early", 2),
+                    tool_result("early-result", 3, "early", &"e".repeat(20_000)),
+                    item("protected", 4, &"tail content ".repeat(30_000)),
+                    item("newest-1", 5, "tail"),
+                ],
+            ),
+            167_000,
+            167_000,
+        );
+        request.protected_tokens_effective = Some(30_000);
+        request.protected_tags = 0;
+        transform(&s, &request, &context).unwrap();
+        let first = s.load("ses").unwrap();
+        assert!(
+            first
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "red:early#0"),
+            "the first backstop pass drops the large arc: {:?}",
+            first.meta.emergency_drop_assessment
+        );
+
+        request.messages.push(bash_call("fresh", 6));
+        request
+            .messages
+            .push(tool_result("fresh-result", 7, "fresh", &"f".repeat(2_000)));
+        request = with_usage(request, 167_000, 167_000);
+        transform(&s, &request, &context).unwrap();
+        let second = s.load("ses").unwrap();
+        assert!(
+            !second
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "red:fresh#0"),
+            "a ~500-token fresh result must not be dropped at the backstop"
+        );
+        let assessment = second.meta.emergency_drop_assessment.unwrap();
+        assert!(assessment.skipped_below_minimum_reclaim, "{assessment:?}");
+    }
+
     #[test]
     fn force_episode_submargin_dip_does_not_price_second_batch() {
         for percentages in [
@@ -20878,7 +22366,9 @@ pub(crate) mod tests {
     fn subagent_emergency_sample_latch_prevents_repeat_selection() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        let huge = "x".repeat(50_000);
+        // Large enough that the first batch clears the emergency minimum achievable
+        // reclaim; this test is about the same-sample latch, not that minimum.
+        let huge = "x".repeat(100_000);
         let messages = vec![
             item("head", 1, "raw"),
             assistant_tool_call("old", 2, "old_call"),
@@ -20903,7 +22393,8 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         assert!(
             !first_red.is_empty(),
-            "the first emergency pass should select drops"
+            "the first emergency pass should select drops: {:?}",
+            s.load("subagent").unwrap().meta.emergency_drop_assessment
         );
         let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
 
@@ -21531,7 +23022,6 @@ pub(crate) mod tests {
         let memory_id = s
             .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", memory_id);
         let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
         let boot = run(&s, &execute_req, &spine());
         assert_eq!(boot.action, "HARD");
@@ -21558,111 +23048,231 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn review_late_host_ack_preserves_m0_across_restart() {
+    fn in_session_memory_mutations_ride_the_next_bust_and_defers_replay_them() {
+        // An update, an archive and a merge each append to context.db's
+        // memory_mutation_log and change no memory id. The mutation-log head is the only
+        // revision input that moves, so it alone must open the next execute-band pass as a
+        // SOFT carrying <memory-updates>; the defers after it replay those bytes exactly.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
-        let first = s
-            .insert_memory(memory_input("git:proj", "CONSTRAINTS", "acknowledged", 0))
+        let updated = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule one", 0))
             .unwrap();
-        let pending = s
-            .insert_memory(memory_input("git:proj", "CONSTRAINTS", "pending", 0))
+        let archived = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule two", 0))
             .unwrap();
-        s.acknowledge_host_memory_ids(
-            "git:proj",
-            &[mc_store::HostMemoryIdentityAck {
-                module_row_id: first,
-                host_row_id: 901,
-            }],
-        )
-        .unwrap();
-        let mut request = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
-        request.serializer_profile = "opencode".into();
+        let merge_target = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule three", 0))
+            .unwrap();
+        let merge_source = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule four", 0))
+            .unwrap();
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        let boot = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(boot.action, "HARD");
-        let frozen = m0_bytes(&boot).to_string();
-        assert!(frozen.contains("#901:"));
-        assert!(!frozen.contains(&format!("#{pending}:")));
-        let second = transform(&s, &request, &ctx).unwrap();
-        assert_ne!(second.action, "HARD");
-        assert_eq!(m0_bytes(&second), frozen);
-        s.acknowledge_host_memory_ids(
-            "git:proj",
-            &[mc_store::HostMemoryIdentityAck {
-                module_row_id: pending,
-                host_row_id: 902,
-            }],
-        )
-        .unwrap();
-        for _ in 0..3 {
-            let pass = transform(&s, &request, &ctx).unwrap();
-            assert_ne!(pass.action, "HARD", "late identity ack must not bust m0");
-            assert_eq!(m0_bytes(&pass), frozen);
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        let defer_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 10, 100);
+        assert_eq!(transform(&s, &execute_req, &ctx).unwrap().action, "HARD");
+        // With nothing pending, an execute-band pass does not bust.
+        assert_eq!(transform(&s, &execute_req, &ctx).unwrap().action, "SOFT+");
+
+        let archived_marker = format!("id=\"{archived}\"");
+        type Mutation<'a> = (&'a str, Box<dyn Fn(&McStore)>);
+        let mutations: [Mutation<'_>; 3] = [
+            (
+                "rule one corrected",
+                Box::new(move |s: &McStore| {
+                    s.update_memory_content("git:proj", updated, "rule one corrected", None, 1)
+                        .unwrap()
+                        .unwrap();
+                }),
+            ),
+            (
+                archived_marker.as_str(),
+                Box::new(move |s: &McStore| {
+                    s.archive_memories("git:proj", &[archived], None, 2)
+                        .unwrap()
+                        .unwrap();
+                }),
+            ),
+            (
+                "rules three and four",
+                Box::new(move |s: &McStore| {
+                    s.merge_memories(
+                        "git:proj",
+                        merge_target,
+                        &[merge_source],
+                        "rules three and four",
+                        3,
+                    )
+                    .unwrap()
+                    .unwrap();
+                }),
+            ),
+        ];
+        for (marker, mutate) in mutations {
+            mutate(&s);
+            let soft = transform(&s, &execute_req, &ctx).unwrap();
+            assert_eq!(soft.action, "SOFT", "{marker}");
+            let m1 = m1_bytes(&soft);
+            assert!(m1.contains("<memory-updates>"), "{marker}: {m1}");
+            assert!(m1.contains(marker), "{marker}: {m1}");
+            let served = serde_json::to_vec(&soft.ck_messages).unwrap();
+            for _ in 0..3 {
+                let deferred = transform(&s, &defer_req, &ctx).unwrap();
+                assert_eq!(deferred.action, "SOFT+", "{marker}");
+                assert_eq!(
+                    serde_json::to_vec(&deferred.ck_messages).unwrap(),
+                    served,
+                    "{marker}: a defer replays the served bytes"
+                );
+            }
         }
-        drop(s);
-        let reopened = store(dir.path());
-        assert_eq!(
-            reopened
-                .get_memory_full(pending)
-                .unwrap()
-                .unwrap()
-                .host_row_id,
-            Some(902)
-        );
-        let pass = transform(&reopened, &request, &ctx).unwrap();
-        assert_ne!(pass.action, "HARD");
-        assert_eq!(m0_bytes(&pass), frozen);
     }
 
     #[test]
-    fn project_memory_epoch_from_state_sync_is_an_eager_hard_input() {
+    fn project_memory_epoch_in_context_db_is_an_eager_hard_input() {
+        // An identity or workspace writer bumps project_state.project_memory_epoch in
+        // context.db. The next pass must rebuild m0 (a HARD naming the epoch), and the pass
+        // after it must not repeat the HARD.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
         let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
         assert_eq!(run(&s, &request, &spine()).action, "HARD");
-        let loaded = s.load("ses").unwrap();
-        s.apply_authority_state_sync(ModuleStateSyncRequest {
-            session_id: "ses",
-            project_path: "git:proj",
-            shadow_generation: loaded.meta.shadow_generation,
-            expected_shadow_seq: loaded.meta.shadow_seq,
-            seed_boundary_id: None,
-            drop_seeds: &[],
-            drop_seed_skipped: 0,
-            strip_seeds: &[],
-            strip_seed_skipped: 0,
-            reasoning_cleared_through_tag: None,
-            compartments: &[],
-            memories: &[],
-            memory_mutations: &[],
-            user_profile: &[],
-            user_profile_present: true,
-            workspace: None,
-            workspace_present: true,
-            last_todo_state: None,
-            project_memory_epoch: Some(7),
-            user_profile_version: None,
-            pending_agent_drops: &[],
-            pending_agent_drops_skipped: 0,
-            user_hint_seeds: &[],
-            auto_search_hint_skipped: 0,
-            note_nudge_anchors: None,
-            todo_synthetic_anchor: None,
-            todo_synthetic_anchor_present: false,
-            emergency_latches: None,
-            pending_compaction_marker: None,
-            deferred_execute_state: None,
-            channel2_nudge_state: None,
-            acked_watermarks: serde_json::Value::Null,
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+
+        s.set_project_memory_epoch_for_test("git:proj", 7).unwrap();
+        let after_epoch = run(&s, &request, &spine());
+        assert_eq!(after_epoch.action, "HARD");
+        assert_eq!(
+            after_epoch.materialize_reason.as_deref(),
+            Some("project_memory_epoch")
+        );
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+    }
+
+    #[test]
+    fn an_in_place_compartment_rewrite_by_another_writer_is_an_eager_hard_input() {
+        // A TypeScript recomp rewrites a session's compartments in place and appends an
+        // m0_mutation_log row; the highest compartment sequence does not move. The next
+        // module pass must still rebuild m0.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
+        assert_eq!(run(&s, &request, &spine()).action, "HARD");
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+
+        s.with_context_conn_for_test(|tx| {
+            tx.execute(
+                "UPDATE compartments SET content = 'REWRITTEN', p1 = 'REWRITTEN'
+                  WHERE session_id = 'ses'",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO m0_mutation_log (session_id, mutation_type, target_id, queued_at)
+                 VALUES ('ses', 'recomp_boundary_change', NULL, 1)",
+                [],
+            )?;
+            Ok(())
         })
         .unwrap();
-        assert!(s.load("ses").unwrap().meta.project_memory_epoch_pending);
-        assert_eq!(run(&s, &request, &spine()).action, "HARD");
-        assert!(!s.load("ses").unwrap().meta.project_memory_epoch_pending);
+        let after_rewrite = run(&s, &request, &spine());
+        assert_eq!(after_rewrite.action, "HARD");
+        assert_eq!(
+            after_rewrite.materialize_reason.as_deref(),
+            Some("compartment_history_revision")
+        );
+    }
+
+    #[test]
+    fn same_length_sql_repair_without_mutation_log_reloads_the_next_managed_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
+        let first = run(&s, &request, &spine());
+        assert!(m0_bytes(&first).contains("SUMMARY"));
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+        let before = s.load("ses").unwrap();
+        let writer = rusqlite::Connection::open(dir.path().join("context.db")).unwrap();
+        let head: i64 = writer
+            .query_row(
+                "SELECT COALESCE(MAX(id),0) FROM m0_mutation_log WHERE session_id='ses'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        writer
+            .execute_batch(
+                "UPDATE compartments SET content='CHANGED', p1='CHANGED' WHERE session_id='ses'",
+            )
+            .unwrap();
+        assert_eq!(
+            writer
+                .query_row(
+                    "SELECT COALESCE(MAX(id),0) FROM m0_mutation_log WHERE session_id='ses'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            head
+        );
+        let repaired = run(&s, &request, &spine());
+        assert_eq!(repaired.action, "HARD");
+        assert!(m0_bytes(&repaired).contains("CHANGED"));
+        assert!(!m0_bytes(&repaired).contains("SUMMARY"));
+        assert_eq!(
+            repaired.materialize_reason.as_deref(),
+            Some("compartment_history_revision")
+        );
+        let after = s.load("ses").unwrap();
+        let mut alternative_meta = before.meta;
+        // Reproduce the old generic label while keeping the same stale aggregate
+        // revision and input snapshot. Only diagnostic history tracking differs.
+        alternative_meta.m1_history_revision = after.meta.m1_history_revision;
+
+        s.commit_transform(
+            "ses",
+            TransformCommit {
+                expected: after.row_version,
+                core: &before.core,
+                meta: &alternative_meta,
+                sections: mc_store::SectionsCommit::default(),
+                consumed_drop_ids: &[],
+                first_applied_command_ids: &[],
+                memory_revision: None,
+                compartment_max_seq: None,
+                project_root: None,
+                first_divergence: None,
+                scheduler_observation: None,
+                scheduler_request_observed_at_ms: None,
+                scheduler_full_array_fingerprint: None,
+                scheduler_eligible_supersession_count: None,
+                scheduler_withheld_by_tag_window: None,
+                scheduler_withheld_by_exempt_message: None,
+                scheduler_applied_supersession_count: None,
+                scheduler_applied_reductions: false,
+                overlays: TransformOverlayBatch::default(),
+            },
+        )
+        .unwrap();
+        let generic = run(&s, &request, &spine());
+        assert_eq!(generic.action, "HARD");
+        assert_eq!(
+            generic.materialize_reason.as_deref(),
+            Some("project_memory_epoch")
+        );
+        assert_eq!(
+            serde_json::to_vec(repaired.messages()).unwrap(),
+            serde_json::to_vec(generic.messages()).unwrap(),
+            "reason labels must not change served bytes"
+        );
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
     }
 
     #[test]
@@ -22069,6 +23679,7 @@ pub(crate) mod tests {
             r#"[{"content":"State sync todo","status":"in_progress","priority":"high"}]"#;
         let loaded = s.load("todo-sync").unwrap();
         s.apply_authority_state_sync(ModuleStateSyncRequest {
+            resolved_compartment_boundaries: &[],
             session_id: "todo-sync",
             project_path: "git:proj",
             shadow_generation: loaded.meta.shadow_generation,
@@ -22079,16 +23690,7 @@ pub(crate) mod tests {
             strip_seeds: &[],
             strip_seed_skipped: 0,
             reasoning_cleared_through_tag: None,
-            compartments: &[],
-            memories: &[],
-            memory_mutations: &[],
-            user_profile: &[],
-            user_profile_present: false,
-            workspace: None,
-            workspace_present: false,
             last_todo_state: Some(state_json.to_string()),
-            project_memory_epoch: None,
-            user_profile_version: None,
             pending_agent_drops: &[],
             pending_agent_drops_skipped: 0,
             user_hint_seeds: &[],
@@ -26417,6 +28019,171 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn marker_only_final_assistant_freezes_on_bust_and_replays_after_append() {
+        for (provider, sentinel) in [("anthropic", ""), ("openai-compatible", "[dropped]")] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let session = format!("marker-only-{provider}");
+            let user = wire_item("user", "user", 1, &["continue"]);
+            let mut assistant = wire_item("assistant", "last", 2, &["§672§ [dropped §672§]"]);
+            assistant
+                .ck
+                .content
+                .push(CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "[cleared]".into(),
+                    signature: None,
+                }));
+            let mut request = req(&session, "cfg0", vec![user, assistant]);
+            request.provider_id = Some(provider.into());
+            let first = run(&store, &request, &spine());
+            assert_eq!(first.action, "HARD");
+            assert_eq!(tail_bytes(&first, "last"), sentinel);
+            assert!(store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:last"));
+            let first_wire = serde_json::to_vec(first.ck_messages.as_ref().unwrap()).unwrap();
+            request
+                .messages
+                .push(wire_item("assistant", "new", 3, &["§655§ [cleared]"]));
+            let second = run(&store, &request, &spine());
+            assert_eq!(tail_bytes(&second, "last"), sentinel);
+            assert_eq!(
+                serde_json::to_vec(
+                    &second.ck_messages.as_ref().unwrap()
+                        [..first.ck_messages.as_ref().unwrap().len()]
+                )
+                .unwrap(),
+                first_wire,
+                "the shared prefix must remain byte-identical after append"
+            );
+            assert_eq!(tail_bytes(&second, "new"), "§655§ [cleared]");
+            assert!(!store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:new"));
+        }
+    }
+
+    #[test]
+    fn blank_only_final_assistant_uses_provider_sentinel_and_replays() {
+        for (provider, sentinel) in [("anthropic", ""), ("openai-compatible", "[dropped]")] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let session = format!("blank-only-{provider}");
+            let mut request = req(
+                &session,
+                "cfg0",
+                vec![
+                    wire_item("user", "user", 1, &["continue"]),
+                    wire_item("assistant", "last", 2, &[" \t"]),
+                ],
+            );
+            request.provider_id = Some(provider.into());
+            let first = run(&store, &request, &spine());
+            assert_eq!(tail_bytes(&first, "last"), sentinel);
+            assert!(store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:last"));
+            request
+                .messages
+                .push(wire_item("assistant", "new", 3, &["answer"]));
+            let second = run(&store, &request, &spine());
+            assert_eq!(tail_bytes(&second, "last"), sentinel);
+            assert_eq!(
+                serde_json::to_vec(
+                    &second.ck_messages.as_ref().unwrap()
+                        [..first.ck_messages.as_ref().unwrap().len()]
+                )
+                .unwrap(),
+                serde_json::to_vec(first.ck_messages.as_ref().unwrap()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn marker_only_parity_examples() {
+        let cases: Value =
+            serde_json::from_str(include_str!("../../../testdata/marker-only-parity.json"))
+                .unwrap();
+        for text in cases["positive"].as_array().unwrap() {
+            let text = text.as_str().unwrap();
+            assert!(is_dropped_placeholder_text(text), "positive: {text:?}");
+        }
+        for text in cases["negative"].as_array().unwrap() {
+            let text = text.as_str().unwrap();
+            if NON_ASCII_DIGIT_MARKERS.contains(&text) {
+                // Known divergence from TypeScript, pinned by
+                // marker_only_counts_non_ascii_digit_markers.
+                assert!(is_dropped_placeholder_text(text), "divergent: {text:?}");
+                continue;
+            }
+            assert!(!is_dropped_placeholder_text(text), "negative: {text:?}");
+        }
+        for parts in cases["positivePartCombinations"].as_array().unwrap() {
+            let blocks: Vec<_> = parts
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| {
+                    CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: part.as_str().unwrap().into(),
+                    })
+                })
+                .collect();
+            assert!(whole_marker_or_blank_message(&blocks), "parts: {parts:?}");
+        }
+    }
+
+    /// Marker-only shapes written with non-ASCII digits. The shared fixture lists
+    /// them as negatives because TypeScript's `\d` is ASCII; Rust's is Unicode.
+    const NON_ASCII_DIGIT_MARKERS: &[&str] =
+        &["\u{a7}\u{663}\u{a7}", "[dropped \u{a7}\u{663}\u{a7}]"];
+
+    #[test]
+    fn marker_only_counts_non_ascii_digit_markers() {
+        // Pins the served-byte behaviour: this check runs on every pass, so making
+        // it ASCII-only changes which reasoning block is kept and which message is
+        // replay-exempt mid-session. Change it only together with a
+        // TAGGER_FEATURE_EPOCH bump.
+        for text in NON_ASCII_DIGIT_MARKERS {
+            assert!(is_dropped_placeholder_text(text), "{text:?}");
+        }
+        assert!(is_dropped_placeholder_text("\u{a7}\u{663}\u{a7} [cleared]"));
+        assert!(!is_dropped_placeholder_text("\u{a7}\u{663}\u{a7} prose"));
+    }
+
+    #[test]
+    fn marker_only_text_and_reasoning_blocks_are_complete_markers() {
+        for kind in [
+            ck_wire::CkKind::Text {
+                text: "§672§ [dropped §672§]".into(),
+            },
+            ck_wire::CkKind::Reasoning {
+                text: "[cleared]".into(),
+                signature: None,
+            },
+        ] {
+            assert!(is_dropped_placeholder_block(&CkWireBlock::bare(kind)));
+        }
+        assert!(!is_dropped_placeholder_block(&CkWireBlock::bare(
+            ck_wire::CkKind::Text {
+                text: "see [dropped §3§] above".into(),
+            }
+        )));
+    }
+
+    #[test]
     fn dropped_assistant_shell_does_not_steal_signed_reasoning_exemption() {
         let signed = CkWireMessage::from_parts(
             "assistant",
@@ -27575,6 +29342,7 @@ pub(crate) mod tests {
             if !interleaved.replace(true) {
                 store
                     .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                        harness: None,
                         session_id: "astro-publish-race",
                         expected_row_version: Some(publish_row_version),
                         expected_revert_epoch: loaded.meta.revert_epoch,
@@ -27681,6 +29449,7 @@ pub(crate) mod tests {
             hook_ran_for_publish.store(true, Ordering::SeqCst);
             store
                 .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                    harness: None,
                     session_id: "astro-torn-read",
                     expected_row_version: Some(publish_row_version),
                     expected_revert_epoch,
@@ -27723,6 +29492,7 @@ pub(crate) mod tests {
         let before = M1RevisionSignal {
             revision: 0xfeed,
             external_revision: 0xbeef,
+            history_revision: 0,
             max_compartment_seq: 47,
             max_memory_id: 9,
             max_memory_mutation_id: 3,
@@ -28531,75 +30301,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stale_full_state_sync_cannot_rewind_a_committed_divergence_recut() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let request = seed_astro_divergence(&store, "astro-stale-state-sync", 2_402);
-        let recut = run(&store, &request, &spine());
-        assert_eq!(recut.action, "HARD");
-        let recut_bytes = serde_json::to_vec(&recut.ck_messages).unwrap();
-        let after_recut = store.load("astro-stale-state-sync").unwrap();
-        let compartments_after_recut = store.load_compartments("astro-stale-state-sync").unwrap();
-        let mut stale_compartments = astro_compartments()[..2].to_vec();
-        for compartment in &mut stale_compartments {
-            compartment.content = format!("STALE-TS-{}", compartment.sequence);
-            compartment.p1 = Some(compartment.content.clone());
-        }
-
-        store
-            .apply_authority_state_sync(ModuleStateSyncRequest {
-                session_id: "astro-stale-state-sync",
-                project_path: "git:proj",
-                shadow_generation: after_recut.meta.shadow_generation,
-                expected_shadow_seq: after_recut.meta.shadow_seq,
-                seed_boundary_id: Some("m425#0"),
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &stale_compartments,
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: true,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                acked_watermarks: Value::Null,
-            })
-            .unwrap();
-
-        let after_sync = store.load("astro-stale-state-sync").unwrap();
-        assert_eq!(after_sync.meta.coverage_ordinal, Some(2_400));
-        assert_eq!(after_sync.meta.folded_compartment_seq, 47);
-        assert_eq!(after_sync.core.boundary_id, "m2400#0");
-        assert_eq!(
-            store.load_compartments("astro-stale-state-sync").unwrap(),
-            compartments_after_recut
-        );
-        let deferred = run(&store, &request, &spine());
-        assert_eq!(deferred.action, "SOFT+");
-        assert_eq!(
-            serde_json::to_vec(&deferred.ck_messages).unwrap(),
-            recut_bytes
-        );
-    }
-
-    #[test]
     fn fired_divergence_with_absent_new_anchor_fails_loud_without_commit() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -28660,6 +30361,174 @@ pub(crate) mod tests {
             matches!(err, TransformError::CoverageGap(_)),
             "a leading gap must fail loud, not silently drop the early live item: {err:?}"
         );
+    }
+
+    #[test]
+    fn synthetic_reclassification_probe_never_reads_full_tag_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = active_opencode_req("probe", "cfg0", vec![item("plain", 1, "plain")]);
+        s.reset_tag_payload_query_count_for_test();
+        assert!(previously_tagged_synthetic_rows(&s, &request)
+            .unwrap()
+            .is_none());
+        assert_eq!(s.tag_payload_query_count_for_test(), 0);
+        request.messages[0].ck.meta.synthetic = true;
+        assert!(previously_tagged_synthetic_rows(&s, &request)
+            .unwrap()
+            .is_none());
+        assert_eq!(s.tag_payload_query_count_for_test(), 0);
+    }
+
+    #[test]
+    fn previously_tagged_synthetic_notice_keeps_priced_prefix_on_append_defer() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut messages = vec![
+            item("first", 1, "first user"),
+            item("notice", 2, "synthetic notice"),
+            item("answer", 3, "signed thinking follows"),
+        ];
+        let mut request = active_opencode_req("synthetic-defer", "cfg0", messages.clone());
+        let priced = run(&s, &request, &spine());
+        assert_eq!(priced.action, "HARD");
+        let priced_prefix = priced.messages().to_vec();
+        assert!(serde_json::to_string(&priced_prefix).unwrap().contains("§"));
+
+        messages[1].ck.meta.synthetic = true;
+        messages.push(item("next", 4, "appended user"));
+        request.messages = messages;
+        let defer = run(&s, &request, &spine());
+        assert_eq!(defer.action, "SOFT+");
+        let shared_ck = &defer.messages()[..priced_prefix.len()];
+        assert_eq!(
+            serde_json::to_vec(shared_ck).unwrap(),
+            serde_json::to_vec(&priced_prefix).unwrap(),
+            "an appended defer must not change previously served CK bytes"
+        );
+        let native = |rows: &[ServedMessage]| {
+            let owned = rows
+                .iter()
+                .map(|row| row.deref().clone())
+                .collect::<Vec<_>>();
+            crate::codec::encode_opencode_with_session(
+                &owned,
+                &crate::codec::DecodeSidecar::new("opencode"),
+                Some("synthetic-defer"),
+                None,
+            )
+        };
+        assert_eq!(
+            serde_json::to_vec(&native(shared_ck)).unwrap(),
+            serde_json::to_vec(&native(&priced_prefix)).unwrap(),
+            "an appended defer must not change previously served native bytes"
+        );
+
+        let mut bust_request = request;
+        bust_request.render_config = "cfg1".to_string();
+        let busted = run(&s, &bust_request, &spine());
+        assert_eq!(busted.action, "HARD");
+        let notice = busted
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("notice"))
+            .unwrap();
+        assert!(notice.meta.synthetic);
+        assert!(!serde_json::to_string(notice).unwrap().contains("§2§"));
+        let busted_prefix = busted.messages().to_vec();
+        let durable = s.load("synthetic-defer").unwrap();
+        assert!(durable.meta.reclassified_synthetic_mids.contains("notice"));
+        assert!(s
+            .load_tags_for_session("synthetic-defer")
+            .unwrap()
+            .iter()
+            .any(|row| row.block_id == "notice#0"));
+        bust_request
+            .messages
+            .push(item("later", 5, "second appended user"));
+        let after_bust = run(&s, &bust_request, &spine());
+        assert_eq!(after_bust.action, "SOFT+");
+        let shared_after_bust = &after_bust.messages()[..busted_prefix.len()];
+        assert_eq!(
+            serde_json::to_vec(shared_after_bust).unwrap(),
+            serde_json::to_vec(&busted_prefix).unwrap(),
+            "the first defer after the bust must preserve the corrected CK prefix"
+        );
+        assert_eq!(
+            serde_json::to_vec(&native(shared_after_bust)).unwrap(),
+            serde_json::to_vec(&native(&busted_prefix)).unwrap(),
+            "the first defer after the bust must preserve corrected native bytes"
+        );
+        assert_eq!(
+            s.load("synthetic-defer")
+                .unwrap()
+                .meta
+                .reclassified_synthetic_mids,
+            durable.meta.reclassified_synthetic_mids
+        );
+    }
+
+    #[test]
+    fn tagged_marker_gap_heals_on_hard_without_replaying_legacy_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut messages = vec![
+            item("m1", 1, "covered one"),
+            item("notice", 2, "synthetic notice"),
+            item("m3", 3, "covered three"),
+            item("tail", 4, "signed thinking follows"),
+        ];
+        let request = active_opencode_req("ses", "cfg0", messages.clone());
+        let priced = run(&s, &request, &spine());
+        assert_eq!(priced.action, "HARD");
+        assert!(s
+            .load_tags_for_session("ses")
+            .unwrap()
+            .iter()
+            .any(|row| row.block_id == "notice#0"));
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 1, "m1", "S1"), comp(2, 3, 3, "m3", "S2")],
+        )
+        .unwrap();
+        messages[1].ck.meta.synthetic = true;
+        let healed = run(&s, &active_opencode_req("ses", "cfg0", messages), &spine());
+        assert_eq!(healed.action, "HARD");
+        assert!(
+            healed.first_divergence.is_some(),
+            "the coverage fold must price a prefix bust"
+        );
+        assert_eq!(healed.coverage_ordinal, Some(3));
+        assert!(healed
+            .messages()
+            .iter()
+            .all(|message| message.meta.harness_id.as_deref() != Some("notice")));
+    }
+
+    #[test]
+    fn synthetic_row_between_compartments_does_not_create_a_live_coverage_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 1, "m1", "S1"), comp(2, 3, 3, "m3", "S2")],
+        )
+        .unwrap();
+        let mut notice = item("notice", 2, "synthetic notice");
+        notice.ck.meta.synthetic = true;
+        let messages = vec![
+            item("m1", 1, "covered one"),
+            notice,
+            item("m3", 3, "covered three"),
+            item("tail", 4, "tail"),
+        ];
+        let result = transform(
+            &s,
+            &req("ses", "cfg0", messages),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(result.action, "HARD");
     }
 
     #[test]
@@ -28797,6 +30666,209 @@ pub(crate) mod tests {
         }
     }
 
+    /// Overwrite the bytes of one stored frozen chunk, as disk corruption or a stray writer
+    /// would, without touching the digest the last codec commit recorded for it.
+    fn corrupt_frozen_chunk(dir: &std::path::Path, session: &str) {
+        let conn = rusqlite::Connection::open(dir.join("store.db")).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE mc_cache_frozen_chunks SET body = json_set(body, '$[0].reset_rule', 'x')
+                  WHERE session_id = ?1 AND chunk = 0",
+                [session],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the session has a first chunk to corrupt");
+    }
+
+    #[test]
+    fn corrupt_chunk_forces_hard_and_full_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let items = || vec![item("m1msg", 1, "raw"), item("t2", 2, "tail2")];
+        let bootstrap = run(&s, &req("ses", "cfg0", items()), &spine());
+        let stable = run(&s, &req("ses", "cfg0", items()), &spine());
+        assert_eq!(stable.action, "SOFT+");
+        let clean_units = s.load("ses").unwrap().core.frozen_units;
+        assert!(!clean_units.is_empty());
+
+        corrupt_frozen_chunk(dir.path(), "ses");
+        let rebuilt = run(&s, &req("ses", "cfg0", items()), &spine());
+        assert_eq!(
+            rebuilt.action, "HARD",
+            "a discarded section never serves a SOFT pass"
+        );
+        assert_eq!(
+            rebuilt.materialize_reason.as_deref(),
+            Some("cache_sections_discarded")
+        );
+        assert!(rebuilt.committed);
+        // The rebuilt frame is the one a clean build of the same messages serves.
+        assert_eq!(m0_bytes(&rebuilt), m0_bytes(&bootstrap));
+        assert_eq!(m1_bytes(&rebuilt), m1_bytes(&bootstrap));
+        assert_eq!(tail_ids(&rebuilt), tail_ids(&bootstrap));
+        // Every chunk was rewritten in full under fresh digests: the next load trusts it.
+        let reloaded = s.load("ses").unwrap();
+        assert!(!reloaded.sections.as_ref().unwrap().any_discarded());
+        assert_eq!(reloaded.core.frozen_units, clean_units);
+        let after = run(&s, &req("ses", "cfg0", items()), &spine());
+        assert_eq!(after.action, "SOFT+");
+    }
+
+    /// Subagent passes replace the classified plan with SOFT or DEFER, and they ignore
+    /// `force_hard`, so a discarded frozen list reaches HARD on a subagent only through the
+    /// explicit discard override. This pins that override.
+    ///
+    /// A subagent session holds no frozen units, so there is no chunk to corrupt. A stray
+    /// write to the frozen entry of `section_index` stands in for the corruption instead: its
+    /// digest no longer matches the (empty) stored chunks, and the load discards the list.
+    #[test]
+    fn subagent_discarded_frozen_list_forces_hard_and_full_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("sub", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let request = || {
+            let mut request = active_opencode_req(
+                "sub",
+                "cfg0",
+                vec![item("m1msg", 1, "raw"), item("t2", 2, "tail2")],
+            );
+            request.is_subagent = true;
+            request
+        };
+        let first = run(&s, &request(), &spine());
+        assert_ne!(
+            first.action, "HARD",
+            "subagent passes do not go HARD on their own"
+        );
+        assert!(first.committed);
+
+        let conn = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE mc_cache_state
+                    SET section_index = json_set(section_index, '$.f.h', '00000000000000000000000000000000')
+                  WHERE session_id = 'sub'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        drop(conn);
+        assert!(
+            s.load("sub")
+                .unwrap()
+                .sections
+                .as_ref()
+                .unwrap()
+                .frozen
+                .discard_reason()
+                .is_some(),
+            "the edited frozen entry is discarded on load"
+        );
+
+        let rebuilt = run(&s, &request(), &spine());
+        assert_eq!(
+            rebuilt.action, "HARD",
+            "a discarded section never serves a subagent SOFT or DEFER pass"
+        );
+        assert_eq!(
+            rebuilt.materialize_reason.as_deref(),
+            Some("cache_sections_discarded")
+        );
+        assert!(rebuilt.committed);
+        // The commit rewrote the frozen entry under a fresh digest: the next load trusts it.
+        let reloaded = s.load("sub").unwrap();
+        assert!(!reloaded.sections.as_ref().unwrap().any_discarded());
+    }
+
+    /// Compaction-off sessions take their own additive pass. An empty (discarded) frozen list
+    /// on an initialized session is not a shape the classifier accepts, so this pins that the
+    /// pass rebuilds the list instead of rejecting every pass from then on.
+    #[test]
+    fn compaction_off_corrupt_chunk_rebuilds_with_hard_instead_of_rejecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = active_opencode_req(
+            "off-corrupt",
+            "cfg0",
+            vec![item("head", 1, "raw head"), item("tail", 2, "raw tail")],
+        );
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.compaction_enabled = false;
+
+        let bootstrap = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(bootstrap.action, "HARD");
+        assert!(bootstrap.committed);
+        let clean_units = s.load("off-corrupt").unwrap().core.frozen_units;
+        assert!(!clean_units.is_empty());
+
+        corrupt_frozen_chunk(dir.path(), "off-corrupt");
+        assert!(
+            s.load("off-corrupt")
+                .unwrap()
+                .sections
+                .as_ref()
+                .unwrap()
+                .frozen
+                .discard_reason()
+                .is_some(),
+            "the corrupted chunk is discarded on load"
+        );
+
+        ctx.now_ms = 20;
+        let rebuilt = transform(&s, &request, &ctx)
+            .expect("a discarded frozen list rebuilds instead of rejecting the pass");
+        assert_eq!(rebuilt.action, "HARD");
+        assert_eq!(
+            rebuilt.materialize_reason.as_deref(),
+            Some("cache_sections_discarded")
+        );
+        assert!(rebuilt.committed);
+        assert_eq!(
+            serde_json::to_vec(rebuilt.messages()).unwrap(),
+            serde_json::to_vec(bootstrap.messages()).unwrap(),
+            "the rebuilt frame is the one the clean bootstrap served"
+        );
+
+        // The commit rewrote the chunks under fresh digests, so the next load trusts them.
+        let reloaded = s.load("off-corrupt").unwrap();
+        let sections = reloaded.sections.as_ref().unwrap();
+        assert!(sections.frozen.intact().is_some());
+        assert!(!sections.any_discarded());
+        assert_eq!(reloaded.core.frozen_units, clean_units);
+
+        ctx.now_ms = 30;
+        let after = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(after.action, "SOFT+");
+    }
+
+    #[test]
+    fn a_new_message_pass_runs_exactly_one_full_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        let mut items = vec![item("m1msg", 1, "raw")];
+        for n in 2..=4u64 {
+            items.push(item(&format!("t{n}"), n, &format!("tail{n}")));
+            let before = mc_store::cache_codec::full_decode_count();
+            let response = run(&s, &req("ses", "cfg0", items.clone()), &spine());
+            assert!(response.committed);
+            assert_eq!(
+                mc_store::cache_codec::full_decode_count() - before,
+                1,
+                "pass {n}: the transform snapshot is the pass's only full decode"
+            );
+        }
+    }
+
     #[test]
     fn public_memory_update_rides_soft_not_hard() {
         let dir = tempfile::tempdir().unwrap();
@@ -28804,7 +30876,6 @@ pub(crate) mod tests {
         let memory_id = s
             .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", memory_id);
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
             .unwrap();
         let before = run(
@@ -28870,74 +30941,6 @@ pub(crate) mod tests {
             "{}",
             m1_bytes(&soft)
         );
-    }
-
-    /// Boot a session on `profile`, then insert a memory whose host mirror id differs from its
-    /// module id. Returns the boot response, the defer that follows the insert, and the SOFT
-    /// that an explicit refresh opens afterwards.
-    fn new_memory_passes_with_distinct_host_id(
-        profile: SerializerProfile,
-    ) -> (TransformResponse, TransformResponse, TransformResponse) {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
-            .unwrap();
-        let request = profile_req(profile, "ses", "cfg0", vec![item("m1msg", 1, "raw")]);
-        let boot = run(&s, &request, &spine());
-        assert_eq!(boot.action, "HARD");
-
-        let module_id = s
-            .insert_memory(memory_input(
-                "git:proj",
-                "ARCHITECTURE",
-                "a durable rule",
-                1,
-            ))
-            .unwrap();
-        assert_eq!(module_id, 1);
-        s.acknowledge_host_memory_ids(
-            "git:proj",
-            &[mc_store::HostMemoryIdentityAck {
-                module_row_id: module_id,
-                host_row_id: 901,
-            }],
-        )
-        .unwrap();
-
-        let deferred = run(&s, &request, &spine());
-        s.arm_soft_refresh("ses").unwrap();
-        let soft = run(&s, &request, &spine());
-        (boot, deferred, soft)
-    }
-
-    #[test]
-    fn host_backed_m1_new_memories_render_host_ids_and_ride_the_next_bust() {
-        let (boot, deferred, soft) =
-            new_memory_passes_with_distinct_host_id(SerializerProfile::OpencodeAiSdk);
-        // A pending memory changes nothing on its own: the defer replays the frozen bytes.
-        assert_eq!(deferred.action, "SOFT+");
-        assert_eq!(
-            serde_json::to_string(deferred.messages()).unwrap(),
-            serde_json::to_string(boot.messages()).unwrap()
-        );
-        assert_eq!(soft.action, "SOFT");
-        let m1 = m1_bytes(&soft);
-        assert!(m1.contains("<new-memories>"), "{m1}");
-        assert!(
-            m1.contains("#901: a durable rule"),
-            "OpenCode m1 must render the host id, as m0 does: {m1}"
-        );
-        assert!(!m1.contains("#1: a durable rule"), "{m1}");
-    }
-
-    #[test]
-    fn claude_code_m1_new_memories_keep_module_ids() {
-        let (_, _, soft) =
-            new_memory_passes_with_distinct_host_id(SerializerProfile::ClaudeCodeAnthropic);
-        assert_eq!(soft.action, "SOFT");
-        let m1 = m1_bytes(&soft);
-        assert!(m1.contains("#1: a durable rule"), "{m1}");
-        assert!(!m1.contains("#901"), "{m1}");
     }
 
     #[test]
@@ -29073,7 +31076,6 @@ pub(crate) mod tests {
         // a memory is in the m0 baseline (seeded before bootstrap → in the manifest)
         s.seed_memory(5, "git:proj", "ARCHITECTURE", "original", 70)
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", 5);
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
             .unwrap();
         let before = run(
@@ -30423,7 +32425,6 @@ pub(crate) mod tests {
                     70,
                 )
                 .unwrap();
-                acknowledge_test_host_memory(s, "git:proj", id);
             })
             .collect()
     }
@@ -30538,7 +32539,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn opencode_tagging_surface_leaves_whitespace_only_assistant_framing_inert() {
+    fn opencode_tagging_surface_neutralizes_whitespace_only_assistant_without_tagging() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let request = active_opencode_req(
@@ -30549,7 +32550,7 @@ pub(crate) mod tests {
 
         let response = run(&s, &request, &spine());
 
-        assert_eq!(tail_bytes(&response, "blank-assistant"), "  \n\t");
+        assert_eq!(tail_bytes(&response, "blank-assistant"), "[dropped]");
         assert!(s
             .load_tags_for_session("opencode-whitespace-framing")
             .unwrap()
@@ -31044,6 +33045,7 @@ pub(crate) mod tests {
                 expected: seeded.row_version,
                 core: &seeded.core,
                 meta: &seeded.meta,
+                sections: mc_store::SectionsCommit::default(),
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
                 memory_revision: None,
@@ -31839,7 +33841,7 @@ pub(crate) mod tests {
             note_session_id: None,
             source_project_path: None,
         }];
-        let singular = render_user_hint(&single).unwrap();
+        let singular = render_user_hint(&single, true).unwrap();
         assert!(singular.contains("Your memory may contain 1 related fragment:"));
 
         let results = (1..=4)
@@ -31861,7 +33863,7 @@ pub(crate) mod tests {
                 source_project_path: None,
             })
             .collect::<Vec<_>>();
-        let hint = render_user_hint(&results).unwrap();
+        let hint = render_user_hint(&results, true).unwrap();
         let bullets = hint
             .lines()
             .filter(|line| line.starts_with("- "))
@@ -31872,59 +33874,62 @@ pub(crate) mod tests {
         assert!(hint.contains("If the fragments above seem relevant to the current request"));
         assert!(hint.chars().count() <= USER_HINT_TOTAL_CHAR_CAP + 2);
 
-        let golden = render_user_hint(&[
-            crate::memory_tool::MemorySearchResult {
-                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                id: 1,
-                snippet: "alpha".to_string(),
-                category: None,
-                sequence: None,
-                title: None,
-                note_status: None,
-                surface_condition: None,
-                score_hundredths: 100,
-                start_ordinal: None,
-                end_ordinal: None,
-                note_created_at_ms: None,
-                note_anchor_ordinal: None,
-                note_session_id: None,
-                source_project_path: None,
-            },
-            crate::memory_tool::MemorySearchResult {
-                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                id: 2,
-                snippet: "beta".to_string(),
-                category: None,
-                sequence: None,
-                title: None,
-                note_status: None,
-                surface_condition: None,
-                score_hundredths: 100,
-                start_ordinal: None,
-                end_ordinal: None,
-                note_created_at_ms: None,
-                note_anchor_ordinal: None,
-                note_session_id: None,
-                source_project_path: None,
-            },
-            crate::memory_tool::MemorySearchResult {
-                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                id: 3,
-                snippet: "gamma".to_string(),
-                category: None,
-                sequence: None,
-                title: None,
-                note_status: None,
-                surface_condition: None,
-                score_hundredths: 100,
-                start_ordinal: None,
-                end_ordinal: None,
-                note_created_at_ms: None,
-                note_anchor_ordinal: None,
-                note_session_id: None,
-                source_project_path: None,
-            },
-        ])
+        let golden = render_user_hint(
+            &[
+                crate::memory_tool::MemorySearchResult {
+                    source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                    id: 1,
+                    snippet: "alpha".to_string(),
+                    category: None,
+                    sequence: None,
+                    title: None,
+                    note_status: None,
+                    surface_condition: None,
+                    score_hundredths: 100,
+                    start_ordinal: None,
+                    end_ordinal: None,
+                    note_created_at_ms: None,
+                    note_anchor_ordinal: None,
+                    note_session_id: None,
+                    source_project_path: None,
+                },
+                crate::memory_tool::MemorySearchResult {
+                    source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                    id: 2,
+                    snippet: "beta".to_string(),
+                    category: None,
+                    sequence: None,
+                    title: None,
+                    note_status: None,
+                    surface_condition: None,
+                    score_hundredths: 100,
+                    start_ordinal: None,
+                    end_ordinal: None,
+                    note_created_at_ms: None,
+                    note_anchor_ordinal: None,
+                    note_session_id: None,
+                    source_project_path: None,
+                },
+                crate::memory_tool::MemorySearchResult {
+                    source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                    id: 3,
+                    snippet: "gamma".to_string(),
+                    category: None,
+                    sequence: None,
+                    title: None,
+                    note_status: None,
+                    surface_condition: None,
+                    score_hundredths: 100,
+                    start_ordinal: None,
+                    end_ordinal: None,
+                    note_created_at_ms: None,
+                    note_anchor_ordinal: None,
+                    note_session_id: None,
+                    source_project_path: None,
+                },
+            ],
+            true,
+        )
         .unwrap();
         assert_eq!(
             golden,
@@ -32657,6 +34662,59 @@ pub(crate) mod tests {
         });
     }
 
+    /// A document's words are all searchable, whatever their place in the alphabet, and a
+    /// long prompt keeps the terms that tell candidates apart.
+    #[test]
+    fn lexical_hint_matches_late_alphabet_words_of_long_documents_and_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // More than the cap of distinct words, with the discriminating one late in the
+        // alphabet: it used to fall outside the alphabetically first 24.
+        let long_memory = "amber apple banana cherry alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo \
+             lima mike november oscar papa quebec romeo sierra tango uniform victor \
+             whiskey xray yankee zulu tokenizer parity suite";
+        s.seed_memory(1, "git:proj", "CONSTRAINTS", long_memory, 50)
+            .unwrap();
+        for id in 2..=10 {
+            s.seed_memory(
+                id,
+                "git:proj",
+                "CONSTRAINTS",
+                &format!("fixture memory {id} about ordinary unrelated material"),
+                50,
+            )
+            .unwrap();
+        }
+        let hit = run_user_hint_lexical_search(
+            &s,
+            "git:proj",
+            "lexical",
+            "tokenizer parity",
+            true,
+            DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(hit.first().map(|result| result.id), Some(1));
+
+        // A prompt with more than the cap of distinct words keeps the terms the pool
+        // contains, however late they sort or appear.
+        let mut prompt_terms = (0..30).map(|n| format!("filler{n:02}")).collect::<Vec<_>>();
+        prompt_terms.push("tokenizer".to_string());
+        prompt_terms.push("parity".to_string());
+        let frequency = HashMap::from([
+            ("tokenizer".to_string(), 1usize),
+            ("parity".to_string(), 1usize),
+        ]);
+        let kept = select_query_tokens(prompt_terms, &frequency);
+        assert_eq!(kept.len(), USER_HINT_TOKEN_CAP);
+        assert!(
+            kept.contains("tokenizer") && kept.contains("parity"),
+            "{kept:?}"
+        );
+        assert!(kept.contains("filler00") && !kept.contains("filler29"));
+    }
+
     #[test]
     fn lexical_hint_scoring_requires_two_specific_tokens() {
         let dir = tempfile::tempdir().unwrap();
@@ -32945,7 +35003,7 @@ pub(crate) mod tests {
                     .find(|block| block.id == row.block_id)
                     .unwrap();
                 let (_, source) = taggable_source(block).expect("minted tags must be overlayable");
-                assert_eq!(row.source_bytes, source.as_bytes());
+                assert_eq!(&*row.source_bytes, source.as_bytes());
             }
             assert_eq!(tail_bytes(&response, "m1"), "§1§   user §7§");
             assert_eq!(tail_bytes(&response, "text"), "§2§   text output");
@@ -33256,7 +35314,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let cached = load_cached_tags(&store, session).unwrap();
-        assert_eq!(cached[0].source_bytes, b"old");
+        assert_eq!(&*cached[0].source_bytes, b"old");
         let before = store.tag_cache_summary(session).unwrap();
 
         // This bypasses transform commits, so only the SQLite mutation trigger can invalidate
@@ -33273,7 +35331,7 @@ pub(crate) mod tests {
         assert_ne!(after.generation, before.generation);
 
         let refilled = load_cached_tags(&store, session).unwrap();
-        assert_eq!(refilled[0].source_bytes, b"poisoned");
+        assert_eq!(&*refilled[0].source_bytes, b"poisoned");
     }
 
     #[test]
@@ -33294,9 +35352,9 @@ pub(crate) mod tests {
         let b = load_cached_tags(&store, "tag-cache-b").unwrap();
         let a_second = load_cached_tags(&store, "tag-cache-a").unwrap();
         assert_eq!(a_first[0].block_id, "a#0");
-        assert_eq!(a_second[0].source_bytes, b"A");
+        assert_eq!(&*a_second[0].source_bytes, b"A");
         assert_eq!(b[0].block_id, "b#0");
-        assert_eq!(b[0].source_bytes, b"B");
+        assert_eq!(&*b[0].source_bytes, b"B");
     }
 
     #[test]
@@ -34471,6 +36529,7 @@ pub(crate) mod tests {
                     expected: loaded.row_version,
                     core: &loaded.core,
                     meta: &loaded.meta,
+                    sections: mc_store::SectionsCommit::default(),
                     consumed_drop_ids: &[pending[0].id],
                     first_applied_command_ids: &command_ids,
                     memory_revision: None,
@@ -34558,6 +36617,7 @@ pub(crate) mod tests {
                     expected: loaded.row_version,
                     core: &loaded.core,
                     meta: &loaded.meta,
+                    sections: mc_store::SectionsCommit::default(),
                     consumed_drop_ids: &[pending_a[0].id],
                     first_applied_command_ids: &command_a,
                     memory_revision: None,
@@ -34692,7 +36752,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 1_500,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             })
             .collect::<Vec<_>>();
         let window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -34712,7 +36772,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 1_000,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             })
             .collect::<Vec<_>>();
         let applying_window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -34939,7 +36999,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 4_000,
                 created_at_ms: 0,
-                source_bytes: b"old source".to_vec(),
+                source_bytes: b"old source".to_vec().into(),
             },
             McTagRow {
                 tag_number: 8,
@@ -34947,7 +37007,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 4_000,
                 created_at_ms: 0,
-                source_bytes: b"new source".to_vec(),
+                source_bytes: b"new source".to_vec().into(),
             },
         ];
         let window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -35482,6 +37542,89 @@ pub(crate) mod tests {
         assert!(!after.committed);
         assert_eq!(m1_bytes(&after), m1_bytes(&r));
         assert_eq!(tail_bytes(&after, "t2"), "[dropped 1]");
+    }
+
+    #[test]
+    fn a_ready_note_is_never_injected_and_defers_replay_while_it_stays_ready() {
+        // The module renders nothing for ready smart notes: not in m1, not in the tail,
+        // not as a reminder. The host's note nudger owns surfacing them. So a ready note
+        // must not appear in any served byte, a bust with the note ready must not change
+        // anything about it, and defers must replay the served bytes exactly while it
+        // stays ready.
+        const NOTE_TEXT: &str = "ready note the module must not inject";
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        let boot = transform(&s, &execute_req, &ctx).unwrap();
+        assert_eq!(boot.action, "HARD");
+
+        let note = s
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: Some("ses"),
+                content: NOTE_TEXT,
+                surface_condition: Some("condition true"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            s.write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: note.status_version,
+                verdict: true,
+                compiled_check: None,
+                manifest_json: None,
+                check_hash: None,
+                next_due_at: None,
+                now_ms: 2,
+            })
+            .unwrap(),
+            NoteCasOutcome::Applied(note) if note.status == "ready"
+        ));
+        let ready = s
+            .get_note_by_id("git:proj", "ses", note.id)
+            .unwrap()
+            .unwrap();
+
+        // A bust (explicit refresh) and a HARD (a new render config) with the note ready.
+        s.arm_soft_refresh("ses").unwrap();
+        let soft = transform(&s, &execute_req, &ctx).unwrap();
+        assert_eq!(soft.action, "SOFT");
+        let hard_req = with_usage(req("ses", "cfg1", vec![item("a", 1, "raw")]), 70, 100);
+        let hard = transform(&s, &hard_req, &ctx).unwrap();
+        assert_eq!(hard.action, "HARD");
+        let served = serde_json::to_vec(&hard.ck_messages).unwrap();
+        for response in [&boot, &soft, &hard] {
+            let bytes = serde_json::to_string(&response.ck_messages).unwrap();
+            assert!(!bytes.contains(NOTE_TEXT), "{}", response.action);
+        }
+
+        let defer_req = with_usage(req("ses", "cfg1", vec![item("a", 1, "raw")]), 10, 100);
+        for _ in 0..3 {
+            let deferred = transform(&s, &defer_req, &ctx).unwrap();
+            assert_eq!(deferred.action, "SOFT+");
+            assert_eq!(serde_json::to_vec(&deferred.ck_messages).unwrap(), served);
+        }
+        let after = s
+            .get_note_by_id("git:proj", "ses", note.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status, "ready",
+            "serving passes must not consume the note"
+        );
+        assert_eq!(after.status_version, ready.status_version);
     }
 
     #[test]
@@ -36443,6 +38586,7 @@ pub(crate) mod tests {
         }];
         store
             .apply_authority_state_sync(ModuleStateSyncRequest {
+                resolved_compartment_boundaries: &[],
                 session_id: "seeded-drops",
                 project_path: "git:proj",
                 shadow_generation: 0,
@@ -36453,16 +38597,7 @@ pub(crate) mod tests {
                 strip_seeds: &[],
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: true,
                 last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
                 pending_agent_drops: &[],
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
@@ -36551,7 +38686,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         }];
         let no_units = new_caveman_units(
             &CoreState::default(),
@@ -36564,6 +38699,7 @@ pub(crate) mod tests {
             None,
             false,
             1,
+            true,
         );
         assert!(no_units.is_empty(), "defer must not mint a cav unit");
 
@@ -36578,6 +38714,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
         );
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].key, "cav:m1#0");
@@ -36770,7 +38907,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         }];
         let units = new_caveman_units(
             &core,
@@ -36783,6 +38920,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
         );
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].reset_rule, "3");
@@ -36791,6 +38929,120 @@ pub(crate) mod tests {
             units[0].frozen_payload,
             crate::caveman::compress(&source, crate::caveman::CavemanLevel::Ultra)
         );
+    }
+
+    #[test]
+    fn caveman_english_word_rules_follow_the_shared_language_fixture() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../testdata/caveman-language-golden.json")).unwrap();
+        for language in golden["englishLanguages"].as_array().unwrap() {
+            assert!(
+                caveman_english_word_rules(language.as_str()),
+                "english: {language:?}"
+            );
+        }
+        for language in golden["nonEnglishLanguages"].as_array().unwrap() {
+            assert!(
+                !caveman_english_word_rules(language.as_str()),
+                "non-english: {language:?}"
+            );
+        }
+    }
+
+    /// Without the English word rules a new caveman unit carries only the language-neutral
+    /// output; English stays the default for every existing caller.
+    #[test]
+    fn caveman_units_without_english_word_rules_keep_the_words() {
+        let source = "Voy a revisar si quite la cache, y es muy importante. ".repeat(8);
+        let request = {
+            let mut value = req("caveman-language", "cfg", vec![item("m1", 1, &source)]);
+            value.caveman_enabled = true;
+            value.caveman_min_chars = 1;
+            value.protected_tags = 0;
+            value
+        };
+        let projection = project_messages(&request.messages).unwrap();
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .collect::<Vec<_>>();
+        let tags = vec![McTagRow {
+            tag_number: 1,
+            block_id: "m1#0".to_string(),
+            kind: "message".to_string(),
+            token_count: 10,
+            created_at_ms: 0,
+            source_bytes: source.as_bytes().to_vec().into(),
+        }];
+        let units = new_caveman_units(
+            &CoreState::default(),
+            &request,
+            CavemanTagState {
+                rows: &tags,
+                protection_cutoff: &protection_cutoff(None),
+            },
+            &live,
+            None,
+            true,
+            1,
+            false,
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].frozen_payload, source.trim());
+    }
+
+    /// A payload frozen under earlier caveman rules can be shorter than what the current rules
+    /// produce for a deeper tier. That must keep the frozen bytes and still advance depth instead
+    /// of panicking the transform.
+    #[test]
+    fn caveman_deeper_tier_longer_than_frozen_payload_keeps_frozen_bytes() {
+        let source =
+            "I just really wanted to basically explain the implementation clearly. ".repeat(8);
+        let request = {
+            let mut value = req("caveman-regrowth", "cfg", vec![item("m1", 1, &source)]);
+            value.caveman_enabled = true;
+            value.caveman_min_chars = 1;
+            value.protected_tags = 0;
+            value
+        };
+        let projection = project_messages(&request.messages).unwrap();
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .collect::<Vec<_>>();
+        let frozen = "older rules froze this shorter payload";
+        let ultra = crate::caveman::compress(&source, crate::caveman::CavemanLevel::Ultra);
+        assert!(ultra.len() > frozen.len());
+        let core = CoreState {
+            frozen_units: vec![caveman_unit("m1#0", 1, frozen)],
+            ..CoreState::default()
+        };
+        let tags = vec![McTagRow {
+            tag_number: 1,
+            block_id: "m1#0".to_string(),
+            kind: "message".to_string(),
+            token_count: 10,
+            created_at_ms: 0,
+            source_bytes: source.as_bytes().to_vec().into(),
+        }];
+        let units = new_caveman_units(
+            &core,
+            &request,
+            CavemanTagState {
+                rows: &tags,
+                protection_cutoff: &protection_cutoff(None),
+            },
+            &live,
+            None,
+            true,
+            1,
+            true,
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].reset_rule, "3");
+        assert_eq!(units[0].frozen_payload, frozen);
     }
 
     #[test]
@@ -36812,7 +39064,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         };
         assert!(new_caveman_units(
             &CoreState::default(),
@@ -36825,6 +39077,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
         )
         .is_empty());
 
@@ -36852,6 +39105,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
         )
         .is_empty());
 
@@ -36876,6 +39130,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
         )
         .is_empty());
     }
@@ -37164,8 +39419,13 @@ pub(crate) mod tests {
             importance: 50,
             ..Default::default()
         }];
+        // The seeded compartments are the host's rows in context.db.
+        store
+            .replace_compartments("seeded-trim", &compartments)
+            .unwrap();
         store
             .apply_authority_state_sync(ModuleStateSyncRequest {
+                resolved_compartment_boundaries: &[],
                 session_id: "seeded-trim",
                 project_path: "git:proj",
                 shadow_generation: 0,
@@ -37176,16 +39436,7 @@ pub(crate) mod tests {
                 strip_seeds: &[],
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
-                compartments: &compartments,
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: true,
                 last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
                 pending_agent_drops: &[],
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
@@ -38028,7 +40279,6 @@ pub(crate) mod tests {
         // keeps its real arguments, large is removed.
         s.seed_memory(1, "git:proj", "ARCHITECTURE", "a new architecture rule", 70)
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", 1);
         force_hard(&s);
         let hard = run(&s, &request, &spine());
         assert_eq!(hard.action, "HARD");
@@ -38560,6 +40810,7 @@ pub(crate) mod tests {
                 expected: poisoned.row_version,
                 core: &poisoned.core,
                 meta: &poisoned.meta,
+                sections: mc_store::SectionsCommit::default(),
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
                 memory_revision: None,
@@ -38710,6 +40961,7 @@ pub(crate) mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: true,
                 supersession_ride_available: false,
+                emergency_minimum_waived: false,
                 emergency_window_yields: false,
                 tag_window_protected_block_ids: HashSet::new(),
                 exempt_message_protected_block_ids: HashSet::new(),
@@ -38981,6 +41233,7 @@ pub(crate) mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: false,
                 supersession_ride_available: true,
+                emergency_minimum_waived: false,
                 emergency_window_yields: false,
                 tag_window_protected_block_ids: HashSet::new(),
                 exempt_message_protected_block_ids: HashSet::new(),
@@ -41510,5 +43763,63 @@ pub(crate) mod tests {
             channel2_directive_id("ses", 1),
             channel2_directive_id("other", 1)
         );
+    }
+}
+
+fn attach_user_answer_markers(items: &mut [SelItem], messages: &[CkIngressMessage]) {
+    let answer_ids: HashSet<String> = messages
+        .iter()
+        .flat_map(|message| {
+            message
+                .ck
+                .provider_extras
+                .values()
+                .filter_map(|extra| {
+                    extra
+                        .get("user_answer_block_indices")
+                        .and_then(Value::as_array)
+                })
+                .flatten()
+                .filter_map(Value::as_u64)
+                .map(|index| format!("{}#{}", message.mid, index))
+        })
+        .collect();
+    for item in items {
+        item.user_answer = answer_ids.contains(&item.id);
+    }
+}
+
+#[cfg(test)]
+mod user_answer_marker_tests {
+    use super::*;
+
+    #[test]
+    fn host_answer_sidecars_protect_selection_without_changing_block_bytes() {
+        let answered = serde_json::json!({ "info": { "id": "m", "role": "assistant" }, "parts": [{ "type": "tool", "tool": "renamed-question", "callID": "q", "state": { "status": "completed", "input": {}, "output": "answer", "metadata": { "answers": [["yes"]] } } }] });
+        let mut ordinary = answered.clone();
+        ordinary["parts"][0]["state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("metadata");
+        let decoded = crate::codec::opencode::decode_opencode(&[answered]);
+        let control = crate::codec::opencode::decode_opencode(&[ordinary]);
+        assert_eq!(
+            decoded.messages[0].ck.content,
+            control.messages[0].ck.content
+        );
+        let projection = crate::ck_wire::project_messages(&decoded.messages).unwrap();
+        let live: Vec<_> = projection.blocks.iter().collect();
+        let mut items = tail_sel_items(&live, None, &HashMap::new());
+        attach_user_answer_markers(&mut items, &decoded.messages);
+        assert!(items.iter().any(|item| item.user_answer));
+
+        let pi_entry = serde_json::json!({"type": "message", "id": "p", "message": {"role": "toolResult", "toolCallId": "q", "toolName": "ask", "content": [{"type": "text", "text": "yes"}], "details": {"selectedOptions": ["yes"]}, "isError": false, "timestamp": 1}});
+        let pi_call = serde_json::json!({"type": "message", "id": "call", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "q", "name": "ask", "arguments": {}}], "timestamp": 0}});
+        let decoded = crate::codec::pi::decode_pi(&[pi_call, pi_entry]);
+        let projection = crate::ck_wire::project_messages(&decoded.messages).unwrap();
+        let live: Vec<_> = projection.blocks.iter().collect();
+        let mut items = tail_sel_items(&live, None, &HashMap::new());
+        attach_user_answer_markers(&mut items, &decoded.messages);
+        assert!(items.iter().any(|item| item.user_answer));
     }
 }

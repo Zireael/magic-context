@@ -32,7 +32,11 @@ import {
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
-import { getEmbeddingCoverageStatus } from "../../features/magic-context/project-embedding-registry";
+import {
+    getAutoEmbeddingSessionCoverage,
+    getEmbeddingCoverageStatus,
+    getProjectEmbeddingSnapshot,
+} from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
     getDatabasePersistenceError,
@@ -54,12 +58,14 @@ import { buildStatusDetail } from "../../plugin/rpc-handlers";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
 import type { ConfigParseFailure } from "../../shared/config-diagnostics";
+import { isEmbeddingHostBusy } from "../../shared/embedding-activity";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import { resolveHistorianModel } from "../../shared/model-resolution";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import type { Database } from "../../shared/sqlite";
+import { cavemanWordRulesForLanguage } from "./caveman";
 import { createMagicContextCommandHandler } from "./command-handler";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
 import {
@@ -75,9 +81,11 @@ import {
 } from "./embed-history-runner";
 import {
     autoEmbedAttemptedBySession,
+    autoEmbedIdentityBySession,
     clearEmbedSessionState,
     embedPauseBySession,
     getEmbedDrainUiStatus,
+    invalidateAutoEmbedSession,
 } from "./embed-session-state";
 import { createEventHandler } from "./event-handler";
 import {
@@ -569,21 +577,33 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
 
     const maybeAutoEmbedSession = (sessionId: string): void => {
+        if (isEmbeddingHostBusy()) return;
+        const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
+        const identity = resolveProjectIdentityForSession(
+            directory,
+            deps.config.allow_home_project,
+        );
+        const snapshot = identity ? getProjectEmbeddingSnapshot(identity) : undefined;
+        const embedIdentity = snapshot
+            ? JSON.stringify([
+                  snapshot.providerIdentity,
+                  snapshot.chunkModelId,
+                  snapshot.runtimeFingerprint,
+              ])
+            : "off";
+        if (autoEmbedIdentityBySession.get(sessionId) !== embedIdentity) {
+            invalidateAutoEmbedSession(sessionId);
+        }
         if (autoEmbedAttemptedBySession.has(sessionId)) return;
         if (embedPauseBySession.has(sessionId)) return;
         // No `memory.enabled` gate: history embedding runs whenever an embedding
         // provider is configured and not `off` (checked via coverage below).
         autoEmbedAttemptedBySession.add(sessionId);
-        const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
+        autoEmbedIdentityBySession.set(sessionId, embedIdentity);
         void (async () => {
-            // Latch discipline: early exits (no identity, provider off, nothing to
-            // embed yet) release the latch so a young session gets its drain once
-            // real work exists — those paths are silent and cost one coverage
-            // query. Once a drain reaches ANY terminal outcome (busy, stalled,
-            // success), the latch holds for the process lifetime: busy means the
-            // project-level passive backfill owns the backlog, and re-attempting
-            // per pass is the announce/busy livelock this shape replaced.
-            let drainReachedTerminal = false;
+            // The autoEmbedAttemptedBySession claim is cleared on compartment
+            // writes or embedding-identity changes, not when coverage is already
+            // complete or a scan fails. Rechecking then would scan every turn.
             try {
                 // Defer off the transform thread BEFORE any DB/config work.
                 // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
@@ -592,16 +612,30 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 // on the transform's return path. A macrotask yield lets the
                 // transform return first, keeping the hot path clean.
                 await new Promise((resolve) => setTimeout(resolve, 0));
+                if (isEmbeddingHostBusy()) {
+                    invalidateAutoEmbedSession(sessionId);
+                    return;
+                }
                 await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
                 const sessionProjectIdentity = resolveProjectIdentityForSession(
                     directory,
                     deps.config.allow_home_project,
                 );
-                if (!sessionProjectIdentity) return;
+                if (!sessionProjectIdentity) {
+                    invalidateAutoEmbedSession(sessionId);
+                    return;
+                }
                 maybeSendProjectIdentitySessionWarning(sessionId, directory);
-                const coverage = getEmbeddingCoverageStatus(db, sessionProjectIdentity, sessionId);
-                if (!coverage.enabled) return;
-                const remaining = coverage.session.total - coverage.session.embedded;
+                const coverage = await getAutoEmbeddingSessionCoverage(
+                    db,
+                    sessionProjectIdentity,
+                    sessionId,
+                );
+                if (!coverage.enabled) {
+                    invalidateAutoEmbedSession(sessionId);
+                    return;
+                }
+                const remaining = coverage.total - coverage.embedded;
                 if (remaining <= 0) return;
                 // The auto lane is a silent bootstrap trigger: no pre-announce, no
                 // busy/zero-work chatter, and the once-per-process latch never
@@ -612,37 +646,31 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 // the same count forever. Retries belong to the passive backfill;
                 // progress lives in /ctx-embed status and the sidebar.
                 await executeEmbedHistory(sessionId, { silent: true });
-                drainReachedTerminal = true;
             } catch (error) {
                 log("[magic-context] auto-embed drain failed:", error);
-            } finally {
-                if (!drainReachedTerminal) autoEmbedAttemptedBySession.delete(sessionId);
             }
         })();
     };
 
     const rustMemorySyncRequestedSessions = new Set<string>();
-    // Build the same subc-backed client for the TS recovery arm. Constructing the
-    // transport is inert; it connects only if a marker actually needs draining.
-    const authorityRecoveryModuleClient =
-        deps.rustModeModuleClient ??
-        createSubcModuleClient({
-            ...(deps.config.subc?.connection_file !== undefined
-                ? { connectionFile: deps.config.subc.connection_file }
-                : {}),
-            projectRoot: deps.directory,
-        });
     const rustModeModuleClient =
-        deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
+        deps.config.transform_mode === "rust"
+            ? (deps.rustModeModuleClient ??
+              createSubcModuleClient({
+                  ...(deps.config.subc?.connection_file !== undefined
+                      ? { connectionFile: deps.config.subc.connection_file }
+                      : {}),
+                  projectRoot: deps.directory,
+              }))
+            : undefined;
     const rustRefusalRecovery = rustModeModuleClient
         ? createRustRefusalRecovery({
               moduleClient: rustModeModuleClient,
               client: deps.client,
           })
         : undefined;
-    // The facades that let the host's own tools write through the module are
-    // built in one place both host lanes call, so a facade cannot be present on
-    // one host and silently missing on the other.
+    // Both host lanes share the module backend for drop state; memories and notes
+    // use the host tools against context.db directly.
     const moduleToolBackends = createModuleToolBackends({
         db,
         moduleClient: rustModeModuleClient,
@@ -650,10 +678,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         memorySyncRequestedSessions: rustMemorySyncRequestedSessions,
     });
     const rustToolBackends: RustToolBackends | undefined = moduleToolBackends?.backends;
-    const ensureModuleNoteEvaluationBridge = (bridgeProjectPath: string): void => {
-        moduleToolBackends?.ensureNoteEvaluationBridge(bridgeProjectPath);
-    };
-    ensureModuleNoteEvaluationBridge(projectPath);
     const notifyRustModeParked = (sessionId: string, message: string): void => {
         const client = deps.client as {
             tui?: {
@@ -688,6 +712,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     registerLkgPersistence(createDbLkgPersistence(db));
 
     const transform = createTransform({
+        cacheTtlConfig: deps.config.cache_ttl,
         tagger: deps.tagger,
         scheduler: deps.scheduler,
         contextUsageMap,
@@ -778,6 +803,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             minPromptChars: deps.config.memory?.auto_search?.min_prompt_chars ?? 20,
             directory: deps.directory,
             ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+            wordRules: cavemanWordRulesForLanguage(deps.config.language),
         },
         // Age-tier caveman text compression is an opt-in primary-session pass.
         // Subagents are excluded in transform.ts because their context is curated
@@ -789,6 +815,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
               ? {
                     enabled: true,
                     minChars: deps.config.caveman_text_compression.min_chars ?? 500,
+                    // `language` is user-level only; a project config cannot set it.
+                    wordRules: cavemanWordRulesForLanguage(deps.config.language),
                 }
               : undefined,
         maybeAutoEmbedSession,
@@ -796,16 +824,17 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         promptSurface: deps.config.prompt_surface,
         promptSurfaceRuntime: deps.promptSurfaceRuntime,
         rustModeModuleClient,
-        tsAuthorityRecoveryModuleClient: authorityRecoveryModuleClient,
+
         rustMemorySyncRequestedSessions,
         onRustModeParked: notifyRustModeParked,
-        onRustModeProjectPrepared: ensureModuleNoteEvaluationBridge,
+
         onRustEngineReconnectRefusal: (args) => rustRefusalRecovery?.arm(args),
     });
     const eventHandler = createEventHandler({
         contextUsageMap,
         compactionHandler: deps.compactionHandler,
         config: deps.config,
+        allowHomeProject: deps.config.allow_home_project,
         compactionOff,
         thinkingBindingRecoveryEnabled: deps.config.transform_mode !== "rust",
         tagger: deps.tagger,
@@ -925,6 +954,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             projectIdentity: projectPath,
             tasks: runtimeConfigs,
             executor,
+            projectMemoryEnabled: deps.config.memory?.enabled !== false,
         }).catch((error: unknown) => {
             log("[dreamer] scheduled task run failed:", error);
         });
@@ -1175,6 +1205,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
     const hooksWithBackends = hooks as typeof hooks & {
         rustToolBackends?: RustToolBackends;
+        disposeRustAdapter?: () => void;
+        getRustReplayParticipant?: () => ReturnType<typeof transform.getRustReplayParticipant>;
         getDebugMemoryHolders?: () => {
             taggerCache: ReturnType<NonNullable<Tagger["getHeapStats"]>>;
             wireCache: ReturnType<typeof transform.getRustWireCacheHeapStats>;
@@ -1183,6 +1215,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     Object.defineProperties(hooksWithBackends, {
         rustToolBackends: {
             value: rustToolBackends,
+            enumerable: false,
+        },
+        disposeRustAdapter: {
+            value: () => transform.disposeRust(),
+            enumerable: false,
+        },
+        getRustReplayParticipant: {
+            value: () => transform.getRustReplayParticipant(),
             enumerable: false,
         },
         getDebugMemoryHolders: {

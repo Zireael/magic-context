@@ -55,8 +55,20 @@ pub(crate) const RECLAIM_HINT_EXCLUDED_TOOLS: &[&str] = &[
 /// `ctx_note` actions that carry no lasting value (droppable when positively read).
 const CTX_NOTE_ZERO_VALUE_ACTIONS: &[&str] = &["read", "dismiss"];
 /// Mirrors the duplicate-safe tool list in the TypeScript twin:
-/// `packages/plugin/src/hooks/magic-context/heuristic-cleanup.ts`.
+/// `packages/plugin/src/hooks/magic-context/heuristic-cleanup.ts`. Hosts hand over bare tool
+/// names (OpenCode 1.18.30 stores `read`, `grep`, `glob`; Pi stores `read`, `grep`), so the bare
+/// names are what match; the `mcp_` forms cover MCP servers that expose the same tools under that
+/// prefix.
 const DEDUP_SAFE_TOOLS: &[&str] = &[
+    "grep",
+    "read",
+    "glob",
+    "ast_grep_search",
+    "lsp_diagnostics",
+    "lsp_symbols",
+    "lsp_find_references",
+    "lsp_goto_definition",
+    "lsp_prepare_rename",
     "mcp_grep",
     "mcp_read",
     "mcp_glob",
@@ -93,6 +105,12 @@ const TIER_RECENCY_RESERVE: f64 = 0.20;
 pub(crate) const AGE_RECLAIM_MIN_TOKENS: usize = 250;
 /// Minimum reclaim to justify an emergency cache bust (tokens).
 const EMERGENCY_REARM_MIN_TOKENS: f64 = 2000.0;
+/// The selected arcs must together reclaim at least this many tokens, or the pass is
+/// skipped unless another mutation already prices it. The gap check above only proves
+/// there is something to close. One live session spent an hour at 100% context dropping
+/// one fresh tool result per pass, 28 to 149 tokens each against a ~9,200-token gap.
+/// Mirrors the TS `EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS`.
+const EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS: f64 = EMERGENCY_REARM_MIN_TOKENS;
 /// Byte→token estimate for the emergency reclaim math (matches the TS nudge).
 const TOKENS_PER_BYTE: f64 = 0.25;
 /// T1 (keep longest): navigation/structure the agent re-uses.
@@ -194,6 +212,8 @@ pub struct SelItem {
     pub kind: SelKind,
     /// True = the model's own SERVER-side tool (stays verbatim; never targeted).
     pub provider_executed: bool,
+    /// Host-owned marker: automatic selection must preserve user decisions.
+    pub user_answer: bool,
     /// Bytes this block contributes to reclaim accounting (output/content bytes).
     pub byte_size: usize,
     /// Persisted tag-token estimate for this block, when one exists.
@@ -242,6 +262,12 @@ pub struct SelectionContext {
     /// True when supersession can ride concrete work already scheduled for this pass.
     /// Unlike `pass_already_busting`, a held emergency latch alone does not set this.
     pub supersession_ride_available: bool,
+    /// True only when a rebuild that is independent of the emergency itself (a fold, an
+    /// m[1] or render-config change, a pending soft refresh) already rewrites the cached
+    /// prefix on this pass. The force-band edge and the 95% backstop are permissions to
+    /// rewrite, not rewrites that are already paid for, so they never set this. Only this
+    /// flag waives the emergency minimum achievable reclaim.
+    pub emergency_minimum_waived: bool,
     /// At the scheduler's >=95% backstop, the token window and tier reserve yield.
     pub emergency_window_yields: bool,
     /// Persisted token-window protection expressed as exact block ids.
@@ -1025,6 +1051,8 @@ fn select_supersession(
 /// Select older completed duplicate calls from safe tools. The owner is in both the lookup key
 /// and the fingerprint, so identical calls from distinct assistant messages stay distinct.
 /// Arguments use `serde_json` serialization; a serialization failure skips that candidate.
+/// Protected arcs join their group so a protected newest copy still anchors it, but are never
+/// selected themselves; leaving them out kept one unprotected copy beside the protected one.
 fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String> {
     // Like the TS tag-side index, retain an owner-qualified lookup key separately
     // from the fingerprint bucket. The owner must also remain in the fingerprint value.
@@ -1033,11 +1061,6 @@ fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<Strin
         if !DEDUP_SAFE_TOOLS.contains(&arc.dedup_name.as_str())
             || arc.owner_message_id.is_none()
             || arc.result_ids.is_empty()
-            || arc
-                .call_inputs
-                .iter()
-                .any(|(id, _)| ctx.block_is_protected(id))
-            || arc.result_ids.iter().any(|id| ctx.block_is_protected(id))
         {
             continue;
         }
@@ -1076,6 +1099,12 @@ fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<Strin
             group.pop();
             group
                 .into_iter()
+                .filter(|arc| {
+                    !arc.call_inputs
+                        .iter()
+                        .any(|(id, _)| ctx.block_is_protected(id))
+                        && !arc.result_ids.iter().any(|id| ctx.block_is_protected(id))
+                })
                 .map(|arc| arc.arc_id.clone())
                 .collect::<Vec<_>>()
         })
@@ -1248,6 +1277,14 @@ fn select_emergency(
     // comparison on that rounded value; comparing the raw float can fire for a
     // sub-threshold fractional remainder at the boundary.
     let reclaim_tokens = (ctx.current_total_input_tokens - target).round();
+    let floor_above_ceiling = fixed_floor > ctx.ceiling_tokens;
+    if floor_above_ceiling {
+        tracing::info!(
+            "mc-module: emergency drop: fixed floor ~{:.0} already exceeds ceiling {:.0}; tool drops cannot reach the target",
+            fixed_floor,
+            ctx.ceiling_tokens
+        );
+    }
     if reclaim_tokens <= EMERGENCY_REARM_MIN_TOKENS {
         *assessment = Some(mc_store::EmergencyDropAssessment {
             fixed_floor_tokens: fixed_floor,
@@ -1256,6 +1293,8 @@ fn select_emergency(
             selected_reclaim_tokens: 0.0,
             candidate_tokens: 0.0,
             target_unreachable: reclaim_tokens > 0.0,
+            floor_above_ceiling,
+            skipped_below_minimum_reclaim: false,
         });
         return HashSet::new();
     }
@@ -1313,9 +1352,14 @@ fn select_emergency(
         by_tier.entry(tier).or_default().push(arc);
     }
 
-    let candidate_tokens = by_tier
-        .values()
-        .flatten()
+    // Summed in tier order: floating-point addition is not associative, so summing in
+    // the hash map's per-process iteration order could give a different last bit for the
+    // same candidates from one run to the next.
+    let mut candidate_tiers = by_tier.keys().copied().collect::<Vec<_>>();
+    candidate_tiers.sort_unstable();
+    let candidate_tokens = candidate_tiers
+        .iter()
+        .flat_map(|tier| by_tier[tier].iter())
         .map(|arc| {
             reclaim_by_arc
                 .get(&arc.arc_id)
@@ -1345,14 +1389,37 @@ fn select_emergency(
             }
         }
     }
+    // Price the selection before committing it. Skipping leaves the pressure episode
+    // armed, so the candidates can still ride a later rewrite.
+    let skipped_below_minimum_reclaim = !selected.is_empty()
+        && !ctx.emergency_minimum_waived
+        && reclaimed < EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS;
+    if skipped_below_minimum_reclaim {
+        tracing::info!(
+            "mc-module: emergency drop skipped: achievable reclaim ~{:.0} < {:.0} against gap {:.0} ({} arcs)",
+            reclaimed,
+            EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS,
+            reclaim_tokens,
+            selected.len()
+        );
+    }
     *assessment = Some(mc_store::EmergencyDropAssessment {
         fixed_floor_tokens: fixed_floor,
         target_tokens: target,
         required_reclaim_tokens: reclaim_tokens,
-        selected_reclaim_tokens: reclaimed,
+        selected_reclaim_tokens: if skipped_below_minimum_reclaim {
+            0.0
+        } else {
+            reclaimed
+        },
         candidate_tokens,
-        target_unreachable: reclaimed < reclaim_tokens,
+        target_unreachable: skipped_below_minimum_reclaim || reclaimed < reclaim_tokens,
+        floor_above_ceiling,
+        skipped_below_minimum_reclaim,
     });
+    if skipped_below_minimum_reclaim {
+        return HashSet::new();
+    }
     selected
 }
 
@@ -1388,6 +1455,96 @@ pub fn select_reductions(
     select_reductions_with_outcome(items, frozen_keys, ctx, cfg).decisions
 }
 
+/// Served-or-original token totals for one tool arc, as emergency reclaim
+/// accounting sees them: every call and result block, and the call blocks alone
+/// (a skeleton-kept call keeps its arguments, so only its results shrink).
+struct ArcTokenTotals {
+    call_and_result: f64,
+    call: f64,
+}
+
+impl Default for ArcTokenTotals {
+    /// Both totals start from the value `Iterator::sum` returns for an empty
+    /// `f64` iterator, and blocks are added one at a time in item order. That
+    /// is exactly the fold a per-arc `.sum()` over the same blocks performs, so
+    /// the totals are bit-identical to summing each arc separately.
+    fn default() -> Self {
+        let empty = std::iter::empty::<f64>().sum::<f64>();
+        Self {
+            call_and_result: empty,
+            call: empty,
+        }
+    }
+}
+
+/// Totals every arc's call and result tokens in one pass over `items`, so
+/// emergency accounting does not rescan all items once per arc.
+fn emergency_arc_token_totals(items: &[SelItem]) -> HashMap<&str, ArcTokenTotals> {
+    let mut totals: HashMap<&str, ArcTokenTotals> = HashMap::new();
+    for item in items {
+        let Some(arc_id) = item.arc_id.as_deref() else {
+            continue;
+        };
+        let is_call = matches!(item.kind, SelKind::ToolCall { .. });
+        if !is_call && !matches!(item.kind, SelKind::ToolResult { .. }) {
+            continue;
+        }
+        let tokens = item.served_token_count.or(item.token_count).unwrap_or(0) as f64;
+        let arc = totals.entry(arc_id).or_default();
+        arc.call_and_result += tokens;
+        if is_call {
+            arc.call += tokens;
+        }
+    }
+    totals
+}
+
+/// Calibrated reclaim estimate per active arc for an emergency pass; empty when
+/// the pass has no calibration seed.
+fn emergency_reclaim_by_arc(
+    items: &[SelItem],
+    active_arcs: &[&ToolArc],
+    ctx: &SelectionContext,
+    reasoning_adjacency_collapse_arcs: &HashSet<String>,
+) -> HashMap<String, f64> {
+    let mut reclaim_by_arc = HashMap::new();
+    let Some(seed) = ctx.calibration else {
+        return reclaim_by_arc;
+    };
+    let recent: HashSet<_> = active_arcs
+        .iter()
+        .rev()
+        .take(RECENT_TOOL_SKELETON_WINDOW)
+        .map(|a| a.arc_id.as_str())
+        .collect();
+    let arc_tokens = emergency_arc_token_totals(items);
+    let no_tokens = ArcTokenTotals::default();
+    for arc in active_arcs {
+        let totals = arc_tokens.get(arc.arc_id.as_str()).unwrap_or(&no_tokens);
+        let before = totals.call_and_result;
+        let skeleton = (!ctx.emergency_window_yields
+            && recent.contains(arc.arc_id.as_str())
+            && is_small_tool_input(&arc.input))
+            || reasoning_adjacency_collapse_arcs.contains(&arc.arc_id);
+        // A kept call keeps its real arguments, so its call blocks reclaim
+        // nothing; only the results shrink to the placeholder. Include a
+        // conservative tag-overlay allowance because tag ids are installed
+        // by the renderer.
+        let after = if skeleton {
+            totals.call
+                + (arc.result_ids.len() * (mc_tokenizer::estimate_tokens(DROPPED_PLACEHOLDER) + 32))
+                    as f64
+        } else {
+            0.0
+        };
+        reclaim_by_arc.insert(
+            arc.arc_id.clone(),
+            (before - after).max(0.0) * seed.tools_ratio,
+        );
+    }
+    reclaim_by_arc
+}
+
 pub(crate) fn select_reductions_with_outcome(
     items: &[SelItem],
     frozen_keys: &HashSet<String>,
@@ -1420,6 +1577,11 @@ pub(crate) fn select_reductions_with_outcome(
         .map(|arc| arc.arc_id.as_str())
         .collect::<HashSet<_>>();
     let reasoning_ineligible_arcs = reasoning_ineligible_arc_ids(items);
+    let user_answer_arcs: HashSet<&str> = items
+        .iter()
+        .filter(|item| item.user_answer)
+        .filter_map(|item| item.arc_id.as_deref())
+        .collect();
     let arc_by_block_id: HashMap<&str, &str> = items
         .iter()
         .filter_map(|item| Some((item.id.as_str(), item.arc_id.as_deref()?)))
@@ -1443,6 +1605,7 @@ pub(crate) fn select_reductions_with_outcome(
         .filter(|a| {
             !a.reduced
                 && !a.provider_executed
+                && !user_answer_arcs.contains(a.arc_id.as_str())
                 && !incomplete_arc_ids.contains(a.arc_id.as_str())
                 && !reasoning_ineligible_arcs.contains(&a.arc_id)
         })
@@ -1479,60 +1642,12 @@ pub(crate) fn select_reductions_with_outcome(
             // text, media, reasoning, and non-droppable tools; system-prefix and opaque metadata
             // remain outside that population. Only active client tool arcs can be selected below.
             let all_active_floor_tokens = active_floor_tokens(items, frozen_keys, ctx.calibration);
-            let mut reclaim_by_arc = HashMap::new();
-            if let Some(seed) = ctx.calibration {
-                let recent: HashSet<_> = active_arcs
-                    .iter()
-                    .rev()
-                    .take(RECENT_TOOL_SKELETON_WINDOW)
-                    .map(|a| a.arc_id.as_str())
-                    .collect();
-                for arc in &active_arcs {
-                    let before = items
-                        .iter()
-                        .filter(|item| {
-                            item.arc_id.as_deref() == Some(arc.arc_id.as_str())
-                                && matches!(
-                                    item.kind,
-                                    SelKind::ToolCall { .. } | SelKind::ToolResult { .. }
-                                )
-                        })
-                        .map(|item| {
-                            item.served_token_count.or(item.token_count).unwrap_or(0) as f64
-                        })
-                        .sum::<f64>();
-                    let skeleton = (!ctx.emergency_window_yields
-                        && recent.contains(arc.arc_id.as_str())
-                        && is_small_tool_input(&arc.input))
-                        || reasoning_adjacency_collapse_arcs.contains(&arc.arc_id);
-                    // A kept call keeps its real arguments, so its call blocks reclaim
-                    // nothing; only the results shrink to the placeholder. Include a
-                    // conservative tag-overlay allowance because tag ids are installed
-                    // by the renderer.
-                    let after = if skeleton {
-                        let call_tokens = items
-                            .iter()
-                            .filter(|item| {
-                                item.arc_id.as_deref() == Some(arc.arc_id.as_str())
-                                    && matches!(item.kind, SelKind::ToolCall { .. })
-                            })
-                            .map(|item| {
-                                item.served_token_count.or(item.token_count).unwrap_or(0) as f64
-                            })
-                            .sum::<f64>();
-                        call_tokens
-                            + (arc.result_ids.len()
-                                * (mc_tokenizer::estimate_tokens(DROPPED_PLACEHOLDER) + 32))
-                                as f64
-                    } else {
-                        0.0
-                    };
-                    reclaim_by_arc.insert(
-                        arc.arc_id.clone(),
-                        (before - after).max(0.0) * seed.tools_ratio,
-                    );
-                }
-            }
+            let reclaim_by_arc = emergency_reclaim_by_arc(
+                items,
+                &active_arcs,
+                ctx,
+                &reasoning_adjacency_collapse_arcs,
+            );
             let emergency_arc_ids = select_emergency(
                 &active_arcs,
                 ctx,
@@ -1824,6 +1939,7 @@ mod tests {
     ) -> SelItem {
         let id = call_block_id(mid);
         SelItem {
+            user_answer: false,
             served_token_count: None,
             id: id.clone(),
             ordinal,
@@ -1841,6 +1957,7 @@ mod tests {
 
     fn tool_result(mid: &str, ordinal: u64, name: &str, bytes: usize) -> SelItem {
         SelItem {
+            user_answer: false,
             served_token_count: None,
             id: result_block_id(mid),
             ordinal,
@@ -1857,6 +1974,7 @@ mod tests {
 
     fn reasoning(mid: &str, ordinal: u64, bytes: usize) -> SelItem {
         SelItem {
+            user_answer: false,
             served_token_count: None,
             id: reasoning_block_id(mid),
             ordinal,
@@ -1871,6 +1989,7 @@ mod tests {
 
     fn reasoning_with_id(id: &str, arc_id: &str, ordinal: u64, bytes: usize) -> SelItem {
         SelItem {
+            user_answer: false,
             served_token_count: None,
             id: id.to_string(),
             ordinal,
@@ -1885,6 +2004,7 @@ mod tests {
 
     fn text_with_id(id: &str, ordinal: u64, bytes: usize) -> SelItem {
         SelItem {
+            user_answer: false,
             served_token_count: None,
             id: id.to_string(),
             ordinal,
@@ -1906,6 +2026,7 @@ mod tests {
         bytes: usize,
     ) -> SelItem {
         SelItem {
+            user_answer: false,
             served_token_count: None,
             id: id.to_string(),
             ordinal,
@@ -1929,6 +2050,7 @@ mod tests {
         bytes: usize,
     ) -> SelItem {
         SelItem {
+            user_answer: false,
             served_token_count: None,
             id: id.to_string(),
             ordinal,
@@ -2033,6 +2155,44 @@ mod tests {
             .any(|d| d.target_id == call_block_id("legacy")));
     }
 
+    /// The candidate total is the same on every run for the same candidates, whatever
+    /// order the per-tier map happens to iterate in.
+    #[test]
+    fn emergency_candidate_total_does_not_depend_on_map_iteration_order() {
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 142_021.0;
+        ctx.ceiling_tokens = 116_900.0;
+        ctx.emergency_window_yields = true;
+        let mut items = vec![text_with_id("text", 1, 240_000)];
+        let mut reclaim = HashMap::new();
+        // One arc per tier, with amounts whose sum depends on the order they are added in.
+        for (n, (name, tokens)) in [("read", 0.1), ("edit", 0.2), ("bash", 0.3)]
+            .into_iter()
+            .enumerate()
+        {
+            let mid = format!("tool-{n}");
+            items.push(tool_call(
+                &mid,
+                n as u64 + 2,
+                name,
+                serde_json::json!({}),
+                0,
+            ));
+            items.push(tool_result(&mid, n as u64 + 2, name, 8_000));
+            reclaim.insert(call_block_id(&mid), tokens);
+        }
+        let arcs = group_arcs(&items, &HashSet::new());
+        let arcs = arcs.iter().collect::<Vec<_>>();
+        let totals = (0..64)
+            .map(|_| {
+                let mut assessment = None;
+                select_emergency(&arcs, &ctx, 80_000.0, &reclaim, &mut assessment);
+                assessment.unwrap().candidate_tokens.to_bits()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(totals.len(), 1, "{totals:?}");
+    }
+
     #[test]
     fn emergency_floor_walk_exhausts_candidates_or_reaches_target() {
         let mut ctx = base_ctx(PassClass::EmergencyForce);
@@ -2072,6 +2232,41 @@ mod tests {
         assert!(!report.target_unreachable);
     }
 
+    /// The live worker shape: the fixed floor (~326K) is already above the ceiling
+    /// (~251K) and the only candidate is a fresh result worth ~149 tokens. At the 95%
+    /// backstop production sets both `emergency_window_yields` and `pass_already_busting`;
+    /// neither waives the minimum, so the pass is skipped. Only an independent rebuild
+    /// (`emergency_minimum_waived`) lets the small selection ride. Mirrors the TS tests.
+    #[test]
+    fn emergency_skips_a_selection_below_the_minimum_achievable_reclaim() {
+        let items = vec![
+            text_with_id("conversation", 1, 36_204),
+            tool_call("fresh", 2, "bash", serde_json::json!({}), 0),
+            tool_result("fresh", 3, "bash", 596),
+        ];
+        let arcs = group_arcs(&items, &HashSet::new());
+        let arcs = arcs.iter().collect::<Vec<_>>();
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 335_200.0;
+        ctx.ceiling_tokens = 251_000.0;
+        ctx.emergency_window_yields = true;
+        ctx.pass_already_busting = true;
+        let mut assessment = None;
+        let selected = select_emergency(&arcs, &ctx, 9_200.0, &HashMap::new(), &mut assessment);
+        let report = assessment.as_ref().unwrap();
+        assert!(selected.is_empty());
+        assert!(report.skipped_below_minimum_reclaim);
+        assert!(report.floor_above_ceiling);
+        assert_eq!(report.selected_reclaim_tokens, 0.0);
+
+        ctx.emergency_minimum_waived = true;
+        let selected = select_emergency(&arcs, &ctx, 9_200.0, &HashMap::new(), &mut assessment);
+        let report = assessment.as_ref().unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(!report.skipped_below_minimum_reclaim);
+        assert!(report.floor_above_ceiling);
+    }
+
     #[test]
     fn calibrated_emergency_uses_current_token_mass_not_original_bytes() {
         let mut items = Vec::new();
@@ -2098,6 +2293,209 @@ mod tests {
         assert!(result.decisions.is_empty());
     }
 
+    /// The emergency reclaim estimate as it was computed before arc token totals
+    /// were gathered in one pass: each arc rescanned every item. Kept only as
+    /// the differential reference for the test below.
+    fn rescanning_emergency_reclaim_by_arc(
+        items: &[SelItem],
+        active_arcs: &[&ToolArc],
+        ctx: &SelectionContext,
+        reasoning_adjacency_collapse_arcs: &HashSet<String>,
+    ) -> HashMap<String, f64> {
+        let mut reclaim_by_arc = HashMap::new();
+        let seed = ctx.calibration.unwrap();
+        let recent: HashSet<_> = active_arcs
+            .iter()
+            .rev()
+            .take(RECENT_TOOL_SKELETON_WINDOW)
+            .map(|a| a.arc_id.as_str())
+            .collect();
+        for arc in active_arcs {
+            let before = items
+                .iter()
+                .filter(|item| {
+                    item.arc_id.as_deref() == Some(arc.arc_id.as_str())
+                        && matches!(
+                            item.kind,
+                            SelKind::ToolCall { .. } | SelKind::ToolResult { .. }
+                        )
+                })
+                .map(|item| item.served_token_count.or(item.token_count).unwrap_or(0) as f64)
+                .sum::<f64>();
+            let skeleton = (!ctx.emergency_window_yields
+                && recent.contains(arc.arc_id.as_str())
+                && is_small_tool_input(&arc.input))
+                || reasoning_adjacency_collapse_arcs.contains(&arc.arc_id);
+            let after = if skeleton {
+                let call_tokens = items
+                    .iter()
+                    .filter(|item| {
+                        item.arc_id.as_deref() == Some(arc.arc_id.as_str())
+                            && matches!(item.kind, SelKind::ToolCall { .. })
+                    })
+                    .map(|item| item.served_token_count.or(item.token_count).unwrap_or(0) as f64)
+                    .sum::<f64>();
+                call_tokens
+                    + (arc.result_ids.len()
+                        * (mc_tokenizer::estimate_tokens(DROPPED_PLACEHOLDER) + 32))
+                        as f64
+            } else {
+                0.0
+            };
+            reclaim_by_arc.insert(
+                arc.arc_id.clone(),
+                (before - after).max(0.0) * seed.tools_ratio,
+            );
+        }
+        reclaim_by_arc
+    }
+
+    /// One-pass arc totals must give bit-identical reclaim estimates to the
+    /// per-arc rescan, and the full emergency selection built on them must pick
+    /// the same reductions in the same order. The fixture mixes served and
+    /// original counts, arcs with several calls and results, reasoning inside
+    /// arcs, reasoning-adjacent arcs, small and large inputs, and arcs with no
+    /// counted blocks.
+    #[test]
+    fn one_pass_emergency_totals_match_per_arc_rescan() {
+        let mut items = Vec::new();
+        let mut ordinal = 0;
+        for i in 0..120usize {
+            let arc = format!("arc{i}");
+            let input = if i % 3 == 0 {
+                serde_json::json!({ "command": "x".repeat(4_000) })
+            } else {
+                serde_json::json!({ "path": format!("f{i}") })
+            };
+            if i % 5 == 0 {
+                ordinal += 1;
+                items.push(reasoning_with_id(
+                    &format!("r{i}"),
+                    &arc,
+                    ordinal as u64,
+                    300,
+                ));
+            }
+            for call in 0..(1 + i % 2) {
+                ordinal += 1;
+                let mut item = tool_call_with_ids(
+                    &format!("{arc}c{call}"),
+                    &arc,
+                    ordinal as u64,
+                    "bash",
+                    input.clone(),
+                    500,
+                );
+                item.token_count = (i % 7 != 0).then_some(40 + i * 3 + call);
+                item.served_token_count = (i % 4 == 1).then_some(11 + i);
+                items.push(item);
+            }
+            for result in 0..(1 + i % 3) {
+                ordinal += 1;
+                let mut item = tool_result_with_ids(
+                    &format!("{arc}r{result}"),
+                    &arc,
+                    ordinal as u64,
+                    "bash",
+                    2_000,
+                );
+                item.token_count = Some(900 + i * 13 + result);
+                item.served_token_count = (i % 6 == 2).then_some(7 + result);
+                items.push(item);
+            }
+            if i % 10 == 0 {
+                ordinal += 1;
+                items.push(text_with_id(&format!("t{i}"), ordinal as u64, 1_000));
+            }
+        }
+        let arcs = group_arcs(&items, &HashSet::new());
+        let active_arcs: Vec<&ToolArc> = arcs.iter().collect();
+        assert!(active_arcs.len() >= 100);
+        let collapse = reasoning_adjacency_collapse_arc_ids(&items);
+        for yields in [false, true] {
+            let mut ctx = base_ctx(PassClass::EmergencyForce);
+            ctx.calibration = Some(crate::decision_calibration::DecisionCalibration::for_model(
+                Some("anthropic/claude-fable-5-1"),
+            ));
+            ctx.emergency_window_yields = yields;
+            let current = emergency_reclaim_by_arc(&items, &active_arcs, &ctx, &collapse);
+            let reference =
+                rescanning_emergency_reclaim_by_arc(&items, &active_arcs, &ctx, &collapse);
+            assert_eq!(current.len(), reference.len());
+            for (arc_id, value) in &reference {
+                assert_eq!(
+                    current[arc_id].to_bits(),
+                    value.to_bits(),
+                    "{arc_id} yields={yields}"
+                );
+            }
+            // The rest of the selector is unchanged, so identical estimates
+            // mean identical selection; assert it produces work to compare.
+            ctx.current_total_input_tokens = 400_000.0;
+            ctx.ceiling_tokens = 200_000.0;
+            let outcome = select_reductions_with_outcome(
+                &items,
+                &HashSet::new(),
+                &ctx,
+                &SelectionConfig::default(),
+            );
+            assert!(!outcome.decisions.is_empty(), "yields={yields}");
+        }
+    }
+
+    #[test]
+    fn user_answers_survive_every_automatic_selector_but_allow_agent_drops() {
+        let mut items = vec![
+            tool_call("answer", 1, "todowrite", serde_json::json!({}), 100),
+            tool_result("answer", 2, "todowrite", 32_000),
+            tool_call("ordinary", 3, "todowrite", serde_json::json!({}), 100),
+            tool_result("ordinary", 4, "todowrite", 16_000),
+            tool_call("latest", 5, "todowrite", serde_json::json!({}), 100),
+            tool_result("latest", 6, "todowrite", 16_000),
+        ];
+        items[1].user_answer = true;
+        for pass in [PassClass::Execute, PassClass::EmergencyForce] {
+            let mut ctx = base_ctx(pass);
+            ctx.current_total_input_tokens = 16_000.0;
+            ctx.ceiling_tokens = 12_000.0;
+            ctx.last_execute_ordinal = 100;
+            ctx.pass_already_busting = true;
+            ctx.supersession_ride_available = true;
+            let outcome = select_reductions_with_outcome(
+                &items,
+                &HashSet::new(),
+                &ctx,
+                &SelectionConfig::default(),
+            );
+            assert!(!outcome.decisions.is_empty());
+            assert!(outcome
+                .decisions
+                .iter()
+                .all(|d| !d.target_id.starts_with("answer#")));
+        }
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.agent_drop_ids = vec![result_block_id("answer")];
+        ctx.pass_already_busting = true;
+        let outcome = select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
+        );
+        assert!(outcome
+            .decisions
+            .iter()
+            .any(|d| d.target_id == result_block_id("answer")));
+        assert!(select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &base_ctx(PassClass::Defer),
+            &SelectionConfig::default()
+        )
+        .decisions
+        .is_empty());
+    }
+
     fn base_ctx(pass: PassClass) -> SelectionContext {
         SelectionContext {
             calibration: None,
@@ -2113,6 +2511,7 @@ mod tests {
             first_applied_agent_drop_ids: HashSet::new(),
             pass_already_busting: false,
             supersession_ride_available: false,
+            emergency_minimum_waived: false,
             emergency_window_yields: false,
             tag_window_protected_block_ids: HashSet::new(),
             exempt_message_protected_block_ids: HashSet::new(),
@@ -2122,6 +2521,7 @@ mod tests {
     #[test]
     fn natural_bust_drains_a_single_command_remainder() {
         let items = vec![SelItem {
+            user_answer: false,
             served_token_count: None,
             id: "drop".to_string(),
             ordinal: 1,
@@ -2320,6 +2720,7 @@ mod tests {
                         SelMessageRole::NonAssistant
                     };
                     SelItem {
+                        user_answer: false,
                         served_token_count: None,
                         id: i.id.clone(),
                         ordinal: i.ordinal,
@@ -2393,6 +2794,7 @@ mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: case.smart_drops || case.ctx.pass_already_busting,
                 supersession_ride_available: case.smart_drops || case.ctx.pass_already_busting,
+                emergency_minimum_waived: false,
                 emergency_window_yields: false,
                 tag_window_protected_block_ids: golden_ordinal_threshold_to_row_identities(
                     &items,
@@ -2724,6 +3126,7 @@ mod tests {
         }
         items.push(text_with_id("heavy-text#0", 7, 30_000));
         items.push(SelItem {
+            user_answer: false,
             served_token_count: None,
             id: "heavy-reasoning#0".to_string(),
             ordinal: 8,
@@ -2735,6 +3138,7 @@ mod tests {
             arc_id: None,
         });
         items.push(SelItem {
+            user_answer: false,
             served_token_count: None,
             id: "irreducible-system#0".to_string(),
             ordinal: 9,
@@ -2773,6 +3177,7 @@ mod tests {
                 4_000,
             ));
             items.push(SelItem {
+                user_answer: false,
                 served_token_count: None,
                 id: format!("{mid}#3"),
                 ordinal,
@@ -3615,6 +4020,7 @@ mod tests {
 
     fn user_text(mid: &str, ordinal: u64) -> SelItem {
         SelItem {
+            user_answer: false,
             served_token_count: None,
             id: format!("{mid}#0"),
             ordinal,
@@ -3768,6 +4174,7 @@ mod tests {
         arc: Option<&str>,
     ) -> SelItem {
         SelItem {
+            user_answer: false,
             served_token_count: None,
             id: id.to_string(),
             ordinal,
@@ -4055,6 +4462,7 @@ mod tests {
             has_prior_drop: true,
             pass_already_busting: true,
             supersession_ride_available: true,
+            emergency_minimum_waived: false,
             ..base_ctx(PassClass::Execute)
         };
 
@@ -4137,6 +4545,7 @@ mod tests {
     #[test]
     fn held_agent_drop_never_trickles_when_the_window_slides() {
         let items = vec![SelItem {
+            user_answer: false,
             served_token_count: None,
             id: "held#0".to_string(),
             ordinal: 1,
@@ -4164,6 +4573,7 @@ mod tests {
     fn different_commands_wait_for_a_single_ride_opportunity() {
         let items = vec![
             SelItem {
+                user_answer: false,
                 served_token_count: None,
                 id: "held#0".to_string(),
                 ordinal: 1,
@@ -4175,6 +4585,7 @@ mod tests {
                 arc_id: None,
             },
             SelItem {
+                user_answer: false,
                 served_token_count: None,
                 id: "new#0".to_string(),
                 ordinal: 2,
@@ -4212,6 +4623,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, kind)| SelItem {
+                user_answer: false,
                 served_token_count: None,
                 id: format!("carrier#{index}"),
                 ordinal: 1,
@@ -4279,7 +4691,25 @@ mod tests {
 
     #[test]
     fn duplicate_non_safe_tools_never_deduplicate() {
-        let args = serde_json::json!({"path": "src/lib.rs"});
+        // `bash` can return different output for identical arguments, so it never dedups.
+        let args = serde_json::json!({"command": "date"});
+        let items = vec![
+            tool_call_with_ids("owner#0", "owner#0", 1, "bash", args.clone(), 50),
+            tool_result_with_ids("older-result#0", "owner#0", 2, "bash", 300),
+            tool_call_with_ids("owner#1", "owner#1", 1, "bash", args, 50),
+            tool_result_with_ids("newer-result#0", "owner#1", 3, "bash", 300),
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.supersession_ride_available = true;
+
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(out.is_empty(), "non-safe tools must stay live: {out:?}");
+    }
+
+    #[test]
+    fn duplicate_bare_host_read_names_deduplicate() {
+        // OpenCode and Pi both hand over the bare `read` name, never `mcp_read`.
+        let args = serde_json::json!({"filePath": "src/lib.rs"});
         let items = vec![
             tool_call_with_ids("owner#0", "owner#0", 1, "read", args.clone(), 50),
             tool_result_with_ids("older-result#0", "owner#0", 2, "read", 300),
@@ -4290,7 +4720,54 @@ mod tests {
         ctx.supersession_ride_available = true;
 
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
-        assert!(out.is_empty(), "non-safe tools must stay live: {out:?}");
+        assert_eq!(
+            out.iter()
+                .map(|decision| (decision.target_id.as_str(), decision.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("older-result#0", "drop"), ("owner#0", "drop")],
+            "the older bare-name duplicate must fully drop: {out:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_safe_tools_keep_one_copy_when_the_newest_is_protected() {
+        let args = serde_json::json!({"filePath": "src/lib.rs"});
+        let mut items = Vec::new();
+        for index in 0..3 {
+            let call = format!("owner#{index}");
+            let result = format!("result-{index}#0");
+            items.push(tool_call_with_ids(
+                &call,
+                &call,
+                1,
+                "read",
+                args.clone(),
+                50,
+            ));
+            items.push(tool_result_with_ids(
+                &result,
+                &call,
+                2 + index as u64,
+                "read",
+                300,
+            ));
+        }
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.supersession_ride_available = true;
+        ctx.tag_window_protected_block_ids =
+            HashSet::from(["owner#2".to_string(), "result-2#0".to_string()]);
+
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        let mut targets = out
+            .iter()
+            .map(|decision| decision.target_id.as_str())
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        assert_eq!(
+            targets,
+            vec!["owner#0", "owner#1", "result-0#0", "result-1#0"],
+            "both unprotected copies drop; only the protected newest stays: {out:?}"
+        );
     }
 
     #[test]
@@ -4333,6 +4810,26 @@ mod tests {
             "protected-owner#1".to_string(),
             "protected-new-result#0".to_string(),
         ]);
+        let out = select_reductions(
+            &protected_items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
+        );
+        assert_eq!(
+            out.iter()
+                .map(|decision| decision.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["protected-old-result#0", "protected-owner#0"],
+            "a protected newest duplicate anchors its group, so the unprotected older copy drops: {out:?}"
+        );
+
+        ctx.tag_window_protected_block_ids = HashSet::from([
+            "protected-owner#0".to_string(),
+            "protected-old-result#0".to_string(),
+            "protected-owner#1".to_string(),
+            "protected-new-result#0".to_string(),
+        ]);
         assert!(
             select_reductions(
                 &protected_items,
@@ -4341,7 +4838,7 @@ mod tests {
                 &SelectionConfig::default(),
             )
             .is_empty(),
-            "a protected newest duplicate must not let the older candidate deduplicate"
+            "a protected duplicate is never selected, even with a newer copy"
         );
 
         let open_items = vec![
@@ -4439,6 +4936,7 @@ mod tests {
         let items = vec![
             reasoning_with_id("left#0", "left#2", 1, 50),
             SelItem {
+                user_answer: false,
                 served_token_count: None,
                 id: "left#1".to_string(),
                 ordinal: 1,
@@ -4453,6 +4951,7 @@ mod tests {
             tool_call_with_ids("left#3", "left#3", 1, "mcp_read", args, 50),
             tool_result_with_ids("older-result#0", "left#2", 2, "mcp_read", 300),
             SelItem {
+                user_answer: false,
                 served_token_count: None,
                 id: "right#0".to_string(),
                 ordinal: 3,

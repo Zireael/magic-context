@@ -1,9 +1,10 @@
 import { drainNotifications, registerNotificationSink } from "../../shared/rpc-notifications";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -138,7 +139,7 @@ afterEach(() => {
 });
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -1158,7 +1159,7 @@ describe("createTransform", () => {
         ).toBe(true);
     });
 
-    it("keeps the raw array untouched when session metadata is unreadable", async () => {
+    it("refuses the pass and leaves the raw array untouched when session metadata is unreadable", async () => {
         useTempDataHome("context-transform-meta-fault-");
         const db = openDatabase();
         const transform = createTransform({
@@ -1182,7 +1183,12 @@ describe("createTransform", () => {
         const output = { messages };
         db.exec("DROP TABLE session_meta");
 
-        await transform({}, output);
+        // Returning would serve these raw messages without the session's
+        // reductions; the pass stops so the wrapper replays or refuses.
+        await expect(transform({}, output)).rejects.toMatchObject({
+            name: "DegradedPassRefusalError",
+            site: "session-meta-early-return",
+        });
 
         expect(output.messages).toBe(messages);
         expect(messages).toEqual(original);
@@ -3164,7 +3170,7 @@ describe("createTransform", () => {
         expect(secondPass[1].parts).toEqual([{ type: "text", text: "" }]);
     });
 
-    it("fails open when session meta lookup throws", async () => {
+    it("refuses the pass when session meta lookup throws", async () => {
         //#given
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
         const tagger = createTagger();
@@ -3192,23 +3198,27 @@ describe("createTransform", () => {
             },
         ];
 
-        //#when
-        await transform({}, { messages });
-
-        //#then
+        //#when / #then: an unreadable session meta stops the pass; the messages
+        // wrapper then replays the last good request or refuses the turn.
+        await expect(transform({}, { messages })).rejects.toMatchObject({
+            name: "DegradedPassRefusalError",
+            site: "session-meta-early-return",
+        });
         expect(text(messages[0], 0)).toBe("keep");
     });
 
-    it("fails open when tagger init fails", async () => {
+    it("refuses the pass and resets tagger state when tagger init fails", async () => {
         //#given
         useTempDataHome("context-transform-tagger-error-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "defer" as const) };
         const db = openDatabase();
+        const baseTagger = createTagger();
         const tagger = {
-            ...createTagger(),
+            ...baseTagger,
             initFromDb: mock(() => {
                 throw new Error("tagger broken");
             }),
+            cleanup: mock((sessionId: string) => baseTagger.cleanup(sessionId)),
         };
         const transform = createTransform({
             tagger,
@@ -3233,10 +3243,14 @@ describe("createTransform", () => {
             },
         ];
 
-        //#when
-        await transform({}, { messages });
-
-        //#then — fail-open: message preserved despite tagger init failure.
+        //#when / #then: without tag targets the session's persisted drops
+        // cannot be replayed, so the pass is not served. The tagger is reset
+        // so the next pass reloads it from the database.
+        await expect(transform({}, { messages })).rejects.toMatchObject({
+            name: "DegradedPassRefusalError",
+            site: "tagging-persistence-failure",
+        });
+        expect(tagger.cleanup).toHaveBeenCalledWith("ses-tagger-fail");
         expect(text(messages[0], 0)).toBe("still works");
     });
 

@@ -32,12 +32,14 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
 import { compareSemverCore } from "@magic-context/core/hooks/auto-update-checker/semver";
+import { inspectWindowsProcessesSync } from "@magic-context/core/shared/rpc-utils";
 import {
     getOpenCodeV2PluginCacheSlot,
     isOpenCodePluginDistTag,
     readConfiguredOpenCodePluginSpec,
     readOpenCodeV2CachedPluginVersion,
 } from "../lib/opencode-plugin-cache";
+import { assertWindowsStoresClosed } from "./doctor-windows-holders";
 
 export type HostUseProbe =
     | { status: "free" }
@@ -54,11 +56,11 @@ export interface HostUseProbeTargets {
 type SpawnLike = (
     command: string,
     args: string[],
-    options: { encoding: "utf-8"; timeout: number },
+    options: { encoding: "utf-8"; timeout: number; windowsHide: true },
 ) => { status: number | null; stdout?: string | null; error?: Error };
 
 function runLsof(args: string[], spawn: SpawnLike): { pids: number[] } | { error: string } {
-    const result = spawn("lsof", args, { encoding: "utf-8", timeout: 15_000 });
+    const result = spawn("lsof", args, { encoding: "utf-8", timeout: 15_000, windowsHide: true });
     if (result.error) return { error: result.error.message };
     // lsof exits 1 when no process matches; any other non-zero status is a failure.
     if (result.status !== 0 && result.status !== 1) {
@@ -72,11 +74,30 @@ function runLsof(args: string[], spawn: SpawnLike): { pids: number[] } | { error
     return { pids };
 }
 
-/** Ask `lsof` which processes (other than this one) hold any of the targets open. */
+/** Check whether processes use the target files or directories before changing them. */
 export function probeHostProcessesUsing(
     targets: HostUseProbeTargets,
     spawn: SpawnLike = spawnSync as unknown as SpawnLike,
 ): HostUseProbe {
+    if (process.platform === "win32") {
+        try {
+            assertWindowsStoresClosed(
+                targets.files.filter((path) => !/-(?:wal|shm)$/.test(path)),
+                inspectWindowsProcessesSync(),
+            );
+            if (targets.directories.some(existsSync))
+                return {
+                    status: "unknown",
+                    reason: "Windows cannot rule out open files in plugin cache directories",
+                };
+            return { status: "free" };
+        } catch (error) {
+            return {
+                status: "unknown",
+                reason: error instanceof Error ? error.message : String(error),
+            };
+        }
+    }
     const files = targets.files.filter((file) => existsSync(file));
     const directories = targets.directories.filter((directory) => existsSync(directory));
     const queries: string[][] = [];
@@ -152,18 +173,29 @@ function prereleaseOf(version: string): string {
     return dash === -1 ? "" : withoutBuild.slice(dash + 1);
 }
 
+/**
+ * Semver precedence of two versions: negative when `a` is older, positive
+ * when newer, 0 when equal. Within one core version a prerelease ranks below
+ * the release (0.44.0-beta.1 < 0.44.0-beta.3 < 0.44.0). Null when either is
+ * not a semver version.
+ */
+export function compareSemverPrecedence(a: string, b: string): number | null {
+    const comparison = compareSemverCore(a, b);
+    if (comparison === null || comparison !== 0) return comparison;
+    return comparePrerelease(prereleaseOf(a), prereleaseOf(b));
+}
+
 /** True when the cached install is older than `latest` or unreadable. */
 function isStale(cached: string | undefined, latest: string): boolean {
     if (cached === undefined) return true;
     if (cached === latest) return false;
-    const comparison = compareSemverCore(cached, latest);
+    const comparison = compareSemverPrecedence(cached, latest);
     // Unparseable versions that differ are treated as stale; a newer cached
-    // build (for example a prerelease ahead of `latest`) is left alone.
+    // build (for example a prerelease ahead of `latest`) is left alone. Same
+    // core: prerelease order decides, which matters for a `@beta` or `@next`
+    // slot (0.44.0-beta.1 is older than 0.44.0-beta.3).
     if (comparison === null) return true;
-    if (comparison !== 0) return comparison < 0;
-    // Same core: prerelease order decides, which matters for a `@beta` or
-    // `@next` slot (0.44.0-beta.1 is older than 0.44.0-beta.3).
-    return comparePrerelease(prereleaseOf(cached), prereleaseOf(latest)) < 0;
+    return comparison < 0;
 }
 
 export interface OpenCodeV2SlotRemovalDeps {

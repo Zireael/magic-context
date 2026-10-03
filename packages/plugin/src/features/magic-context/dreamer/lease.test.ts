@@ -1,13 +1,14 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it, spyOn } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { $ } from "bun";
 import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import {
@@ -217,7 +218,7 @@ describe("dreamer lease (serialized acquisition)", () => {
     });
 
     it("allows exactly one winner across separate DB handles", () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-dream-lease-handles-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-dream-lease-handles-"));
         const path = join(dir, "context.db");
         const dbA = makeDb(path);
         const dbB = makeDb(path);
@@ -233,7 +234,7 @@ describe("dreamer lease (serialized acquisition)", () => {
     });
 
     it("allows exactly one winner across subprocesses sharing a DB", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-dream-lease-process-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-dream-lease-process-"));
         const path = join(dir, "context.db");
         const setup = makeDb(path);
         closeQuietly(setup);
@@ -452,24 +453,18 @@ describe("startLeaseHeartbeat", () => {
     });
 
     it("detects takeover by a second process without reclaiming its lease", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-dream-lease-heartbeat-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-dream-lease-heartbeat-"));
         const path = join(dir, "context.db");
         const db = makeDb(path);
         const acquisition = acquireLeaseWithAcquisition(db, "holder-a");
         expect(acquisition).not.toBeNull();
         const reasons: string[] = [];
         const controller = new AbortController();
-        const hb = startLeaseHeartbeat(
-            db,
-            "holder-a",
-            DREAMING_LEASE_KEY,
-            (reason) => {
-                reasons.push(reason);
-                controller.abort(new Error(reason));
-            },
-            20,
-        );
+        let hb: ReturnType<typeof startLeaseHeartbeat> | undefined;
         try {
+            // The second process takes the expired lease before the heartbeat starts.
+            // A running heartbeat is allowed to re-acquire its own expired lease while
+            // nobody else holds it, so starting it first would race the subprocess.
             expireLease(db);
             const pluginRoot = process.cwd().endsWith("/packages/plugin")
                 ? process.cwd()
@@ -487,6 +482,16 @@ describe("startLeaseHeartbeat", () => {
                 holder: string;
             };
             expect(other).toEqual({ acquired: true, holder: "holder-b" });
+            hb = startLeaseHeartbeat(
+                db,
+                "holder-a",
+                DREAMING_LEASE_KEY,
+                (reason) => {
+                    reasons.push(reason);
+                    controller.abort(new Error(reason));
+                },
+                20,
+            );
             await sleep(80);
             expect(hb.lost).toBe(true);
             expect(controller.signal.aborted).toBe(true);
@@ -496,7 +501,7 @@ describe("startLeaseHeartbeat", () => {
             expect(reasons).toEqual(["lease_lost: taken by holder-b"]);
             expect(getLeaseHolder(db)).toBe("holder-b");
         } finally {
-            hb.stop();
+            hb?.stop();
             closeQuietly(db);
             rmSync(dir, { recursive: true, force: true });
         }

@@ -194,7 +194,6 @@ export function applyPiThinkingBindingRecovery(args: {
 	 */
 	endOfPassOrder?: boolean;
 }): PiThinkingBindingApplication | null {
-	if (args.provider?.toLowerCase() !== "anthropic") return null;
 	const frozenEntryIds = frozenBindingEntryIds(args.db, args.sessionId);
 
 	const flagTarget = isPrefixBoundThinkingModel(args.provider, args.model)
@@ -244,7 +243,7 @@ export interface PiProactiveThinkingStrip {
 
 /**
  * Remove every thinking block still on the wire on a busting pass of a
- * prefix-bound model (Fable 5.1, Opus 5.5).
+ * prefix-bound model (Fable 5.1, Opus 5.5, Sonnet 5.5).
  *
  * On those models a thinking block is valid only while every byte before it is
  * unchanged, and a busting pass is the pass that changes those bytes: older
@@ -317,7 +316,8 @@ export function applyPiProactiveThinkingStrip(args: {
 	return { entryIds };
 }
 
-function frozenBindingEntryIds(
+/** Branch entries whose thinking the binding-mismatch set removes on every pass. */
+export function frozenBindingEntryIds(
 	db: ContextDatabase,
 	sessionId: string,
 ): Set<string> {
@@ -383,4 +383,17 @@ export function resolvePiBindingStripOrder(args: {
 		return "end";
 	}
 	return "start";
+}
+
+/**
+ * Whether this pass may run the proactive thinking strip. Subagents are
+ * included, as in OpenCode: their busting passes invalidate signed blocks
+ * exactly as a primary's do.
+ */
+export function shouldRunPiProactiveThinkingStrip(args: {
+	compactionOff: boolean;
+	bindingStripOrder: "start" | "end";
+	isSubagent: boolean;
+}): boolean {
+	return !args.compactionOff && args.bindingStripOrder === "end";
 }

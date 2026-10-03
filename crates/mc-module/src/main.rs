@@ -10,16 +10,34 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use mc_module::route_targets::RouteTargetConfig;
-use mc_module::{manifest_with_route_targets, McHandler, DEFAULT_MODULE_ID};
+use mc_module::{manifest_with_route_targets, McHandler, McTransportHandler, DEFAULT_MODULE_ID};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Consume the inherited pipe before initialization can start any helper;
+    // the SDK's HELLO and historian route opens reuse this process-wide cache.
+    subc_os::launch_nonce()?;
     // Fleet convention: a side-effect-free single-line --version, evaluated before
     // any runtime argument so supervisors and test substrates can probe the binary
     // without a connection file.
     if std::env::args().skip(1).any(|arg| arg == "--version") {
         println!("{}", mc_module::version_line());
         return Ok(());
+    }
+    if std::env::args().skip(1).any(|arg| arg == "--print-fences") {
+        println!("{}", mc_module::supported_fences_line());
+        return Ok(());
+    }
+    // The offline single-store migration runs without subc and without serving: the doctor
+    // command calls it while nothing has either database open.
+    if std::env::args().nth(1).as_deref() == Some("single-store-migrate") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(mc_module::single_store_migrate::cli_main(&args));
+    }
+    // The history repair after a migration is also a one-shot command without subc.
+    if std::env::args().nth(1).as_deref() == Some("single-store-repair-history") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(mc_module::single_store_repair::cli_main(&args));
     }
     let module_id = std::env::var(subc_protocol::SUBC_MODULE_ID_ENV)
         .ok()
@@ -47,11 +65,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     subc_client_rs::serve_with(
         &connection_file,
         manifest_with_route_targets(&module_id, &route_targets),
-        McHandler::new_with_connection_file_and_route_targets(
-            Some(connection_file.clone()),
-            route_targets,
-        )
-        .with_log_directory(logger.logs_dir().to_path_buf()),
+        McTransportHandler::new(
+            McHandler::new_with_connection_file_and_route_targets(
+                Some(connection_file.clone()),
+                route_targets,
+            )
+            .with_log_directory(logger.logs_dir().to_path_buf()),
+        ),
     )
     .await?;
     Ok(())

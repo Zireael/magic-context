@@ -8,6 +8,7 @@ import { withContentLanguageDirective } from "./agents/language-directive";
 import { denyTaskRoutingToCallerAgents } from "./agents/permissions";
 import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
+import { createDreamerOutputCapSampler } from "./config/live-child-output-cap";
 import { dreamerRunConfig, historianRunConfig, pluginConfigReader } from "./config/live-run-config";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
@@ -21,7 +22,11 @@ import {
     createFailClosedController,
     getLastHookInitFailure,
 } from "./features/magic-context/fail-closed-block";
-import { resolveProjectIdentityForSession } from "./features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentityForSession,
+    setHomeProjectPermission,
+} from "./features/magic-context/memory/project-identity";
+import { backfillSessionActivity } from "./features/magic-context/session-activity";
 import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
 import {
@@ -45,6 +50,7 @@ import {
     SubcModuleTransport,
 } from "./hooks/magic-context/module-transport";
 import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
+import type { RustLkgReplayParticipant } from "./hooks/magic-context/rust-lkg-freeze-registry";
 import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import {
     createBootBudget,
@@ -134,7 +140,12 @@ const server: Plugin = async (ctx) => {
     });
     const loadedPluginConfig = loadPluginConfigDetailed(ctx.directory);
     const pluginConfig = loadedPluginConfig.config;
+    setHomeProjectPermission(pluginConfig.allow_home_project);
     const liveConfigReader = pluginConfigReader(ctx.directory, pluginConfig);
+    const dreamerCap = createDreamerOutputCapSampler(
+        pluginConfig,
+        () => liveConfigReader.poll().effective,
+    );
     reloadWindowOverlay(pluginConfig.models?.window_overlay_path);
     const promptSurfaceRuntime = createPromptSurfaceRuntime({
         harness: "opencode",
@@ -446,34 +457,49 @@ const server: Plugin = async (ctx) => {
                 const ocDb = openOpenCodeDb();
                 if (!ocDb) return;
                 try {
-                    await runSessionProjectBackfill(db, (afterSessionId, limit) => {
-                        const rows = (
-                            afterSessionId === null
-                                ? ocDb
-                                      .prepare(
-                                          `SELECT id, COALESCE(directory, '') AS directory
+                    await runSessionProjectBackfill(
+                        db,
+                        (afterSessionId, limit) => {
+                            const rows = (
+                                afterSessionId === null
+                                    ? ocDb
+                                          .prepare(
+                                              `SELECT id, COALESCE(directory, '') AS directory
                                        FROM session
                                        ORDER BY id ASC
                                        LIMIT ?`,
-                                      )
-                                      .all(limit)
-                                : ocDb
-                                      .prepare(
-                                          `SELECT id, COALESCE(directory, '') AS directory
+                                          )
+                                          .all(limit)
+                                    : ocDb
+                                          .prepare(
+                                              `SELECT id, COALESCE(directory, '') AS directory
                                        FROM session
                                        WHERE id > ?
                                        ORDER BY id ASC
                                        LIMIT ?`,
-                                      )
-                                      .all(afterSessionId, limit)
-                        ) as Array<{
-                            id: string;
-                            directory: string;
-                        }>;
-                        return rows.map((session) => ({
-                            sessionId: session.id,
-                            directory: session.directory,
-                        }));
+                                          )
+                                          .all(afterSessionId, limit)
+                            ) as Array<{
+                                id: string;
+                                directory: string;
+                            }>;
+                            return rows.map((session) => ({
+                                sessionId: session.id,
+                                directory: session.directory,
+                            }));
+                        },
+                        {
+                            leaseKey: "opencode:session-projects-creation-v2",
+                            allowHomeProject: pluginConfig.allow_home_project,
+                        },
+                    );
+                    await backfillSessionActivity(db, "opencode", (sessionId) => {
+                        const row = ocDb
+                            .prepare(
+                                "SELECT MAX(time_created) AS time FROM message WHERE session_id = ?",
+                            )
+                            .get(sessionId) as { time: number | null } | undefined;
+                        return row?.time ?? undefined;
                     });
                 } finally {
                     closeQuietly(ocDb);
@@ -809,6 +835,10 @@ const server: Plugin = async (ctx) => {
         event: createEventHandler({
             magicContext: {
                 event: async (input) => {
+                    if (input.event.type === "session.deleted") {
+                        const properties = input.event.properties as { info?: { id?: string } };
+                        if (properties.info?.id) dreamerCap.delete(properties.info.id);
+                    }
                     await magicContextRuntime.magicContext?.event?.(input);
                 },
             },
@@ -850,11 +880,25 @@ const server: Plugin = async (ctx) => {
                 } catch {
                     // best-effort
                 }
+                try {
+                    // Stop offering this instance's Rust adapter to the last-known-good
+                    // replay registry, which other instances in this process share.
+                    (
+                        magicContextRuntime.magicContext as {
+                            disposeRustAdapter?: () => void;
+                        } | null
+                    )?.disposeRustAdapter?.();
+                } catch {
+                    // best-effort
+                }
                 log(
-                    "[magic-context] instance disposed — stopped RPC server, dream timer, auto-update",
+                    "[magic-context] instance disposed — stopped RPC server, dream timer, auto-update, Rust replay registration",
                 );
             },
         }),
+        "chat.params": async (input, output) => {
+            dreamerCap.apply(input, output);
+        },
         "experimental.chat.messages.transform": createMessagesTransformHandler({
             magicContext: magicContextRuntime.magicContext,
             getMagicContext: () => magicContextRuntime.magicContext,
@@ -866,6 +910,26 @@ const server: Plugin = async (ctx) => {
             compactionOff: !isCompactionEnabled(pluginConfig),
             internalChildSessions: liveSessionState.internalChildSessions,
             tryReopenStorage,
+            // This instance's own Rust adapter (null in TypeScript mode), so a replay
+            // this wrapper serves is admitted and frozen by the adapter that runs it.
+            rustReplayParticipant: () =>
+                (
+                    magicContextRuntime.magicContext as {
+                        getRustReplayParticipant?: () => RustLkgReplayParticipant | null;
+                    } | null
+                )?.getRustReplayParticipant?.() ?? null,
+            onStorageBusyRefusal: async (sessionId, message) => {
+                const { sendStatusNotification } = await import(
+                    "./hooks/magic-context/send-session-notification"
+                );
+                const { abortSessionFailClosed } = await import(
+                    "./hooks/magic-context/transform-postprocess-phase"
+                );
+                await sendStatusNotification(ctx.client, sessionId, message, {
+                    toastDurationMs: 15000,
+                });
+                await abortSessionFailClosed(ctx.client, sessionId);
+            },
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
             await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(
@@ -977,7 +1041,7 @@ const server: Plugin = async (ctx) => {
                     : undefined;
                 // Strip two_pass + disallowed_tools + thinking_level from historian
                 // overrides — two_pass is consumed by the runner, disallowed_tools is
-                // consumed below to build the permission map, thinking_level is Pi-only
+                // a legacy no-op now that historians have no tools, thinking_level is Pi-only
                 // (passed as --thinking to the Pi subprocess). None is a valid OpenCode
                 // agent config field, so leaking them in would put unknown keys on the
                 // OpenCode agent config. Both historian and historian-editor agents use

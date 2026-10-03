@@ -29,6 +29,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
     assertOpenCodeStoreGeneration,
@@ -161,6 +162,9 @@ function isOpenCodeSchemaCompatible(db: Database, dbPath: string): boolean {
 }
 
 function getWritableOpenCodeDb(): Database {
+    if (!harnessOwnsOpenCodeStore()) {
+        throw new Error("OpenCode database is not writable from a Pi-compatible process");
+    }
     const resolution = resolveOpenCodeDbPath();
     const dbPath = resolution.path;
     if (cachedWriteDb?.path === dbPath) {
@@ -283,7 +287,17 @@ export function findBoundaryUserMessage(
                         AND COALESCE(json_extract(data, '$.finish'), '') = 'stop')
                AND COALESCE(json_extract(data, '$.role'), '') = 'user'
                AND (time_created < ? OR (time_created = ? AND id <= ?))
-             ORDER BY time_created DESC, id DESC
+                AND NOT (
+                    EXISTS (SELECT 1 FROM part p
+                            WHERE p.message_id = message.id AND p.session_id = message.session_id
+                              AND COALESCE(json_extract(p.data, '$.type'), '') <> 'compaction')
+                    AND NOT EXISTS (SELECT 1 FROM part p
+                                    WHERE p.message_id = message.id AND p.session_id = message.session_id
+                                      AND COALESCE(json_extract(p.data, '$.type'), '') <> 'compaction'
+                                      AND COALESCE(json_extract(p.data, '$.synthetic'), 0) <> 1
+                                      AND COALESCE(json_extract(p.data, '$.syntheticTodoMarker'), 0) <> 1)
+                )
+              ORDER BY time_created DESC, id DESC
              LIMIT 1`,
         )
         .get(sessionId, target.timeCreated, target.timeCreated, target.id) as

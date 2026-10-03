@@ -60,8 +60,20 @@ function uniqueProjectPaths(projectPaths: readonly string[]): string[] {
     return [...new Set(projectPaths.filter((path) => path.length > 0))];
 }
 
+export function relaxedFtsQuery(query: string): string {
+    const tokens = [...new Set(query.match(/[\p{L}\p{N}_]+/gu) ?? [])]
+        .filter((token) => token.length > 2 || /\d/.test(token))
+        .slice(0, 16);
+    return tokens.map((token) => `"${token.replace(/"/g, '""')}"`).join(" OR ");
+}
+
 export function sanitizeFtsQuery(query: string): string {
-    const tokens = query.split(/\s+/).filter((token) => token.length > 0);
+    // FTS5 rejects a NUL byte inside a quoted string ("unterminated string"),
+    // so treat it as a word break like any other separator.
+    const tokens = query
+        .replaceAll("\0", " ")
+        .split(/\s+/)
+        .filter((token) => token.length > 0);
     if (tokens.length === 0) return "";
 
     return tokens.map((token) => `"${token.replace(/"/g, '""')}"`).join(" ");
@@ -84,7 +96,7 @@ export function searchMemoriesFTS(
         return [];
     }
 
-    const rows = getSearchStatement(db, dateRange !== null)
+    let rows = getSearchStatement(db, dateRange !== null)
         .all(
             projectPath,
             Date.now(),
@@ -93,6 +105,19 @@ export function searchMemoriesFTS(
             limit,
         )
         .filter(isMemoryRow);
+    if (rows.length === 0) {
+        const relaxed = relaxedFtsQuery(trimmedQuery);
+        if (relaxed)
+            rows = getSearchStatement(db, dateRange !== null)
+                .all(
+                    projectPath,
+                    Date.now(),
+                    ...(dateRange === null ? [] : [dateRange.from, dateRange.to]),
+                    relaxed,
+                    limit,
+                )
+                .filter(isMemoryRow);
+    }
 
     return rows.map(toMemory);
 }
@@ -132,7 +157,7 @@ export function searchMemoriesFTSUnion(
     const sanitized = sanitizeFtsQuery(trimmedQuery);
     if (sanitized.length === 0) return [];
 
-    const rows = sharingFilter.active
+    let rows = sharingFilter.active
         ? db
               .prepare(
                   `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path IN (${identities.map(() => "?").join(", ")}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?)${dateRange === null ? "" : " AND memories.created_at BETWEEN ? AND ?"} AND memories_fts MATCH ?${sharingFilter.clause} ORDER BY bm25(memories_fts), memories.updated_at DESC, memories.id ASC LIMIT ?`,
@@ -156,5 +181,26 @@ export function searchMemoriesFTSUnion(
               )
               .filter(isMemoryRow);
 
+    if (rows.length === 0) {
+        const relaxed = relaxedFtsQuery(trimmedQuery);
+        if (relaxed) {
+            rows = (
+                sharingFilter.active
+                    ? db.prepare(
+                          `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path IN (${identities.map(() => "?").join(", ")}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?)${dateRange === null ? "" : " AND memories.created_at BETWEEN ? AND ?"} AND memories_fts MATCH ?${sharingFilter.clause} ORDER BY bm25(memories_fts), memories.updated_at DESC, memories.id ASC LIMIT ?`,
+                      )
+                    : getUnionSearchStatement(db, identities.length, dateRange !== null)
+            )
+                .all(
+                    ...identities,
+                    Date.now(),
+                    ...(dateRange === null ? [] : [dateRange.from, dateRange.to]),
+                    relaxed,
+                    ...sharingFilter.params,
+                    limit,
+                )
+                .filter(isMemoryRow);
+        }
+    }
     return rows.map(toMemory);
 }

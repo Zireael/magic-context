@@ -53,7 +53,7 @@ function containsHostInstance(value: unknown): boolean {
 
 /** Deep copy that keeps class instances by reference, so a pipeline edit to the copy cannot
  * reach the host's draft while the host's own objects survive the round trip. */
-function clonePreservingInstances<T>(value: T): T {
+export function clonePreservingInstances<T>(value: T): T {
     if (isHostInstance(value)) return value;
     if (Array.isArray(value)) return value.map(clonePreservingInstances) as T;
     if (value && typeof value === "object") {
@@ -235,6 +235,12 @@ export function adaptPayload(draft: SessionContext, admittedIDs: ReadonlySet<str
                 input: structuredClone(call?.input ?? {}),
                 status: result ? "completed" : "running",
                 ...(result ? { output } : {}),
+                // OpenCode 2 omits the user's answers in state.metadata.answers from its
+                // LLM context event. Mark built-in question results as answers until the
+                // host forwards that metadata, so automatic reclaim cannot erase them.
+                ...(result && (call?.name ?? result.part.name) === "question"
+                    ? { metadata: { userAnswer: true } }
+                    : {}),
                 ...(files ? { attachments: contentValueAttachments(files) } : {}),
             },
         };

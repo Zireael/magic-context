@@ -2,12 +2,12 @@
 
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import todoRideGolden from "../../../../../crates/mc-module/testdata/todo-ride-only.json";
-
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
+import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
 import {
     addProcessedImageStrippedIds,
@@ -48,6 +48,7 @@ import {
     setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
+import { getRemovedReasoningIds } from "../../features/magic-context/storage-reasoning-removal";
 import {
     markWhitespaceAssistantTagInert,
     updateTagStatus,
@@ -55,6 +56,7 @@ import {
 import { createTagger } from "../../features/magic-context/tagger";
 import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { registerActiveCompartmentRun } from "./compartment-runner";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
@@ -101,7 +103,7 @@ const originalXdgDataHome = process.env.XDG_DATA_HOME;
 let db: Database;
 
 function createOpenCodeDbWithoutMessages(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
     mkdirSync(join(dir, "opencode"), { recursive: true });
@@ -581,6 +583,58 @@ function serializeAnthropicVisibleRoleGroups(messages: MessageLike[]): string {
 }
 
 describe("stripped placeholder replay across temporary marker windows", () => {
+    for (const providerID of ["anthropic", "openai-compatible"]) {
+        it(`freezes a marker-only final assistant across a priced pass and appended defer (${providerID})`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `ses-marker-only-${providerID}`;
+            const makePrefix = (): MessageLike[] =>
+                [
+                    {
+                        info: { id: "user", role: "user", sessionID: sessionId },
+                        parts: [{ type: "text", text: "continue" }],
+                    },
+                    {
+                        info: { id: "last", role: "assistant", sessionID: sessionId },
+                        parts: [
+                            { type: "text", text: "§672§ [dropped §672§]" },
+                            { type: "reasoning", text: "[cleared]" },
+                        ],
+                    },
+                ] as unknown as MessageLike[];
+            const first = makePrefix();
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, first, {
+                    schedulerDecision: "execute",
+                    pendingMaterializationSessions: new Set([sessionId]),
+                    schedulerDeferReason: null,
+                    resolvedProviderID: providerID,
+                }),
+            );
+            expect(getStrippedPlaceholderIds(db, sessionId).has("last")).toBe(true);
+            const prefix = JSON.stringify(first);
+            expect(first[1]?.parts).toEqual([
+                { type: "text", text: providerID === "anthropic" ? "" : "[dropped]" },
+            ]);
+            const second = [
+                ...makePrefix(),
+                {
+                    info: { id: "new", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "§655§ [cleared]" }],
+                },
+            ] as MessageLike[];
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, second, {
+                    schedulerDecision: "defer",
+                    resolvedProviderID: providerID,
+                }),
+            );
+            expect(JSON.stringify(second.slice(0, first.length))).toBe(prefix);
+            expect(second[2]?.parts).toEqual([{ type: "text", text: "§655§ [cleared]" }]);
+            expect(getStrippedPlaceholderIds(db, sessionId).has("new")).toBe(false);
+        });
+    }
+
     for (const [missingPassDecision, replayPassDecision] of [
         ["execute", "defer"],
         ["defer", "execute"],
@@ -1027,7 +1081,9 @@ describe("deferred compaction marker representation", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-rust-marker-retry-every-defer";
-        const dataHome = mkdtempSync(join(tmpdir(), "postprocess-rust-marker-retry-"));
+        const dataHome = createTestTempDirFromPath(
+            join(tmpdir(), "postprocess-rust-marker-retry-"),
+        );
         tempDirs.push(dataHome);
         process.env.XDG_DATA_HOME = dataHome;
         appendCompartments(db, sessionId, [
@@ -1086,7 +1142,7 @@ describe("deferred compaction marker representation", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-rust-marker-retry-heals";
-        const dataHome = mkdtempSync(join(tmpdir(), "postprocess-rust-marker-heal-"));
+        const dataHome = createTestTempDirFromPath(join(tmpdir(), "postprocess-rust-marker-heal-"));
         tempDirs.push(dataHome);
         process.env.XDG_DATA_HOME = dataHome;
         appendCompartments(db, sessionId, [
@@ -1297,7 +1353,7 @@ describe("deferred compaction marker representation", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-marker-wire-stability";
-        const dataHome = mkdtempSync(join(tmpdir(), "postprocess-marker-wire-"));
+        const dataHome = createTestTempDirFromPath(join(tmpdir(), "postprocess-marker-wire-"));
         tempDirs.push(dataHome);
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
@@ -1609,7 +1665,9 @@ describe("deferred compaction marker advance representation", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-marker-advance-wire-stability";
-        const dataHome = mkdtempSync(join(tmpdir(), "postprocess-marker-advance-wire-"));
+        const dataHome = createTestTempDirFromPath(
+            join(tmpdir(), "postprocess-marker-advance-wire-"),
+        );
         tempDirs.push(dataHome);
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
@@ -3187,11 +3245,13 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         );
     });
 
-    it("preserves a pre-deploy whitespace prefix through a HARD fold and rebuilt defer tail", async () => {
+    it("neutralizes a tag-only assistant on the HARD fold and replays its sentinel on defer", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-hardfold-inert-whitespace";
-        const dataHome = mkdtempSync(join(tmpdir(), "postprocess-hardfold-whitespace-"));
+        const dataHome = createTestTempDirFromPath(
+            join(tmpdir(), "postprocess-hardfold-whitespace-"),
+        );
         tempDirs.push(dataHome);
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
@@ -3228,7 +3288,6 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         });
         insertTag(db, sessionId, "assistant-framing:p0", "message", 1, 1);
         markWhitespaceAssistantTagInert(db, sessionId, 1, "assistant-framing:p0");
-        const previousServe = "§1§  ";
         const makeTail = () =>
             [
                 {
@@ -3289,7 +3348,8 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         );
         expect(hardResult.materialized).toBe(true);
         expect(marker?.boundaryOrdinal).toBe(10);
-        expect(hardWhitespace?.parts).toEqual([{ type: "text", text: previousServe }]);
+        // A bare tag is a complete marker; its replacement text is replayed on later passes.
+        expect(hardWhitespace?.parts).toEqual([{ type: "text", text: "[dropped]" }]);
         const hardWire = JSON.stringify(hardMessages);
 
         const deferMessages = [
@@ -3327,7 +3387,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         const deferWhitespace = deferMessages.find(
             (message) => message.info.id === "assistant-framing",
         );
-        expect(deferWhitespace?.parts).toEqual([{ type: "text", text: previousServe }]);
+        expect(deferWhitespace?.parts).toEqual([{ type: "text", text: "[dropped]" }]);
         expect(JSON.stringify(deferMessages)).toBe(hardWire);
     });
 
@@ -4559,7 +4619,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         // as a change.
         for (const lean of [false, true]) {
             it(`REGATE mural unchanged (${lean ? "lean" : "hydrated"} state): an identical-bytes epoch HARD holds the drop`, async () => {
-                const xdg = mkdtempSync(join(tmpdir(), "mc-regate-oc-mural-"));
+                const xdg = createTestTempDirFromPath(join(tmpdir(), "mc-regate-oc-mural-"));
                 tempDirs.push(xdg);
                 process.env.XDG_DATA_HOME = xdg;
                 const modelsDev = await import("../../shared/models-dev-cache");
@@ -4644,7 +4704,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             getTagsBySession(db, sessionId).find((row) => row.tagNumber === tag)?.status;
 
         it("mural-only change: an OpenCode HARD that swaps only the mural image opens the lanes", async () => {
-            const xdg = mkdtempSync(join(tmpdir(), "mc-adv-oc-mural-"));
+            const xdg = createTestTempDirFromPath(join(tmpdir(), "mc-adv-oc-mural-"));
             tempDirs.push(xdg);
             process.env.XDG_DATA_HOME = xdg;
             const modelsDev = await import("../../shared/models-dev-cache");
@@ -6819,9 +6879,12 @@ describe("final message representation", () => {
         initializeDatabase(db);
         const sessionId = "ses-trailing-refresh-cas-failure";
         addTrailingBlankDecisions(db, sessionId, [["assistant-target", "keep:3"]]);
+        // Each decision is its own row, updated only while it still holds the value
+        // the writer read. Ignoring the update leaves zero changed rows, which the
+        // writer treats as a lost race on every retry.
         db.exec(`
             CREATE TRIGGER reject_trailing_blank_refresh
-            BEFORE UPDATE OF trailing_blank_decisions ON session_meta
+            BEFORE UPDATE ON session_replay_decisions
             WHEN NEW.session_id = '${sessionId}'
             BEGIN
                 SELECT RAISE(IGNORE);
@@ -8262,7 +8325,7 @@ describe("contract adversarial cache sequences", () => {
         const { resolveEpochFloorForPass, resetEpochFloorRegistryForTest } = await import(
             "../../features/magic-context/storage-meta-persisted"
         );
-        const dir = mkdtempSync(join(tmpdir(), "audit-floor-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "audit-floor-"));
         tempDirs.push(dir);
         const path = join(dir, "context.db");
         db = new Database(path);
@@ -8345,7 +8408,7 @@ describe("contract adversarial cache sequences", () => {
     });
 
     it("contract marker contraction reopen reexpansion keeps frozen visible bytes", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "audit-marker-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "audit-marker-"));
         tempDirs.push(dir);
         const path = join(dir, "context.db");
         db = new Database(path);
@@ -8964,7 +9027,7 @@ describe("pending-ops and heuristics permission labels", () => {
     });
 });
 
-// Claude Fable 5.1 and Claude Opus 5.5 bind each signed thinking block to every
+// Claude Fable 5.1, Opus 5.5 and Sonnet 5.5 bind each signed thinking block to every
 // byte served before it, so a pass that busts the cache removes every thinking
 // block still on the wire (the provider would drop it or reject the request).
 // Every later pass replays the removal byte-identically; a defer pass never
@@ -9071,6 +9134,54 @@ describe("proactive strip of thinking on busting passes", () => {
         initializeDatabase(db);
     };
 
+    it("a budget-shrink HARD strips thinking on the resizing pass and not the next replay", async () => {
+        openDb();
+        const sessionId = "ses-proactive-budget-shrink";
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 1,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "user-prefix",
+                endMessageId: "user-prefix",
+                title: "large history",
+                content: "",
+                p1: "history bytes ".repeat(500),
+                p2: "dense",
+                p3: "brief",
+                p4: "anchor",
+                importance: 100,
+            },
+        ]);
+        const pass = (messages: MessageLike[], historyBudgetTokens: number) =>
+            runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    resolvedProviderID: "anthropic",
+                    thinkingBindingRecoveryEnabledForModel: true,
+                    fullFeatureMode: true,
+                    schedulerDecision: "defer",
+                    m0M1: {
+                        projectPath: "git:budget-shrink",
+                        projectDirectory: "/nonexistent",
+                        historyBudgetTokens,
+                        historyBudgetPolicyIdentity: "p0.15:percentage:40",
+                    },
+                }),
+            );
+        await pass(buildSession(sessionId), 12000);
+        const shrinking = appendTurn(buildSession(sessionId), sessionId, "shrink");
+        const result = await pass(shrinking, 1);
+        expect(result.materializeReason).toContain("render_config:budget_shrink(");
+        expect(result.bustedThisPass).toBe(true);
+        expect(result.proactiveThinkingStrip?.messageIds).toContain("assistant-shrink");
+        expect(reasoningCount(findMessage(shrinking, "assistant-shrink"))).toBe(0);
+        const replay = appendTurn(shrinking, sessionId, "after-shrink");
+        const next = await pass(replay, 1);
+        expect(next.materialized).toBe(false);
+        expect(next.proactiveThinkingStrip).toBeNull();
+        expect(reasoningCount(findMessage(replay, "assistant-after-shrink"))).toBe(1);
+    });
+
     it("strips every thinking block on a busting pass; the next defer pass keeps the shared prefix hash", async () => {
         openDb();
         const sessionId = "ses-proactive-bust";
@@ -9100,6 +9211,93 @@ describe("proactive strip of thinking on busting passes", () => {
         expect(sha256(passB.slice(0, passA.length))).toBe(sha256(passA));
         expect(reasoningCount(findMessage(passB, "assistant-four"))).toBe(1);
     });
+
+    for (const [providerID, modelID] of [
+        ["google-vertex-anthropic", "claude-sonnet-5-5@20260930"],
+        ["vertex-eu-anthropic", "claude-opus-5-5"],
+        ["amazon-bedrock", "us.anthropic.claude-fable-5-1-v1:0"],
+    ]) {
+        it(`TS and Rust-mode host strip/replay parity for ${providerID}/${modelID}`, async () => {
+            openDb();
+            const outputs: MessageLike[][] = [];
+            for (const rustMode of [false, true]) {
+                const sessionId = `ses-cloud-parity-${rustMode}`;
+                const postprocess = async (messages: MessageLike[], busting: boolean) => {
+                    const enabled = isPrefixBoundThinkingModel(providerID, modelID);
+                    if (rustMode) {
+                        return runRustModePostprocess({
+                            db,
+                            sessionId,
+                            messages,
+                            fullFeatureMode: true,
+                            resolvedProviderID: providerID,
+                            thinkingBindingRecoveryEnabledForModel: enabled,
+                            cacheBustingPass: busting,
+                            tagger: createTagger(),
+                            ctxReduceAvailability: { callable: true, frozen: true },
+                        });
+                    }
+                    return runPostTransformPhase(
+                        basePostTransformArgs(db, sessionId, messages, {
+                            resolvedProviderID: providerID,
+                            thinkingBindingRecoveryEnabledForModel: enabled,
+                            ...(busting
+                                ? { pendingMaterializationSessions: new Set([sessionId]) }
+                                : { schedulerDecision: "defer" as const }),
+                        }),
+                    );
+                };
+                const cloudSession = () => {
+                    const messages = buildSession(sessionId, "rebuilt prefix");
+                    messages.push({
+                        info: { id: "reasoning-only", role: "assistant", sessionID: sessionId },
+                        parts: [{ type: "redacted_thinking", data: "signed-redacted" }],
+                    } as unknown as MessageLike);
+                    return messages;
+                };
+                const cloudAssistants = [...ALL_ASSISTANTS, "reasoning-only"];
+                const initial = cloudSession();
+                const original = JSON.stringify(initial);
+                expect((await postprocess(initial, false)).proactiveThinkingStrip).toBeNull();
+                expect(JSON.stringify(initial)).toBe(original);
+                const bust = cloudSession();
+                expect((await postprocess(bust, true)).proactiveThinkingStrip).toEqual({
+                    messageIds: cloudAssistants,
+                });
+                expect(findMessage(bust, "reasoning-only").parts).toEqual([
+                    { type: "text", text: "[dropped]" },
+                ]);
+                for (const id of cloudAssistants) {
+                    expect(reasoningCount(findMessage(bust, id))).toBe(0);
+                }
+                for (let pass = 0; pass < 2; pass++) {
+                    const replay = appendTurn(cloudSession(), sessionId, "four");
+                    expect((await postprocess(replay, false)).proactiveThinkingStrip).toBeNull();
+                    expect(JSON.stringify(replay.slice(0, bust.length))).toBe(JSON.stringify(bust));
+                    expect(reasoningCount(findMessage(replay, "assistant-four"))).toBe(1);
+                }
+                const lkg = cloudSession();
+                replayRustModeBindingMismatchStrips({
+                    db,
+                    sessionId,
+                    messages: lkg,
+                    resolvedProviderID: providerID,
+                });
+                expect(JSON.stringify(lkg)).toBe(JSON.stringify(bust));
+                const recovery = appendTurn(cloudSession(), sessionId, "recovery");
+                armThinkingBindingRecovery(db, sessionId, "all_reasoning_bearing_assistants");
+                expect(
+                    (await postprocess(recovery, false)).thinkingBindingRecovery?.messageIds,
+                ).toContain("assistant-recovery");
+                expect(reasoningCount(findMessage(recovery, "assistant-recovery"))).toBe(0);
+                outputs.push(bust);
+            }
+            // Session routing metadata differs; provider-facing parts must not.
+            expect(outputs[0].map((message) => message.parts)).toEqual(
+                outputs[1].map((message) => message.parts),
+            );
+        });
+    }
 
     it("replays a strip byte-identically on a reasoning-only assistant with a trailing blank", async () => {
         openDb();
@@ -9197,14 +9395,41 @@ describe("proactive strip of thinking on busting passes", () => {
         expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
     });
 
-    it("leaves subagent sessions alone, as Rust mode does", async () => {
+    // Subagents used to be left out. The age lane no longer removes reasoning on
+    // prefix-bound models (an older removal invalidates every newer signed
+    // block), so a busting pass strips subagents' thinking the same way.
+    it("strips subagent sessions on a busting pass too", async () => {
         openDb();
         const sessionId = "ses-proactive-subagent";
         const pass = buildSession(sessionId, "re-rendered first user message");
         const result = await serve(sessionId, pass, { busting: true, fullFeatureMode: false });
-        expect(result.proactiveThinkingStrip).toBeNull();
-        expect(reasoningCount(findMessage(pass, "assistant-one"))).toBe(1);
-        expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+        expect(result.proactiveThinkingStrip).toEqual({ messageIds: ALL_ASSISTANTS });
+        for (const id of ALL_ASSISTANTS) expect(reasoningCount(findMessage(pass, id))).toBe(0);
+    });
+
+    it("strips Rust-mode subagents on a busting pass and replays it on defer", () => {
+        openDb();
+        const sessionId = "ses-proactive-rust-subagent";
+        const postprocess = (messages: MessageLike[], cacheBustingPass: boolean) =>
+            runRustModePostprocess({
+                db,
+                sessionId,
+                messages,
+                fullFeatureMode: false,
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+                cacheBustingPass,
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: true, frozen: true },
+            });
+        const busting = buildSession(sessionId, "re-rendered first user message");
+        expect(postprocess(busting, true).proactiveThinkingStrip).toEqual({
+            messageIds: ALL_ASSISTANTS,
+        });
+        for (const id of ALL_ASSISTANTS) expect(reasoningCount(findMessage(busting, id))).toBe(0);
+        const defer = buildSession(sessionId, "re-rendered first user message");
+        expect(postprocess(defer, false).proactiveThinkingStrip).toBeNull();
+        expect(sha256(defer)).toBe(sha256(busting));
     });
 
     it("strips through Rust-mode host postprocess only on a busting pass and replays it", () => {
@@ -9279,5 +9504,234 @@ describe("proactive strip of thinking on busting passes", () => {
         });
         expect(result.proactiveThinkingStrip).toBeNull();
         expect(JSON.stringify(busting)).toBe(before);
+    });
+});
+
+// Each test is named after the row of Anthropic's "What counts as an edit" table
+// (https://platform.claude.com/docs/en/build-with-claude/preserved-thinking) that
+// the behavior relies on.
+describe("prefix-bound oldest-prefix reasoning trim", () => {
+    const PROVIDER = "google-vertex-anthropic";
+    const sha256 = (value: unknown): string =>
+        createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    const reasoningCount = (message: MessageLike): number =>
+        message.parts.filter((part) => (part as { type?: unknown }).type === "reasoning").length;
+
+    /**
+     * One user message (tag 1) and `steps` assistant steps; step i carries a
+     * signed reasoning part and a completed tool call and owns tag i + 2.
+     */
+    const boundLoop = (sessionId: string, steps: number, options: { untagged?: number } = {}) => {
+        const messages: MessageLike[] = [
+            {
+                info: { id: "user-0", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "do the work" }],
+            } as unknown as MessageLike,
+        ];
+        const tags = new Map<MessageLike, number>([[messages[0], 1]]);
+        for (let step = 0; step < steps; step += 1) {
+            const message = {
+                info: { id: `assistant-${step}`, role: "assistant", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "reasoning",
+                        text: `signed ${step}`,
+                        metadata: { anthropic: { signature: `sig-${step}` } },
+                    },
+                    {
+                        type: "tool",
+                        tool: "bash",
+                        callID: `call-${step}`,
+                        state: {
+                            status: "completed",
+                            input: {},
+                            output: `out ${step} `.repeat(200),
+                        },
+                    },
+                ],
+            } as unknown as MessageLike;
+            messages.push(message);
+            if (options.untagged !== step) tags.set(message, step + 2);
+        }
+        return { messages, tags };
+    };
+
+    const serve = (
+        sessionId: string,
+        session: ReturnType<typeof boundLoop>,
+        options: {
+            /** A force-band pass: busting, with no drop, fold or materialization of its own. */
+            force?: boolean;
+            /** A requested materialization, which also busts. */
+            flush?: boolean;
+            fullFeatureMode?: boolean;
+            clearReasoningAge?: number;
+            overrides?: Partial<PostTransformArgs>;
+        } = {},
+    ) =>
+        runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, session.messages, {
+                resolvedProviderID: PROVIDER,
+                thinkingBindingRecoveryEnabledForModel: true,
+                messageTagNumbers: session.tags,
+                clearReasoningAge: options.clearReasoningAge ?? 3,
+                fullFeatureMode: options.fullFeatureMode ?? true,
+                contextUsage: options.force
+                    ? { percentage: 96, inputTokens: 96_000 }
+                    : { percentage: 20, inputTokens: 1000 },
+                ...(options.flush ? { pendingMaterializationSessions: new Set([sessionId]) } : {}),
+                ...options.overrides,
+            }),
+        );
+
+    const openDb = () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+    };
+    const message = (session: ReturnType<typeof boundLoop>, id: string) =>
+        findMessage(session.messages, id);
+    const AGED = [0, 1, 2, 3, 4].map((step) => `assistant-${step}`);
+    const NEWER = [5, 6, 7].map((step) => `assistant-${step}`);
+
+    for (const fullFeatureMode of [true, false]) {
+        const who = fullFeatureMode ? "primary" : "subagent";
+        it(`${who}: "Remove \`thinking\` blocks from the start of the history" is valid, so a trim-only pass keeps every newer signed block byte-identical and defer passes replay it`, async () => {
+            openDb();
+            const sessionId = `ses-bound-trim-only-${who}`;
+            const served = boundLoop(sessionId, 8);
+            await serve(sessionId, served, { fullFeatureMode });
+            expect(served.messages.slice(1).every((m) => reasoningCount(m) === 1)).toBe(true);
+
+            const trim = boundLoop(sessionId, 8);
+            const result = await serve(sessionId, trim, { force: true, fullFeatureMode });
+            expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set(AGED));
+            for (const id of AGED) expect(reasoningCount(message(trim, id))).toBe(0);
+            // Nothing else changed, so no newer block is stripped.
+            expect(result.proactiveThinkingStrip).toBeNull();
+            expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+            for (const id of NEWER) {
+                expect(JSON.stringify(message(trim, id))).toBe(JSON.stringify(message(served, id)));
+            }
+
+            for (const steps of [8, 10]) {
+                const defer = boundLoop(sessionId, steps);
+                const deferResult = await serve(sessionId, defer, { fullFeatureMode });
+                expect(deferResult.proactiveThinkingStrip).toBeNull();
+                expect(sha256(defer.messages.slice(0, trim.messages.length))).toBe(
+                    sha256(trim.messages),
+                );
+            }
+        });
+    }
+
+    it('"Clear or shorten an earlier `tool_result`" invalidates every later block, so a pass that trims and also applies a drop strips every signed block', async () => {
+        openDb();
+        const sessionId = "ses-bound-trim-and-drop";
+        await serve(sessionId, boundLoop(sessionId, 8));
+        const pass = boundLoop(sessionId, 8);
+        const dropped = message(pass, "assistant-6");
+        insertTag(db, sessionId, "call-6", "tool", 1000, 8, 0, "bash", 0, "assistant-6");
+        padRecentToolSkeletonWindow(sessionId, 9);
+        queuePendingOp(db, sessionId, 8, "drop");
+        const result = await serve(sessionId, pass, {
+            force: true,
+            overrides: { targets: new Map([[8, makeDropTarget(dropped)]]) },
+        });
+        expect(getPendingOps(db, sessionId)).toHaveLength(0);
+        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set(AGED));
+        expect(result.proactiveThinkingStrip?.messageIds).toEqual(
+            expect.arrayContaining([...AGED, ...NEWER]),
+        );
+        for (const m of pass.messages.slice(1)) expect(reasoningCount(m)).toBe(0);
+    });
+
+    it('"Change the top-level `system` string or blocks" is invalid, and a requested materialization cannot say whether it changed it, so a trimming pass that materializes strips every signed block', async () => {
+        openDb();
+        const sessionId = "ses-bound-trim-and-flush";
+        await serve(sessionId, boundLoop(sessionId, 8));
+        const pass = boundLoop(sessionId, 8);
+        const result = await serve(sessionId, pass, { flush: true });
+        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set(AGED));
+        expect(result.proactiveThinkingStrip?.messageIds).toEqual(expect.arrayContaining(NEWER));
+        for (const m of pass.messages.slice(1)) expect(reasoningCount(m)).toBe(0);
+    });
+
+    it('"Remove a `thinking` block from the middle of the history and keep later ones" is invalid, so an ineligible message stops the trim and nothing after it is removed', async () => {
+        openDb();
+        const sessionId = "ses-bound-gap";
+        await serve(sessionId, boundLoop(sessionId, 8, { untagged: 2 }));
+        const pass = boundLoop(sessionId, 8, { untagged: 2 });
+        const result = await serve(sessionId, pass, { force: true });
+        expect(result.proactiveThinkingStrip).toBeNull();
+        expect(getRemovedReasoningIds(db, sessionId)).toEqual(
+            new Set(["assistant-0", "assistant-1"]),
+        );
+        for (const step of [2, 3, 4, 5, 6, 7]) {
+            expect(reasoningCount(message(pass, `assistant-${step}`))).toBe(1);
+        }
+    });
+
+    it('"Put back a `thinking` block you removed on an earlier request" is invalid, so removed and stripped blocks never return and the trim continues behind a strip', async () => {
+        openDb();
+        const sessionId = "ses-bound-never-restore";
+        await serve(sessionId, boundLoop(sessionId, 8));
+        await serve(sessionId, boundLoop(sessionId, 8), { force: true });
+        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set(AGED));
+
+        // A later busting pass that selects nothing new still serves the removal.
+        const quiet = boundLoop(sessionId, 8);
+        await serve(sessionId, quiet, { force: true, clearReasoningAge: 999 });
+        for (const id of AGED) expect(reasoningCount(message(quiet, id))).toBe(0);
+
+        // A materializing pass strips everything; the strip set is replayed.
+        const flush = boundLoop(sessionId, 8);
+        await serve(sessionId, flush, { flush: true });
+        for (const m of flush.messages.slice(1)) expect(reasoningCount(m)).toBe(0);
+
+        // New steps arrive. The trim passes over the stripped messages and
+        // removes the newly aged steps, without stripping the newest ones.
+        const grown = boundLoop(sessionId, 14);
+        const result = await serve(sessionId, grown, { force: true });
+        expect(result.proactiveThinkingStrip).toBeNull();
+        for (const step of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
+            expect(reasoningCount(message(grown, `assistant-${step}`))).toBe(0);
+        }
+        for (const step of [11, 12, 13]) {
+            expect(reasoningCount(message(grown, `assistant-${step}`))).toBe(1);
+        }
+        expect(getRemovedReasoningIds(db, sessionId)).toEqual(
+            new Set([...AGED, ...[8, 9, 10].map((step) => `assistant-${step}`)]),
+        );
+    });
+
+    it("Rust-mode host keeps newer blocks on a module bust whose only edit is the oldest-prefix trim, and strips them otherwise", () => {
+        openDb();
+        const postprocess = (
+            sessionId: string,
+            messages: MessageLike[],
+            moduleReasoningTrimOnly: boolean,
+        ) =>
+            runRustModePostprocess({
+                db,
+                sessionId,
+                messages,
+                fullFeatureMode: true,
+                resolvedProviderID: PROVIDER,
+                thinkingBindingRecoveryEnabledForModel: true,
+                cacheBustingPass: true,
+                moduleReasoningTrimOnly,
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: true, frozen: true },
+            });
+        const kept = boundLoop("ses-rust-trim-only", 8).messages;
+        const before = JSON.stringify(kept);
+        expect(postprocess("ses-rust-trim-only", kept, true).proactiveThinkingStrip).toBeNull();
+        expect(JSON.stringify(kept)).toBe(before);
+
+        const stripped = boundLoop("ses-rust-other-edit", 8).messages;
+        expect(
+            postprocess("ses-rust-other-edit", stripped, false).proactiveThinkingStrip?.messageIds,
+        ).toHaveLength(8);
+        for (const m of stripped.slice(1)) expect(reasoningCount(m)).toBe(0);
     });
 });
