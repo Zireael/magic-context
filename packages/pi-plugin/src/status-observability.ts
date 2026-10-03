@@ -40,6 +40,10 @@ import {
 	buildStatusView as buildSharedStatusView,
 	type StatusView,
 } from "@magic-context/core/shared/status-view";
+import {
+	readTuiPreferencesFileSync,
+	resolveMagicContextPrefs,
+} from "@magic-context/core/shared/tui-preferences";
 import packageJson from "../package.json";
 import type { CtxStatusRuntimeDeps } from "./commands/ctx-status";
 import { resolveSessionId } from "./commands/pi-command-utils";
@@ -556,7 +560,15 @@ function buildAuthoritativeViews(
 			dreamer: true,
 			stats: true,
 		},
-		headerLabel: "MagicContext",
+		// The label is the shared OpenCode TUI preference (`tui-preferences.jsonc`
+		// -> `magic-context.header.label`), read exactly the way the OpenCode
+		// sidebar slot reads it: one file, one resolver, one default. Read per
+		// rebuild rather than once at registration: the reader is sync, tolerant
+		// and never throws, the file is tiny, and rebuilds are debounced
+		// event-driven work -- so a label edit lands on the next status event
+		// with no watcher lifecycle in the producer (REQ-MC1-005: no timer).
+		headerLabel: resolveMagicContextPrefs(readTuiPreferencesFileSync()).header
+			.label,
 	});
 	return { statusView, sidebarView };
 }

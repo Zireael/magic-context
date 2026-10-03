@@ -9,7 +9,9 @@
  * breaks these tests.
  */
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -715,6 +717,64 @@ describe("Magic Context status observability registration", () => {
 			}
 		} finally {
 			closeQuietly(db);
+		}
+	});
+	it("published sidebarView header label follows the shared TUI preference file (default = OpenCode parity)", async () => {
+		const bus = makeBus();
+		const { api, handlers } = makeMockPi(bus);
+		const db = createTestDb();
+		const previousPrefsFile = process.env.OPENCODE_TUI_PREFERENCES_FILE;
+		const dir = mkdtempSync(join(tmpdir(), "mc-header-label-"));
+		try {
+			// Point at a nonexistent file first: the tolerant reader resolves the
+			// shared default, exactly like an untouched install.
+			process.env.OPENCODE_TUI_PREFERENCES_FILE = join(dir, "absent.jsonc");
+			const producer = registerMagicContextStatusObservability(api, {
+				resolveStatusDeps: () => ({
+					db,
+					projectIdentity: resolveProjectIdentity(process.cwd()),
+				}),
+				debounceMs: DEBOUNCE,
+				onWarn: () => undefined,
+			});
+			try {
+				fire(
+					handlers,
+					"session_start",
+					undefined,
+					makeCtx("ses-label-default"),
+				);
+				await sleep(AFTER);
+				expect(snapshotEvents(bus)).toHaveLength(1);
+				expect(snapshotEvents(bus)[0]?.payload.sidebarView?.header.label).toBe(
+					"Magic Context",
+				);
+
+				// A customized preference is observed by the NEXT rebuild — no
+				// producer restart, no watcher: the label is read per build.
+				writeFileSync(
+					join(dir, "custom.jsonc"),
+					`${JSON.stringify({ "magic-context": { header: { label: "Ctx Panel" } } })}
+`,
+					"utf8",
+				);
+				process.env.OPENCODE_TUI_PREFERENCES_FILE = join(dir, "custom.jsonc");
+				fire(handlers, "session_start", undefined, makeCtx("ses-label-custom"));
+				await sleep(AFTER);
+				expect(snapshotEvents(bus)).toHaveLength(2);
+				expect(snapshotEvents(bus)[1]?.payload.sidebarView?.header.label).toBe(
+					"Ctx Panel",
+				);
+			} finally {
+				producer.dispose({ withdraw: false });
+			}
+		} finally {
+			if (previousPrefsFile === undefined) {
+				delete process.env.OPENCODE_TUI_PREFERENCES_FILE;
+			} else {
+				process.env.OPENCODE_TUI_PREFERENCES_FILE = previousPrefsFile;
+			}
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 });
