@@ -1,0 +1,78 @@
+name: Windows plugin build
+
+# Manual, on-demand build of the Magic Context plugin for Windows.
+#
+# The release lanes build on Linux; this exists so a Windows artifact can be
+# produced from a fork without installing Bun locally. Pick the package:
+#   - pi-plugin : the Pi / OMP extension (@cortexkit/pi-magic-context) — the
+#                 artifact this repo's OMP sidepanel program consumes
+#   - plugin    : the OpenCode plugin (@cortexkit/opencode-magic-context)
+#
+# Run it by hand (Actions -> Windows plugin build -> Run workflow). Pushing a
+# commit does not run this.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Plugin package to build
+        required: true
+        type: choice
+        default: pi-plugin
+        options:
+          - pi-plugin
+          - plugin
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ inputs.package }} (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # `scripts/check-bun.mjs` enforces the repo's engines.bun floor;
+          # latest satisfies it and matches the release lanes.
+          bun-version: latest
+
+      - name: Cache Bun install cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      - name: Install workspace dependencies
+        # The package build scripts use POSIX tools (`rm -f dist/...`), so run
+        # everything under Git Bash instead of PowerShell.
+        shell: bash
+        run: bun install --frozen-lockfile
+
+      - name: Build ${{ inputs.package }}
+        shell: bash
+        run: bun run --cwd packages/${{ inputs.package }} build
+
+      - name: Pack installable tarball
+        shell: bash
+        working-directory: packages/${{ inputs.package }}
+        run: npm pack --pack-destination "${{ github.workspace }}/artifacts"
+
+      - name: Upload installable tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: magic-context-${{ inputs.package }}-windows
+          path: artifacts/*.tgz
+          if-no-files-found: error
+
+      - name: Upload built dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: magic-context-${{ inputs.package }}-dist
+          path: packages/${{ inputs.package }}/dist
+          if-no-files-found: error
+          retention-days: 14
