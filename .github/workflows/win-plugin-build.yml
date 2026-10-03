@@ -60,7 +60,10 @@ jobs:
       - name: Pack installable tarball
         shell: bash
         working-directory: packages/${{ inputs.package }}
-        run: npm pack --pack-destination "${{ github.workspace }}/artifacts"
+        # npm does not create the destination on Windows, so make it first.
+        run: |
+          mkdir -p "${{ github.workspace }}/artifacts"
+          npm pack --pack-destination "${{ github.workspace }}/artifacts"
 
       - name: Upload installable tarball
         uses: actions/upload-artifact@v4
