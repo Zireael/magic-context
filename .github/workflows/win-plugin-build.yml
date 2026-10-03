@@ -61,6 +61,16 @@ jobs:
         shell: bash
         run: bun install --frozen-lockfile
 
+      - name: Seed the build script's chunk-cleanup glob
+        # The pi-plugin build starts with `rm -f dist/*-*.js`. Under Bun's own
+        # shell — which is what runs a package script, on every platform — a
+        # glob that matches nothing aborts the whole script, while sh passes the
+        # literal to `rm -f`. A fresh Windows checkout has no `dist/`, so seed
+        # one chunk-shaped file: the glob then matches, and the script removes it
+        # exactly as it removes a stale chunk.
+        shell: bash
+        run: mkdir -p packages/${{ inputs.package }}/dist && touch packages/${{ inputs.package }}/dist/ci-bootstrap.js
+
       - name: Build ${{ inputs.package }}
         shell: bash
         run: bun run --cwd packages/${{ inputs.package }} build
