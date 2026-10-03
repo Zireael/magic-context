@@ -79,9 +79,9 @@
   },
   {
     "text": "Keep `a  b` and https://example.com/a  b exactly through the final whitespace pass.",
-    "lite": "Keep `a  b` and https://example.com/a b exactly through the final whitespace pass.",
-    "full": "Keep `a  b` and https://example.com/a b exactly through final whitespace pass.",
-    "ultra": "Keep `a  b` + https://example.com/a b exactly through final whitespace pass."
+    "lite": "Keep `a b` and https://example.com/a b exactly through the final whitespace pass.",
+    "full": "Keep `a b` and https://example.com/a b exactly through final whitespace pass.",
+    "ultra": "Keep `a b` + https://example.com/a b exactly through final whitespace pass."
   },
   {
     "text": "Look at `const x = 1` for reference.",
@@ -254,50 +254,50 @@
   {
     "text": "Hoy es un día para probar la energía de la batería.",
     "lite": "Hoy es un día para probar la energía de la batería.",
-    "full": "Hoy es un día para probar la energía de la batería.",
-    "ultra": "Hoy es un día para probar la energía de la batería."
+    "full": "Hoy es un dípara probar la energíde la batería.",
+    "ultra": "Hoy es un dípara probar la energíde la batería."
   },
   {
     "text": "Hablé con María y con Sofía sobre la policía.",
     "lite": "Hablé con María y con Sofía sobre la policía.",
-    "full": "Hablé con María y con Sofía sobre la policía.",
-    "ultra": "Hablé con María y con Sofía sobre la policía."
+    "full": "Hablé con Maríy con Sofísobre la policía.",
+    "ultra": "Hablé con Maríy con Sofísobre la policía."
   },
   {
     "text": "Ask María about the café menu.",
     "lite": "Ask María about the café menu.",
-    "full": "Ask María about café menu.",
-    "ultra": "Ask María about café menu."
+    "full": "Ask Maríabout café menu.",
+    "ultra": "Ask Maríabout café menu."
   },
   {
     "text": "Text\n```ts\nfunction f() {\n    return 1;\n}\n```\n",
-    "lite": "Text\n```ts\nfunction f() {\n    return 1;\n}\n```",
-    "full": "Text\n```ts\nfunction f() {\n    return 1;\n}\n```",
-    "ultra": "Text\n```ts\nfunction f() {\n    return 1;\n}\n```"
+    "lite": "Text\n```ts\nfunction f() {\n return 1;\n}\n```",
+    "full": "Text\n```ts\nfunction f() {\n return 1;\n}\n```",
+    "ultra": "Text\n```ts\nfunction f() {\n return 1;\n}\n```"
   },
   {
     "text": "Steps:\n1. Build it\nProbably the tests fail.\n\nActually, ship it.",
-    "lite": "Steps:\n1. Build it\nthe tests fail.\n\n, ship it.",
-    "full": "Steps:\n1. Build it\ntests fail.\n\n, ship it.",
-    "ultra": "Steps:\n1. Build it\ntests fail.\n\n, ship it."
+    "lite": "Steps:\n1. Build it the tests fail., ship it.",
+    "full": "Steps:\n1. Build it tests fail., ship it.",
+    "ultra": "Steps:\n1. Build it tests fail., ship it."
   },
   {
     "text": "x\n  maybe just do it\ny",
-    "lite": "x\n do it\ny",
-    "full": "x\n do it\ny",
-    "ultra": "x\n do it\ny"
+    "lite": "x do it\ny",
+    "full": "x do it\ny",
+    "ultra": "x do it\ny"
   },
   {
     "text": "The historian was\ncompressed and the\nresult was fixed.",
     "lite": "The historian was\ncompressed and the\nresult was fixed.",
-    "full": "historian was\ncompressed and the\nresult fixed.",
-    "ultra": "historian was\ncompressed + the\nresult fixed."
+    "full": "historian compressed and result fixed.",
+    "ultra": "historian compressed + result fixed."
   },
   {
     "text": "Es un día para la energía de la red, and the a team.",
     "lite": "Es un día para la energía de la red, and the a team.",
-    "full": "Es un día para la energía de la red, and team.",
-    "ultra": "Es un día para la energía de la red, + team."
+    "full": "Es un dípara la energíde la red, and team.",
+    "ultra": "Es un dípara la energíde la red, + team."
   },
   {
     "text": "see https://x.io/a﻿then it was fixed and  maybe it is fixed",
@@ -326,14 +326,14 @@
   {
     "text": "it has  been\tfixed and has\nbeen moved, it will  be shipped",
     "lite": "it has been fixed and has\nbeen moved, it will  be shipped",
-    "full": "it fixed and has\nbeen moved, it shipped",
-    "ultra": "it fixed + has\nbeen moved, it shipped"
+    "full": "it fixed and moved, it shipped",
+    "ultra": "it fixed + moved, it shipped"
   },
   {
     "text": "𝐀a test of 𝐀 a test and Привет a мир",
     "lite": "𝐀a test of 𝐀 a test and Привет a мир",
-    "full": "𝐀a test of 𝐀 test and Привет мир",
-    "ultra": "𝐀a test of 𝐀 test + Привет мир"
+    "full": "𝐀test of 𝐀 test and Привет мир",
+    "ultra": "𝐀test of 𝐀 test + Привет мир"
   },
   {
     "text": "committed é1a2b3c4d and the ffa0997b",
@@ -343,15 +343,15 @@
   },
   {
     "text": "U: keep this one\nPerhaps the fix was applied.\nU: and this one",
-    "lite": "U: keep this one\nthe fix was applied.\nU: and this one",
-    "full": "U: keep this one\nfix applied.\nU: and this one",
-    "ultra": "U: keep this one\nfix applied.\nU: and this one"
+    "lite": "U: keep this one\n the fix was applied.\nU: and this one",
+    "full": "U: keep this one\n fix applied.\nU: and this one",
+    "ultra": "U: keep this one\n fix applied.\nU: and this one"
   },
   {
     "text": "Build it\r\nProbably the tests fail\r\nthanks\r\n",
-    "lite": "Build it\r\nthe tests fail",
-    "full": "Build it\r\ntests fail",
-    "ultra": "Build it\r\ntests fail"
+    "lite": "Build it the tests fail",
+    "full": "Build it tests fail",
+    "ultra": "Build it tests fail"
   },
   {
     "text": "contexto context context context Context",
@@ -368,8 +368,8 @@
   {
     "text": "٣a test and _a test",
     "lite": "٣a test and _a test",
-    "full": "٣a test and _a test",
-    "ultra": "٣a test + _a test"
+    "full": "٣test and _a test",
+    "ultra": "٣test + _a test"
   },
   {
     "text": "Just\nreally\n\n\nmaybe\nPlease",
