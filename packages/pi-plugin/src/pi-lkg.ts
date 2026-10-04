@@ -53,6 +53,12 @@ export interface PiLkgCaptureTiming {
 	reusedPrefix: number;
 }
 
+/** Detached serialization of this pass's exact output, for same-pass observers. */
+export interface PiLkgSerializedOutput {
+	jsonMessages: readonly string[];
+	json: string;
+}
+
 interface PiLkgSessionState {
 	captureSequence: number;
 	syncCaptureRequired: boolean;
@@ -203,7 +209,7 @@ export interface PiLkgCoordinator {
 		outputEntryIds?: readonly (string | null | undefined)[];
 		cacheBusting: boolean;
 		hostEnvelopeSignature?: string;
-	}): void;
+	}): PiLkgSerializedOutput | undefined;
 }
 
 export function isTransientPiStorageError(error: unknown): boolean {
@@ -840,20 +846,21 @@ export function createPiLkgCoordinator(
 		};
 		if (state.syncCaptureRequired) {
 			commit();
-			return;
+		} else {
+			try {
+				scheduleCapture(commit);
+			} catch (error) {
+				dropSlot(plan.sessionId, "lkg_capture_schedule_failed");
+				state.syncCaptureRequired = true;
+				state.acceptedInputs = null;
+				sessionLog(
+					plan.sessionId,
+					"LKG CAPTURE SCHEDULE FAILED; forcing synchronous capture on the next applied pass:",
+					error,
+				);
+			}
 		}
-		try {
-			scheduleCapture(commit);
-		} catch (error) {
-			dropSlot(plan.sessionId, "lkg_capture_schedule_failed");
-			state.syncCaptureRequired = true;
-			state.acceptedInputs = null;
-			sessionLog(
-				plan.sessionId,
-				"LKG CAPTURE SCHEDULE FAILED; forcing synchronous capture on the next applied pass:",
-				error,
-			);
-		}
+		return state.outputSnapshot ?? undefined;
 	};
 
 	return {

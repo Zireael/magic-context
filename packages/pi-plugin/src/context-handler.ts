@@ -282,6 +282,7 @@ import {
 	createPiLkgCoordinator,
 	isTransientPiStorageError,
 	type PiLkgPassSnapshot,
+	type PiLkgSerializedOutput,
 	piStorageErrorReason,
 	reconcilePiLkgEntryIds,
 	resolvePiLkgOutputEntryIds,
@@ -325,7 +326,10 @@ import {
 	replayStrippedInlineThinkingPi,
 	stripInlineThinkingPi,
 } from "./reasoning-replay-pi";
-import { capturePiServedArray } from "./served-array-ledger";
+import {
+	capturePiServedArray,
+	clearPiServedArraySession,
+} from "./served-array-ledger";
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import {
@@ -3997,6 +4001,7 @@ export function registerPiContextHandler(
 			) {
 				assertTailHygieneLastWriter();
 			}
+			let serializedOutput: PiLkgSerializedOutput | undefined;
 			if (!lkgCompactionOff && lkgPassSnapshot) {
 				let hostEnvelopeSignature: string | undefined;
 				try {
@@ -4009,7 +4014,7 @@ export function registerPiContextHandler(
 				} catch {
 					/* Missing optional attribution must not prevent capturing the good prefix. */
 				}
-				lkgCoordinator.captureAppliedPass({
+				serializedOutput = lkgCoordinator.captureAppliedPass({
 					hostEnvelopeSignature,
 					snapshot: lkgPassSnapshot,
 					outputMessages,
@@ -4025,7 +4030,7 @@ export function registerPiContextHandler(
 					cacheBusting: result.bustedThisPass,
 				});
 			}
-			capturePiServedArray(sessionId, outputMessages);
+			capturePiServedArray(sessionId, outputMessages, { serializedOutput });
 			if (thinkingBindingRecoveryApplied) {
 				try {
 					clearThinkingBindingRecoveryIf(
@@ -7961,6 +7966,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	invalidateTrueRawTokenCache({ sessionId, reason: "pi.branch.changed" });
 	clearPiLiveUsageClassification(sessionId);
 	clearPiLkgSessionState(sessionId);
+	clearPiServedArraySession(sessionId);
 	activeContextHandlerSessions.delete(sessionId);
 	clearAutoSearchForPiSession(sessionId);
 	lastEmergencyNotificationAtMs.delete(sessionId);
