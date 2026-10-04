@@ -63,8 +63,9 @@ import { resolvePromptSurface } from "@magic-context/core/shared/prompt-surface"
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
+import { isPrefixBoundThinkingModel } from "../../plugin/src/features/magic-context/overflow-detection";
+import * as decisionLogs from "../../plugin/src/features/magic-context/transform-decision-log";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
-
 import { clearAutoSearchForPiSession } from "./auto-search-pi";
 import {
 	awaitInFlightHistorians,
@@ -2153,6 +2154,82 @@ describe("registerPiContextHandler", () => {
 				expect(getPendingOps(db, sessionId)).toHaveLength(1);
 			} finally {
 				restoreHistorian?.();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+	}
+
+	for (const [name, isSubagent, tokens, queued, applies] of [
+		["subagent execute drains queued drops", true, 70000, true, true],
+		["primary execute holds queued drops", false, 70000, true, false],
+		["subagent defer holds queued drops", true, 20000, true, false],
+		["subagent empty execute is byte-identical", true, 70000, false, false],
+	] as const) {
+		it(`issue 619 ${name}`, async () => {
+			const db = createTestDb();
+			const sessionId = `issue-619-${name}`;
+			try {
+				getOrCreateSessionMeta(db, sessionId);
+				updateSessionMeta(db, sessionId, {
+					isSubagent,
+					lastResponseTime: Date.now(),
+					cacheTtl: "59m",
+				});
+				const fake = createFakePi();
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 0,
+					heuristics: { clearReasoningAge: 1 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				let passTokens = 20000;
+				const ctx = {
+					...fakeContext(sessionId),
+					getContextUsage: () => ({
+						tokens: passTokens,
+						percent: passTokens / 1000,
+						contextWindow: 100000,
+					}),
+				};
+				const pass = () =>
+					handler(
+						{
+							messages: [
+								userMessage("keep user", 1),
+								assistantMessage("spent assistant", 2),
+								...(applies
+									? [
+											assistantMessage(
+												"Keep <think>issue-619-stale-thought</think> visible",
+												3,
+											),
+											userMessage("new tail", 4),
+											assistantMessage("fresh assistant", 5),
+										]
+									: []),
+							] as never[],
+						},
+						ctx as never,
+					);
+				await pass();
+				const baseline = JSON.stringify((await pass()).messages);
+				if (queued) queuePendingOp(db, sessionId, 2, "drop");
+				passTokens = tokens;
+				const bytes = JSON.stringify((await pass()).messages);
+				expect(getPendingOps(db, sessionId)).toHaveLength(
+					queued && !applies ? 1 : 0,
+				);
+				if (applies) {
+					expect(bytes).not.toBe(baseline);
+					expect(bytes).not.toContain("issue-619-stale-thought");
+				} else expect(bytes).toBe(baseline);
+				for (let replay = 0; replay < 3; replay++)
+					expect(JSON.stringify((await pass()).messages)).toBe(bytes);
+			} finally {
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);
 			}
@@ -7333,6 +7410,269 @@ describe("Pi proactive strip of invalidated thinking", () => {
 		).filter?.((part) => part.type === "thinking").length ?? 0;
 	const sha256 = (value: unknown) =>
 		createHash("sha256").update(JSON.stringify(value)).digest("hex");
+	for (const [lane, isSubagent, executePercent, name] of [
+		[
+			"image",
+			true,
+			70,
+			"issue 619 Pi terminal image edit keeps earlier signed thinking and actual-edit telemetry",
+		],
+		[
+			"stale",
+			true,
+			70,
+			"issue 619 Pi terminal stale edit keeps earlier signed thinking and actual-edit telemetry",
+		],
+		[
+			"image",
+			false,
+			96,
+			"issue 619 Pi primary terminal image edit keeps earlier signed thinking and actual-edit telemetry",
+		],
+	] as const) {
+		it(name, async () => {
+			const db = createTestDb();
+			const sessionId = `pi-terminal-${lane}`;
+			const fake = createFakePi();
+			const telemetry = spyOn(decisionLogs, "recordPendingPiTransformDecision");
+			try {
+				getOrCreateSessionMeta(db, sessionId);
+				updateSessionMeta(db, sessionId, {
+					isSubagent,
+					piStableIdScheme: 1,
+					cacheTtl: "59m",
+					lastResponseTime: Date.now(),
+				});
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 0,
+					heuristics: { clearReasoningAge: 999 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: unknown[] }>;
+				const build = () => {
+					const edits =
+						lane === "image"
+							? [
+									{
+										...userMessage("image request", 4),
+										content: [
+											{
+												type: "image",
+												mimeType: "image/png",
+												data: "a".repeat(220),
+											},
+										],
+									},
+								]
+							: Array.from({ length: 4 }, (_, index) => [
+									assistantToolCall(
+										`terminal-${index}`,
+										"ctx_reduce",
+										{ drop: "1" },
+										index * 2 + 4,
+									),
+									{
+										...toolResultMessage(
+											`terminal-${index}`,
+											"Queued",
+											index * 2 + 5,
+										),
+										toolName: "ctx_reduce",
+									},
+								]).flat();
+					const messages = [
+						userMessage("one", 1),
+						opusAssistant("signed one", "answer one", 2),
+						userMessage("two", 3),
+						...edits,
+						userMessage("three", 19),
+						assistantMessage("plain answer", 20),
+					];
+					return {
+						messages,
+						entryIds: messages.map((_, index) => `entry-${index}`),
+					};
+				};
+				const pass = async (percent: number, warmOnly = false) => {
+					const { messages, entryIds } = build();
+					if (warmOnly) {
+						messages.splice(1);
+						entryIds.splice(1);
+					}
+					const result = await handler({ messages: messages as never[] }, {
+						...fakeContext(
+							sessionId,
+							process.cwd(),
+							entryIds,
+							messages as never,
+						),
+						model: { provider: "anthropic", id: "claude-opus-5-5" },
+						getContextUsage: () => ({
+							tokens: percent * 1000,
+							percent,
+							contextWindow: 100000,
+						}),
+					} as never);
+					return result.messages;
+				};
+				await pass(20, !isSubagent);
+				const baseline = await pass(20);
+				expect(
+					baseline.reduce((sum, message) => sum + thinkingIn(message), 0),
+				).toBe(1);
+				if (lane === "image") {
+					const max = Math.max(
+						...getTagsBySession(db, sessionId).map((tag) => tag.tagNumber),
+					);
+					insertTag(db, sessionId, "off-branch-drop", "tool", 10, max + 1);
+					updateTagStatus(db, sessionId, max + 1, "dropped");
+				}
+				telemetry.mockClear();
+				const edited = await pass(executePercent);
+				expect(
+					edited.reduce((sum, message) => sum + thinkingIn(message), 0),
+				).toBe(1);
+				expect(sha256(edited.slice(0, 3))).toBe(sha256(baseline.slice(0, 3)));
+				expect(sha256(edited)).not.toBe(sha256(baseline));
+				expect(telemetry).toHaveBeenCalledTimes(1);
+				telemetry.mockClear();
+				for (const percent of [20, executePercent])
+					expect(sha256(await pass(percent))).toBe(sha256(edited));
+				expect(telemetry).not.toHaveBeenCalled();
+			} finally {
+				telemetry.mockRestore();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+	}
+
+	for (const lane of ["image", "stale reduce", "sentinel"] as const) {
+		it(`issue 619 Pi ${lane} first application invalidates thinking and replay is not a new edit`, async () => {
+			const db = createTestDb();
+			const sessionId = `pi-first-application-${lane}`;
+			const fake = createFakePi();
+			const telemetry = spyOn(decisionLogs, "recordPendingPiTransformDecision");
+			try {
+				getOrCreateSessionMeta(db, sessionId);
+				updateSessionMeta(db, sessionId, {
+					isSubagent: true,
+					piStableIdScheme: 1,
+					cacheTtl: "59m",
+					lastResponseTime: Date.now(),
+				});
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 0,
+					heuristics: { clearReasoningAge: 999 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: unknown[] }>;
+				const build = () => {
+					const head =
+						lane === "image"
+							? [
+									{
+										...userMessage("image request", 1),
+										content: [
+											{
+												type: "image",
+												mimeType: "image/png",
+												data: "a".repeat(220),
+											},
+										],
+									},
+								]
+							: lane === "sentinel"
+								? [assistantMessage("[dropped §1§]", 1)]
+								: Array.from({ length: 4 }, (_, index) => [
+										assistantToolCall(
+											`reduce-${index}`,
+											"ctx_reduce",
+											{ drop: "1" },
+											index * 2 + 1,
+										),
+										{
+											...toolResultMessage(
+												`reduce-${index}`,
+												"Queued",
+												index * 2 + 2,
+											),
+											toolName: "ctx_reduce",
+										},
+									]).flat();
+					const messages = [
+						...head,
+						userMessage("first request", 10),
+						opusAssistant("signed one", "answer one", 11),
+						userMessage("second request", 12),
+						opusAssistant("signed two", "answer two", 13),
+					];
+					return {
+						messages,
+						entryIds: messages.map((_, index) => `entry-${index}`),
+					};
+				};
+				const pass = async (percent: number) => {
+					const { messages, entryIds } = build();
+					expect(
+						isPrefixBoundThinkingModel("anthropic", "claude-opus-5-5"),
+					).toBe(true);
+					const result = await handler({ messages: messages as never[] }, {
+						...fakeContext(
+							sessionId,
+							process.cwd(),
+							entryIds,
+							messages as never,
+						),
+						model: { provider: "anthropic", id: "claude-opus-5-5" },
+						getContextUsage: () => ({
+							tokens: percent * 1000,
+							percent,
+							contextWindow: 100000,
+						}),
+					} as never);
+					return result.messages;
+				};
+				await pass(20);
+				const baseline = await pass(20);
+				expect(
+					baseline.reduce((sum, message) => sum + thinkingIn(message), 0),
+				).toBe(2);
+				telemetry.mockClear();
+				if (lane === "image") {
+					const max = Math.max(
+						...getTagsBySession(db, sessionId).map((tag) => tag.tagNumber),
+					);
+					insertTag(db, sessionId, "off-branch-drop", "tool", 10, max + 1);
+					updateTagStatus(db, sessionId, max + 1, "dropped");
+				}
+				// Pi's splicing placeholder discovery stays restricted to refresh.
+				if (lane === "sentinel") signalPiHistoryRefresh(sessionId);
+				const applied = await pass(70);
+				expect(sha256(applied)).not.toBe(sha256(baseline));
+				expect(
+					applied.reduce((sum, message) => sum + thinkingIn(message), 0),
+				).toBe(0);
+				expect(telemetry).toHaveBeenCalledTimes(1);
+				telemetry.mockClear();
+				for (const percent of [20, 70]) {
+					const replay = await pass(percent);
+					expect(sha256(replay)).toBe(sha256(applied));
+				}
+				expect(telemetry).not.toHaveBeenCalled();
+			} finally {
+				telemetry.mockRestore();
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+	}
 
 	it("strips on the busting pass that renders a drop and replays on the defer pass", async () => {
 		const db = createTestDb();

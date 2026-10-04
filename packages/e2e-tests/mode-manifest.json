@@ -19,6 +19,14 @@
             "hosts": ["opencode2"]
         },
         {
+            "path": "tests/subagent-execute-ride.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 619: OpenCode 1.18.x task child drains ctx_reduce on a token-configured execute pass, shrinks the real provider request and replays the frozen prefix; PID lsof proves throwaway-store containment; Rust and Pi gates have module/unit counterparts",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/historian-expand-tools.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

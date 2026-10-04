@@ -3751,8 +3751,8 @@ export function registerPiContextHandler(
 						// Same permission as synthetic todo injection:
 						// executedWorkThisPass is true when the pipeline was allowed to
 						// bust the cache (a HARD fold included). bustedThisPass is not
-						// used, because replaying saved drop statuses sets it even on
-						// a defer pass.
+						// used as permission: it describes the earlier pipeline and cannot
+						// observe host-side reminder edits made after that pipeline.
 						//
 						// A pass whose only edit is the oldest-prefix thinking clear
 						// keeps the newer blocks: Anthropic's "What counts as an edit"
@@ -5395,7 +5395,91 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// An edit this pass made before newer thinking other than the oldest-prefix
 	// thinking clear of a prefix-bound model; see RunPipelineResult.
 	let prefixEditBesidesReasoningTrim = false;
-	let didMutateFromFlushedStatuses = false;
+	// Only first application changes the served prefix. Frozen-id replay rebuilds
+	// prior bytes from raw history and must not create a new bust or invalidation.
+	const recordFirstApplicationWireEdit = (
+		beforeNewerThinking: boolean,
+	): void => {
+		heuristicOrReasoningDidMutate = true;
+		prefixEditBesidesReasoningTrim ||= beforeNewerThinking;
+		executedWorkThisPass = true;
+	};
+	// Retain source order through later splices. A terminal edit must not move
+	// the rewrite backward into thinking whose preceding bytes did not change.
+	let firstEditSourceOrder: Map<string, number> | undefined;
+	const firstEditParts = new Map<string, number>();
+	const recordFirstApplicationAt = (
+		message: unknown,
+		index: number,
+		partIndex: number,
+		resolveId: (
+			message: unknown,
+			index: number,
+		) => string | undefined = stableIdResolver,
+	): void => {
+		firstEditSourceOrder ??= new Map(
+			args.messages.flatMap((item, sourceIndex) => {
+				const id = resolveId(item, sourceIndex);
+				return id ? [[id, sourceIndex] as const] : [];
+			}),
+		);
+		const id = resolveId(message, index);
+		if (!id || !firstEditSourceOrder.has(id)) {
+			recordFirstApplicationWireEdit(true);
+			return;
+		}
+		recordFirstApplicationWireEdit(false);
+		firstEditParts.set(
+			id,
+			Math.min(firstEditParts.get(id) ?? Infinity, partIndex),
+		);
+	};
+	// Call ids can repeat across owners; only the matched arc and its paired
+	// results contribute locations, not unrelated turns reusing the same id.
+	const recordStaleReduceEdit = (tag: {
+		messageId: string;
+		toolOwnerMessageId: string | null;
+	}): void => {
+		let matchedOwner = false;
+		let located = false;
+		for (let index = 0; index < args.messages.length; index++) {
+			const raw = args.messages[index];
+			if (!raw || typeof raw !== "object") continue;
+			const message = raw as {
+				role?: string;
+				toolCallId?: string;
+				content?: unknown;
+			};
+			if (message.role === "assistant" && Array.isArray(message.content)) {
+				for (
+					let partIndex = 0;
+					partIndex < message.content.length;
+					partIndex++
+				) {
+					const part = message.content[partIndex] as {
+						type?: string;
+						id?: string;
+					};
+					if (part?.type !== "toolCall" || part.id !== tag.messageId) continue;
+					matchedOwner =
+						tag.toolOwnerMessageId === null ||
+						stableIdResolver(raw, index) === tag.toolOwnerMessageId;
+					if (matchedOwner) {
+						recordFirstApplicationAt(raw, index, partIndex);
+						located = true;
+					}
+				}
+			} else if (
+				message.role === "toolResult" &&
+				message.toolCallId === tag.messageId &&
+				matchedOwner
+			) {
+				recordFirstApplicationAt(raw, index, 0);
+				located = true;
+			}
+		}
+		if (!located) recordFirstApplicationWireEdit(true);
+	};
 	let droppedCount = 0;
 	let droppedTokens = 0;
 	const droppedTokenReductions: DroppedTokenReduction[] = [];
@@ -5709,10 +5793,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		executePressureEligible &&
 		routinePressureAppliedBySession.get(args.sessionId) === true;
 	const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
-	// Pi sessions are primary-equivalent today. If Pi adds subagents on this
-	// transform path, subagents should bypass this once-per-turn guard like
-	// OpenCode does, because they do not share the primary agent's turn cache.
+	// Subagents have no history fold to ride. Their execute pass admits every
+	// eligible cleanup lane together, without rewriting bytes when none acts.
 	const rideSignals = {
+		subagentExecute:
+			args.sessionMeta.isSubagent && args.schedulerDecision === "execute",
 		hardFold: foldBustsServedPrefixThisPass || firstRenderBust,
 		force:
 			(args.forceMaterialization === true || emergencyDropEligible) &&
@@ -5753,6 +5838,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// reductions may ride it without causing an independent bust.
 			foldBustsServedPrefixThisPass ||
 			firstRenderBust ||
+			rideSignals.subagentExecute ||
 			(args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn));
 
 	// 1. Tagging: assigns tag numbers + injects §N§ prefixes when ctx_reduce
@@ -6087,16 +6173,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		`targets=${targetTagNumbers.length} fetched=${flushedDroppedTags.length}`,
 	);
 	const tFlushed = performance.now();
-	didMutateFromFlushedStatuses = runPersistedReplayStage(
-		"flushed-status-failure",
-		undefined,
-		() =>
-			applyFlushedStatuses(
-				args.sessionId,
-				args.db,
-				targets,
-				flushedDroppedTags,
-			),
+	runPersistedReplayStage("flushed-status-failure", undefined, () =>
+		applyFlushedStatuses(args.sessionId, args.db, targets, flushedDroppedTags),
 	);
 	logTransformTiming(args.sessionId, "applyFlushedStatuses", tFlushed);
 	logTransformTiming(args.sessionId, "batchFinalize:flushed", tFlushed);
@@ -6280,6 +6358,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						: undefined,
 					routine: routineCleanupApplied,
 					staleReduceStripEnabled: args.canUseEmptySentinels,
+					onStaleReduceEdit: recordStaleReduceEdit,
 					// Tiered emergency drop fires only at the derived force band AND when the
 					// ceiling is known. forceMaterialization already incorporates
 					// the derived force-band / emergency condition for Pi (primary-equivalent).
@@ -6315,6 +6394,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 							: undefined,
 						routine: true,
 						staleReduceStripEnabled: args.canUseEmptySentinels,
+						onStaleReduceEdit: recordStaleReduceEdit,
 						caveman: args.isSubagent ? undefined : args.heuristics.caveman,
 					},
 					getActiveTagsBySession(args.db, args.sessionId),
@@ -6368,9 +6448,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			if (heuristicsResult.droppedTokenReductions.length > 0) {
 				droppedTokenReductions.push(...heuristicsResult.droppedTokenReductions);
 			}
-			if (heuristicMutationCount > 0) {
-				heuristicOrReasoningDidMutate = true;
-				prefixEditBesidesReasoningTrim = true;
+			if (heuristicMutationCount > heuristicsResult.droppedStaleReduceCalls) {
+				recordFirstApplicationWireEdit(true);
 			}
 			heuristicsExecuted = true;
 			executedWorkThisPass = true;
@@ -6628,11 +6707,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				watermark: getMaxDroppedTagNumber(args.db, args.sessionId),
 				messageIdToMaxTag,
 				stableId: stableIdResolver,
+				onFirstApplication: recordFirstApplicationAt,
 			});
 			if (imageResult.newlyStrippedIds.length > 0) {
-				heuristicOrReasoningDidMutate = true;
-				prefixEditBesidesReasoningTrim = true;
-				executedWorkThisPass = true;
 				droppedCount += imageResult.stripped;
 			}
 		} catch (err) {
@@ -6762,9 +6839,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				)
 			: 0;
 		if (nativeInputsApplied > 0 || nativeReasoningApplied > 0) {
-			heuristicOrReasoningDidMutate = true;
-			prefixEditBesidesReasoningTrim = true;
-			executedWorkThisPass = true;
+			recordFirstApplicationWireEdit(true);
 		}
 	}
 	// Finalize the shared episode after all reclaim producers, including processed
@@ -6970,18 +7045,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		db: args.db,
 		sessionId: args.sessionId,
 		messages: args.messages,
-		// Discovery is gated to history-refresh passes ONLY (args.isCacheBusting) —
-		// deliberately NARROWER than OpenCode's `shouldApplyPendingOps ||
-		// shouldRunHeuristics`. The two harnesses diverge in strip SEMANTICS:
-		// OpenCode NEUTRALIZES a placeholder-only message in place (replaces parts
-		// with an empty sentinel, message stays in the array), so discovering on a
-		// fresh-drop execute pass is harmless. Pi REMOVES (splices) the message.
-		// A freshly-dropped tool stub renders as `[dropped §N§]`, which
-		// isDroppedOnlyText matches — so discovering on the same execute pass that
-		// created it would splice out the just-dropped turn and collapse it. We
-		// therefore discover only at history-refresh boundaries (where the array is
-		// rebuilt anyway); a stub created on a drop-only execute pass is tiny and
-		// gets discovered on the next refresh pass. Replay still runs every pass.
+		// Pi splices placeholder-only messages rather than neutralizing them in
+		// place. Subagent execute alone must not discover new splices that collapse
+		// a freshly dropped turn: tiny shells wait for a history refresh (or the
+		// stable-id cutover below). Frozen discoveries still replay every pass.
 		isCacheBusting: args.isCacheBusting,
 		stableIdByRef: postCommitStableIdByRef,
 		// F4 cutover: when the stable-id scheme just changed, force rediscovery so
@@ -6992,6 +7059,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// that already changes the served prefix, so the stored set never changes
 		// on a pass meant to replay the previous bytes.
 		canFirstApply: isCacheBustingPass,
+		onFirstApplication: (message, index) =>
+			recordFirstApplicationAt(message, index, 0, (item) =>
+				item && typeof item === "object"
+					? postCommitStableIdByRef.get(item)
+					: undefined,
+			),
 	});
 	logTransformTiming(
 		args.sessionId,
@@ -7202,10 +7275,60 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	}
 
 	const materialized = injectionResult?.m0Materialized === true;
+	if (
+		args.reasoningClearing?.prefixBound &&
+		firstEditSourceOrder &&
+		firstEditParts.size > 0 &&
+		!prefixEditBesidesReasoningTrim
+	) {
+		const frozenThinking = frozenBindingEntryIds(args.db, args.sessionId);
+		let firstEdit: { index: number; part: number } | undefined;
+		for (const [id, part] of firstEditParts) {
+			const index = firstEditSourceOrder.get(id);
+			if (
+				index !== undefined &&
+				(!firstEdit ||
+					index < firstEdit.index ||
+					(index === firstEdit.index && part < firstEdit.part))
+			)
+				firstEdit = { index, part };
+		}
+		for (const raw of outputMessages) {
+			if (!raw || typeof raw !== "object") continue;
+			const message = raw as { role?: string; content?: unknown };
+			if (message.role !== "assistant" || !Array.isArray(message.content))
+				continue;
+			const id = postCommitStableIdByRef.get(raw);
+			if (id && frozenThinking.has(id)) continue;
+			const index = id ? firstEditSourceOrder.get(id) : undefined;
+			for (let partIndex = 0; partIndex < message.content.length; partIndex++) {
+				const part = message.content[partIndex] as {
+					type?: string;
+					thinking?: string;
+				};
+				const thinking =
+					part?.type === "thinking" &&
+					part.thinking !== "" &&
+					part.thinking !== "[cleared]";
+				if (
+					!thinking &&
+					part?.type !== "redactedThinking" &&
+					part?.type !== "redacted_thinking"
+				)
+					continue;
+				if (
+					index === undefined ||
+					(firstEdit &&
+						(index > firstEdit.index ||
+							(index === firstEdit.index && partIndex >= firstEdit.part)))
+				)
+					prefixEditBesidesReasoningTrim = true;
+			}
+		}
+	}
 	const materializeReason = injectionResult?.m0Reason ?? null;
 	const bustedThisPass =
 		firstRenderBust ||
-		didMutateFromFlushedStatuses ||
 		pendingOpsDidMutate ||
 		heuristicOrReasoningDidMutate ||
 		autoReclaimDidMutateThisPass ||
@@ -7216,7 +7339,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			? "fold"
 			: args.forceMaterialization
 				? "force"
-				: pendingOpsDidMutate || didMutateFromFlushedStatuses
+				: pendingOpsDidMutate
 					? "flush"
 					: historyWasConsumedThisPass
 						? "refresh"

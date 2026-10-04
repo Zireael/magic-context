@@ -9213,6 +9213,77 @@ it("contract OC zero yield stays armed and text-only reclaim consumes the shared
 });
 
 describe("ride-only queued drops", () => {
+    for (const [name, fullFeatureMode, schedulerDecision, queued, applies] of [
+        ["subagent execute drains queued drops", false, "execute", true, true],
+        ["primary execute holds queued drops", true, "execute", true, false],
+        ["subagent defer holds queued drops", false, "defer", true, false],
+        ["subagent empty execute is byte-identical", false, "execute", false, false],
+    ] as const) {
+        it(`issue 619 ${name}`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `issue-619-${name}`;
+            const message = makeToolMessage("issue-619-tool");
+            insertTag(
+                db,
+                sessionId,
+                "issue-619-call",
+                "tool",
+                1000,
+                1,
+                0,
+                "bash",
+                0,
+                message.info.id,
+            );
+            if (queued) padRecentToolSkeletonWindow(sessionId, 1);
+            const args = basePostTransformArgs(db, sessionId, [message], {
+                fullFeatureMode,
+                schedulerDecision: "defer",
+                schedulerDeferReason: undefined,
+                contextUsage: { percentage: 40, inputTokens: 40000 },
+                targets: new Map([[1, makeDropTarget(message)]]),
+                protectedTagIds: new Set(queued ? [] : [1]),
+            });
+            await runPostTransformPhase(args);
+            if (applies) {
+                const aged = makeToolMessage("issue-619-aged-tool");
+                insertTag(
+                    db,
+                    sessionId,
+                    "issue-619-aged-call",
+                    "tool",
+                    1000,
+                    22,
+                    0,
+                    "bash",
+                    0,
+                    aged.info.id,
+                );
+                args.messages.push(aged);
+                args.targets.set(22, makeDropTarget(aged));
+                // The queued drop and a distinct eligible age candidate must
+                // consume the same permission, not bust on successive passes.
+                args.sessionMeta.toolReclaimWatermark = 22;
+            }
+            const baseline = JSON.stringify(args.messages);
+            if (queued) queuePendingOp(db, sessionId, 1, "drop");
+            await runPostTransformPhase({ ...args, schedulerDecision });
+            expect(getPendingOps(db, sessionId)).toHaveLength(queued && !applies ? 1 : 0);
+            if (applies) {
+                expect(JSON.stringify(args.messages)).not.toBe(baseline);
+                expect(
+                    getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === 22)?.status,
+                ).toBe("dropped");
+            } else expect(JSON.stringify(args.messages)).toBe(baseline);
+            const appliedBytes = JSON.stringify(args.messages);
+            for (let pass = 0; pass < 3; pass++) {
+                await runPostTransformPhase({ ...args, schedulerDecision });
+                expect(JSON.stringify(args.messages)).toBe(appliedBytes);
+            }
+        });
+    }
+
     for (const historianRunning of [false, true]) {
         it(`holds execute-only queued drops with historian=${historianRunning}`, async () => {
             db = new Database(":memory:");
@@ -9994,6 +10065,337 @@ describe("proactive strip of thinking on busting passes", () => {
 // Each test is named after the row of Anthropic's "What counts as an edit" table
 // (https://platform.claude.com/docs/en/build-with-claude/preserved-thinking) that
 // the behavior relies on.
+describe("issue 619 first-application thinking accounting", () => {
+    for (const model of ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"]) {
+        for (const lane of ["image", "stale reduce", "sentinel"] as const) {
+            it(`${lane} alone invalidates later signed thinking on ${model}`, async () => {
+                db = new Database(":memory:");
+                initializeDatabase(db);
+                const sessionId = `accounting-${lane}-${model}`;
+                getOrCreateSessionMeta(db, sessionId);
+                updateSessionMeta(db, sessionId, { isSubagent: true });
+                const raw = [
+                    {
+                        info: { id: "head-user", role: "user" },
+                        parts: [{ type: "text", text: "first request" }],
+                    },
+                    {
+                        info: { id: "edit-owner", role: lane === "image" ? "user" : "assistant" },
+                        parts:
+                            lane === "image"
+                                ? [
+                                      {
+                                          type: "file",
+                                          mime: "image/png",
+                                          url: `data:image/png;base64,${"a".repeat(220)}`,
+                                      },
+                                  ]
+                                : lane === "stale reduce"
+                                  ? [
+                                        {
+                                            type: "tool",
+                                            tool: "ctx_reduce",
+                                            callID: "old-reduce",
+                                            state: {
+                                                status: "completed",
+                                                input: { drop: "1" },
+                                                output: "Queued",
+                                            },
+                                        },
+                                    ]
+                                  : [{ type: "text", text: "[dropped §1§]" }],
+                    },
+                    {
+                        info: { id: "middle-user", role: "user" },
+                        parts: [{ type: "text", text: "next request" }],
+                    },
+                    {
+                        info: { id: "a1", role: "assistant" },
+                        parts: [
+                            {
+                                type: "reasoning",
+                                text: "signed one",
+                                metadata: { anthropic: { signature: "sig-one" } },
+                            },
+                            { type: "text", text: "answer one" },
+                        ],
+                    },
+                    {
+                        info: { id: "later-user", role: "user" },
+                        parts: [{ type: "text", text: "last request" }],
+                    },
+                    {
+                        info: { id: "a2", role: "assistant" },
+                        parts: [
+                            {
+                                type: "reasoning",
+                                text: "signed two",
+                                metadata: { anthropic: { signature: "sig-two" } },
+                            },
+                            { type: "text", text: "answer two" },
+                        ],
+                    },
+                ] as MessageLike[];
+                addTrailingBlankDecisions(db, sessionId, [
+                    ["edit-owner", "strip"],
+                    ["a1", "strip"],
+                    ["a2", "strip"],
+                ]);
+                const serve = async (decision: "execute" | "defer") => {
+                    const messages = structuredClone(raw);
+                    const result = await runPostTransformPhase(
+                        basePostTransformArgs(db, sessionId, messages, {
+                            fullFeatureMode: false,
+                            resolvedProviderID: "anthropic",
+                            thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(
+                                "anthropic",
+                                model,
+                            ),
+                            schedulerDecision: decision,
+                            schedulerDeferReason: undefined,
+                            contextUsage: { percentage: 70, inputTokens: 70000 },
+                            watermark: lane === "image" ? 1 : 0,
+                            messageTagNumbers: new Map([[messages[1], 1]]),
+                        }),
+                    );
+                    return { messages, result };
+                };
+                const baseline = await serve("defer");
+                const applied = await serve("execute");
+                expect(JSON.stringify(applied.messages)).not.toBe(
+                    JSON.stringify(baseline.messages),
+                );
+                expect(applied.result.bustedThisPass).toBe(true);
+                expect(applied.result.proactiveThinkingStrip?.messageIds).toEqual(["a1", "a2"]);
+                expect(
+                    applied.messages
+                        .flatMap((message) => message.parts)
+                        .some((part) => part.type === "reasoning"),
+                ).toBe(false);
+                for (const decision of ["defer", "execute"] as const) {
+                    const replay = await serve(decision);
+                    expect(JSON.stringify(replay.messages)).toBe(JSON.stringify(applied.messages));
+                    expect(replay.result.bustedThisPass).toBe(false);
+                    expect(replay.result.proactiveThinkingStrip).toBeNull();
+                }
+            });
+        }
+    }
+});
+
+describe("issue 619 metadata-only trailing decisions", () => {
+    for (const [name, isSubagent, model] of [
+        ["primary bound", false, "claude-sonnet-5-5"],
+        ["subagent unbound", true, "claude-sonnet-4-5"],
+        ["subagent bound", true, "claude-sonnet-5-5"],
+    ] as const) {
+        it(`${name} keeps bytes and reports no bust when a historical strip already matches`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `metadata-only-${name}`;
+            getOrCreateSessionMeta(db, sessionId);
+            updateSessionMeta(db, sessionId, { isSubagent });
+            const raw = [
+                { info: { id: "u1", role: "user" }, parts: [{ type: "text", text: "one" }] },
+                {
+                    info: { id: "a1", role: "assistant" },
+                    parts: [
+                        {
+                            type: "reasoning",
+                            text: "signed one",
+                            metadata: { anthropic: { signature: "sig-one" } },
+                        },
+                        { type: "text", text: "answer one" },
+                    ],
+                },
+                { info: { id: "u2", role: "user" }, parts: [{ type: "text", text: "two" }] },
+                {
+                    info: { id: "a2", role: "assistant" },
+                    parts: [
+                        {
+                            type: "reasoning",
+                            text: "signed two",
+                            metadata: { anthropic: { signature: "sig-two" } },
+                        },
+                        { type: "text", text: "answer two" },
+                    ],
+                },
+            ] as MessageLike[];
+            const pass = async (schedulerDecision: "defer" | "execute") => {
+                const messages = structuredClone(raw);
+                const result = await runPostTransformPhase(
+                    basePostTransformArgs(db, sessionId, messages, {
+                        fullFeatureMode: !isSubagent,
+                        resolvedProviderID: "anthropic",
+                        thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(
+                            "anthropic",
+                            model,
+                        ),
+                        schedulerDecision,
+                        schedulerDeferReason: undefined,
+                        contextUsage: { percentage: 70, inputTokens: 70000 },
+                    }),
+                );
+                return { messages, result };
+            };
+            const baseline = await pass("defer");
+            expect(getTrailingBlankDecisions(db, sessionId).has("a1")).toBe(false);
+            for (let index = 0; index < 3; index++) {
+                const execute = await pass("execute");
+                expect(JSON.stringify(execute.messages)).toBe(JSON.stringify(baseline.messages));
+                expect(execute.result.bustedThisPass).toBe(false);
+                expect(execute.result.proactiveThinkingStrip).toBeNull();
+            }
+            expect(getTrailingBlankDecisions(db, sessionId).has("a1")).toBe(isSubagent);
+        });
+    }
+});
+
+describe("issue 619 terminal first edits", () => {
+    for (const [lane, placement, name] of [
+        [
+            "image",
+            "terminal",
+            "primary terminal image edit preserves thinking whose preceding prefix is unchanged",
+        ],
+        [
+            "stale",
+            "terminal",
+            "primary terminal stale edit preserves thinking whose preceding prefix is unchanged",
+        ],
+        [
+            "sentinel",
+            "terminal",
+            "primary terminal sentinel edit preserves thinking whose preceding prefix is unchanged",
+        ],
+        [
+            "stale",
+            "same-message",
+            "terminal stale part after its own signed block preserves the untouched prefix",
+        ],
+        [
+            "image",
+            "frozen-later",
+            "terminal image edit ignores later thinking already frozen for removal",
+        ],
+    ] as const) {
+        it(name, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `terminal-${lane}`;
+            getOrCreateSessionMeta(db, sessionId);
+            updateSessionMeta(db, sessionId, { isSubagent: false });
+            const raw = [
+                { info: { id: "u1", role: "user" }, parts: [{ type: "text", text: "one" }] },
+                {
+                    info: { id: "a1", role: "assistant" },
+                    parts: [
+                        {
+                            type: "reasoning",
+                            text: "signed one",
+                            metadata: { anthropic: { signature: "sig-one" } },
+                        },
+                        { type: "text", text: "answer one" },
+                    ],
+                },
+                { info: { id: "u2", role: "user" }, parts: [{ type: "text", text: "two" }] },
+                {
+                    info: { id: "edit", role: lane === "image" ? "user" : "assistant" },
+                    parts:
+                        lane === "image"
+                            ? [
+                                  {
+                                      type: "file",
+                                      mime: "image/png",
+                                      url: `data:image/png;base64,${"a".repeat(220)}`,
+                                  },
+                              ]
+                            : lane === "stale"
+                              ? [
+                                    {
+                                        type: "tool",
+                                        tool: "ctx_reduce",
+                                        callID: "terminal-reduce",
+                                        state: {
+                                            status: "completed",
+                                            input: { drop: "1" },
+                                            output: "Queued",
+                                        },
+                                    },
+                                ]
+                              : [{ type: "text", text: "[dropped §1§]" }],
+                },
+                { info: { id: "u3", role: "user" }, parts: [{ type: "text", text: "three" }] },
+                {
+                    info: { id: "a2", role: "assistant" },
+                    parts: [{ type: "text", text: "plain answer" }],
+                },
+            ] as MessageLike[];
+            if (placement === "same-message") {
+                raw[1].parts.push(raw[3].parts[0]);
+                raw.splice(3, 1);
+            }
+            if (placement === "frozen-later") {
+                raw[5].parts.unshift({
+                    type: "reasoning",
+                    text: "already frozen",
+                    metadata: { anthropic: { signature: "sig-two" } },
+                });
+                addMergedReasoningStrippedIds(db, sessionId, ["binding_mismatch:a2"]);
+            }
+            addTrailingBlankDecisions(db, sessionId, [
+                ["a1", "strip"],
+                ["edit", "strip"],
+                ["a2", "strip"],
+            ]);
+            const pass = async (force: boolean) => {
+                const messages = structuredClone(raw);
+                const result = await runPostTransformPhase(
+                    basePostTransformArgs(db, sessionId, messages, {
+                        resolvedProviderID: "anthropic",
+                        thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(
+                            "anthropic",
+                            "claude-sonnet-5-5",
+                        ),
+                        contextUsage: {
+                            percentage: force ? 96 : 20,
+                            inputTokens: force ? 96000 : 20000,
+                        },
+                        watermark: lane === "image" ? 1 : 0,
+                        messageTagNumbers: new Map([[messages[3], 1]]),
+                    }),
+                );
+                return { messages, result };
+            };
+            const baseline = await pass(false);
+            const edited = await pass(true);
+            expect(
+                edited.messages
+                    .flatMap((message) => message.parts)
+                    .filter((part) => part.type === "reasoning"),
+            ).toHaveLength(1);
+            if (placement === "same-message")
+                expect(JSON.stringify(edited.messages[1].parts[0])).toBe(
+                    JSON.stringify(baseline.messages[1].parts[0]),
+                );
+            else
+                expect(JSON.stringify(edited.messages.slice(0, 3))).toBe(
+                    JSON.stringify(baseline.messages.slice(0, 3)),
+                );
+            expect(JSON.stringify(edited.messages)).not.toBe(JSON.stringify(baseline.messages));
+            expect(edited.result.bustedThisPass).toBe(true);
+            expect(edited.result.proactiveThinkingStrip).toBeNull();
+            expect(edited.result.materialized).toBe(false);
+            for (const force of [false, true]) {
+                const replay = await pass(force);
+                expect(JSON.stringify(replay.messages)).toBe(JSON.stringify(edited.messages));
+                expect(replay.result.bustedThisPass).toBe(false);
+                expect(replay.result.proactiveThinkingStrip).toBeNull();
+            }
+        });
+    }
+});
+
 describe("prefix-bound oldest-prefix reasoning trim", () => {
     const PROVIDER = "google-vertex-anthropic";
     const sha256 = (value: unknown): string =>

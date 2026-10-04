@@ -2016,6 +2016,7 @@ export async function runPostTransformPhase(
     // retry, not on the warm tool step after the provider finally answers.
     const idleExpiryRebuild = !freezeM0M1 && args.m0M1?.hardSignals?.cacheExpired === true;
     const rideSignals = {
+        subagentExecute: !args.fullFeatureMode && args.schedulerDecision === "execute",
         hardFold: foldBustsServedPrefixThisPass || firstRenderBust || idleExpiryRebuild,
         force:
             emergencyDropEligible &&
@@ -2179,6 +2180,22 @@ export async function runPostTransformPhase(
     let explicitMaterializedSuccessfully = false;
     let deferredMaterializedSuccessfully = false;
     let pendingOpsDidMutate = false;
+    // First application is an edit; restoring the same frozen choice from raw
+    // history is replay. Telemetry and signed-thinking invalidation consume the
+    // same edit record so a strip cannot silently escape either accounting lane.
+    const firstApplicationEdits = { any: false, beforeNewerThinking: false };
+    const recordFirstApplicationWireEdit = (beforeNewerThinking: boolean): void => {
+        firstApplicationEdits.any = true;
+        firstApplicationEdits.beforeNewerThinking ||= beforeNewerThinking;
+    };
+    const firstApplicationLocations = new Map<MessageLike, number>();
+    const recordFirstApplicationAt = (message: MessageLike, partIndex: number): void => {
+        recordFirstApplicationWireEdit(false);
+        firstApplicationLocations.set(
+            message,
+            Math.min(firstApplicationLocations.get(message) ?? Infinity, partIndex),
+        );
+    };
     let heuristicOrReasoningDidMutate = false;
     // Like heuristicOrReasoningDidMutate, but leaving out the oldest-prefix
     // reasoning removal, which on a prefix-bound model leaves every newer
@@ -2726,6 +2743,7 @@ export async function runPostTransformPhase(
             const staleReduceResult = dropStaleReduceCalls(args.messages, frozenStaleReduceIds, {
                 detect: isCacheBustingPass,
                 protectedCount: args.protectedCount,
+                onFirstApplication: recordFirstApplicationAt,
             });
             if (isCacheBustingPass && staleReduceResult.newlyStrippedIds.length > 0) {
                 addStaleReduceStrippedIds(
@@ -2755,6 +2773,7 @@ export async function runPostTransformPhase(
                 detect: isCacheBustingPass && args.watermark > 0,
                 watermark: args.watermark,
                 messageTagNumbers: args.messageTagNumbers,
+                onFirstApplication: recordFirstApplicationAt,
             });
             if (isCacheBustingPass && imageResult.newlyStrippedIds.length > 0) {
                 addProcessedImageStrippedIds(args.db, args.sessionId, imageResult.newlyStrippedIds);
@@ -2926,6 +2945,7 @@ export async function runPostTransformPhase(
             const droppedResult = stripDroppedPlaceholderMessages(
                 args.messages,
                 args.resolvedProviderID,
+                recordFirstApplicationAt,
             );
             const protectedTailStart = Math.max(
                 0,
@@ -2935,6 +2955,7 @@ export async function runPostTransformPhase(
                 args.messages,
                 protectedTailStart,
                 args.resolvedProviderID,
+                recordFirstApplicationAt,
             );
             const hiddenMessages = args.hiddenMessagesAtCompactionSeam ?? [];
             const hiddenDroppedResult = stripDroppedPlaceholderMessages(
@@ -3345,6 +3366,7 @@ export async function runPostTransformPhase(
         explicitMaterializedSuccessfully ||
         deferredMaterializedSuccessfully;
     let bustedThisPass =
+        firstApplicationEdits.any ||
         firstRenderBust ||
         pendingOpsDidMutate ||
         heuristicOrReasoningDidMutate ||
@@ -3391,10 +3413,8 @@ export async function runPostTransformPhase(
     // any stripped bytes. The newest assistant is excluded from both detection
     // and replay because Anthropic requires its signed blocks byte-identically.
     const mergedReasoningStrippedIds = new Set(replaySnapshot?.mergedReasoningStrippedIds ?? []);
-    // Set by the frozen-decision lanes below (binding recovery, merged-reasoning
-    // strip, trailing-blank decisions) when they change bytes that sit before
-    // a newer signed thinking block.
-    let lateEditBeforeNewestThinking = false;
+    // Binding recovery keeps its replay ids separate from the first-edit record;
+    // restoring those ids must not invalidate newly appended thinking again.
     const thinkingBindingRecoveryMessageIds = new Set<string>();
     let thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null = null;
     if (!compactionOff) {
@@ -3422,8 +3442,7 @@ export async function runPostTransformPhase(
                         mergedReasoningStrippedIds.add(thinkingBindingRecoveryFrozenId(messageId));
                     }
                     if (thinkingBindingRecovery.messageIds.length > 0) {
-                        bustedThisPass = true;
-                        lateEditBeforeNewestThinking = true;
+                        recordFirstApplicationWireEdit(true);
                     }
                 } else {
                     failPass("thinking-binding-recovery-persistence-failure");
@@ -3457,11 +3476,10 @@ export async function runPostTransformPhase(
                         for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
                             mergedReasoningStrippedIds.add(id);
                         }
-                        bustedThisPass = true;
                         // The merged-reasoning strip keeps the first block of a run of
                         // consecutive assistants and strips the later ones: a removal
                         // from the middle of the history.
-                        lateEditBeforeNewestThinking = true;
+                        recordFirstApplicationWireEdit(true);
                     } else {
                         failPass("merged-reasoning-strip-persistence-failure");
                         sessionLog(
@@ -3485,6 +3503,35 @@ export async function runPostTransformPhase(
         typeof trailingBlankNewestAssistant?.info.id === "string"
             ? trailingBlankNewestAssistant.info.id
             : undefined;
+
+    let trailingDecisionMessages: Map<string, MessageLike> | undefined;
+    const recordTrailingBlankWireEdit = (id: string, next: TrailingBlankDecision): void => {
+        // Persisting a choice is not an edit when it renders the same shape.
+        // Compare against the previous frozen projection, not pristine ingress:
+        // applying an old strip to raw history is replay, not a new cache bust.
+        trailingDecisionMessages ??= new Map(
+            args.messages.flatMap((message) =>
+                typeof message.info.id === "string" ? [[message.info.id, message] as const] : [],
+            ),
+        );
+        const message = trailingDecisionMessages.get(id);
+        if (!message) return;
+        const before = [{ ...message, parts: [...message.parts] }];
+        const after = [{ ...message, parts: [...message.parts] }];
+        const previous = trailingBlankDecisions.get(id);
+        if (previous) applyFrozenTrailingBlankDecisions(before, new Map([[id, previous]]));
+        applyFrozenTrailingBlankDecisions(after, new Map([[id, next]]));
+        if (JSON.stringify(before[0].parts) !== JSON.stringify(after[0].parts)) {
+            let partIndex = 0;
+            while (
+                partIndex < before[0].parts.length &&
+                JSON.stringify(before[0].parts[partIndex]) ===
+                    JSON.stringify(after[0].parts[partIndex])
+            )
+                partIndex++;
+            recordFirstApplicationAt(message, partIndex);
+        }
+    };
 
     if (isCacheBustingPass && trailingBlankDecisions.size > 0) {
         // A source snapshot can outlive the message's projection when a marker trims history.
@@ -3522,9 +3569,8 @@ export async function runPostTransformPhase(
                     );
                 } else {
                     for (const id of demotedIds) {
+                        recordTrailingBlankWireEdit(id, "strip");
                         trailingBlankDecisions.set(id, "strip");
-                        bustedThisPass = true;
-                        lateEditBeforeNewestThinking = true;
                         sessionLog(
                             args.sessionId,
                             `trailing blank heal: demoted message ${id} from keep to strip because its source has no trailing blank`,
@@ -3576,14 +3622,10 @@ export async function runPostTransformPhase(
                     );
                     for (const [id] of candidates) {
                         const decision = committed.get(id);
-                        if (decision) trailingBlankDecisions.set(id, decision);
-                    }
-                    if (isCacheBustingPass) bustedThisPass = true;
-                    // A trailing-blank decision for the newest assistant edits no
-                    // byte before a newer thinking block; one for an older
-                    // assistant does.
-                    if (isCacheBustingPass && candidates.some(([id]) => id !== newestAssistantId)) {
-                        lateEditBeforeNewestThinking = true;
+                        if (decision) {
+                            if (isCacheBustingPass) recordTrailingBlankWireEdit(id, decision);
+                            trailingBlankDecisions.set(id, decision);
+                        }
                     }
                 } else {
                     failPass("trailing-blank-decision-persistence-failure");
@@ -3604,6 +3646,7 @@ export async function runPostTransformPhase(
     }
 
     logTransformTiming(args.sessionId, "pp.frozenDecisions", tFrozenDecisions);
+    bustedThisPass ||= firstApplicationEdits.any;
     const finalizeOptions: FinalizeMessageRepresentationOptions = {
         prependedMessageCount,
         reasoningMutatedMessages,
@@ -3645,6 +3688,51 @@ export async function runPostTransformPhase(
                 message.info.role === "assistant" &&
                 message.parts.some((part) => isNeutralizedReasoningPart(part)),
         );
+    if (
+        prefixBoundModel &&
+        firstApplicationLocations.size > 0 &&
+        !firstApplicationEdits.beforeNewerThinking
+    ) {
+        // Check the remaining representation, not reasoning already frozen for
+        // removal. Only real first edits pay for this positional replay preview.
+        const remaining = args.messages.map((message) => ({
+            ...message,
+            parts: [...message.parts],
+        }));
+        stripClearedReasoning(remaining);
+        stripReasoningFromAssistantIds(
+            remaining,
+            args.resolvedProviderID,
+            thinkingBindingRecoveryMessageIds,
+        );
+        stripReasoningFromMergedAssistants(remaining, args.resolvedProviderID, {
+            frozenMessageIds: mergedReasoningStrippedIds,
+            mutationExemptMessage:
+                remaining[args.messages.indexOf(reasoningMutationExemptMessage as MessageLike)],
+        });
+        let newerThinking = false;
+        for (let index = remaining.length - 1; index >= 0; index--) {
+            const message = remaining[index];
+            const editIndex = firstApplicationLocations.get(args.messages[index]);
+            // A removed suffix follows every part still in its own message.
+            if (editIndex !== undefined && editIndex >= message.parts.length && newerThinking)
+                firstApplicationEdits.beforeNewerThinking = true;
+            for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex--) {
+                const part = message.parts[partIndex];
+                if (
+                    message.info.role === "assistant" &&
+                    isRecord(part) &&
+                    part.ignored !== true &&
+                    (part.type === "reasoning" ||
+                        part.type === "thinking" ||
+                        part.type === "redacted_thinking")
+                )
+                    newerThinking = true;
+                if (editIndex !== undefined && partIndex === editIndex && newerThinking)
+                    firstApplicationEdits.beforeNewerThinking = true;
+            }
+        }
+    }
     const prefixEditBesidesReasoningTrim =
         firstRenderBust ||
         materializationRequested ||
@@ -3665,7 +3753,7 @@ export async function runPostTransformPhase(
         todoAnchorMovedThisPass ||
         autoSearchHintAppendedThisPass ||
         dropModeSwitchesThisPass ||
-        lateEditBeforeNewestThinking;
+        firstApplicationEdits.beforeNewerThinking;
     let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
     if (
         !compactionOff &&

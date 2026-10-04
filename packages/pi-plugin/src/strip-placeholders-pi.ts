@@ -119,6 +119,8 @@ export function stripPiDroppedPlaceholderMessages(args: {
 	canFirstApply?: boolean;
 	/** Test seam for exhausting the durable CAS write. */
 	applyDelta?: typeof applyStrippedPlaceholderDelta;
+	/** Called only for newly persisted removals, before the message is spliced. */
+	onFirstApplication?: (message: unknown, index: number) => void;
 }): StripPiDroppedPlaceholderResult {
 	const { db, sessionId, messages, isCacheBusting, stableIdByRef } = args;
 	const persistedIds = getStrippedPlaceholderIds(db, sessionId);
@@ -204,6 +206,8 @@ export function stripPiDroppedPlaceholderMessages(args: {
 		const id = idOf(messages[i], i);
 		if (!id || !idsToStrip.has(id)) continue;
 		if (toolOwnerIds.has(id)) continue;
+		if (discovered > 0 && discoveredIds.includes(id))
+			args.onFirstApplication?.(messages[i], i);
 		messages.splice(i, 1);
 		removed++;
 	}
