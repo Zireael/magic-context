@@ -43,6 +43,10 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			// override fields began calling disallowed_tools a legacy no-op
 			// (878b65a3e3, "make historian agents tool-free across OpenCode and
 			// Pi"); a comment-only v1 change.
+			// It was re-minted again when the v1 `config` hook began denying
+			// ctx_memory and ctx_note to task child sessions through OpenCode 1's
+			// primary_tools list (528f693e84, "hide memory and note tools from
+			// OpenCode subagents"); OpenCode 2 filters them per request instead.
 			bytes = bytes
 				.replace('import { setup } from "./v2/server";\n', "")
 				.replace("PluginModule & { setup: typeof setup }", "PluginModule")
