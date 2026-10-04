@@ -1,8 +1,6 @@
 {
-  "preset": "tools-only",
-  "params": {
-    "model": "anthropic/claude-haiku-4-5"
-  },
+  "preset": "head",
+  "params": {},
   "composition": {
     "providers": [
       {
@@ -56,6 +54,12 @@
         "provider": "magic-context",
         "tools": [
           {
+            "name": "ctx_expand",
+            "capabilities": [
+              "magic-context:history.expand/v1"
+            ]
+          },
+          {
             "name": "ctx_memory",
             "capabilities": [
               "magic-context:memory.write/v1"
@@ -65,6 +69,12 @@
             "name": "ctx_note",
             "capabilities": [
               "magic-context:notes/v1"
+            ]
+          },
+          {
+            "name": "ctx_reduce",
+            "capabilities": [
+              "magic-context:context.reduce/v1"
             ]
           },
           {
@@ -94,12 +104,13 @@
           }
         ]
       }
-    ]
+    ],
+    "compaction": {
+      "provider": "magic-context"
+    }
   },
   "system_text": {
-    "preset": "tools-only",
-    "params": {
-      "model": "anthropic/claude-haiku-4-5"
-    }
+    "preset": "head",
+    "params": {}
   }
 }

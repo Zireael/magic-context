@@ -1,5 +1,5 @@
 {
-  "preset": "subagent",
+  "preset": "reader",
   "params": {},
   "composition": {
     "providers": [
@@ -60,18 +60,6 @@
             ]
           },
           {
-            "name": "ctx_memory",
-            "capabilities": [
-              "magic-context:memory.write/v1"
-            ]
-          },
-          {
-            "name": "ctx_note",
-            "capabilities": [
-              "magic-context:notes/v1"
-            ]
-          },
-          {
             "name": "ctx_reduce",
             "capabilities": [
               "magic-context:context.reduce/v1"
@@ -85,10 +73,13 @@
           }
         ]
       }
-    ]
+    ],
+    "compaction": {
+      "provider": "magic-context"
+    }
   },
   "system_text": {
-    "preset": "subagent",
+    "preset": "reader",
     "params": {}
   }
 }

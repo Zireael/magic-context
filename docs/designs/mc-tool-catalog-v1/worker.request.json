@@ -1,5 +1,5 @@
 {
-  "preset": "primary",
+  "preset": "worker",
   "params": {},
   "composition": {
     "providers": [
@@ -60,18 +60,6 @@
             ]
           },
           {
-            "name": "ctx_memory",
-            "capabilities": [
-              "magic-context:memory.write/v1"
-            ]
-          },
-          {
-            "name": "ctx_note",
-            "capabilities": [
-              "magic-context:notes/v1"
-            ]
-          },
-          {
             "name": "ctx_reduce",
             "capabilities": [
               "magic-context:context.reduce/v1"
@@ -84,31 +72,14 @@
             ]
           }
         ]
-      },
-      {
-        "provider": "prefrontal-core",
-        "tools": [
-          {
-            "name": "browser_use",
-            "capabilities": [
-              "browser.use/v1",
-              "cerebellum:browser.use/v1"
-            ]
-          },
-          {
-            "name": "computer_use",
-            "capabilities": [
-              "cerebellum:computer.use/v1",
-              "computer.use/v1"
-            ]
-          }
-        ]
       }
-    ]
+    ],
+    "compaction": {
+      "provider": "magic-context"
+    }
   },
   "system_text": {
-    "preset": "primary",
+    "preset": "worker",
     "params": {}
-  },
-  "digest_only": true
+  }
 }

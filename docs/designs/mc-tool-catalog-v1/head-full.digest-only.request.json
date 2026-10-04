@@ -1,10 +1,6 @@
 {
   "preset": "head",
-  "params": {
-    "exclude": [
-      "ctx_reduce"
-    ]
-  },
+  "params": {},
   "composition": {
     "providers": [
       {
@@ -76,6 +72,12 @@
             ]
           },
           {
+            "name": "ctx_reduce",
+            "capabilities": [
+              "magic-context:context.reduce/v1"
+            ]
+          },
+          {
             "name": "ctx_search",
             "capabilities": [
               "magic-context:archive.search/v1"
@@ -110,5 +112,6 @@
   "system_text": {
     "preset": "head",
     "params": {}
-  }
+  },
+  "digest_only": true
 }

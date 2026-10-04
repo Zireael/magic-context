@@ -10,6 +10,17 @@ are regenerated, and checked against the plugin's shipped strings, the Rust
 module's guidance assets and the commons and prefrontal test vectors, by
 `bun docs/designs/mc-tool-catalog-v1/generate.ts --check`.
 
+**Role-catalog update:** §2.1 below is the current ck-mc contract. Historical
+plugin variant names elsewhere in this design describe the unchanged OpenCode
+and Pi surfaces, not catalog presets. Use `--examples-only --check` to check
+the local examples independently of external vectors; `--check` also enforces
+the Prefrontal plan compatibility fence at the pinned ref. The visibility-based
+subagent warning is deferred pending an agreed `present_tools` request field;
+neither the commons request nor the current Claude Code guidance fetch carries
+that set. No serializer or guidance epoch changes accompany this update.
+The [role update report](mc-tool-catalog-v1/role-presets-report.md) records the
+before/after digests and the vector results against Prefrontal `22d9b3dafa95`.
+
 ## Summary
 
 - **One fetch, five tools, one text.** Magic Context answers `tool.catalog` with
@@ -17,11 +28,9 @@ module's guidance assets and the commons and prefrontal test vectors, by
   order), and with its guidance as `system_text` when the plan asks for it. It
   declares no session-level capabilities: every Magic Context call settles inside
   its own reply.
-- **Three presets, chosen by core.** `primary` (heads and masons) and
-  `subagent` (bounded readers and one-shot calls) are sent only when the plan's
-  `compaction_item` names `magic-context`. Otherwise core sends `tools-only`: no
-  `ctx_reduce` and the no-reduce text. Core's plan builder refuses any other
-  pairing. Magic Context never knows the session's role.
+- **Three role presets, chosen by core.** `head`, `worker` and `reader` select
+  the role. Only `composition.compaction.provider == "magic-context"` selects
+  Magic Context compaction. Missing compaction means not compacting.
 - **Two knobs and a frozen model.** Light or full wording comes from the shared
   `tool_descs` param on the tool item and an MC `surface` param on the text
   item. When neither is given, it comes from the user's existing
@@ -109,39 +118,44 @@ system_text?, digest_only?}`. Magic Context defines the following.
 **Presets** (the tool item's `preset` and `system_text.preset`; both must name
 the same preset):
 
-| Preset | Sent when | Serves | Today's equivalent |
+| Preset | Magic Context compacts | Tools (before config/params filtering) | Text |
 |---|---|---|---|
-| `primary` | Magic Context compacts the session, and core runs it as a head or a mason. | All five tools; the stamping text when the composition lists `ctx_reduce`, the no-reduce text otherwise. | Every non-subagent session. |
-| `subagent` | Magic Context compacts the session, and core runs it as a bounded reader or a one-shot call. | All five tools; the short stamping text, or `text: ""` without `ctx_reduce` (§2.3). | `isSubagent` session metadata (`packages/plugin/src/hooks/magic-context/system-prompt-hash.ts:334-359`). |
-| `tools-only` | Another provider compacts the session, or none does, whatever its role. | Only `ctx_search`, `ctx_memory` and `ctx_note`; the tools-only text, which describes only the tools (§7.2). | None: today Magic Context compacts every session it serves. |
-| absent | | As `primary`. | |
+| `head` | no | `ctx_note`, `ctx_memory`, `ctx_search` | Existing tools-only text |
+| `worker` | no | none | empty |
+| `reader` | no | none | empty |
+| `head` | yes | `ctx_reduce`, `ctx_expand`, `ctx_note`, `ctx_memory`, `ctx_search` | Existing primary text |
+| `worker` | yes | `ctx_reduce`, `ctx_expand`, `ctx_search` | Existing subagent text; no memory/note tool mentions |
+| `reader` | yes | `ctx_reduce`, `ctx_expand`, `ctx_search` | Same as worker |
 
-- **Who picks.** Core's plan builder, never Magic Context, which doesn't know a
-  head from a worker. The composition doesn't name the compaction provider, so
-  the preset carries that fact. Core sends `primary` or `subagent` only when the
-  plan's `compaction_item` names `magic-context` (FP README line 134), and
-  `tools-only` otherwise. The plan builder refuses any other pairing of preset
-  and compaction provider: `primary` or `subagent` beside another compaction
-  provider or none, and `tools-only` beside Magic Context's compaction
-  (decisions 1 and 2).
-- **`tools-only` never serves `ctx_reduce` or `ctx_expand`.** An `exclude`
-  naming either is accepted and changes nothing. A composition that lists either under
-  `magic-context` with `tools-only` doesn't match the fetched tools, and the
-  runner refuses the plan (FP vector
-  `admission/refuse-fetched-tools-differ-from-composition`). The generator
-  refuses such an example the same way.
-- **The text is its own.** Under `tools-only` Magic Context puts nothing
-  into the conversation, so its text (`crates/mc-module/assets/catalog_tools_only.txt`
-  and its light twin) describes only `ctx_search`, `ctx_memory` and
-  `ctx_note`: no desk, tags, history, `<project-memory>` block or markings.
-  Memory (the `ctx_memory` paragraph) and language resolve as for `primary`;
-  dreamer, temporal awareness and caveman change nothing, because the
-  sentences they switch describe what Magic Context renders (§7.2).
+- **Aliases and default.** The definition's one `preset_aliases` table maps
+  `primary` → `head`, `subagent` → `worker`, `tools-only` → `head`. Aliases
+  never imply compaction. An absent preset means `head`.
+- **Who compacts.** The request's frozen composition may carry
+  `compaction: {"provider": "<module id>"}`. It must be omitted when the plan
+  has no compaction item, never null. Only Magic Context's module id selects
+  its compaction tools and text; another id is equivalent to missing for tool
+  selection. The composition digest covers the member when present.
+- **Plan compatibility.** An empty helper catalog is a valid answer, but a
+  worker/reader plan without Magic Context compaction must omit Magic Context
+  items entirely. The generator's cross-check rejects those items and unknown
+  Magic Context presets in actual plan item arrays, not inferred filenames.
+- **Per-call admission.** Fleet envelopes carry a top-level `preset` only,
+  not caller-asserted compaction state. A full successful catalog fetch with a
+  composition freezes the tools and compaction decision for the bound session;
+  preflight and digest-only probes do not replace it. `ctx_reduce` is refused
+  when that state does not grant compaction. `ctx_memory` and `ctx_note` are
+  refused for worker/reader calls even when a shared head list exposes them.
+  Refusals use the role's `unknown_tool` code, message `no tool named <name>`,
+  detail `{"tool": "<name>"}`. Unknown presets use `invalid_request`, message
+  `Magic Context defines no preset "<name>"`, detail `{"field": "preset"}`.
+  Legacy plugin and Claude Code MCP calls without a fleet preset or frozen
+  catalog keep their own path, even on a route declaring `tool-provider/v1`.
 
-Any other preset is refused as `invalid_request {field: "preset"}`
-(`catalog-requests.json` in TPV). FP's vectors use `head` for Magic Context, but
-the vectors' presets are illustrative (FP README lines 99–103); core sends the
-three names above.
+`role.describe` remains build-only discovery: ops, stability, version and
+capabilities, never a tool list. All catalog strings and role aliases live in
+the shared JSON definition consumed by the Rust module and TypeScript generator.
+The OpenCode and Pi primary/subagent guidance and plugin tool definitions are
+unchanged.
 
 **Tool-item params** (`params`):
 
@@ -338,7 +352,10 @@ assets byte for byte (`crates/mc-module/assets/guidance_primary.txt`,
 compares them on every run, and checks that `guidance_light_no_reduce.txt`,
 which no example uses, is the definition's light no-reduce text.
 
-| Example | Request | Old `catalog_digest` → new `catalog_digest` | Text (`item_digest`, UTF-8 bytes) |
+The following table records the historical r2 examples. Current role-named
+examples and their changed digests are in the role update report linked above.
+
+| Historical example | Request | Old `catalog_digest` → r2 `catalog_digest` | Text (`item_digest`, UTF-8 bytes) |
 |---|---|---|---|
 | `preflight` | `primary`, no composition, no text | `4dbfd638576261155e2f10b6dddfbd16ba652da5529e8a978b0ca625e2a994f2` → `4dbfd638576261155e2f10b6dddfbd16ba652da5529e8a978b0ca625e2a994f2` | none |
 | `primary-full` | a head with AFT's tools, Magic Context's five and Prefrontal's forwarding tools; `ctx_reduce` is present, so the guidance text is included | `363be1ae56892bef2904595cf6644ddfbe4144d080d073776069a1f881ab5e4f` → `363be1ae56892bef2904595cf6644ddfbe4144d080d073776069a1f881ab5e4f` | `ee720eeb…`, 6,016 |

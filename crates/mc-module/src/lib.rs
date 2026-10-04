@@ -3805,6 +3805,9 @@ pub struct McHandler {
     /// (`role_versions`). Only those get the role's refusal codes; every other route
     /// keeps the legacy facade errors byte for byte.
     tool_provider_v1_channels: Mutex<HashSet<u16>>,
+    /// The last full catalog fetched with a composition for each bound session.
+    /// Preflight and digest probes cannot overwrite the session's admitted tools.
+    frozen_tool_catalogs: Mutex<HashMap<(PathBuf, String), tool_catalog::FrozenCatalog>>,
     #[cfg(test)]
     guidance_now_ms: Mutex<Option<i64>>,
     #[cfg(test)]
@@ -4434,6 +4437,7 @@ impl McHandler {
             guidance_dates: Mutex::new(HashMap::new()),
             prompt_surface_epochs: Mutex::new(HashMap::new()),
             tool_provider_v1_channels: Mutex::new(HashSet::new()),
+            frozen_tool_catalogs: Mutex::new(HashMap::new()),
             #[cfg(test)]
             guidance_now_ms: Mutex::new(None),
             #[cfg(test)]
@@ -4815,6 +4819,7 @@ impl McHandler {
             guidance_dates: Mutex::new(HashMap::new()),
             prompt_surface_epochs: Mutex::new(HashMap::new()),
             tool_provider_v1_channels: Mutex::new(HashSet::new()),
+            frozen_tool_catalogs: Mutex::new(HashMap::new()),
             guidance_now_ms: Mutex::new(None),
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
@@ -4876,6 +4881,10 @@ impl McHandler {
         }
         let replacement_session = replacement.map(|previous| previous.session);
         if let Some(session_id) = replacement_session {
+            self.frozen_tool_catalogs
+                .lock()
+                .expect("frozen catalog mutex")
+                .retain(|(_, session), _| session != &session_id);
             self.state_sync_seeds
                 .lock()
                 .expect("state sync seed mutex")
@@ -5308,6 +5317,10 @@ impl McHandler {
             self.clear_note_evaluation_capability_if_unbound(&root);
         }
         if let Some(session) = last_session_route {
+            self.frozen_tool_catalogs
+                .lock()
+                .expect("frozen catalog mutex")
+                .retain(|(_, key_session), _| key_session != &session);
             if session.starts_with("mc-dreamer:") {
                 self.unregister_dreamer_run(&session);
             }
@@ -12511,6 +12524,9 @@ impl McHandler {
         let Some(name) = request.get("name").and_then(Value::as_str) else {
             return unrecognized_request_error(&request);
         };
+        if let Err(outcome) = self.check_catalog_call(channel, name, &request) {
+            return outcome;
+        }
         match name {
             "memory.set_classification" => {
                 self.handle_memory_set_classification(channel, &request)
@@ -12565,9 +12581,96 @@ impl McHandler {
         let config = tool_catalog::CatalogConfig::from_module_config(&binding.config);
         let arguments = request.get("arguments").unwrap_or(&Value::Null);
         match tool_catalog::catalog_answer_bytes(arguments, &config) {
-            Ok(bytes) => HandlerOutcome::Response(bytes),
+            Ok(bytes) => {
+                if arguments.get("composition").is_some_and(Value::is_object)
+                    && arguments.get("digest_only") != Some(&Value::Bool(true))
+                {
+                    // These bytes were just produced by the catalog, not supplied
+                    // by a caller. Retain only the facts needed to admit calls.
+                    let answer: Value = serde_json::from_slice(&bytes).expect("catalog JSON");
+                    let tools = answer["tools"]
+                        .as_array()
+                        .expect("catalog tools")
+                        .iter()
+                        .map(|tool| {
+                            tool["name"]
+                                .as_str()
+                                .expect("catalog tool name")
+                                .to_string()
+                        })
+                        .collect();
+                    self.frozen_tool_catalogs
+                        .lock()
+                        .expect("frozen catalog mutex")
+                        .insert(
+                            (binding.project_root, binding.session),
+                            tool_catalog::FrozenCatalog {
+                                compacting: tool_catalog::compacts_session(arguments)
+                                    .expect("validated composition"),
+                                tools,
+                            },
+                        );
+                }
+                HandlerOutcome::Response(bytes)
+            }
             Err(error) => error.into_outcome(),
         }
+    }
+
+    /// Apply role-catalog admission only when a call carries a preset or the
+    /// session has fetched a frozen catalog. Legacy plugin and Claude Code MCP
+    /// calls do neither; declaring the role's version alone cannot move them
+    /// onto a different tool set or disable their transform-backed reduction.
+    fn check_catalog_call(
+        &self,
+        channel: u16,
+        name: &str,
+        request: &Value,
+    ) -> Result<(), HandlerOutcome> {
+        if !name.starts_with("ctx_") {
+            return Ok(());
+        }
+        let preset = match request.get("preset") {
+            Some(Value::String(name)) => {
+                Some(tool_catalog::Preset::parse(name).ok_or_else(|| {
+                    tool_catalog::CatalogError::unserved_preset(name).into_outcome()
+                })?)
+            }
+            Some(_) => {
+                return Err(tool_catalog::CatalogError::Invalid {
+                    field: "preset".to_string(),
+                    message: "preset must be a string".to_string(),
+                }
+                .into_outcome())
+            }
+            None => None,
+        };
+        let frozen = self.facade_binding(channel).ok().and_then(|binding| {
+            self.frozen_tool_catalogs
+                .lock()
+                .expect("frozen catalog mutex")
+                .get(&(binding.project_root, binding.session))
+                .cloned()
+        });
+        if preset.is_none() && frozen.is_none() {
+            return Ok(());
+        }
+        let compacting = frozen.as_ref().is_some_and(|catalog| catalog.compacting);
+        let served = preset
+            .unwrap_or(tool_catalog::Preset::Head)
+            .serves(name, compacting)
+            && frozen
+                .as_ref()
+                .is_none_or(|catalog| catalog.tools.contains(name));
+        if !served {
+            let body = cortexkit_role_tool_provider::errors::unknown_tool(name);
+            return Err(HandlerOutcome::ErrorWithDetail {
+                code: body.code,
+                message: body.message,
+                detail: body.detail.unwrap_or(Value::Null),
+            });
+        }
+        Ok(())
     }
 
     /// Remember whether the route's consumer declared it speaks `tool-provider/v1`.
