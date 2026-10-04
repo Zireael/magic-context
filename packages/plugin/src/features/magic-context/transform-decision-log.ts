@@ -1,4 +1,5 @@
 import { Database } from "../../shared/sqlite";
+import { configureContextDatabasePragmas } from "../../shared/sqlite-context-pragmas";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getDatabasePath } from "./storage-db";
 
@@ -430,6 +431,8 @@ function writeTransformDecisionBestEffort(dbPath: string, row: TransformDecision
 function writeTransformDecisionRow(dbPath: string, row: TransformDecisionRow): void {
     const db = new Database(dbPath);
     try {
+        db.exec("PRAGMA busy_timeout=0");
+        configureContextDatabasePragmas(db);
         writeTransformDecisionRowOnDatabase(db, row, true);
     } finally {
         closeQuietly(db);

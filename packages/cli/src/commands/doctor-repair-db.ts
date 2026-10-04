@@ -432,6 +432,7 @@ export function migrateAndCheckRecoveredDatabase(
         }
         const afterCounts = readCountsFromOpenDatabase(db);
         db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        db.exec("PRAGMA synchronous=FULL");
         db.exec("PRAGMA journal_mode=DELETE");
         return { ok: true, afterCounts, schemaVersionBefore, schemaVersionAfter };
     } catch (error) {
@@ -477,6 +478,7 @@ function prepareFreshDatabase(path: string): SalvageResult {
         }
         const afterCounts = readCountsFromOpenDatabase(db);
         db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        db.exec("PRAGMA synchronous=FULL");
         db.exec("PRAGMA journal_mode=DELETE");
         return { ok: true, afterCounts, schemaVersionBefore, schemaVersionAfter };
     } catch (error) {

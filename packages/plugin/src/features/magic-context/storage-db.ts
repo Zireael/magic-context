@@ -42,6 +42,7 @@ import {
     withoutSqliteTransformPass,
     withSqliteBackgroundWriter,
 } from "../../shared/sqlite";
+import { configureContextDatabasePragmas } from "../../shared/sqlite-context-pragmas";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { importPluginModule } from "../../shared/stale-plugin-build";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
@@ -328,6 +329,7 @@ function migrateLegacyStorageIfNeeded(targetDbPath: string, targetDbDir: string)
     try {
         const legacyDb = new Database(legacyDbPath);
         try {
+            configureContextDatabasePragmas(legacyDb, true);
             legacyDb.exec("PRAGMA wal_checkpoint(TRUNCATE)");
         } finally {
             closeQuietly(legacyDb);
@@ -1172,7 +1174,7 @@ export function initializeDatabase(
     // or writes: it defaults to OFF, which silently breaks every ON DELETE
     // CASCADE / SET NULL declared in the schema below and in migrations.
     db.exec("PRAGMA foreign_keys=ON");
-    db.exec("PRAGMA journal_mode=WAL");
+    configureContextDatabasePragmas(db);
     applySqliteTuningPragmas(db);
     db.exec(`
     CREATE TABLE IF NOT EXISTS tags (
