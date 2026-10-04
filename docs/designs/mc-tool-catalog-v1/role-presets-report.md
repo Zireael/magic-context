@@ -28,7 +28,7 @@ defaults to head. OpenCode and Pi plugin tool/guidance paths are unchanged.
   `no tool named ctx_memory`, detail `{"tool":"ctx_memory"}`.
 - Worker/reader `ctx_note` call: `unknown_tool`, message
   `no tool named ctx_note`, detail `{"tool":"ctx_note"}`.
-- Non-compacting session's `ctx_reduce`: `unknown_tool`, message
+- Role-admitted non-compacting session's `ctx_reduce`: `unknown_tool`, message
   `no tool named ctx_reduce`, detail `{"tool":"ctx_reduce"}`.
 
 The named call refusals use the role's existing code for a tool not served by
@@ -38,8 +38,52 @@ write arguments through dispatch, verify the store remains empty after each
 helper refusal, and verify head calls write successfully with and without
 compaction. Full catalog fetches with a composition retain process-local state
 for the session's bound routes; preflight, digest-only and failed fetches cannot
-replace it. A fleet call before any such fetch cannot gain `ctx_reduce` by
-claiming compaction in its own envelope.
+replace it. A call carrying a fleet preset before any such fetch cannot gain
+`ctx_reduce` by claiming compaction in its own envelope. Calls with neither a
+preset nor a frozen catalog retain the legacy path regardless of the route's
+declared role versions.
+
+### Legacy Claude Code bridge
+
+Read-only inspection of subconscious `crates/subc-mcp/src/main.rs` (checkout
+HEAD `1a14993c120725fa1dce7267b6e7d0823835930c`) confirms:
+
+- `open_provider_route` calls `open_route`, whose `RouteOpen` sets
+  `role_versions: None` (line 2700). The bridge does not currently declare
+  `tool-provider/v1`. This absence is no longer a requirement for legacy calls:
+  declaring the role alone cannot switch admission to a non-compacting head.
+- `route_tool_call_request` carries `preset: None`; the protocol serializer
+  omits absent presets. A planless MCP call never asserts compaction.
+- MCP `list_tools` reads `state.exposed_tools()`. These originate in subc's
+  control-plane `catalog.list` manifest roles: `desired_session_from_catalog`
+  clones `ProviderRole::ToolProvider.tools`, namespaces the names, and preserves
+  each schema. `mcp_tool_from_exposed` copies the schema object into MCP
+  `inputSchema`. It does not call Magic Context's `tool.catalog`.
+- Magic Context's startup `manifest` uses
+  `prompt_surface::module_tools(PromptSurfaceSelection::default())`. This path
+  is unchanged, still advertising `ctx_reduce` with the legacy schema along
+  with the other facade tools (subject to bridge policy).
+
+Existing Broca facade goldens already pin the legacy full/light arrays and
+their equivalence to the startup manifest. The additional
+`legacy_bridge_startup_ctx_reduce_schema_bytes_are_pinned` test pins the exact
+startup reduce schema serialization, including description bytes, against an
+independent literal. `planless_calls_keep_legacy_response_bytes_even_on_a_v1_declaring_route`
+drives a Claude Code-profile transform to mint valid tags, then executes
+`ctx_reduce`, `ctx_memory` and `ctx_note` without presets or a catalog. All three
+succeed on a v1-declaring route, including real memory/note writes, with responses
+byte-identical to a legacy non-declaring route. An omitted call preset still
+cannot bypass an already fetched non-compacting catalog.
+
+**Future Broca compaction prerequisite, reported but not fixed:**
+`frozen_tool_catalogs` is process-local and is lost on ck-mc restart (also when
+the session's last route closes). Broca does not re-fetch its frozen plan on
+resume. Current non-compacting Broca sessions are unaffected, but a future
+compacting Broca head call carrying `preset: head` after a restart has no frozen
+record, is treated as not compacting, and `ctx_reduce` is refused. Before Magic
+Context serves as Broca's compaction provider, this record must be durable or
+re-derivable from the session's frozen plan. No persistence, schema or migration
+change is included here.
 
 **Deferred guidance sentence:** commons `CatalogRequest` has only `params`,
 `preset`, `composition`, `system_text` and `digest_only`. It has no actual

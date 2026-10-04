@@ -12617,9 +12617,10 @@ impl McHandler {
         }
     }
 
-    /// Apply role-catalog admission only to fleet calls. Legacy OpenCode/Pi
-    /// envelopes omit preset and never fetch a frozen catalog, so their own
-    /// primary/subagent permission and guidance paths remain unchanged.
+    /// Apply role-catalog admission only when a call carries a preset or the
+    /// session has fetched a frozen catalog. Legacy plugin and Claude Code MCP
+    /// calls do neither; declaring the role's version alone cannot move them
+    /// onto a different tool set or disable their transform-backed reduction.
     fn check_catalog_call(
         &self,
         channel: u16,
@@ -12651,7 +12652,7 @@ impl McHandler {
                 .get(&(binding.project_root, binding.session))
                 .cloned()
         });
-        if preset.is_none() && frozen.is_none() && !self.speaks_tool_provider_v1(channel) {
+        if preset.is_none() && frozen.is_none() {
             return Ok(());
         }
         let compacting = frozen.as_ref().is_some_and(|catalog| catalog.compacting);

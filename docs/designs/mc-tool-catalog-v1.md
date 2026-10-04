@@ -148,7 +148,8 @@ the same preset):
   Refusals use the role's `unknown_tool` code, message `no tool named <name>`,
   detail `{"tool": "<name>"}`. Unknown presets use `invalid_request`, message
   `Magic Context defines no preset "<name>"`, detail `{"field": "preset"}`.
-  Legacy plugin calls without a fleet preset or catalog keep their own path.
+  Legacy plugin and Claude Code MCP calls without a fleet preset or frozen
+  catalog keep their own path, even on a route declaring `tool-provider/v1`.
 
 `role.describe` remains build-only discovery: ops, stability, version and
 capabilities, never a tool list. All catalog strings and role aliases live in
