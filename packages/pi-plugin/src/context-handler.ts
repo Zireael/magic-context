@@ -97,8 +97,6 @@ import {
 	getTagsByNumbers,
 	getTagsBySession,
 	getTagsForPendingOperations,
-	hasPiFallbackMessageTags,
-	hasPiFallbackToolOwnerTags,
 	isWrapupInProgress,
 	setSessionWorkMetrics,
 	updateSessionMeta,
@@ -244,6 +242,10 @@ import {
 import { runPiDebugAssertion } from "./debug-assertions-pi";
 import { detectRecentCommit } from "./detect-recent-commit";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
+import {
+	hasPiFallbackMessageTags,
+	hasPiFallbackToolOwnerTags,
+} from "./fallback-tag-probes-pi";
 import {
 	applyPiHeuristicCleanup,
 	type PiHeuristicCleanupResult,

@@ -38,7 +38,12 @@ const { tokenizePiMessages } = await import("../../../pi-plugin/src/tokenize-pi-
 const { createPiTagSnapshotReader } = await import("../../../pi-plugin/src/tag-snapshot-pi");
 const { readPiSessionMessages } = await import("../../../pi-plugin/src/read-session-pi");
 const { hasPiFallbackMessageTags, hasPiFallbackToolOwnerTags } = await import("../../src/features/magic-context/storage-tags");
+const { hasPiFallbackMessageTags: cachedMessageProbe, hasPiFallbackToolOwnerTags: cachedToolProbe } = await import("../../../pi-plugin/src/fallback-tag-probes-pi");
 const { runPiDebugAssertion } = await import("../../../pi-plugin/src/debug-assertions-pi");
+const { __test: handlerTest, clearContextHandlerSession } = await import("../../../pi-plugin/src/context-handler");
+const { createPiTranscript } = await import("../../../pi-plugin/src/transcript-pi");
+const { createPiM0M1PassSnapshot } = await import("../../../pi-plugin/src/inject-compartments-pi");
+const { findFirstKeptEntryId } = await import("../../../pi-plugin/src/pi-historian-runner");
 
 function median(run: () => unknown): number {
  run();
@@ -75,6 +80,24 @@ try {
   const tokenOptions = { cache, stableId: (m:unknown) => idByRef.get(m) };
   tokenizePiMessages(messages, tokenOptions);
   const ctx = { sessionManager: { getBranch: () => fixture.entries, getSessionId: () => "audit", getSessionFile: () => undefined } };
+  const transcript = createPiTranscript(messages, `identity-${size}`, ids);
+  const assignments = new Map<string,number>();
+  db.transaction(() => {
+   const source = db.prepare("INSERT INTO source_contents(session_id,tag_id,content,created_at) VALUES(?,?,?,1)");
+   let number = 0;
+   for (const message of transcript.messages) {
+    let ordinal = 0;
+    for (const part of message.parts) if (part.kind === "text") {
+     assignments.set(`${message.info.id}:p${ordinal++}`, ++number);
+     source.run(`identity-${size}`, number, part.getText() ?? "");
+    }
+   }
+   const compartment = db.prepare("INSERT INTO compartments(session_id,sequence,start_message,end_message,title,content,p1,p2,p3,p4,created_at) VALUES('audit',?,0,100,'title',?,?,?,?,?,1)");
+   const body = "compartment body\n".repeat(240);
+   for(let i=0;i<Math.ceil(size/100);i++) compartment.run(i,body,body,body,body,body);
+  })();
+  const tagger = { getAssignments: () => assignments };
+  const plan = () => handlerTest.buildPiTextIdentityPlan(db,`identity-${size}`,tagger as never,transcript,new Set(ids));
   const timings = {
    ledger: median(() => capturePiServedArray("audit", messages, { storageDir: root })),
    lkgInput: median(begin), lkgOutput: median(capture),
@@ -87,14 +110,25 @@ try {
    meta4Reads: median(() => { for(let i=0;i<4;i++) getOrCreateSessionMeta(db,"audit"); }),
    memoryRowsForCount: median(() => getMemoriesByProject(db,"audit").length),
    fallbackProbes: median(() => { hasPiFallbackMessageTags(db,"audit"); hasPiFallbackMessageTags(db,"audit"); hasPiFallbackToolOwnerTags(db,"audit"); }),
+   cachedFallbackProbes: median(() => { cachedMessageProbe(db,"audit"); cachedMessageProbe(db,"audit"); cachedToolProbe(db,"audit"); }),
    tagSnapshot: median(() => readTags("audit")),
    branchConversion: median(() => readPiSessionMessages(ctx as never)),
    tokenCacheHit: median(() => tokenizePiMessages(messages,tokenOptions)),
    tokenUncached: median(() => tokenizePiMessages(messages)),
    prefixCloneTwice: median(() => { const prefix=[{role:"user",content:"history ".repeat(size)}]; structuredClone(prefix); structuredClone(prefix); }),
+   identityPlan: median(plan),
+   m0PassSnapshot: median(() => createPiM0M1PassSnapshot({db,sessionId:"audit",compactionOff:false})),
+   firstKeptEntry: median(() => findFirstKeptEntryId(fixture.entries,Math.floor(size/2))),
+   threeMetadataWrites: median(() => {
+    db.prepare("UPDATE session_meta SET conversation_tokens = 1, tool_call_tokens = 1 WHERE session_id = 'audit'").run();
+    db.prepare("UPDATE session_meta SET new_work_tokens = 1, total_input_tokens = 1 WHERE session_id = 'audit'").run();
+    db.prepare("UPDATE session_meta SET channel2_nudge_state = '' WHERE session_id = 'audit' AND channel2_nudge_state = 'pending'").run();
+   }),
   };
+  db.prepare("UPDATE session_meta SET cached_m0_bytes = ?, cached_m1_bytes = ?, cached_m0_mural_data_url = ? WHERE session_id = 'audit'").run(Buffer.from("m0 ".repeat(5000)),Buffer.from("m1 ".repeat(100)),"data:image/png;base64,"+"a".repeat(1024*1024));
+  Object.assign(timings, { meta4BlobReads: median(() => { for(let i=0;i<4;i++) getOrCreateSessionMeta(db,"audit"); }), m0BlobSnapshot: median(() => createPiM0M1PassSnapshot({db,sessionId:"audit",compactionOff:false})) });
   const plans = ["message_id", "tool_owner_message_id"].map(column => db.prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM tags WHERE session_id = ? AND type = ? AND ${column} LIKE 'pi-msg-%' LIMIT 1`).all("audit",column === "message_id" ? "message" : "tool"));
   console.log(JSON.stringify({ messages: size, bytes: Buffer.byteLength(JSON.stringify(messages)), ms: timings, plans }));
-  flushPiServedArrayLedger(); clearPiLkgSessionState("audit"); clearPiTailHygieneContentMemo(); db.close();
+  flushPiServedArrayLedger(); clearContextHandlerSession(`identity-${size}`); clearPiLkgSessionState("audit"); clearPiTailHygieneContentMemo(); db.close();
  }
 } finally { flushPiServedArrayLedger(); rmSync(root,{recursive:true,force:true}); }
