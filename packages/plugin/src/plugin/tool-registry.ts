@@ -29,6 +29,7 @@ import { parameterDescriptionsFor } from "../tools/parameter-descriptions";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
 import type { RustToolBackends } from "./rust-tool-backends";
+import { guardSubagentTools } from "./subagent-tool-policy";
 import type { PluginContext } from "./types";
 
 /**
@@ -64,6 +65,7 @@ export function createToolRegistry(args: {
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     registrationPromptSurface?: PromptSurfaceConfig;
     includeDreamerOnlyTools?: boolean;
+    internalChildSessions?: ReadonlySet<string>;
 }): Record<string, ToolDefinition> {
     const { ctx, pluginConfig, rustToolBackends } = args;
 
@@ -233,5 +235,9 @@ export function createToolRegistry(args: {
         normalizeToolArgSchemas(toolDefinition);
     }
 
-    return surfacedTools;
+    return guardSubagentTools(
+        surfacedTools,
+        db,
+        (id) => args.internalChildSessions?.has(id) === true,
+    );
 }

@@ -7,6 +7,7 @@ import { getObservedEpochFloor } from "../../features/magic-context/storage-meta
 import { setCtxReduceRegisteredGlobally } from "../../hooks/magic-context/ctx-reduce-availability";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
+import { subagentToolRefusal } from "../../plugin/subagent-tool-policy";
 import { type Database, withAsyncPrivilegedWriter } from "../../shared/sqlite";
 import { createCtxExpandTools } from "../../tools/ctx-expand";
 import { createCtxMemoryListTools, createCtxMemoryTools } from "../../tools/ctx-memory";
@@ -29,6 +30,7 @@ export async function registerTools(
     db: Database,
     config: MagicContextPluginConfig,
     rustToolBackends?: RustToolBackends,
+    isInternalChild?: (sessionId: string) => boolean,
 ) {
     const compaction = isCompactionEnabled(config);
     setCtxReduceRegisteredGlobally(compaction);
@@ -80,6 +82,10 @@ export async function registerTools(
                 input: tool.schema.toJSONSchema(tool.schema.object(definition.args)),
                 options: { codemode: false },
                 async execute(input, call) {
+                    // A stale or invented call must not bypass request-local hiding,
+                    // reach a module backend, or acquire a write transaction.
+                    const refusal = subagentToolRefusal(db, name, call.sessionID, isInternalChild);
+                    if (refusal) return { content: refusal };
                     // Admit write tools asynchronously before their synchronous storage helpers run.
                     if (name === "ctx_memory" || name === "ctx_note" || name === "ctx_reduce")
                         await withAsyncPrivilegedWriter(db, () => undefined);

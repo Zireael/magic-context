@@ -81,6 +81,7 @@ import { UnresolvedHistoryBoundaryError } from "../../hooks/magic-context/unreso
 import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { registerRpcHandlers } from "../../plugin/rpc-handlers";
+import { hideSubagentTools } from "../../plugin/subagent-tool-policy";
 import { detectConflicts } from "../../shared/conflict-detector";
 import { getDataDir, getMagicContextStorageDir } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
@@ -653,9 +654,12 @@ export async function registerContext(context: V2Context) {
                   memorySyncRequestedSessions: rustMemorySyncRequestedSessions,
               })
             : undefined;
+    const hiddenChildHook = new HiddenChildHook();
     const tools =
         db && isDatabasePersisted(db)
-            ? await registerTools(context, db, config, moduleToolBackends?.backends)
+            ? await registerTools(context, db, config, moduleToolBackends?.backends, (id) =>
+                  hiddenChildHook.owns(id),
+              )
             : undefined;
     const usage: TransformDeps["contextUsageMap"] = new Map();
     const generateReplay = new V2GenerateReplay();
@@ -703,7 +707,6 @@ export async function registerContext(context: V2Context) {
             }
         }
     });
-    const hiddenChildHook = new HiddenChildHook();
     await registerHiddenChildAgents(context.agent);
     let hiddenAgentsReady: Promise<void> | undefined;
     const createHiddenExecutor = async (database: NonNullable<typeof db>) => {
@@ -1282,7 +1285,10 @@ export async function registerContext(context: V2Context) {
             const admissionDb = db ?? storage.current();
             if (!compactionOff && admissionDb)
                 await withAsyncPrivilegedWriter(admissionDb, () => undefined);
-            // Measure only after admission and after per-model descriptions are final.
+            // Hidden maintenance carriers returned above with their explicit
+            // allow-lists. Only this request's map changes, never registrations
+            // or the primary session's cached tool definitions.
+            if (admissionDb) hideSubagentTools(draft, admissionDb);
             recordV2ToolDefinitions(draft);
             // Only a failure to read or record usage refuses here. A high reading is
             // left to the transform below: its force band and emergency path are what
