@@ -37,6 +37,7 @@ const { measurePiTailHygiene, assertPiTailHygieneContentUnchanged, clearPiTailHy
 const { tokenizePiMessages } = await import("../../../pi-plugin/src/tokenize-pi-messages");
 const { createPiTagSnapshotReader } = await import("../../../pi-plugin/src/tag-snapshot-pi");
 const { readPiSessionMessages } = await import("../../../pi-plugin/src/read-session-pi");
+const { convertPiAssistantEntryById } = await import("../../../pi-plugin/src/read-session-pi");
 const { hasPiFallbackMessageTags, hasPiFallbackToolOwnerTags } = await import("../../src/features/magic-context/storage-tags");
 const { hasPiFallbackMessageTags: cachedMessageProbe, hasPiFallbackToolOwnerTags: cachedToolProbe } = await import("../../../pi-plugin/src/fallback-tag-probes-pi");
 const { runPiDebugAssertion } = await import("../../../pi-plugin/src/debug-assertions-pi");
@@ -113,6 +114,7 @@ try {
    cachedFallbackProbes: median(() => { cachedMessageProbe(db,"audit"); cachedMessageProbe(db,"audit"); cachedToolProbe(db,"audit"); }),
    tagSnapshot: median(() => readTags("audit")),
    branchConversion: median(() => readPiSessionMessages(ctx as never)),
+   branchSingleAssistant: median(() => convertPiAssistantEntryById(fixture.entries, ids.at(-1)!)),
    tokenCacheHit: median(() => tokenizePiMessages(messages,tokenOptions)),
    tokenUncached: median(() => tokenizePiMessages(messages)),
    prefixCloneTwice: median(() => { const prefix=[{role:"user",content:"history ".repeat(size)}]; structuredClone(prefix); structuredClone(prefix); }),

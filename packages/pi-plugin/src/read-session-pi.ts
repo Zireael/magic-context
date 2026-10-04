@@ -520,6 +520,32 @@ export function convertEntriesToRawMessages(
 	];
 }
 
+/** Convert a located assistant without hydrating unrelated historical bodies. */
+export function convertPiAssistantEntryById(
+	entries: readonly unknown[],
+	entryId: string,
+): RawMessage | null {
+	for (let index = 0; index < entries.length; index++) {
+		const entry = entries[index];
+		if (!isMessageEntry(entry) || entry.id !== entryId) continue;
+		if (
+			(entry.message as { role?: unknown }).role !== "assistant" ||
+			entryId.startsWith(SYNTH_USER_ID_PREFIX)
+		) {
+			return (
+				convertEntriesToRawMessages(entries).find(
+					(message) => message.id === entryId,
+				) ?? null
+			);
+		}
+		const raw = convertEntriesToRawMessages([entry])[0];
+		return raw
+			? { ...raw, ordinal: countPiRawMessages(entries.slice(0, index + 1)) }
+			: null;
+	}
+	return null;
+}
+
 /** Convert only one raw-message page without hydrating the rest of the Pi branch. */
 export function convertEntriesToRawMessagePage(
 	entries: Iterable<unknown>,
