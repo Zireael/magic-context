@@ -5657,10 +5657,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		executePressureEligible &&
 		routinePressureAppliedBySession.get(args.sessionId) === true;
 	const hasPendingMaterializeSignal = hasPendingMaterialization(args.sessionId);
-	// Pi sessions are primary-equivalent today. If Pi adds subagents on this
-	// transform path, subagents should bypass this once-per-turn guard like
-	// OpenCode does, because they do not share the primary agent's turn cache.
+	// Subagents have no history fold to ride. Their execute pass admits every
+	// eligible cleanup lane together, without rewriting bytes when none acts.
 	const rideSignals = {
+		subagentExecute:
+			args.sessionMeta.isSubagent && args.schedulerDecision === "execute",
 		hardFold: foldBustsServedPrefixThisPass || firstRenderBust,
 		force:
 			(args.forceMaterialization === true || emergencyDropEligible) &&
@@ -5701,6 +5702,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// reductions may ride it without causing an independent bust.
 			foldBustsServedPrefixThisPass ||
 			firstRenderBust ||
+			rideSignals.subagentExecute ||
 			(args.schedulerDecision === "execute" && !alreadyRanHeuristicsThisTurn));
 
 	// 1. Tagging: assigns tag numbers + injects §N§ prefixes when ctx_reduce

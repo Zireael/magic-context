@@ -3,6 +3,14 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and the Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh. The tag release workflow also runs the Rust invocation; both Rust lanes require public sibling path dependencies (../commons and ../subconscious).",
     "entries": [
         {
+            "path": "tests/subagent-execute-ride.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 619: OpenCode 1.18.x task child drains ctx_reduce on a token-configured execute pass, shrinks the real provider request and replays the frozen prefix; PID lsof proves throwaway-store containment; Rust and Pi gates have module/unit counterparts",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/historian-expand-tools.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

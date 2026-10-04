@@ -4679,6 +4679,9 @@ fn apply_once(
         || loaded.meta.soft_refresh_pending
         || (prefix_materialization_enabled && scheduler_outcome.idle_ttl_fired);
     let supersession_ride_available = independent_rebuild
+        // Subagents cannot fold history. Execute is their one shared permission
+        // for queued drops and automatic cleanup, not a request to change bytes.
+        || (req.is_subagent && scheduler_outcome.pass.canonical_decision() == "execute")
         || force_episode_available
         || scheduler_outcome.pass == scheduler::PassDecision::Emergency95;
     let pass_already_busting = supersession_ride_available;
@@ -21049,6 +21052,86 @@ pub(crate) mod tests {
         check_execute_only_queued_drops(false);
     }
 
+    fn check_issue_619_subagent_ride(is_subagent: bool, execute: bool, queued: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("old", 1, "spent content"),
+                    item("tail", 2, "keep tail"),
+                ],
+            ),
+            if execute { 70 } else { 20 },
+            100,
+        );
+        request.is_subagent = is_subagent;
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        transform(&s, &request, &ctx).unwrap();
+        let baseline = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(
+            baseline.scheduler_decision.as_deref(),
+            Some(if execute { "execute" } else { "defer" })
+        );
+        if queued {
+            s.append_pending_agent_drops("ses", &["old#0".into()], 1)
+                .unwrap();
+        }
+        if is_subagent && execute && queued {
+            request.messages = vec![
+                item("old", 1, "spent content"),
+                assistant_tool_call("aged-call", 2, "aged-tool"),
+                tool_result("aged-result", 3, "aged-tool", &"aged output ".repeat(400)),
+                item("tail", 4, "keep tail"),
+            ];
+            let mut loaded = s.load("ses").unwrap();
+            loaded.meta.last_execute_ordinal = 3;
+            s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+        }
+        let result = transform(&s, &request, &ctx).unwrap();
+        let applies = is_subagent && execute && queued;
+        assert_eq!(
+            s.load_pending_agent_drops("ses").unwrap().len(),
+            usize::from(queued && !applies)
+        );
+        assert_eq!(result.ck_messages == baseline.ck_messages, !applies);
+        if applies {
+            assert!(
+                frozen_red_payload(&s.load("ses").unwrap().core, "aged-result#0").is_some(),
+                "queued drops and eligible age cleanup must share this execute pass"
+            );
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                transform(&s, &request, &ctx).unwrap().ck_messages,
+                result.ck_messages
+            );
+        }
+    }
+
+    #[test]
+    fn issue_619_subagent_execute_drains_queued_drops() {
+        check_issue_619_subagent_ride(true, true, true);
+    }
+
+    #[test]
+    fn issue_619_primary_execute_holds_queued_drops() {
+        check_issue_619_subagent_ride(false, true, true);
+    }
+
+    #[test]
+    fn issue_619_subagent_defer_holds_queued_drops() {
+        check_issue_619_subagent_ride(true, false, true);
+    }
+
+    #[test]
+    fn issue_619_subagent_empty_execute_is_byte_identical() {
+        check_issue_619_subagent_ride(true, true, false);
+    }
+
     #[test]
     fn execute_only_queued_drops_are_held_with_historian() {
         check_execute_only_queued_drops(true);
@@ -22853,15 +22936,19 @@ pub(crate) mod tests {
                     item("tail", 5, "continue"),
                 ],
             ),
-            75,
+            20,
             100,
         );
         // The reductions-only subagent branch never executes a prefix plan,
-        // even if it receives inherited HARD or reconcile state.
+        // even if it receives inherited HARD or reconcile state. Keep this a
+        // defer pass: subagent execute itself now authorizes reductions without
+        // relying on those advisories, so it cannot isolate the advisory gate.
         request.is_subagent = true;
         let mut context = pctx("git:proj", "/nonexistent-docs", 300_002);
+        context.cache_ttl = "never".into();
         context.observed_last_response_at_ms = Some(1);
         let response = transform(&s, &request, &context).unwrap();
+        assert_eq!(response.scheduler_decision.as_deref(), Some("defer"));
         assert_ne!(response.action, "HARD");
         let after = s.load("ses").unwrap();
         assert_eq!(after.core.frozen_units, before, "reconcile={reconcile}");

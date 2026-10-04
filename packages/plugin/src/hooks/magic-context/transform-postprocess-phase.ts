@@ -2016,6 +2016,7 @@ export async function runPostTransformPhase(
     // retry, not on the warm tool step after the provider finally answers.
     const idleExpiryRebuild = !freezeM0M1 && args.m0M1?.hardSignals?.cacheExpired === true;
     const rideSignals = {
+        subagentExecute: !args.fullFeatureMode && args.schedulerDecision === "execute",
         hardFold: foldBustsServedPrefixThisPass || firstRenderBust || idleExpiryRebuild,
         force:
             emergencyDropEligible &&
