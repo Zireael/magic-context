@@ -188,9 +188,9 @@ was not changed, because permission correctness does not require a prompt rewrit
 
 - `bun run build`: passed, three package builds and four embedded OpenCode 2 server
   tests (Bun 1.4.2).
-- `bun run --cwd packages/plugin test`: passed, **6752 pass / 4 skip / 0 fail**,
+- `bun run --cwd packages/plugin test`: passed, **6757 pass / 4 skip / 0 fail**,
   650 files (Bun 1.4.2).
-- `bun run --cwd packages/pi-plugin test`: passed, **1504 pass / 3 skip / 0 fail**,
+- `bun run --cwd packages/pi-plugin test`: passed, **1507 pass / 3 skip / 0 fail**,
   138 files (Bun 1.4.2).
 - `bun run typecheck`: passed, four configured packages (TypeScript 5.9.3).
 - `bun run lint`: passed, Biome 2.5.1 checked 1197 plugin, 224 Pi, 133 CLI and
@@ -230,7 +230,8 @@ OpenCode now records first image, stale-reduce and visible sentinel edits in the
 same actual-edit ledger consumed by bust telemetry and prefix-bound thinking
 invalidation. Frozen-id replay and hidden-at-seam-only persistence do not enter
 that ledger. The ledger also covers later binding/merged-reasoning edits. It
-distinguishes edits before newer thinking from terminal edits, so the
+distinguishes edits before newer thinking from terminal edits using actual visible
+message/part locations (see the positional re-review repair below), so the
 oldest-prefix-trim exception applies only when no other prefix edit occurred.
 
 Trailing-blank decisions are compared against the previous frozen projection
@@ -339,3 +340,80 @@ and Pi package scripts initially collided in concurrent frozen-lockfile workspac
 linking (`EEXIST`); serial install and separate, sequential package test processes
 passed with no dependency changes. The repaired hooks were rebuilt and the real
 OpenCode task-host/manifest run passed again with the same eleven-pass byte table.
+
+## Positional re-review repair
+
+The full re-review report was read from
+`alfonso/task/bg_b77d69ad9e84f87e-re-review-issue-619-fixes-for-the-blocking-findi:docs/reports/issue-619-re-review.md`.
+It confirmed the earlier repairs but found a new primary cache regression: the
+first-edit recorder's default `beforeNewerThinking=true` made a terminal image,
+stale-reduce or sentinel edit remove an earlier, still-valid signed block. All
+three new primary controls reproduced that regression before this repair.
+
+The recorder now requires an explicit positional verdict. Supported strip helpers
+report actual first-application message/part locations through optional internal
+observers; replay never fires those observers. OpenCode retains `any=true`, then
+checks the edit locations against the remaining reasoning projection after frozen
+reasoning removals. Thus thinking already frozen for removal cannot spuriously
+invalidate an earlier block. Only actual positional edits on bound models pay for
+that replay preview; no-op passes do not copy/hash the corpus. The real message
+arrays are not changed by the preview.
+
+Pi mirrors the distinction: stale-arc observers preserve owner/call identity,
+images report first-stripped parts, and permitted placeholder removals report
+their location before splicing. Stable source order survives those removals.
+Telemetry still records a real edit when no signed thinking follows it. Existing
+head/fold/materialization and unclassified native-edit invalidation remains
+conservative; the shared admission and force formula are unchanged. Pi's narrower
+placeholder discovery and Rust's reductions-only exclusions remain intact.
+
+The requested primary controls use a real Sonnet 5.5 predicate, frozen trailing
+decisions, fresh raw arrays and a 96% force ride with no head/fold/materialization
+change. They assert the unaffected prefix and signed block are retained, the
+terminal edit actually occurs, `bustedThisPass=true`, no proactive strip occurs,
+and both force and defer replay report no fresh edit. Additional controls cover a
+stale part after thinking in the same message and later thinking already frozen
+for removal. Pi has corresponding ordinary-child image/stale controls and a
+primary-force image control. Existing earlier-edit/model, metadata-only, trim and
+replay controls remain part of the final gates. These are source representation
+tests, not paid-provider cryptographic/cache measurements.
+
+### Positional failing-first and restored controls
+
+On `2a378709c9459dc7ec8a1225b557ff05585e7a77`, the three requested primary terminal
+tests all failed with **one signed block expected, zero received**. The two Pi
+child terminal controls reproduced the same over-strip before its mirror repair.
+Restoring the old unconditional positional bit, without disabling actual-edit
+telemetry, also made the additional same-message/frozen-later OpenCode controls
+and the Pi primary-force image control red.
+
+All ten intentional files were staged before mutation, with an empty
+`git diff --stat`. Each mutant below changed only the respective handler:
+**2 insertions / 1 deletion**, marked `NON-VACUITY BREAK`. Restoration used
+`git checkout -- <path> && touch <path>` and returned an empty diff before final
+verification. Each terminal row below was a separate one-test red invocation.
+
+| Control | Exact red test | Failure / unaffected control |
+| --- | --- | --- |
+| Restore unconditional OpenCode positional bit | `issue 619 terminal first edits > primary terminal image edit preserves thinking whose preceding prefix is unchanged` | Expected 1 reasoning block, received 0 |
+| Same bit | `issue 619 terminal first edits > primary terminal stale edit preserves thinking whose preceding prefix is unchanged` | Expected 1, received 0 |
+| Same bit | `issue 619 terminal first edits > primary terminal sentinel edit preserves thinking whose preceding prefix is unchanged` | Expected 1, received 0 |
+| Same bit | `issue 619 terminal first edits > terminal stale part after its own signed block preserves the untouched prefix` | Expected 1, received 0 |
+| Same bit | `issue 619 terminal first edits > terminal image edit ignores later thinking already frozen for removal` | Expected 1, received 0 |
+| Restore unconditional Pi positional bit | `Pi proactive strip of invalidated thinking > issue 619 Pi terminal image edit keeps earlier signed thinking and actual-edit telemetry` | Expected 1, received 0 |
+| Same bit | `Pi proactive strip of invalidated thinking > issue 619 Pi terminal stale edit keeps earlier signed thinking and actual-edit telemetry` | Expected 1, received 0 |
+| Same bit | `Pi proactive strip of invalidated thinking > issue 619 Pi primary terminal image edit keeps earlier signed thinking and actual-edit telemetry` | Expected 1, received 0 |
+| Disable only OpenCode positional classifier | `issue 619 first-application thinking accounting > image alone invalidates later signed thinking on claude-sonnet-5-5` | Missing proactive strip; primary terminal image control still passed |
+| Disable only Pi positional classifier | `Pi proactive strip of invalidated thinking > issue 619 Pi image first application invalidates thinking and replay is not a new edit` | Retained 2 thinking blocks; Pi primary terminal image control still passed |
+
+The last two controls defend the original safety repair against a wholesale
+invalidation disable: preserving a terminal block is not sufficient if an earlier
+edit can leave later signatures intact. After restoration, the full plugin suite
+passed **6757 tests**, and the full Pi suite passed **1507 tests** in a separate,
+subsequent process; all existing lane/model, metadata, trim and replay tests stayed
+green. `cargo test --locked -p mc-module issue_619` passed **5 unit tests**, with
+other targets selecting zero. Rust source was not changed in this positional
+follow-up. Workspace typecheck (TypeScript 5.9.3), lint (Biome 2.5.1), and the three
+package builds plus four embedded server tests (Bun 1.4.2) also passed. No new
+standalone host or paid-provider probe was needed or launched for this follow-up;
+the earlier eleven-pass host table remains a historical measurement.

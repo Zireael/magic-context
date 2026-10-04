@@ -2184,9 +2184,17 @@ export async function runPostTransformPhase(
     // history is replay. Telemetry and signed-thinking invalidation consume the
     // same edit record so a strip cannot silently escape either accounting lane.
     const firstApplicationEdits = { any: false, beforeNewerThinking: false };
-    const recordFirstApplicationWireEdit = (beforeNewerThinking = true): void => {
+    const recordFirstApplicationWireEdit = (beforeNewerThinking: boolean): void => {
         firstApplicationEdits.any = true;
         firstApplicationEdits.beforeNewerThinking ||= beforeNewerThinking;
+    };
+    const firstApplicationLocations = new Map<MessageLike, number>();
+    const recordFirstApplicationAt = (message: MessageLike, partIndex: number): void => {
+        recordFirstApplicationWireEdit(false);
+        firstApplicationLocations.set(
+            message,
+            Math.min(firstApplicationLocations.get(message) ?? Infinity, partIndex),
+        );
     };
     let heuristicOrReasoningDidMutate = false;
     // Like heuristicOrReasoningDidMutate, but leaving out the oldest-prefix
@@ -2735,9 +2743,9 @@ export async function runPostTransformPhase(
             const staleReduceResult = dropStaleReduceCalls(args.messages, frozenStaleReduceIds, {
                 detect: isCacheBustingPass,
                 protectedCount: args.protectedCount,
+                onFirstApplication: recordFirstApplicationAt,
             });
             if (isCacheBustingPass && staleReduceResult.newlyStrippedIds.length > 0) {
-                recordFirstApplicationWireEdit();
                 addStaleReduceStrippedIds(
                     args.db,
                     args.sessionId,
@@ -2765,9 +2773,9 @@ export async function runPostTransformPhase(
                 detect: isCacheBustingPass && args.watermark > 0,
                 watermark: args.watermark,
                 messageTagNumbers: args.messageTagNumbers,
+                onFirstApplication: recordFirstApplicationAt,
             });
             if (isCacheBustingPass && imageResult.newlyStrippedIds.length > 0) {
-                recordFirstApplicationWireEdit();
                 addProcessedImageStrippedIds(args.db, args.sessionId, imageResult.newlyStrippedIds);
             }
             logTransformTiming(args.sessionId, "stripProcessedImages", tImg);
@@ -2937,6 +2945,7 @@ export async function runPostTransformPhase(
             const droppedResult = stripDroppedPlaceholderMessages(
                 args.messages,
                 args.resolvedProviderID,
+                recordFirstApplicationAt,
             );
             const protectedTailStart = Math.max(
                 0,
@@ -2946,11 +2955,9 @@ export async function runPostTransformPhase(
                 args.messages,
                 protectedTailStart,
                 args.resolvedProviderID,
+                recordFirstApplicationAt,
             );
             const hiddenMessages = args.hiddenMessagesAtCompactionSeam ?? [];
-            if (droppedResult.stripped > 0 || systemInjectedResult.stripped > 0) {
-                recordFirstApplicationWireEdit();
-            }
             const hiddenDroppedResult = stripDroppedPlaceholderMessages(
                 hiddenMessages,
                 args.resolvedProviderID,
@@ -3435,7 +3442,7 @@ export async function runPostTransformPhase(
                         mergedReasoningStrippedIds.add(thinkingBindingRecoveryFrozenId(messageId));
                     }
                     if (thinkingBindingRecovery.messageIds.length > 0) {
-                        recordFirstApplicationWireEdit();
+                        recordFirstApplicationWireEdit(true);
                     }
                 } else {
                     failPass("thinking-binding-recovery-persistence-failure");
@@ -3472,7 +3479,7 @@ export async function runPostTransformPhase(
                         // The merged-reasoning strip keeps the first block of a run of
                         // consecutive assistants and strips the later ones: a removal
                         // from the middle of the history.
-                        recordFirstApplicationWireEdit();
+                        recordFirstApplicationWireEdit(true);
                     } else {
                         failPass("merged-reasoning-strip-persistence-failure");
                         sessionLog(
@@ -3515,7 +3522,14 @@ export async function runPostTransformPhase(
         if (previous) applyFrozenTrailingBlankDecisions(before, new Map([[id, previous]]));
         applyFrozenTrailingBlankDecisions(after, new Map([[id, next]]));
         if (JSON.stringify(before[0].parts) !== JSON.stringify(after[0].parts)) {
-            recordFirstApplicationWireEdit(id !== newestAssistantId);
+            let partIndex = 0;
+            while (
+                partIndex < before[0].parts.length &&
+                JSON.stringify(before[0].parts[partIndex]) ===
+                    JSON.stringify(after[0].parts[partIndex])
+            )
+                partIndex++;
+            recordFirstApplicationAt(message, partIndex);
         }
     };
 
@@ -3674,6 +3688,51 @@ export async function runPostTransformPhase(
                 message.info.role === "assistant" &&
                 message.parts.some((part) => isNeutralizedReasoningPart(part)),
         );
+    if (
+        prefixBoundModel &&
+        firstApplicationLocations.size > 0 &&
+        !firstApplicationEdits.beforeNewerThinking
+    ) {
+        // Check the remaining representation, not reasoning already frozen for
+        // removal. Only real first edits pay for this positional replay preview.
+        const remaining = args.messages.map((message) => ({
+            ...message,
+            parts: [...message.parts],
+        }));
+        stripClearedReasoning(remaining);
+        stripReasoningFromAssistantIds(
+            remaining,
+            args.resolvedProviderID,
+            thinkingBindingRecoveryMessageIds,
+        );
+        stripReasoningFromMergedAssistants(remaining, args.resolvedProviderID, {
+            frozenMessageIds: mergedReasoningStrippedIds,
+            mutationExemptMessage:
+                remaining[args.messages.indexOf(reasoningMutationExemptMessage as MessageLike)],
+        });
+        let newerThinking = false;
+        for (let index = remaining.length - 1; index >= 0; index--) {
+            const message = remaining[index];
+            const editIndex = firstApplicationLocations.get(args.messages[index]);
+            // A removed suffix follows every part still in its own message.
+            if (editIndex !== undefined && editIndex >= message.parts.length && newerThinking)
+                firstApplicationEdits.beforeNewerThinking = true;
+            for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex--) {
+                const part = message.parts[partIndex];
+                if (
+                    message.info.role === "assistant" &&
+                    isRecord(part) &&
+                    part.ignored !== true &&
+                    (part.type === "reasoning" ||
+                        part.type === "thinking" ||
+                        part.type === "redacted_thinking")
+                )
+                    newerThinking = true;
+                if (editIndex !== undefined && partIndex === editIndex && newerThinking)
+                    firstApplicationEdits.beforeNewerThinking = true;
+            }
+        }
+    }
     const prefixEditBesidesReasoningTrim =
         firstRenderBust ||
         materializationRequested ||

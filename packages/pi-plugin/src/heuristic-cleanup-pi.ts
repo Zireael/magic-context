@@ -105,6 +105,8 @@ export interface PiHeuristicCleanupConfig {
 	 * tags still replay through applyFlushedStatuses on every provider.
 	 */
 	staleReduceStripEnabled: boolean;
+	/** Reports actual new stale-arc edits, not dropped-status replay. */
+	onStaleReduceEdit?: (tag: TagEntry) => void;
 	/**
 	 * Tiered target-headroom emergency drop (Phase 2). Provided only on the
 	 * derived force-band materialize (cache-busting) pass; undefined on routine execute
@@ -499,6 +501,7 @@ export function applyPiHeuristicCleanup(
 				updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
 				if (result === "removed" || result === "truncated") {
 					droppedStaleReduceCalls++;
+					config.onStaleReduceEdit?.(tag);
 				}
 			}
 		}).immediate();

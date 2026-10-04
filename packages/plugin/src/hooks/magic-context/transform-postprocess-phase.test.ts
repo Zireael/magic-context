@@ -10251,6 +10251,151 @@ describe("issue 619 metadata-only trailing decisions", () => {
     }
 });
 
+describe("issue 619 terminal first edits", () => {
+    for (const [lane, placement, name] of [
+        [
+            "image",
+            "terminal",
+            "primary terminal image edit preserves thinking whose preceding prefix is unchanged",
+        ],
+        [
+            "stale",
+            "terminal",
+            "primary terminal stale edit preserves thinking whose preceding prefix is unchanged",
+        ],
+        [
+            "sentinel",
+            "terminal",
+            "primary terminal sentinel edit preserves thinking whose preceding prefix is unchanged",
+        ],
+        [
+            "stale",
+            "same-message",
+            "terminal stale part after its own signed block preserves the untouched prefix",
+        ],
+        [
+            "image",
+            "frozen-later",
+            "terminal image edit ignores later thinking already frozen for removal",
+        ],
+    ] as const) {
+        it(name, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `terminal-${lane}`;
+            getOrCreateSessionMeta(db, sessionId);
+            updateSessionMeta(db, sessionId, { isSubagent: false });
+            const raw = [
+                { info: { id: "u1", role: "user" }, parts: [{ type: "text", text: "one" }] },
+                {
+                    info: { id: "a1", role: "assistant" },
+                    parts: [
+                        {
+                            type: "reasoning",
+                            text: "signed one",
+                            metadata: { anthropic: { signature: "sig-one" } },
+                        },
+                        { type: "text", text: "answer one" },
+                    ],
+                },
+                { info: { id: "u2", role: "user" }, parts: [{ type: "text", text: "two" }] },
+                {
+                    info: { id: "edit", role: lane === "image" ? "user" : "assistant" },
+                    parts:
+                        lane === "image"
+                            ? [
+                                  {
+                                      type: "file",
+                                      mime: "image/png",
+                                      url: `data:image/png;base64,${"a".repeat(220)}`,
+                                  },
+                              ]
+                            : lane === "stale"
+                              ? [
+                                    {
+                                        type: "tool",
+                                        tool: "ctx_reduce",
+                                        callID: "terminal-reduce",
+                                        state: {
+                                            status: "completed",
+                                            input: { drop: "1" },
+                                            output: "Queued",
+                                        },
+                                    },
+                                ]
+                              : [{ type: "text", text: "[dropped §1§]" }],
+                },
+                { info: { id: "u3", role: "user" }, parts: [{ type: "text", text: "three" }] },
+                {
+                    info: { id: "a2", role: "assistant" },
+                    parts: [{ type: "text", text: "plain answer" }],
+                },
+            ] as MessageLike[];
+            if (placement === "same-message") {
+                raw[1].parts.push(raw[3].parts[0]);
+                raw.splice(3, 1);
+            }
+            if (placement === "frozen-later") {
+                raw[5].parts.unshift({
+                    type: "reasoning",
+                    text: "already frozen",
+                    metadata: { anthropic: { signature: "sig-two" } },
+                });
+                addMergedReasoningStrippedIds(db, sessionId, ["binding_mismatch:a2"]);
+            }
+            addTrailingBlankDecisions(db, sessionId, [
+                ["a1", "strip"],
+                ["edit", "strip"],
+                ["a2", "strip"],
+            ]);
+            const pass = async (force: boolean) => {
+                const messages = structuredClone(raw);
+                const result = await runPostTransformPhase(
+                    basePostTransformArgs(db, sessionId, messages, {
+                        resolvedProviderID: "anthropic",
+                        thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(
+                            "anthropic",
+                            "claude-sonnet-5-5",
+                        ),
+                        contextUsage: {
+                            percentage: force ? 96 : 20,
+                            inputTokens: force ? 96000 : 20000,
+                        },
+                        watermark: lane === "image" ? 1 : 0,
+                        messageTagNumbers: new Map([[messages[3], 1]]),
+                    }),
+                );
+                return { messages, result };
+            };
+            const baseline = await pass(false);
+            const edited = await pass(true);
+            expect(
+                edited.messages
+                    .flatMap((message) => message.parts)
+                    .filter((part) => part.type === "reasoning"),
+            ).toHaveLength(1);
+            if (placement === "same-message")
+                expect(JSON.stringify(edited.messages[1].parts[0])).toBe(
+                    JSON.stringify(baseline.messages[1].parts[0]),
+                );
+            else
+                expect(JSON.stringify(edited.messages.slice(0, 3))).toBe(
+                    JSON.stringify(baseline.messages.slice(0, 3)),
+                );
+            expect(JSON.stringify(edited.messages)).not.toBe(JSON.stringify(baseline.messages));
+            expect(edited.result.bustedThisPass).toBe(true);
+            expect(edited.result.proactiveThinkingStrip).toBeNull();
+            expect(edited.result.materialized).toBe(false);
+            for (const force of [false, true]) {
+                const replay = await pass(force);
+                expect(JSON.stringify(replay.messages)).toBe(JSON.stringify(edited.messages));
+                expect(replay.result.bustedThisPass).toBe(false);
+                expect(replay.result.proactiveThinkingStrip).toBeNull();
+            }
+        });
+    }
+});
+
 describe("prefix-bound oldest-prefix reasoning trim", () => {
     const PROVIDER = "google-vertex-anthropic";
     const sha256 = (value: unknown): string =>
