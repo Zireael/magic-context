@@ -3699,8 +3699,8 @@ export function registerPiContextHandler(
 						// Same permission as synthetic todo injection:
 						// executedWorkThisPass is true when the pipeline was allowed to
 						// bust the cache (a HARD fold included). bustedThisPass is not
-						// used, because replaying saved drop statuses sets it even on
-						// a defer pass.
+						// used as permission: it describes the earlier pipeline and cannot
+						// observe host-side reminder edits made after that pipeline.
 						//
 						// A pass whose only edit is the oldest-prefix thinking clear
 						// keeps the newer blocks: Anthropic's "What counts as an edit"
@@ -5343,7 +5343,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// An edit this pass made before newer thinking other than the oldest-prefix
 	// thinking clear of a prefix-bound model; see RunPipelineResult.
 	let prefixEditBesidesReasoningTrim = false;
-	let didMutateFromFlushedStatuses = false;
+	// Only first application changes the served prefix. Frozen-id replay rebuilds
+	// prior bytes from raw history and must not create a new bust or invalidation.
+	const recordFirstApplicationWireEdit = (): void => {
+		heuristicOrReasoningDidMutate = true;
+		prefixEditBesidesReasoningTrim = true;
+		executedWorkThisPass = true;
+	};
 	let droppedCount = 0;
 	let droppedTokens = 0;
 	const droppedTokenReductions: DroppedTokenReduction[] = [];
@@ -6037,16 +6043,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		`targets=${targetTagNumbers.length} fetched=${flushedDroppedTags.length}`,
 	);
 	const tFlushed = performance.now();
-	didMutateFromFlushedStatuses = runPersistedReplayStage(
-		"flushed-status-failure",
-		undefined,
-		() =>
-			applyFlushedStatuses(
-				args.sessionId,
-				args.db,
-				targets,
-				flushedDroppedTags,
-			),
+	runPersistedReplayStage("flushed-status-failure", undefined, () =>
+		applyFlushedStatuses(args.sessionId, args.db, targets, flushedDroppedTags),
 	);
 	logTransformTiming(args.sessionId, "applyFlushedStatuses", tFlushed);
 	logTransformTiming(args.sessionId, "batchFinalize:flushed", tFlushed);
@@ -6319,8 +6317,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				droppedTokenReductions.push(...heuristicsResult.droppedTokenReductions);
 			}
 			if (heuristicMutationCount > 0) {
-				heuristicOrReasoningDidMutate = true;
-				prefixEditBesidesReasoningTrim = true;
+				recordFirstApplicationWireEdit();
 			}
 			heuristicsExecuted = true;
 			executedWorkThisPass = true;
@@ -6580,9 +6577,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				stableId: stableIdResolver,
 			});
 			if (imageResult.newlyStrippedIds.length > 0) {
-				heuristicOrReasoningDidMutate = true;
-				prefixEditBesidesReasoningTrim = true;
-				executedWorkThisPass = true;
+				recordFirstApplicationWireEdit();
 				droppedCount += imageResult.stripped;
 			}
 		} catch (err) {
@@ -6712,9 +6707,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				)
 			: 0;
 		if (nativeInputsApplied > 0 || nativeReasoningApplied > 0) {
-			heuristicOrReasoningDidMutate = true;
-			prefixEditBesidesReasoningTrim = true;
-			executedWorkThisPass = true;
+			recordFirstApplicationWireEdit();
 		}
 	}
 	// Finalize the shared episode after all reclaim producers, including processed
@@ -6916,22 +6909,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 
 	transcript.finalizeToolRemovals();
 	const tDroppedPlaceholders = performance.now();
-	stripPiDroppedPlaceholderMessages({
+	const placeholderResult = stripPiDroppedPlaceholderMessages({
 		db: args.db,
 		sessionId: args.sessionId,
 		messages: args.messages,
-		// Discovery is gated to history-refresh passes ONLY (args.isCacheBusting) —
-		// deliberately NARROWER than OpenCode's `shouldApplyPendingOps ||
-		// shouldRunHeuristics`. The two harnesses diverge in strip SEMANTICS:
-		// OpenCode NEUTRALIZES a placeholder-only message in place (replaces parts
-		// with an empty sentinel, message stays in the array), so discovering on a
-		// fresh-drop execute pass is harmless. Pi REMOVES (splices) the message.
-		// A freshly-dropped tool stub renders as `[dropped §N§]`, which
-		// isDroppedOnlyText matches — so discovering on the same execute pass that
-		// created it would splice out the just-dropped turn and collapse it. We
-		// therefore discover only at history-refresh boundaries (where the array is
-		// rebuilt anyway); a stub created on a drop-only execute pass is tiny and
-		// gets discovered on the next refresh pass. Replay still runs every pass.
+		// Pi splices placeholder-only messages rather than neutralizing them in
+		// place. Subagent execute alone must not discover new splices that collapse
+		// a freshly dropped turn: tiny shells wait for a history refresh (or the
+		// stable-id cutover below). Frozen discoveries still replay every pass.
 		isCacheBusting: args.isCacheBusting,
 		stableIdByRef: postCommitStableIdByRef,
 		// F4 cutover: when the stable-id scheme just changed, force rediscovery so
@@ -6943,6 +6928,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// on a pass meant to replay the previous bytes.
 		canFirstApply: isCacheBustingPass,
 	});
+	if (placeholderResult.discovered > 0 && placeholderResult.removed > 0) {
+		recordFirstApplicationWireEdit();
+	}
 	logTransformTiming(
 		args.sessionId,
 		"stripDroppedPlaceholders",
@@ -7155,7 +7143,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const materializeReason = injectionResult?.m0Reason ?? null;
 	const bustedThisPass =
 		firstRenderBust ||
-		didMutateFromFlushedStatuses ||
 		pendingOpsDidMutate ||
 		heuristicOrReasoningDidMutate ||
 		autoReclaimDidMutateThisPass ||
@@ -7166,7 +7153,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			? "fold"
 			: args.forceMaterialization
 				? "force"
-				: pendingOpsDidMutate || didMutateFromFlushedStatuses
+				: pendingOpsDidMutate
 					? "flush"
 					: historyWasConsumedThisPass
 						? "refresh"

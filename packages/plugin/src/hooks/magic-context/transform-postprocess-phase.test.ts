@@ -10065,6 +10065,192 @@ describe("proactive strip of thinking on busting passes", () => {
 // Each test is named after the row of Anthropic's "What counts as an edit" table
 // (https://platform.claude.com/docs/en/build-with-claude/preserved-thinking) that
 // the behavior relies on.
+describe("issue 619 first-application thinking accounting", () => {
+    for (const model of ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"]) {
+        for (const lane of ["image", "stale reduce", "sentinel"] as const) {
+            it(`${lane} alone invalidates later signed thinking on ${model}`, async () => {
+                db = new Database(":memory:");
+                initializeDatabase(db);
+                const sessionId = `accounting-${lane}-${model}`;
+                getOrCreateSessionMeta(db, sessionId);
+                updateSessionMeta(db, sessionId, { isSubagent: true });
+                const raw = [
+                    {
+                        info: { id: "head-user", role: "user" },
+                        parts: [{ type: "text", text: "first request" }],
+                    },
+                    {
+                        info: { id: "edit-owner", role: lane === "image" ? "user" : "assistant" },
+                        parts:
+                            lane === "image"
+                                ? [
+                                      {
+                                          type: "file",
+                                          mime: "image/png",
+                                          url: `data:image/png;base64,${"a".repeat(220)}`,
+                                      },
+                                  ]
+                                : lane === "stale reduce"
+                                  ? [
+                                        {
+                                            type: "tool",
+                                            tool: "ctx_reduce",
+                                            callID: "old-reduce",
+                                            state: {
+                                                status: "completed",
+                                                input: { drop: "1" },
+                                                output: "Queued",
+                                            },
+                                        },
+                                    ]
+                                  : [{ type: "text", text: "[dropped §1§]" }],
+                    },
+                    {
+                        info: { id: "middle-user", role: "user" },
+                        parts: [{ type: "text", text: "next request" }],
+                    },
+                    {
+                        info: { id: "a1", role: "assistant" },
+                        parts: [
+                            {
+                                type: "reasoning",
+                                text: "signed one",
+                                metadata: { anthropic: { signature: "sig-one" } },
+                            },
+                            { type: "text", text: "answer one" },
+                        ],
+                    },
+                    {
+                        info: { id: "later-user", role: "user" },
+                        parts: [{ type: "text", text: "last request" }],
+                    },
+                    {
+                        info: { id: "a2", role: "assistant" },
+                        parts: [
+                            {
+                                type: "reasoning",
+                                text: "signed two",
+                                metadata: { anthropic: { signature: "sig-two" } },
+                            },
+                            { type: "text", text: "answer two" },
+                        ],
+                    },
+                ] as MessageLike[];
+                addTrailingBlankDecisions(db, sessionId, [
+                    ["edit-owner", "strip"],
+                    ["a1", "strip"],
+                    ["a2", "strip"],
+                ]);
+                const serve = async (decision: "execute" | "defer") => {
+                    const messages = structuredClone(raw);
+                    const result = await runPostTransformPhase(
+                        basePostTransformArgs(db, sessionId, messages, {
+                            fullFeatureMode: false,
+                            resolvedProviderID: "anthropic",
+                            thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(
+                                "anthropic",
+                                model,
+                            ),
+                            schedulerDecision: decision,
+                            schedulerDeferReason: undefined,
+                            contextUsage: { percentage: 70, inputTokens: 70000 },
+                            watermark: lane === "image" ? 1 : 0,
+                            messageTagNumbers: new Map([[messages[1], 1]]),
+                        }),
+                    );
+                    return { messages, result };
+                };
+                const baseline = await serve("defer");
+                const applied = await serve("execute");
+                expect(JSON.stringify(applied.messages)).not.toBe(
+                    JSON.stringify(baseline.messages),
+                );
+                expect(applied.result.bustedThisPass).toBe(true);
+                expect(applied.result.proactiveThinkingStrip?.messageIds).toEqual(["a1", "a2"]);
+                expect(
+                    applied.messages
+                        .flatMap((message) => message.parts)
+                        .some((part) => part.type === "reasoning"),
+                ).toBe(false);
+                for (const decision of ["defer", "execute"] as const) {
+                    const replay = await serve(decision);
+                    expect(JSON.stringify(replay.messages)).toBe(JSON.stringify(applied.messages));
+                    expect(replay.result.bustedThisPass).toBe(false);
+                    expect(replay.result.proactiveThinkingStrip).toBeNull();
+                }
+            });
+        }
+    }
+});
+
+describe("issue 619 metadata-only trailing decisions", () => {
+    for (const [name, isSubagent, model] of [
+        ["primary bound", false, "claude-sonnet-5-5"],
+        ["subagent unbound", true, "claude-sonnet-4-5"],
+        ["subagent bound", true, "claude-sonnet-5-5"],
+    ] as const) {
+        it(`${name} keeps bytes and reports no bust when a historical strip already matches`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `metadata-only-${name}`;
+            getOrCreateSessionMeta(db, sessionId);
+            updateSessionMeta(db, sessionId, { isSubagent });
+            const raw = [
+                { info: { id: "u1", role: "user" }, parts: [{ type: "text", text: "one" }] },
+                {
+                    info: { id: "a1", role: "assistant" },
+                    parts: [
+                        {
+                            type: "reasoning",
+                            text: "signed one",
+                            metadata: { anthropic: { signature: "sig-one" } },
+                        },
+                        { type: "text", text: "answer one" },
+                    ],
+                },
+                { info: { id: "u2", role: "user" }, parts: [{ type: "text", text: "two" }] },
+                {
+                    info: { id: "a2", role: "assistant" },
+                    parts: [
+                        {
+                            type: "reasoning",
+                            text: "signed two",
+                            metadata: { anthropic: { signature: "sig-two" } },
+                        },
+                        { type: "text", text: "answer two" },
+                    ],
+                },
+            ] as MessageLike[];
+            const pass = async (schedulerDecision: "defer" | "execute") => {
+                const messages = structuredClone(raw);
+                const result = await runPostTransformPhase(
+                    basePostTransformArgs(db, sessionId, messages, {
+                        fullFeatureMode: !isSubagent,
+                        resolvedProviderID: "anthropic",
+                        thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(
+                            "anthropic",
+                            model,
+                        ),
+                        schedulerDecision,
+                        schedulerDeferReason: undefined,
+                        contextUsage: { percentage: 70, inputTokens: 70000 },
+                    }),
+                );
+                return { messages, result };
+            };
+            const baseline = await pass("defer");
+            expect(getTrailingBlankDecisions(db, sessionId).has("a1")).toBe(false);
+            for (let index = 0; index < 3; index++) {
+                const execute = await pass("execute");
+                expect(JSON.stringify(execute.messages)).toBe(JSON.stringify(baseline.messages));
+                expect(execute.result.bustedThisPass).toBe(false);
+                expect(execute.result.proactiveThinkingStrip).toBeNull();
+            }
+            expect(getTrailingBlankDecisions(db, sessionId).has("a1")).toBe(isSubagent);
+        });
+    }
+});
+
 describe("prefix-bound oldest-prefix reasoning trim", () => {
     const PROVIDER = "google-vertex-anthropic";
     const sha256 = (value: unknown): string =>

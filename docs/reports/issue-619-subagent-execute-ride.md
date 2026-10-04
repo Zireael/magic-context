@@ -33,22 +33,22 @@ it does not undo the primary-session ride-only policy.
 
 - **OpenCode:** the existing `rideSignals` assembly adds `subagentExecute` when
   reduced mode and the effective scheduler decision is `execute`. The shared
-  `hasReclaimRide` admits it; queued operations, heuristics, age reclaim, reasoning,
-  sentinel/image first application and the other ride-only lanes still use that
-  one permission. Logs name `ride=subagentExecute`, not a fictitious fold.
+  `hasReclaimRide` admits it; queued operations and supported ordinary cleanup
+  retain that shared admission permission. Per-lane session and emergency-latch
+  restrictions still apply. Logs name `ride=subagentExecute`, not a fictitious fold.
 - **Pi:** the same shared predicate receives the session's subagent flag and
   effective execute decision. Its heuristic once-per-turn guard also yields to
   that signal, matching OpenCode. Current hidden/no-session Pi children do not
   use this handler; the marked-session path is nevertheless consistent and tested.
 - **Rust:** the reductions-only subagent branch adds canonical `execute` to
   `supersession_ride_available`, which already feeds `pass_already_busting`, queued
-  admission, automatic selection, protection-floor adoption and returned ride
-  telemetry. Canonicalization includes the existing force/emergency execute
+  admission, automatic reduction selection, protection-floor adoption and returned
+  ride telemetry. Canonicalization includes the existing force/emergency execute
   variants; it does not bypass effective mid-turn deferral. No mc-core gate needed
   modification. No Rust epoch constant changed.
 
 The permission opens on every subagent execute, not just when a queue is nonempty:
-heuristics and first-application lanes can have eligible work without queued drops.
+supported heuristics and first-application lanes can have eligible work without queued drops.
 Precomputing all their eligibility would duplicate selection and risk giving lanes
 different permissions. Permission is not evidence of a mutation. Each lane keeps
 its existing candidate/protection checks and only actual byte changes count as
@@ -78,7 +78,7 @@ and empty/no-eligible execute replay were already-correct negative controls and
 passed on the baseline; claiming those fail on the old code would be false.
 The original real-host run likewise reached execute repeatedly but never shrank.
 
-The final fixtures were then tested with the new ride neutralized, marked
+The execute-ride fixtures were also tested with the new ride neutralized, marked
 `NON-VACUITY BREAK`. All intentional files were staged first; the working-tree
 `git diff --stat` was empty. The applied diff for each mutated path was **1 file,
 2 insertions, 1 deletion**. After each control, restoration used
@@ -153,10 +153,10 @@ also lands on its next execute pass; C displaces B's protected floor and adds re
 bytes at the same time, so total request length is not a second shrink assertion.
 There are no other old-content changes in the eleven child requests.
 
-Successful measured host: **pid 96290**, throwaway root
-`$TMPDIR/magic-context/issue-619/opencode-e2e-F3SpI0` (canonical
-`/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-619/opencode-e2e-F3SpI0`).
-`lsof -p 96290 -Fn` ran before and after the task. Every open DB/WAL/SHM was under
+Latest repaired-hook host run: **pid 42812**, throwaway root
+`$TMPDIR/magic-context/issue-619/opencode-e2e-H1uG2z` (canonical
+`/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-619/opencode-e2e-H1uG2z`).
+`lsof -p 42812 -Fn` ran before and after the task. Every open DB/WAL/SHM was under
 that root: `data/opencode/opencode.db` and
 `data/cortexkit/magic-context/context.db`. HOME, XDG config/data/cache/state/runtime,
 OPENCODE_DB and MAGIC_CONTEXT_STORAGE_DIR were all isolated by the existing harness.
@@ -188,15 +188,15 @@ was not changed, because permission correctness does not require a prompt rewrit
 
 - `bun run build`: passed, three package builds and four embedded OpenCode 2 server
   tests (Bun 1.4.2).
-- `bun run --cwd packages/plugin test`: passed, **6736 pass / 4 skip / 0 fail**,
-  648 files (Bun 1.4.2).
-- `bun run --cwd packages/pi-plugin test`: passed, **1497 pass / 3 skip / 0 fail**,
+- `bun run --cwd packages/plugin test`: passed, **6752 pass / 4 skip / 0 fail**,
+  650 files (Bun 1.4.2).
+- `bun run --cwd packages/pi-plugin test`: passed, **1504 pass / 3 skip / 0 fail**,
   138 files (Bun 1.4.2).
 - `bun run typecheck`: passed, four configured packages (TypeScript 5.9.3).
-- `bun run lint`: passed, Biome 2.5.1 checked 1196 plugin, 224 Pi, 133 CLI and
+- `bun run lint`: passed, Biome 2.5.1 checked 1197 plugin, 224 Pi, 133 CLI and
   6 retina files, with only existing warnings/infos.
 - Real-host plus manifest command above: passed, **7 tests / 0 fail / 84 assertions**.
-- `cargo test --locked -p mc-module -- --test-threads=1`: passed, **1557 unit tests
+- `cargo test --locked -p mc-module -- --test-threads=1`: passed, **1562 unit tests
   and 24 binary/integration tests**, 22 ignored in total (Cargo/rustc 1.99.0).
 - `cargo clippy --locked -p mc-module --all-targets -- -D warnings`: passed,
   mc-module all targets (Cargo/rustc 1.99.0).
@@ -217,3 +217,125 @@ was not changed, because permission correctness does not require a prompt rewrit
   Frozen-lockfile installs inside this worktree reported no dependency changes.
   No config knob, architecture/structure document, package manifest, lockfile or
   Rust epoch update is delivered.
+
+## Adversarial review follow-up
+
+The review in `docs/reports/issue-619-review.md` identified two real accounting
+defects and a vacuous HARD-advisory fixture. The branch was rebased onto master
+before repairing them.
+
+### Actual edits, not permission or persistence
+
+OpenCode now records first image, stale-reduce and visible sentinel edits in the
+same actual-edit ledger consumed by bust telemetry and prefix-bound thinking
+invalidation. Frozen-id replay and hidden-at-seam-only persistence do not enter
+that ledger. The ledger also covers later binding/merged-reasoning edits. It
+distinguishes edits before newer thinking from terminal edits, so the
+oldest-prefix-trim exception applies only when no other prefix edit occurred.
+
+Trailing-blank decisions are compared against the previous frozen projection
+before being counted. Capturing `strip` for a historical message with no blank
+suffix changes only metadata: it does not report a bust or remove signed thinking.
+Poisoned keeps are still repaired, but count only when their served representation
+actually changes. The comparison is lazy and examines only newly committed
+decisions; steady replay does not hash the full message corpus.
+
+Pi uses the same coupled first-edit recording for its supported image, stale
+reduce, native activation and permitted placeholder discoveries. Restoring durable
+dropped statuses from raw history no longer reports a fresh bust. Pi's image and
+stale-reduce invalidation already worked; the new controls also expose stale-reduce
+replay's false telemetry and placeholder discovery's missing telemetry.
+
+The isolated OpenCode lane tests pre-freeze every trailing decision, including
+the strip owner, so an unrelated metadata event cannot mask an omitted edit. All
+three lanes run against the real model predicate for Opus 5.5, Sonnet 5.5 and
+Fable 5.1, with correctly shaped Anthropic signatures, and replay fresh raw arrays.
+The three metadata controls cover primary bound, subagent unbound and subagent
+bound. Pi has separate image, stale-reduce and refresh-only placeholder controls.
+These are representation safety tests, not a paid-provider cryptographic test.
+
+### Remaining intentional exclusions
+
+The original report's universal all-lanes wording was too broad. Rust's
+reductions-only child branch still accepts reduction units, not new image/system
+or age-reasoning strip units. The `!req.is_subagent` gate now documents that
+separate inherited-history/replay contract and is unchanged. Rust's primary
+first-strip planning already excludes non-reasoning strips from its trim-only
+classification; no child strip gate was widened by this repair.
+
+Pi placeholder discovery still requires history refresh or stable-id cutover,
+because Pi splices entire messages and discovering on a fresh-drop execute can
+collapse a tool turn. A short comment at that gate states the exclusion. Its
+sentinel control uses a permitted refresh, not an invented ordinary-execute
+discovery path. Frozen discoveries replay on every pass. Existing emergency
+latches, primary-only caveman/todo rules and session-mode restrictions likewise
+remain independent eligibility limits, not claims of universal coalescing.
+
+### Genuine Rust advisory controls
+
+The HARD negative now submits `cfg1` against the stored `cfg0` identity and asserts
+that a primary control actually returns HARD for that same non-scheduler input.
+The reconcile negative retains its asserted missing-boundary/reconcile input.
+Both children defer, keep the complete served wire unchanged, retain old tool
+output, and expose no history summary. The execute companion applies an eligible
+queued reduction for both advisories while keeping the inherited history frozen:
+the old output disappears from the served wire, the queue drains, and no summary
+is materialized. These assertions no longer rely solely on frozen-unit equality.
+
+### Accepted continuously eligible rewrite cost
+
+The reviewer independently reran the real OpenCode 1.18.30 task child. The first
+batch saved 29245 message bytes, but traded a roughly 14928-token prefix read for
+66 read and 8488 write tokens on the rewrite. The second batch traded a 7812-token
+read for 128 read while new C output was appended. Those counters are mock-prefix
+meters verified against the real host, not production Anthropic pricing.
+
+A continuously growing, eligible child can now rewrite on **every execute pass**;
+the accepted design has no new cooldown or minimum ordinary batch gain. For the
+reviewer's scale example, 100 rewrites each invalidating about 20000 still-live
+tokens expose about **2 million tokens** to input/cache-write rather than cache-read
+pricing. Net cost also subtracts permanently reclaimed tokens from future requests
+and depends on provider rates and cache minimums. The finite fixture proves one
+rewrite per batch and stable replay between batches, not a global frequency cap.
+Primary admission and the force-band formula remain unchanged.
+
+### Follow-up failing-first and non-vacuity checks
+
+Before the accounting fixes, all **nine** isolated OpenCode lane/model tests failed
+(`bustedThisPass=false` despite a strip). Seeding trailing decisions for the strip
+owner as well as both signed assistants was essential: otherwise the old
+metadata-only trailing bug could accidentally mask the stale/sentinel omissions.
+Before the trailing-shape fix, the unbound child reported a false bust and the
+bound child lost both signed blocks; the already-correct primary control passed.
+Pi's initial three-case run passed image invalidation, but failed stale-reduce
+replay telemetry (two fresh decision records) and sentinel first-application
+telemetry (zero records). No primary expectation was inverted to make these pass.
+
+Each restored mutation below was marked `NON-VACUITY BREAK`. The six intentional
+files were staged first and `git diff --stat` was empty. OpenCode/Pi recorder
+neutralization added **2 lines** in the respective handler. The trailing predicate,
+Rust HARD input and Rust execute arm controls each changed **2 insertions / 1
+deletion**. Every restore used `git checkout -- <path> && touch <path>` and left an
+empty diff. Tests were run in separate engine processes, never a mixed Pi/OpenCode
+test process.
+
+| Removed/neutralized protection | Exact red test | Observed failure / unaffected selection |
+| --- | --- | --- |
+| OpenCode actual-edit recorder | `issue 619 first-application thinking accounting > image alone invalidates later signed thinking on claude-sonnet-5-5` | Bust expected true, actual false; sole selected test |
+| Same recorder | `issue 619 first-application thinking accounting > stale reduce alone invalidates later signed thinking on claude-sonnet-5-5` | Bust expected true, actual false; sole selected test |
+| Same recorder | `issue 619 first-application thinking accounting > sentinel alone invalidates later signed thinking on claude-sonnet-5-5` | Bust expected true, actual false; sole selected test |
+| Pi coupled recorder | `Pi proactive strip of invalidated thinking > issue 619 Pi image first application invalidates thinking and replay is not a new edit` | Expected zero signed blocks, retained two; sole selected test |
+| Same recorder | `Pi proactive strip of invalidated thinking > issue 619 Pi stale reduce first application invalidates thinking and replay is not a new edit` | Expected zero signed blocks, retained two; sole selected test |
+| Same recorder | `Pi proactive strip of invalidated thinking > issue 619 Pi sentinel first application invalidates thinking and replay is not a new edit` | Expected one telemetry record, got zero; sole selected test |
+| Treat metadata capture as a wire edit | `issue 619 metadata-only trailing decisions > subagent unbound keeps bytes and reports no bust when a historical strip already matches` | Bust expected false, actual true; sole selected test |
+| Same false-edit predicate | `issue 619 metadata-only trailing decisions > subagent bound keeps bytes and reports no bust when a historical strip already matches` | Signed parts replaced by sentinels; primary-bound control passed |
+| Remove cfg1 HARD trigger | `transform::tests::hard_advisory_without_prefix_materialization_cannot_price_reductions` | Primary control returned SOFT+ instead of HARD; sole selected test |
+| Remove subagent execute reduction ride | `transform::tests::issue_619_execute_reduces_wire_without_materializing_inherited_advisories` | Served wire incorrectly equaled baseline; sole selected test |
+
+An initial Rust exact selector omitted its module qualification and selected zero
+tests; it was corrected to the full symbol before accepting the HARD-input proof.
+The final full Rust suite and all-target clippy passed after restoration. Plugin
+and Pi package scripts initially collided in concurrent frozen-lockfile workspace
+linking (`EEXIST`); serial install and separate, sequential package test processes
+passed with no dependency changes. The repaired hooks were rebuilt and the real
+OpenCode task-host/manifest run passed again with the same eleven-pass byte table.
