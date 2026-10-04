@@ -57,7 +57,6 @@ import { isPrefixBoundThinkingModel } from "@magic-context/core/features/magic-c
 import {
 	encodePiContentDecision,
 	freezePiContentDecision,
-	getPiContentDecisions,
 } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import {
 	computeProtectionWindow,
@@ -327,6 +326,7 @@ import {
 	replayStrippedInlineThinkingPi,
 	stripInlineThinkingPi,
 } from "./reasoning-replay-pi";
+import { replayPiReminderStrips } from "./reminder-strip-pi";
 import {
 	capturePiServedArray,
 	clearPiServedArraySession,
@@ -6728,64 +6728,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 
 	// Caveman renders from pristine source, so frozen reminder cleanup must run
 	// after both its discovery and replay paths, including when cleanup is disabled.
-	const contentDecisions = getPiContentDecisions(args.db, args.sessionId);
-	const undecidedTagNumbers = activeTags
-		.filter(
-			(tag) =>
-				!contentDecisions.has(
-					encodePiContentDecision("reminder-strip", tag.messageId),
-				),
-		)
-		.map((tag) => tag.tagNumber);
-	const legacySources = new Map<number, string>();
-	for (let offset = 0; offset < undecidedTagNumbers.length; offset += 500) {
-		const loaded = getSourceContents(
-			args.db,
-			args.sessionId,
-			undecidedTagNumbers.slice(offset, offset + 500),
-		);
-		for (const [tagNumber, source] of loaded) {
-			legacySources.set(tagNumber, source);
-		}
-	}
-	for (const tag of activeTags) {
-		const target = targets.get(tag.tagNumber);
-		const content = target?.getContent?.();
-		if (!content) continue;
-		const encodedDecision = encodePiContentDecision(
-			"reminder-strip",
-			tag.messageId,
-		);
-		let frozen = contentDecisions.has(encodedDecision);
-		const legacySource = legacySources.get(tag.tagNumber) ?? "";
-		const isLegacyReminderProjection =
-			textIdentityPlan.legacyReminderTagNumbers.has(tag.tagNumber) ||
-			(legacySource.trimStart().startsWith("<!-- +") &&
-				withoutPiLeadingTemporalMarker(`${legacySource}\n`).trim().length ===
-					0);
-		if (
-			!frozen &&
-			isCacheBustingPass &&
-			isLegacyReminderProjection &&
-			freezePiContentDecision(
-				args.db,
-				args.sessionId,
-				"reminder-strip",
-				tag.messageId,
-			)
-		) {
-			contentDecisions.add(encodedDecision);
-			frozen = true;
-		}
-		const stripped = stripSystemInjection(content);
-		if (stripped === null) continue;
-		// Older releases could overwrite source_contents with the stripped body.
-		// Replaying that exact legacy source on defer prevents one unpriced
-		// resurrection; the next reclaim ride freezes the normal decision.
-		const legacyStripped =
-			!frozen && stripTagPrefix(legacySource) === stripTagPrefix(stripped);
-		if (frozen || legacyStripped) target?.setContent(stripped);
-	}
+	const contentDecisions = replayPiReminderStrips({
+		db: args.db,
+		sessionId: args.sessionId,
+		activeTags,
+		targets,
+		legacyReminderTagNumbers: textIdentityPlan.legacyReminderTagNumbers,
+		cacheBusting: isCacheBustingPass,
+	});
 
 	// 5. Commit tagging mutations back to Pi messages BEFORE injecting
 	// the history block. Otherwise the injection write target is the
