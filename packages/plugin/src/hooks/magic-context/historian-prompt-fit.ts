@@ -29,7 +29,7 @@ import { calibrationForModelKey, providerMass } from "./decision-calibration";
 import { resolveHistorianProducerLimits } from "./derive-budgets";
 import { orderHistorianMemories, renderHistorianMemoryBlock } from "./inject-compartments";
 import { historianProducerReserve, producerInputTokenLimit } from "./producer-window-guard";
-import { estimateTokens } from "./read-session-formatting";
+import { estimateFixedPromptTokens } from "./read-session-formatting";
 import {
     type ReferenceCompartment,
     renderSeedExamplesBlock,
@@ -219,7 +219,7 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
     }
 
     const calibration = calibrationForModelKey(args.window.modelKey);
-    const systemLocal = estimateTokens(args.systemPrompt);
+    const systemLocal = estimateFixedPromptTokens(args.systemPrompt);
     const mass = (proseLocal: number) =>
         providerMass({ prose: proseLocal, system: systemLocal }, calibration, true);
     if (!Number.isFinite(mass(0)) || mass(0) <= 0) {
@@ -242,7 +242,7 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
         });
         let tokens = counted.get(text);
         if (tokens === undefined) {
-            tokens = estimateTokens(text);
+            tokens = estimateFixedPromptTokens(text);
             counted.set(text, tokens);
         }
         return tokens;
