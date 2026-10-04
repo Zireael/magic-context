@@ -38,6 +38,7 @@ const { tokenizePiMessages } = await import("../../../pi-plugin/src/tokenize-pi-
 const { createPiTagSnapshotReader } = await import("../../../pi-plugin/src/tag-snapshot-pi");
 const { readPiSessionMessages } = await import("../../../pi-plugin/src/read-session-pi");
 const { hasPiFallbackMessageTags, hasPiFallbackToolOwnerTags } = await import("../../src/features/magic-context/storage-tags");
+const { runPiDebugAssertion } = await import("../../../pi-plugin/src/debug-assertions-pi");
 
 function median(run: () => unknown): number {
  run();
@@ -81,6 +82,7 @@ try {
    detachedFields: median(() => messages.map(lkgContentFields)),
    hygiene: median(() => measurePiTailHygiene(hygieneInput)),
    assertion: median(() => assertPiTailHygieneContentUnchanged({ ...hygieneInput, expectedSignature: measured.contentSignature })),
+   debugDisabled: median(() => runPiDebugAssertion(() => assertPiTailHygieneContentUnchanged({ ...hygieneInput, expectedSignature: measured.contentSignature }))),
    reminderRegex: median(() => { for(const m of messages as {content: unknown}[]) { if(typeof m.content === "string") stripSystemInjection(m.content); else for(const p of m.content as {text?:string}[]) if(p.text) stripSystemInjection(p.text); } }),
    meta4Reads: median(() => { for(let i=0;i<4;i++) getOrCreateSessionMeta(db,"audit"); }),
    memoryRowsForCount: median(() => getMemoriesByProject(db,"audit").length),
