@@ -2126,13 +2126,56 @@ function hasAdoptablePiFallbackMessageTags(
 	sessionId: string,
 	fingerprintById: ReadonlyMap<string, string>,
 ): boolean {
-	for (const [realMessageId, fingerprint] of fingerprintById) {
-		if (realMessageId.startsWith("pi-msg-")) continue;
-		if (findAdoptableFallbackTags(db, sessionId, fingerprint).length > 0) {
-			return true;
-		}
+	const fingerprints = [
+		...new Set(
+			[...fingerprintById]
+				.filter(([id]) => !id.startsWith("pi-msg-"))
+				.map(([, fingerprint]) => fingerprint),
+		),
+	];
+	// Historical fallback rows can remain unmatchable indefinitely. Probe all
+	// visible candidates in bounded batches, not one SQLite call per message.
+	// Migration still re-reads each candidate after writer admission below.
+	for (let index = 0; index < fingerprints.length; index += 900) {
+		const batch = fingerprints.slice(index, index + 900);
+		const placeholders = batch.map(() => "?").join(",");
+		const match = db
+			.prepare(
+				`SELECT 1 FROM tags WHERE session_id = ? AND type = 'message'
+             AND entry_fingerprint IN (${placeholders})
+             AND message_id LIKE 'pi-msg-%' LIMIT 1`,
+			)
+			.get(sessionId, ...batch);
+		if (match != null) return true;
 	}
 	return false;
+}
+
+function readAdoptablePiFallbackFingerprints(
+	db: ContextDatabase,
+	sessionId: string,
+	fingerprintById: ReadonlyMap<string, string>,
+): Set<string> {
+	const fingerprints = [
+		...new Set(
+			[...fingerprintById]
+				.filter(([id]) => !id.startsWith("pi-msg-"))
+				.map(([, fingerprint]) => fingerprint),
+		),
+	];
+	const found = new Set<string>();
+	for (let index = 0; index < fingerprints.length; index += 900) {
+		const batch = fingerprints.slice(index, index + 900);
+		const placeholders = batch.map(() => "?").join(",");
+		const rows = db
+			.prepare(
+				`SELECT DISTINCT entry_fingerprint FROM tags WHERE session_id = ? AND type = 'message'
+             AND entry_fingerprint IN (${placeholders}) AND message_id LIKE 'pi-msg-%'`,
+			)
+			.all(sessionId, ...batch) as { entry_fingerprint: string }[];
+		for (const row of rows) found.add(row.entry_fingerprint);
+	}
+	return found;
 }
 
 /**
@@ -2170,10 +2213,19 @@ function adoptPiFallbackTags(
 
 	runImmediateTransaction(db, () => {
 		if (shouldRunMessageMigration) {
+			// After writer admission the candidate set cannot gain rows from a
+			// sibling connection. Missing fingerprints need no per-message read;
+			// present ones still use the sequential, authoritative migration path.
+			const adoptable = readAdoptablePiFallbackFingerprints(
+				db,
+				sessionId,
+				fingerprintById,
+			);
 			for (const [realMessageId, fingerprint] of fingerprintById) {
 				// Only real ids can be adoption targets; a pi-msg-* id has no fallback
 				// predecessor to migrate from.
 				if (realMessageId.startsWith("pi-msg-")) continue;
+				if (!adoptable.has(fingerprint)) continue;
 				const candidates = findAdoptableFallbackTags(
 					db,
 					sessionId,

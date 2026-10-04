@@ -1,9 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { Memory } from "../../features/magic-context/memory/types";
 import { buildCompartmentAgentPrompt, COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
 import { calibrationForModelKey, providerMass } from "./decision-calibration";
 import { fitHistorianPrompt, type HistorianPromptFitArgs } from "./historian-prompt-fit";
 import { producerInputTokenLimit } from "./producer-window-guard";
+import * as formatting from "./read-session-formatting";
 import { estimateTokens } from "./read-session-formatting";
 import type { ReferenceCompartment } from "./reference-retrieval";
 
@@ -78,6 +79,24 @@ function limitOf(input: HistorianPromptFitArgs): number {
 }
 
 describe("fitHistorianPrompt", () => {
+    test("repeated fixed historian prompts reuse exact token counts without changing fit bytes", () => {
+        const input = args({
+            sessionId: "fit-token-reuse",
+            systemPrompt: `${COMPARTMENT_AGENT_SYSTEM_PROMPT}\nunique-token-reuse`,
+        });
+        const first = fitHistorianPrompt(input);
+        const estimate = spyOn(formatting, "estimateTokens");
+        try {
+            const repeated = fitHistorianPrompt(structuredClone(input));
+            expect(estimate).toHaveBeenCalledTimes(0);
+            expect(JSON.stringify(repeated)).toBe(JSON.stringify(first));
+            const edited = fitHistorianPrompt({ ...input, systemPrompt: `${input.systemPrompt}!` });
+            expect(estimate.mock.calls.length).toBeGreaterThan(0);
+            expect(edited.ok).toBe(true);
+        } finally {
+            estimate.mockRestore();
+        }
+    });
     test("keeps every block and the requested chunk when the window has room", () => {
         const input = args({});
         const fit = fitHistorianPrompt(input);

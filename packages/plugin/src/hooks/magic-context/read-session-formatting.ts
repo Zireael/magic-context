@@ -413,6 +413,43 @@ export function estimateTokens(text: string): number {
     }
 }
 
+const promptTokenCounts = new Map<
+    string,
+    { tokenizer: ReturnType<typeof getTokenizer>; tokens: number }
+>();
+let promptTokenCountBytes = 0;
+const PROMPT_TOKEN_COUNT_BYTES = 8 * 1024 * 1024;
+
+/** Count identical fixed historian prompts once, without borrowing counts after tokenizer fallback. */
+export function estimateFixedPromptTokens(text: string): number {
+    const activeTokenizer = getTokenizer();
+    const cached = promptTokenCounts.get(text);
+    if (cached && cached.tokenizer === activeTokenizer) {
+        promptTokenCounts.delete(text);
+        promptTokenCounts.set(text, cached);
+        return cached.tokens;
+    }
+    const tokens = estimateTokens(text);
+    if (cached) {
+        promptTokenCountBytes -= text.length * 2;
+        promptTokenCounts.delete(text);
+    }
+    if (text.length * 2 <= PROMPT_TOKEN_COUNT_BYTES) {
+        while (
+            promptTokenCounts.size >= 64 ||
+            promptTokenCountBytes + text.length * 2 > PROMPT_TOKEN_COUNT_BYTES
+        ) {
+            const oldest = promptTokenCounts.keys().next().value;
+            if (oldest === undefined) break;
+            promptTokenCountBytes -= oldest.length * 2;
+            promptTokenCounts.delete(oldest);
+        }
+        promptTokenCounts.set(text, { tokenizer: getTokenizer(), tokens });
+        promptTokenCountBytes += text.length * 2;
+    }
+    return tokens;
+}
+
 export function normalizeText(text: string): string {
     return text.replace(/\s+/g, " ").trim();
 }

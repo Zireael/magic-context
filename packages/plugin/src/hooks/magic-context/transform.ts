@@ -670,7 +670,12 @@ export function createTransform(deps: TransformDeps) {
                   memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
               })
             : undefined;
-    const projectEntry = createLkgEntryProjector();
+    let entryReuse: { reused: number; retained: number; retainedBytes: number } | undefined;
+    const projectEntry = createLkgEntryProjector({
+        onReuse: (stats) => {
+            entryReuse = stats;
+        },
+    });
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
@@ -708,7 +713,14 @@ export function createTransform(deps: TransformDeps) {
         // The Rust adapter captures its own last-known-good input snapshot and returns
         // before the TypeScript capture, so it does not need this entry projection.
         const lkgInput = deps.transformMode === "rust" ? [] : projectEntry(sessionId, messages);
-        logTransformTiming(sessionId, "lkg.entryProjection", tLkgEntry);
+        logTransformTiming(
+            sessionId,
+            "lkg.entryProjection",
+            tLkgEntry,
+            deps.transformMode === "rust" || !entryReuse
+                ? undefined
+                : `reused=${entryReuse.reused} retained=${entryReuse.retained} retainedBytes=${entryReuse.retainedBytes}`,
+        );
         const resolvedSessionId = sessionId;
         const runNotificationParams = (sid: string) => {
             const params = deps.getNotificationParams?.(sid) ?? {};
