@@ -1,6 +1,8 @@
 {
-  "preset": "tools-only",
-  "params": {},
+  "preset": "head",
+  "params": {
+    "model": "anthropic/claude-haiku-4-5"
+  },
   "composition": {
     "providers": [
       {
@@ -95,7 +97,9 @@
     ]
   },
   "system_text": {
-    "preset": "tools-only",
-    "params": {}
+    "preset": "head",
+    "params": {
+      "model": "anthropic/claude-haiku-4-5"
+    }
   }
 }

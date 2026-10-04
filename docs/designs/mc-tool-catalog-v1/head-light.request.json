@@ -1,5 +1,5 @@
 {
-  "preset": "primary",
+  "preset": "head",
   "params": {
     "tool_descs": "concise"
   },
@@ -106,10 +106,13 @@
           }
         ]
       }
-    ]
+    ],
+    "compaction": {
+      "provider": "magic-context"
+    }
   },
   "system_text": {
-    "preset": "primary",
+    "preset": "head",
     "params": {
       "surface": "light"
     }

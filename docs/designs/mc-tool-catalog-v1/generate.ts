@@ -69,18 +69,13 @@ import {
     LIGHT_PARAMETER_DESCRIPTIONS,
 } from "../../../packages/plugin/src/tools/parameter-descriptions";
 
-type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
-type JsonObject = { [key: string]: Json };
+export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+export type JsonObject = { [key: string]: Json };
 type Surface = "full" | "light";
 type ToolId = "ctx_reduce" | "ctx_expand" | "ctx_note" | "ctx_memory" | "ctx_search";
 
-/**
- * The presets Magic Context defines. `primary` and `subagent` are sent only when
- * Magic Context is the session's compaction provider; `tools-only` is sent when
- * another provider compacts, so nothing in the session carries Magic Context's
- * tags and `ctx_reduce` would have nothing to stamp.
- */
-const PRESETS = ["primary", "subagent", "tools-only"] as const;
+/** Fleet roles; the frozen composition independently selects compaction. */
+const PRESETS = ["head", "worker", "reader"] as const;
 type Preset = (typeof PRESETS)[number];
 
 const TOOL_PARAMS = new Set(["scope", "tool_descs", "exclude", "behavior", "model"]);
@@ -173,7 +168,8 @@ interface Definition {
     format: string;
     /** Catalog order: the plugin's single list of ctx_* tools (ACTIVE_TOOL_IDS). */
     tools: ToolDefinition[];
-    preset_tools: Record<Preset, ToolId[]>;
+    preset_tools: Record<"compacting" | "not_compacting", Record<Preset, ToolId[]>>;
+    preset_aliases: Record<string, Preset>;
     descriptions: Record<Surface, Record<ToolId, string>>;
     parameter_descriptions: Record<Surface, Record<ToolId, Record<string, string>>>;
     /** Guidance templates and the fragments they include, by name (see `renderText`). */
@@ -200,7 +196,7 @@ function loadDefinition(): Definition {
 
 const DEFINITION = loadDefinition();
 const TOOL_ORDER: readonly ToolId[] = DEFINITION.tools.map((tool) => tool.name);
-const TOOL_DEFINITIONS = new Map(DEFINITION.tools.map((tool) => [tool.name, tool]));
+const TOOL_DEFINITIONS = new Map<string, ToolDefinition>(DEFINITION.tools.map((tool) => [tool.name, tool]));
 const FULL_DESCRIPTIONS = DEFINITION.descriptions.full;
 const LIGHT_DESCRIPTIONS = DEFINITION.descriptions.light;
 
@@ -292,7 +288,7 @@ interface TextInputs {
 }
 
 function renderVariant(
-    variant: "primary/reduce" | "primary/no_reduce" | "subagent" | "tools_only",
+    variant: "primary/reduce" | "primary/no_reduce" | "subagent" | "tools_only" | "head/reduce" | "head/no_reduce" | "worker",
     inputs: TextInputs,
     override?: string,
 ): string {
@@ -408,6 +404,9 @@ function guidanceMatrix(): JsonObject {
             ["subagent", undefined],
             ["tools_only", undefined],
             ["primary/reduce", OVERRIDE_SAMPLE],
+            ["head/reduce", undefined],
+            ["head/no_reduce", undefined],
+            ["worker", undefined],
         ];
         for (const [variant, override] of entries) {
             const text = renderVariant(variant as "primary/reduce", inputs, override);
@@ -437,7 +436,7 @@ interface ResolvedConfig {
     disabled_tools: string[];
 }
 
-const EXAMPLE_CONFIG: ResolvedConfig = {
+export const EXAMPLE_CONFIG: ResolvedConfig = {
     compaction_enabled: true,
     memory_enabled: true,
     dreamer_runnable: true,
@@ -553,16 +552,33 @@ function resolvedSurface(params: JsonObject, config: ResolvedConfig): Surface {
     return resolvePromptSurface(config.prompt_surface, model).preset;
 }
 
-/** The request's preset, refusing anything Magic Context does not define. */
-function requestPreset(request: CatalogRequest): Preset {
-    const preset = request.preset ?? "primary";
+/** One shared alias table is consumed by both engines and by call admission. */
+export function parsePreset(name: string): Preset {
+    const preset = Object.hasOwn(DEFINITION.preset_aliases, name) ? DEFINITION.preset_aliases[name] : name;
     if (!(PRESETS as readonly string[]).includes(preset)) {
-        throw new Error(`invalid_request {field: "preset"}: ${preset}`);
-    }
-    if (request.system_text && request.system_text.preset !== preset) {
-        throw new Error("the tool item and the text item must name the same preset");
+        throw new Error(`invalid_request {field: "preset"}: Magic Context defines no preset ${JSON.stringify(name)}`);
     }
     return preset as Preset;
+}
+
+/** Missing compaction means Magic Context does not compact this session. */
+export function compactsSession(composition?: JsonObject): boolean {
+    if (!composition || !Object.hasOwn(composition, "compaction")) return false;
+    const item = composition.compaction;
+    if (item === null || typeof item !== "object" || Array.isArray(item)
+        || typeof item.provider !== "string" || item.provider.length === 0) {
+        throw new Error('invalid_request {field: "composition.compaction"}');
+    }
+    return item.provider === MODULE_ID;
+}
+
+/** The request's preset, refusing anything Magic Context does not define. */
+function requestPreset(request: CatalogRequest): Preset {
+    const preset = parsePreset(request.preset ?? "head");
+    if (request.system_text && parsePreset(request.system_text.preset) !== preset) {
+        throw new Error("the tool item and the text item must name the same preset");
+    }
+    return preset;
 }
 
 function checkParams(params: JsonObject, allowed: Set<string>, field: string): void {
@@ -604,9 +620,10 @@ function servedToolIds(request: CatalogRequest, config: ResolvedConfig): ToolId[
     }
     const scope = (request.params.scope as string | undefined) ?? "all";
     const preset = requestPreset(request);
+    const table = DEFINITION.preset_tools[compactsSession(request.composition) ? "compacting" : "not_compacting"];
     return TOOL_ORDER.filter((tool) => {
         if (tool === "ctx_reduce" && !config.compaction_enabled) return false;
-        if (!DEFINITION.preset_tools[preset].includes(tool)) return false;
+        if (!table[preset].includes(tool)) return false;
         if (tool === "ctx_memory" && !config.memory_enabled) return false;
         if (config.disabled_tools.includes(tool)) return false;
         if (exclude.has(tool)) return false;
@@ -660,9 +677,11 @@ function guidanceText(request: CatalogRequest, config: ResolvedConfig): string {
     if (!item) throw new Error("guidanceText needs a system_text item");
     const own = ownToolNames(request, servedToolIds(request, config));
     const preset = requestPreset(request);
-    const requiredTools = preset === "tools-only"
+    const compacting = compactsSession(request.composition);
+    if (!compacting && preset !== "head") return "";
+    const requiredTools = !compacting
         ? ["ctx_search", "ctx_memory", "ctx_note"]
-        : ["ctx_expand", "ctx_search", "ctx_note"];
+        : preset === "head" ? ["ctx_expand", "ctx_search", "ctx_note"] : ["ctx_expand", "ctx_search"];
     for (const required of requiredTools) {
         if (!own.has(required)) {
             throw new Error(`no shipped text names the session without ${required} (open question 3)`);
@@ -677,7 +696,7 @@ function guidanceText(request: CatalogRequest, config: ResolvedConfig): string {
         language: config.language,
         surface: textSurface(item.params, config),
     };
-    if (preset === "tools-only") {
+    if (!compacting) {
         // Another provider compacts the session, or none does, so Magic Context
         // puts nothing into the conversation: no tags, no history, no project
         // memory block, no markings. The tools-only text describes only the
@@ -686,13 +705,13 @@ function guidanceText(request: CatalogRequest, config: ResolvedConfig): string {
         // compositions listing either because they differ from the served tools.
         return renderVariant("tools_only", inputs);
     }
-    if (preset === "subagent") {
+    if (preset !== "head") {
         // A subagent without ctx_reduce has no tagged messages and no archive use,
         // so it gets no guidance (the OpenCode plugin behaves the same way).
         if (!reduce) return "";
-        return renderVariant("subagent", inputs);
+        return renderVariant("worker", inputs);
     }
-    return renderVariant(reduce ? "primary/reduce" : "primary/no_reduce", inputs);
+    return renderVariant(reduce ? "head/reduce" : "head/no_reduce", inputs);
 }
 
 /**
@@ -801,7 +820,7 @@ function capabilityTags(value: Json, found: string[] = []): string[] {
     return found;
 }
 
-function answer(request: CatalogRequest, config: ResolvedConfig): JsonObject {
+export function answer(request: CatalogRequest, config: ResolvedConfig): JsonObject {
     checkParams(request.params, TOOL_PARAMS, "params");
     if (request.system_text) checkParams(request.system_text.params, TEXT_PARAMS, "system_text.params");
     checkCompositionMatches(request, servedToolIds(request, config));
@@ -873,7 +892,9 @@ const PREFRONTAL_HEAD: JsonObject = {
 
 const ALL_TOOLS: ToolId[] = [...TOOL_ORDER];
 const WITHOUT_REDUCE: ToolId[] = TOOL_ORDER.filter((tool) => tool !== "ctx_reduce");
-const TOOLS_ONLY = DEFINITION.preset_tools["tools-only"];
+const TOOLS_ONLY = DEFINITION.preset_tools.not_compacting.head;
+const HELPER_TOOLS = DEFINITION.preset_tools.compacting.worker;
+const MC_COMPACTION: JsonObject = { provider: MODULE_ID };
 
 interface Example {
     name: string;
@@ -885,76 +906,84 @@ interface Example {
 const EXAMPLES: Example[] = [
     {
         name: "preflight",
-        request: { preset: "primary", params: {} },
+        request: { preset: "head", params: {} },
     },
     {
-        name: "primary-full",
+        name: "head-full",
         request: {
-            preset: "primary",
+            preset: "head",
             params: {},
-            composition: { providers: [AFT_HEAD, mcEntry(ALL_TOOLS), PREFRONTAL_HEAD] },
-            system_text: { preset: "primary", params: {} },
+            composition: { providers: [AFT_HEAD, mcEntry(ALL_TOOLS), PREFRONTAL_HEAD], compaction: MC_COMPACTION },
+            system_text: { preset: "head", params: {} },
         },
         rustAsset: "guidance_primary.txt",
     },
     {
-        name: "primary-full.digest-only",
+        name: "head-full.digest-only",
         request: {
-            preset: "primary",
+            preset: "head",
             params: {},
-            composition: { providers: [AFT_HEAD, mcEntry(ALL_TOOLS), PREFRONTAL_HEAD] },
-            system_text: { preset: "primary", params: {} },
+            composition: { providers: [AFT_HEAD, mcEntry(ALL_TOOLS), PREFRONTAL_HEAD], compaction: MC_COMPACTION },
+            system_text: { preset: "head", params: {} },
             digest_only: true,
         },
     },
     {
-        name: "primary-light",
+        name: "head-light",
         request: {
-            preset: "primary",
+            preset: "head",
             params: { tool_descs: "concise" },
-            composition: { providers: [AFT_HEAD, mcEntry(ALL_TOOLS), PREFRONTAL_HEAD] },
-            system_text: { preset: "primary", params: { surface: "light" } },
+            composition: { providers: [AFT_HEAD, mcEntry(ALL_TOOLS), PREFRONTAL_HEAD], compaction: MC_COMPACTION },
+            system_text: { preset: "head", params: { surface: "light" } },
         },
         rustAsset: "guidance_light_primary.txt",
     },
     {
-        name: "subagent",
+        name: "worker",
         request: {
-            preset: "subagent",
+            preset: "worker",
             params: {},
-            composition: { providers: [AFT_HEAD, mcEntry(ALL_TOOLS)] },
-            system_text: { preset: "subagent", params: {} },
+            composition: { providers: [AFT_HEAD, mcEntry(HELPER_TOOLS)], compaction: MC_COMPACTION },
+            system_text: { preset: "worker", params: {} },
         },
     },
     {
         name: "no-reduce",
         request: {
-            preset: "primary",
+            preset: "head",
             params: { exclude: ["ctx_reduce"] },
-            composition: { providers: [AFT_HEAD, mcEntry(WITHOUT_REDUCE), PREFRONTAL_HEAD] },
-            system_text: { preset: "primary", params: {} },
+            composition: { providers: [AFT_HEAD, mcEntry(WITHOUT_REDUCE), PREFRONTAL_HEAD], compaction: MC_COMPACTION },
+            system_text: { preset: "head", params: {} },
         },
         rustAsset: "guidance_no_reduce.txt",
     },
     {
-        name: "tools-only",
+        name: "head-no-compaction",
         request: {
-            preset: "tools-only",
+            preset: "head",
             params: {},
             composition: { providers: [AFT_HEAD, mcEntry(TOOLS_ONLY), PREFRONTAL_HEAD] },
-            system_text: { preset: "tools-only", params: {} },
+            system_text: { preset: "head", params: {} },
         },
     },
     {
         // The surface comes from the frozen `model` param, looked up in the
         // example config's `prompt_surface.models`, not from explicit params.
-        name: "tools-only-light",
+        name: "head-no-compaction-light",
         request: {
-            preset: "tools-only",
+            preset: "head",
             params: { model: "anthropic/claude-haiku-4-5" },
             composition: { providers: [AFT_HEAD, mcEntry(TOOLS_ONLY), PREFRONTAL_HEAD] },
-            system_text: { preset: "tools-only", params: { model: "anthropic/claude-haiku-4-5" } },
+            system_text: { preset: "head", params: { model: "anthropic/claude-haiku-4-5" } },
         },
+    },
+    ...["worker", "reader"].map((preset): Example => ({
+        name: `${preset}-no-compaction`,
+        request: { preset, params: {}, composition: { providers: [AFT_HEAD] }, system_text: { preset, params: {} } },
+    })),
+    {
+        name: "reader",
+        request: { preset: "reader", params: {}, composition: { providers: [AFT_HEAD, mcEntry(HELPER_TOOLS)], compaction: MC_COMPACTION }, system_text: { preset: "reader", params: {} } },
     },
 ];
 
@@ -1034,6 +1063,25 @@ interface CrossCheck {
     report: string[];
 }
 
+/** Validate real plan items, not a guessed role derived from a filename.
+ * Empty helper catalogs are valid, but a non-compacting helper plan must omit
+ * Magic Context entirely rather than fetching an unnecessary empty item.
+ */
+export function checkPlanMagicContext(plan: JsonObject): void {
+    const compacting = compactsSession(plan.composition as JsonObject | undefined);
+    for (const key of ["tool_items", "system_text_items", "step_transform_items"]) {
+        const items = plan[key];
+        if (!Array.isArray(items)) continue;
+        for (const item of items) {
+            if (item === null || typeof item !== "object" || Array.isArray(item) || item.provider !== MODULE_ID) continue;
+            const preset = parsePreset(typeof item.preset === "string" ? item.preset : "head");
+            if (!compacting && preset !== "head") {
+                throw new Error(`Magic Context ${key} preset ${JSON.stringify(item.preset)} without Magic Context compaction: omit the item`);
+            }
+        }
+    }
+}
+
 function crossCheckCommons(repo: string, out: CrossCheck): void {
     const show = (path: string) => git(repo, ["show", `${COMMONS_REF}:${path}`]);
     const compositions = show("test-vectors/tool-provider-v1/composition-digest.json");
@@ -1097,9 +1145,9 @@ function checkPrefrontalMagicContextTags(value: Json, vectorFile: string, out: C
     const providers = composition?.providers;
     if (!Array.isArray(providers)) return;
     for (const provider of providers) {
-        if (provider === null || typeof provider !== "object" || provider.provider !== MODULE_ID || !Array.isArray(provider.tools)) continue;
+        if (provider === null || typeof provider !== "object" || Array.isArray(provider) || provider.provider !== MODULE_ID || !Array.isArray(provider.tools)) continue;
         for (const entry of provider.tools) {
-            if (entry === null || typeof entry !== "object" || typeof entry.name !== "string" || !Array.isArray(entry.capabilities)) continue;
+            if (entry === null || typeof entry !== "object" || Array.isArray(entry) || typeof entry.name !== "string" || !Array.isArray(entry.capabilities)) continue;
             const definition = TOOL_DEFINITIONS.get(entry.name);
             const expected = definition?.capabilities ?? [];
             const actual = entry.capabilities;
@@ -1112,27 +1160,48 @@ function checkPrefrontalMagicContextTags(value: Json, vectorFile: string, out: C
 
 function crossCheckPrefrontal(repo: string, out: CrossCheck): void {
     const dir = "test-vectors/fetch-plan-v1";
-    const listing = git(repo, ["ls-tree", "-r", "--name-only", PREFRONTAL_REF, "--", dir]);
+    const listing = git(repo, ["show", `${PREFRONTAL_REF}:${dir}`]);
     if (!listing) {
         out.report.push(`prefrontal: skipped, ${PREFRONTAL_REF.slice(0, 8)} not readable in ${repo}`);
         return;
     }
     let checked = 0;
     let skipped = 0;
-    for (const path of listing.split("\n").filter((line) => line.endsWith(".jcs"))) {
+    // Read both tree entries and vector bytes via git show; the sibling's
+    // working tree is neither a source nor a destination for this check.
+    function vectorPaths(tree: string, path: string): string[] {
+        return tree.split("\n").flatMap((entry) => {
+            if (entry.endsWith(".jcs")) return [`${path}/${entry}`];
+            if (!entry.endsWith("/")) return [];
+            const child = `${path}/${entry.slice(0, -1)}`;
+            const contents = git(repo, ["show", `${PREFRONTAL_REF}:${child}`]);
+            if (contents === undefined) { out.failures.push(`prefrontal: unreadable tree ${child}`); return []; }
+            return vectorPaths(contents, child);
+        });
+    }
+    for (const path of vectorPaths(listing, dir)) {
         const stem = path.slice(0, -".jcs".length);
         const show = (suffix: string) => git(repo, ["show", `${PREFRONTAL_REF}:${stem}${suffix}`]);
         const pretty = show(".json");
         const bytes = show(".jcs");
         const digest = show(".sha256");
-        if (pretty === undefined || bytes === undefined || digest === undefined) continue;
+        if (pretty === undefined || bytes === undefined || digest === undefined) {
+            out.failures.push(`prefrontal: incomplete vector ${stem}`);
+            continue;
+        }
         const value = JSON.parse(pretty) as Json;
         if (!integersOnly(value)) {
             skipped++;
             continue;
         }
         checked++;
-        checkPrefrontalMagicContextTags(value, stem.slice(dir.length + 1), out);
+        const name = stem.slice(dir.length + 1);
+        const previousFailures = out.failures.length;
+        checkPrefrontalMagicContextTags(value, name, out);
+        if (name.startsWith("plans/")) {
+            try { checkPlanMagicContext(value as JsonObject); }
+            catch (error) { out.failures.push(`prefrontal ${name}: ${error instanceof Error ? error.message : error}`); }
+        }
         if (jcs(value) !== bytes || sha256Hex(bytes) !== digest.trim()) {
             out.failures.push(`prefrontal ${stem.slice(dir.length + 1)}`);
         }
@@ -1144,10 +1213,11 @@ function crossCheckPrefrontal(repo: string, out: CrossCheck): void {
             }
             out.report.push(`prefrontal plans/broca-head-no-compaction composition_digest: ${computed}`);
         }
+        out.report.push(`prefrontal ${name}: ${out.failures.length === previousFailures ? "PASS" : "FAIL"}`);
     }
     if (checked === 0) out.failures.push("prefrontal: no fetch-plan vectors found");
     out.report.push(
-        `prefrontal ${PREFRONTAL_REF.slice(0, 8)}: ${checked} fetch-plan vectors match (${skipped} with floats skipped)`,
+        `prefrontal ${PREFRONTAL_REF.slice(0, 8)}: ${checked} fetch-plan vectors checked (${skipped} with floats skipped)`,
     );
 }
 
@@ -1165,14 +1235,15 @@ function crossCheck(): CrossCheck {
 function main(): void {
     const here = dirname(new URL(import.meta.url).pathname);
     const check = process.argv.includes("--check");
-    const crossChecks = crossCheck();
+    const crossChecks = process.argv.includes("--examples-only") ? { failures: [], report: ["external vectors skipped (--examples-only)"] } : crossCheck();
     for (const line of crossChecks.report) console.log(`cross-check ${line}`);
     if (crossChecks.failures.length > 0) {
         console.error(`cross-check failed: ${crossChecks.failures.join("; ")}`);
         process.exit(1);
     }
     const differing: string[] = [];
-    for (const [relative, content] of outputs()) {
+    const generated = outputs();
+    for (const [relative, content] of generated) {
         const path = join(here, relative);
         if (check) {
             let current: string | undefined;
@@ -1191,7 +1262,7 @@ function main(): void {
         console.error(`out of date: ${differing.join(", ")}`);
         process.exit(1);
     }
-    console.log(check ? "all example files are current" : "wrote example files");
+    console.log(`${check ? "all example files are current" : "wrote example files"}: ${EXAMPLES.length} examples, ${generated.size} files, ${(guidanceMatrix().cases as Json[]).length} guidance cases`);
 }
 
 if (import.meta.main) main();
