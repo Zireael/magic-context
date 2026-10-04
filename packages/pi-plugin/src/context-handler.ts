@@ -254,6 +254,7 @@ import { readPiHistorianTail } from "./historian-tail-pi";
 import {
 	clearM0M1PiCache,
 	clearPiInjectionTokenCountCache,
+	clearPiMuralProcessCache,
 	createPiM0M1PassSnapshot,
 	injectM0M1Pi,
 	mustMaterializePi,
@@ -346,6 +347,7 @@ import { clearPiSystemPromptSession } from "./system-prompt";
 import { getPiTagSnapshot } from "./tag-snapshot-pi";
 import {
 	assertPiTailHygieneContentUnchanged,
+	clearPiTailHygieneContentMemo,
 	countRealPiUserMessages,
 	effectivePiTailHygiene,
 	refreshPiTailHygieneBaseline,
@@ -7939,6 +7941,10 @@ export function clearContextHandlerSession(sessionId: string): void {
 	piTextIdentitySourceCacheBySession.delete(sessionId);
 	piBranchProjectionBySession.delete(sessionId);
 	clearPiInjectionTokenCountCache(sessionId);
+	clearPiMuralProcessCache(sessionId);
+	// The content memo is shared across sessions, not owned by one session id.
+	// Dropping it at teardown releases old bodies; deterministic counts rebuild.
+	clearPiTailHygieneContentMemo();
 	clearPiChannel1State(sessionId);
 	lastHeuristicsTurnIdBySession.delete(sessionId);
 	routinePressureAppliedBySession.delete(sessionId);

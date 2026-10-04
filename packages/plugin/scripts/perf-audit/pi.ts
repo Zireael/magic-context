@@ -33,7 +33,7 @@ const { stripSystemInjection } = await import("../../src/hooks/magic-context/sys
 const { lkgContentFields } = await import("../../src/hooks/magic-context/lkg-slot");
 const { capturePiServedArray, flushPiServedArrayLedger } = await import("../../../pi-plugin/src/served-array-ledger");
 const { createPiLkgCoordinator, clearPiLkgSessionState } = await import("../../../pi-plugin/src/pi-lkg");
-const { measurePiTailHygiene, assertPiTailHygieneContentUnchanged, clearPiTailHygieneContentMemo } = await import("../../../pi-plugin/src/tail-hygiene-walk-pi");
+const { measurePiTailHygiene, assertPiTailHygieneContentUnchanged, clearPiTailHygieneContentMemo, __test: hygieneTest } = await import("../../../pi-plugin/src/tail-hygiene-walk-pi");
 const { tokenizePiMessages } = await import("../../../pi-plugin/src/tokenize-pi-messages");
 const { createPiTagSnapshotReader } = await import("../../../pi-plugin/src/tag-snapshot-pi");
 const { readPiSessionMessages } = await import("../../../pi-plugin/src/read-session-pi");
@@ -130,7 +130,9 @@ try {
   db.prepare("UPDATE session_meta SET cached_m0_bytes = ?, cached_m1_bytes = ?, cached_m0_mural_data_url = ? WHERE session_id = 'audit'").run(Buffer.from("m0 ".repeat(5000)),Buffer.from("m1 ".repeat(100)),"data:image/png;base64,"+"a".repeat(1024*1024));
   Object.assign(timings, { meta4BlobReads: median(() => { for(let i=0;i<4;i++) getOrCreateSessionMeta(db,"audit"); }), m0BlobSnapshot: median(() => createPiM0M1PassSnapshot({db,sessionId:"audit",compactionOff:false})) });
   const plans = ["message_id", "tool_owner_message_id"].map(column => db.prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM tags WHERE session_id = ? AND type = ? AND ${column} LIKE 'pi-msg-%' LIMIT 1`).all("audit",column === "message_id" ? "message" : "tool"));
-  console.log(JSON.stringify({ messages: size, bytes: Buffer.byteLength(JSON.stringify(messages)), ms: timings, plans }));
-  flushPiServedArrayLedger(); clearContextHandlerSession(`identity-${size}`); clearPiLkgSessionState("audit"); clearPiTailHygieneContentMemo(); db.close();
+  const memoBeforeTeardown = hygieneTest.contentMemoStats();
+  clearContextHandlerSession(`identity-${size}`);
+  console.log(JSON.stringify({ messages: size, bytes: Buffer.byteLength(JSON.stringify(messages)), ms: timings, plans, memoBeforeTeardown, memoAfterTeardown: hygieneTest.contentMemoStats() }));
+  flushPiServedArrayLedger(); clearPiLkgSessionState("audit"); clearPiTailHygieneContentMemo(); db.close();
  }
 } finally { flushPiServedArrayLedger(); rmSync(root,{recursive:true,force:true}); }
