@@ -3,6 +3,22 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and the Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh. The tag release workflow also runs the Rust invocation; both Rust lanes require public sibling path dependencies (../commons and ../subconscious).",
     "entries": [
         {
+            "path": "tests/subagent-write-tools.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 1.18.x task child hides memory and note tools via child-session permission denies while primary writes and complete provider tool-definition bytes remain unchanged; host PID lsof proves throwaway-store containment",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
+        },
+        {
+            "path": "tests/opencode2/subagent-write-tools.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 2.0.22 task child omits memory and note tools from provider requests while primary writes and complete tool-definition bytes remain unchanged; host PID lsof proves throwaway-store containment",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/historian-expand-tools.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

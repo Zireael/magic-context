@@ -70,6 +70,7 @@ import { createMessagesTransformHandler } from "./plugin/messages-transform";
 import { disableNativeAutoCompaction } from "./plugin/native-compaction-guard";
 import { isDebugRpcEnabled, registerRpcHandlers } from "./plugin/rpc-handlers";
 import { bindStaleBuildNotice } from "./plugin/stale-build-notice";
+import { primaryOnlyToolIds } from "./plugin/subagent-tool-policy";
 import { createToolRegistry } from "./plugin/tool-registry";
 import { getMagicContextBuiltinCommands } from "./shared/builtin-commands";
 import { claimConfigParseFailuresOnce } from "./shared/config-diagnostics";
@@ -428,6 +429,7 @@ const server: Plugin = async (ctx) => {
         promptSurfaceRuntime,
         registrationPromptSurface: loadedPluginConfig.registrationPromptSurface,
         includeDreamerOnlyTools: true,
+        internalChildSessions: liveSessionState.internalChildSessions,
     });
 
     // v22 deferred legacy-memory identity backfill. createSessionHooks() opens
@@ -1012,6 +1014,16 @@ const server: Plugin = async (ctx) => {
                 if (pluginConfig.enabled !== true) {
                     return;
                 }
+                // The host applies these only when task creates a child session.
+                // Unlike agent permissions, this leaves the same agent's primary
+                // tool list unchanged and does not touch hidden maintenance runs.
+                const experimental = config.experimental as typeof config.experimental & {
+                    primary_tools?: string[];
+                };
+                config.experimental = {
+                    ...experimental,
+                    primary_tools: primaryOnlyToolIds(experimental?.primary_tools),
+                } as typeof config.experimental;
                 // In compaction-off mode native compaction is the user's chosen
                 // window manager, so it is left alone.
                 if (isCompactionEnabled(pluginConfig)) {

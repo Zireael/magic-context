@@ -21,7 +21,7 @@ describe("mode manifest validator", () => {
         // Bump this with the manifest whenever a tests/**/*.test.ts file is added or
         // removed. Moving a file between excluded and ts-only changes the invocation
         // counts and excluded list below, but not the total number of files.
-        expect(validation.files.length).toBe(165);
+        expect(validation.files.length).toBe(167);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -32,14 +32,14 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(51);
+        expect(ts).toHaveLength(53);
         expect(rust).toHaveLength(57);
         expect(rust).toContain("tests/idle-ttl-restart.test.ts");
         expect(rust).toContain("tests/subagent-behavior.test.ts");
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(3);
-        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(37);
+        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(38);
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(27);
-        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(31);
+        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(32);
         // These OpenCode 2 files are ts-only with hosts ["opencode2"], so only the
         // OpenCode 2 host lane runs them; the other host lanes never select them.
         for (const path of [
@@ -50,6 +50,7 @@ describe("mode manifest validator", () => {
             "tests/opencode2/storage-busy.test.ts",
             "tests/opencode2/generate.test.ts",
             "tests/opencode2/subagent-mode.test.ts",
+            "tests/opencode2/subagent-write-tools.test.ts",
         ]) {
             expect(filesForMode(validation, "ts", "opencode2")).toContain(path);
             expect(filesForMode(validation, "ts", "opencode")).not.toContain(path);
