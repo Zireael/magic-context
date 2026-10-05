@@ -25,7 +25,6 @@ import { createHash } from "node:crypto";
 import { type ContextDatabase, getTagById } from "../../features/magic-context/storage";
 import {
     readRawSessionMessageById,
-    readRawSessionMessages,
     visitRawSessionMessages,
 } from "../../hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "../../hooks/magic-context/read-session-formatting";
@@ -325,16 +324,20 @@ export function renderItemByTag(
             ) ?? [];
         // Pi stores a tool's invocation and result as separate messages.
         if (!parts.some((part) => isRecord(part) && asToolPart(part)?.output !== null)) {
-            const messages = readRawSessionMessages(sessionId);
-            const ownerIndex = messages.findIndex((candidate) => candidate.id === owner);
-            for (const candidate of messages.slice(Math.max(0, ownerIndex + 1))) {
-                const matching = candidate.parts.filter(
-                    (part) => isRecord(part) && asToolPart(part)?.callId === tag.messageId,
-                );
-                if (matching.some((part) => isRecord(part) && part.type === "tool_use")) break;
-                parts.push(...matching);
-                if (matching.length > 0) break;
-            }
+            visitRawSessionMessages(
+                sessionId,
+                message.ordinal + 1,
+                Number.MAX_SAFE_INTEGER,
+                (candidate) => {
+                    const matching = candidate.parts.filter(
+                        (part) => isRecord(part) && asToolPart(part)?.callId === tag.messageId,
+                    );
+                    if (matching.some((part) => isRecord(part) && part.type === "tool_use"))
+                        return false;
+                    parts.push(...matching);
+                    return matching.length === 0;
+                },
+            );
         }
         const rendered = parts.map(renderPartFull).filter((part): part is string => part !== null);
         return rendered.length

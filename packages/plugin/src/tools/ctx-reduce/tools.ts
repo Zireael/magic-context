@@ -8,7 +8,7 @@ import { parseRangeString } from "../../features/magic-context/range-parser";
 import {
     getOrCreateSessionMeta,
     getPendingOps,
-    getTagsBySession,
+    getTagsByNumbers,
     queuePendingOp,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
@@ -158,7 +158,7 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
 
             const allIds = [...new Set(dropIds)];
 
-            const allTags = getTagsBySession(deps.db, sessionId);
+            const allTags = getTagsByNumbers(deps.db, sessionId, allIds);
             const foundSet = new Set(allTags.map((tag) => tag.tagNumber));
             const unknownIds = allIds.filter((id) => !foundSet.has(id));
             if (unknownIds.length > 0) {
