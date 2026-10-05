@@ -60,6 +60,7 @@ import {
     LKG_SLOTS_DDL,
     SESSION_REPLAY_DECISIONS_DDL,
 } from "./migration-v94-write-split";
+import { installV95PerfSchema } from "./migration-v95-perf-indexes";
 import { runMigrationsOffThread } from "./migration-worker-client";
 import {
     FORK_MIGRATION_VERSION_FLOOR,
@@ -157,7 +158,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastUnconfirmedMigrationHolders = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 94;
+export const LATEST_SUPPORTED_VERSION = 95;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -1236,7 +1237,6 @@ export function initializeDatabase(
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
-    CREATE INDEX IF NOT EXISTS idx_compartments_session ON compartments(session_id);
 
     CREATE TABLE IF NOT EXISTS compartment_chunk_embeddings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1297,7 +1297,6 @@ export function initializeDatabase(
       harness TEXT NOT NULL DEFAULT 'opencode',
       PRIMARY KEY(session_id, message_ordinal)
     );
-    CREATE INDEX IF NOT EXISTS idx_compression_depth_session ON compression_depth(session_id);
 
     CREATE TABLE IF NOT EXISTS session_facts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1603,7 +1602,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       stale_reason           TEXT,
       PRIMARY KEY (project_path, path)
     );
-    CREATE INDEX IF NOT EXISTS idx_project_key_files_project ON project_key_files(project_path);
     CREATE INDEX IF NOT EXISTS idx_project_key_files_generated_at ON project_key_files(project_path, generated_at);
 
     CREATE TABLE IF NOT EXISTS project_key_files_version (
@@ -1988,10 +1986,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       input_tokens       INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (session_id, harness, message_id)
     );
-    CREATE INDEX IF NOT EXISTS idx_transform_decisions_session_harness
-      ON transform_decisions(session_id, harness);
 
-    CREATE INDEX IF NOT EXISTS idx_tags_session_tag_number ON tags(session_id, tag_number);
     CREATE INDEX IF NOT EXISTS idx_tags_session_message_id ON tags(session_id, message_id);
 
     -- Clone/import paths can write tags before session bootstrap. Keep trigger-created
@@ -2037,9 +2032,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       WHERE NEW.session_id != OLD.session_id
       ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
     END;
-    CREATE INDEX IF NOT EXISTS idx_pending_ops_session ON pending_ops(session_id);
     CREATE INDEX IF NOT EXISTS idx_pending_ops_session_tag_id ON pending_ops(session_id, tag_id);
-    CREATE INDEX IF NOT EXISTS idx_source_contents_session ON source_contents(session_id);
     
     CREATE TABLE IF NOT EXISTS recomp_compartments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2529,8 +2522,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         input_tokens       INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (session_id, harness, message_id)
       );
-      CREATE INDEX IF NOT EXISTS idx_transform_decisions_session_harness
-        ON transform_decisions(session_id, harness);
     `);
 
     // transform_decisions existed before comparison telemetry was introduced.
@@ -2585,6 +2576,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // here. Migration v6 handles `notes` separately (see migrations.ts).
     // notes.anchor_ordinal is added by migration v29 for the same reason — it
     // cannot go here because the table doesn't exist yet on a fresh DB.
+    // An upgrade changes indexes/triggers only inside the migration transaction.
+    // Fresh/current schemas share the same installer, without rescanning FTS on open.
+    const version = getPersistedSchemaVersion(db);
+    if (version === 0 || version >= 95) installV95PerfSchema(db);
 }
 
 const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;

@@ -4,6 +4,7 @@ import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { splitLkgSlotPrefixes, splitReplayDecisions } from "./migration-v94-write-split";
+import { installV95PerfSchema } from "./migration-v95-perf-indexes";
 import { repairOpenCode2HarnessLabels } from "./opencode2-relabel";
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
@@ -3200,6 +3201,14 @@ export const MIGRATIONS: Migration[] = [
             // migration-v94-write-split.ts.
             splitLkgSlotPrefixes(db);
             splitReplayDecisions(db);
+        },
+    },
+    {
+        version: 95,
+        description:
+            "cover cleanup and retention reads, remove redundant indexes and index git FTS rowids",
+        up(db: Database): void {
+            installV95PerfSchema(db, true);
         },
     },
 ];

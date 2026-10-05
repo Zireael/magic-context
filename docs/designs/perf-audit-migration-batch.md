@@ -1,9 +1,18 @@
 # Performance-audit migration batch
 
-Status: **plan for approval, not implemented**. Inspected at
+Status: **approved reduced cut implemented and verified**. Initially inspected at
 `51ece6fd479b27364458f7e735af3052abe2d706` (context.db 94, store.db 63).
 
-## Decision requested
+## Approved scope (after measured gates)
+
+The initial recommendation below was conditionally approved, then narrowed after
+the two requested gates failed. **v95 now contains only DB-10, DB-13, DB-14,
+DB-18 and MEM-4. DB-2 and DB-5/11 are OUT.** store.db remains 63. Sections A/B are
+retained as rejected prototype designs for reproducing the gate, not migration
+instructions. No cold payload move, aggregate ledger, memo, coordinated dashboard/
+CLI/Pi repair change or additional session-scoped table is being implemented.
+
+## Initial recommendation (superseded by the gates)
 
 Recommend **one context.db migration, 95**, containing DB-2 (a limited,
 coordinated payload split), DB-5/11 (shared change-version infrastructure and
@@ -16,7 +25,7 @@ metadata fields: OpenCode, Pi/OMP, CLI, dashboard, and ck-mc's context.db repair
 path. A plugin-only DB-2 is **not safe**. If that coordinated scope is unwanted,
 remove DB-2 before implementation; do not introduce compatibility triggers.
 
-No source, schema, dist, frozen state, or live store is changed by this plan.
+No live source store is changed by this work.
 Large-store migration durations below are **engineering estimates**, not new
 measurements. The actual v95 duration and health evidence are approval-gated
 deliverables. There is no way to measure an unimplemented migration honestly.
@@ -88,7 +97,7 @@ assumed inventory or duration, report it, do not discard payloads or change
 transactionality to meet the estimate. Writer lock duration and off-thread
 responsiveness are separate metrics: other writers still wait/refuse normally.
 
-## v95: exact storage design and rewrites
+## Storage design and rewrites (only C/D/E make the approved v95 cut)
 
 All sections below execute within the migration runner's **one BEGIN IMMEDIATE
 transaction and v95 ledger insertion**. No independent commits or background
@@ -808,3 +817,261 @@ store migration or codec byte change is part of this approval request.
 - Typecheck/build/full suites and the copy/host/mutation gates above are deferred
   to approved implementation. AFT has no authoritative Markdown diagnostic
   producer; its partial inspection is not claimed as a clean diagnostic pass.
+
+## Conditional approval gate results
+
+The parent approved measuring DB-2 first, including it only if it halves scalar
+WAL on large sessions, and required stopping on any net ledger hot-path regression.
+After these results, the parent explicitly approved dropping **both DB-2 and
+DB-5/11** and proceeding with C/D/E only. The split prototype took **3,026.3 ms**
+(the preliminary ask's approximate duration was incorrect; this is the captured
+timer). It was never installed in a production migration.
+
+### Residual v94 inventory
+
+Disk preflight: 278 GiB free. A read-only `sqlite3 VACUUM INTO` produced a 5.8 GiB
+context.db at 94, quick_check=ok. No OpenCode store or store.db was copied.
+There are **13,956 session_meta rows**. Sizes below are bytes of stored values,
+not JS object sizes. Whole-row logical bytes sum SQLite BLOB/text lengths and
+decimal numeric lengths; the largest-row table separately computes exact SQLite
+record payload sizes (serial-type widths and varint header, excluding b-tree
+cell/overflow-page overhead).
+
+| Field | Nonempty | Total | p50 | p90 | p99 | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| cached_m0_bytes | 147 | 18,861,748 | 0 | 0 | 14,296 | 607,397 |
+| cached_m1_bytes | 147 | 185,088 | 0 | 0 | 90 | 35,287 |
+| cached_m0_mural_data_url | 43 | 4,218,186 | 0 | 0 | 0 | 128,586 |
+| memory_block_cache | 85 | 2,705,826 | 0 | 0 | 0 | 68,376 |
+| note_nudge_anchors | 13,956 | 193,707 | 2 | 2 | 2 | 66,529 |
+| Whole row, logical | 13,956 | 39,259,601 | 227 | 937 | 20,616 | 1,973,974 |
+
+The nudge array's default `[]` counts as nonempty here. Largest sessions, labelled
+by their stable id prefix rather than retaining their contents:
+
+| Session | Exact record bytes | m0 | m1 | Mural | Memory cache | Note anchors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 019de471 | 1,973,995 | 357,094 | 9,588 | 0 | 0 | 4,021 |
+| ses_331acff9 | 1,145,201 | 361,045 | 28,226 | 126,030 | 44,419 | 658 |
+| ses_12a4fa38 | 1,079,991 | 360,402 | 19,600 | 118,082 | 62,884 | 2 |
+| ses_31366057 | 970,429 | 607,397 | 90 | 117,962 | 45,674 | 34,491 |
+| ses_227ce578 | 954,449 | 495,331 | 19,112 | 117,566 | 3,113 | 66,529 |
+| 019e8905 | 946,360 | 369,693 | 20,844 | 0 | 0 | 2 |
+| ses_114f158c | 910,008 | 343,020 | 17,270 | 125,686 | 7,560 | 719 |
+| ses_100a028a | 799,390 | 354,599 | 90 | 126,594 | 10,167 | 2 |
+| ses_110d8791 | 719,287 | 389,059 | 90 | 121,002 | 1,248 | 219 |
+| ses_070d004c | 657,106 | 370,623 | 90 | 50,030 | 7,245 | 2 |
+
+### Scalar-update gate: rejected
+
+`migration-batch-gates.ts` operates only on disposable copies of the specimen.
+Bun 1.4.2 / SQLite 3.54.0, WAL/NORMAL, autocheckpoint disabled during samples.
+Five repetitions of eight updates per session/mode; reset WAL between samples.
+Fixed-length alternates two equally sized last_nudge_band strings; length-changing
+alternates 9/13-byte strings. One explicit transaction per update, clock starts
+after BEGIN succeeds and ends after COMMIT. No writer wait is attributed to hold.
+Report independent medians of WAL and hold; shared-load timing is noisy.
+
+| Session | Fixed WAL before→split | Fixed hold ms before→split | Length-changing WAL before→split | Length-changing hold ms before→split | WAL reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 019de471 | 32,992→32,992 | 5.582→7.069 | 16,018,592→13,052,192 | 71.516→34.143 | 18.5% |
+| ses_331acff9 | 32,992→32,992 | 5.080→3.671 | 9,327,712→4,812,192 | 61.951→11.095 | 48.4% |
+| ses_12a4fa38 | 32,992→32,992 | 3.133→3.073 | 8,800,352→4,284,832 | 27.735→8.819 | 51.3% |
+
+Only one of three largest rows halves length-changing WAL; fixed-length writes
+do not improve at all. Do not expand the payload list or normalize remaining
+frozen JSON just to satisfy the gate. The coordinated DB-2 changes are excluded.
+
+### Ledger plus DB-14 gate: rejected
+
+1k/10k/60k tag fixtures, public insertTag for setup, actual createTagger.assignTag
+for minting and updateTagStatus for status. Five repetitions of 32 new mints or
+32 active→dropped transitions, one explicit outer transaction per operation.
+The mint API retains its own nested transaction/savepoint; these are matched
+single-operation held-writer probes, not whole transform timings. All other
+indexes/fields are identical between arms. WAL bytes include a 32-byte WAL header.
+
+| Tags | Mint WAL before→ledger-minus-indexes | Mint hold ms | Status WAL before→ledger-minus-indexes | Status hold ms |
+| --- | ---: | ---: | ---: | ---: |
+| 1,000 | 976,472→984,712 | 7.513→7.774 | 527,392→659,232 | 2.587→3.222 |
+| 10,000 | 1,017,672→1,001,192 | 123.123→85.554 | 527,392→659,232 | 3.919→3.403 |
+| 60,000 | 972,352→959,992 | 662.019→408.105 | 527,392→659,232 | 5.108→2.618 |
+
+Status WAL increases **131,840 bytes / 32 frames (+25%) at every size**: the new
+ledger dirties one additional page per transaction, and removing the tag-order
+index does not save that page on status-only writes. Faster noisy wall/hold
+samples do not excuse this durable regression. The 1k mint also grows 0.8%.
+The gate was reached and the implementation stopped before obtaining the parent
+decision to exclude DB-5/11. **20 fixture/isolation checks passed**; performance
+gates failed as reported, not counted as passing checks. lsof observed only this
+task's copy/fixture database paths.
+
+### What a future ledger redesign must prove
+
+No redesign is included here. It must preserve identity/status/accounting and
+pending-op freshness, generation/rollback/sibling-write safety, frozen decisions
+and mutable-result isolation, while proving **non-regressing net WAL and hold on
+both mint and status** at all three scales. It must account for record growth if
+versions share an already-dirtied row, not just assume that sharing is free.
+Keep bookkeeping small/separate so future per-session dirty-log triggers can
+coexist; measure their combined write amplification too. A partial invalidation
+key is not an acceptable way to meet the write gate.
+
+## Reduced-cut implementation results
+
+### DB-14 on its own
+
+The reduced fixture uses an explicitly reconstructed **v94** schema, not the
+new fresh initializer pretending to be the baseline. The candidate applies C/D/E
+without a ledger or payload split. Same five-repetition, 32-operation held-writer
+method as above. `--hot-only --index-only` reproduces this comparison in a fresh
+copy root. **15 fixture/isolation checks passed**, 12 measurement records.
+
+| Tags | Mint WAL before→reduced | Bytes saved / 32 mints | Mint hold ms | Status WAL before→reduced | Status hold ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 976,472→852,872 | 123,600 | 12.258→10.869 | 527,392→527,392 | 4.886→5.028 |
+| 10,000 | 1,017,672→869,352 | 148,320 | 31.208→31.586 | 527,392→527,392 | 2.285→2.700 |
+| 60,000 | 972,352→828,152 | 144,200 | 147.812→142.542 | 527,392→527,392 | 2.564→2.386 |
+
+Minting saves **30/36/35 WAL frames** respectively. Status WAL is exactly
+unchanged; sub-millisecond hold differences do not establish a speedup or a
+regression under shared load. No new tag/status trigger or transaction policy
+was deployed.
+
+### Migration and durable-data rehearsal
+
+The final specimen has **13,956 metadata rows, 2,082,727 tags and 48,035 git FTS
+rows**. v94→95 via the real migration runner took **4,248.312 ms**, including
+commit; the second no-op run took **0.158 ms**. Earlier warmed rehearsals took
+308–319 ms. These are load-dependent measurements, not a latency guarantee.
+Before/after streaming hashes match (FTS hash includes its actual **rowid**, not
+just its content); quick_check=ok and foreign_key_check has **zero violations**.
+
+| Data | Equal SHA-256 before/after |
+| --- | --- |
+| session_meta, all stored fields | `2b4168be6b2c4cdbdb408361208f3234c2d2c4cdab974ffa8dcbae722226964c` |
+| tags, all stored fields | `4d5bb0150fc6fb6d7bf0b1ca4107781b7ceff509c4bfcad2aa2018070eb0235a` |
+| git_commits_fts, rowid and stored fields | `f29626cb987325184bc32b75aa2d8cc8637940c584c80a1c55bf7aefded145d1` |
+
+No rewrite of frozen decisions, head bytes, statuses, tag identities or FTS
+content. The only new table is project-scoped git_commit_fts_rowid_map, so no
+SESSION_SCOPED_TABLES entry is appropriate. There are no new columns to ensure;
+fresh/current schema uses the shared installer, and old schemas leave its DDL
+to v95's transaction. Existing ensureColumn logic is unchanged. A lost-ledger
+replay validates an existing map and fails closed on disagreement; ordinary
+current opens do not scan FTS or reset the map.
+
+Rust's fingerprint includes **indexes**, so dropping the compartment prefix
+index and adding the candidate session index changed the compartments and
+user_memory_candidates fingerprints. Their two expected hashes were advanced,
+and the schema fixture regenerated with `scripts/dump-context-db-schema.ts`.
+The legacy v92 test removes all ledger rows >=93 so it still tests v92 rather
+than accidentally leaving later version rows behind. This release needs a
+rebuilt/restarted **ck-mc too**, not only the plugin dists: an old module refuses
+the two changed domains rather than silently using the wrong schema. store.db
+and its codec remain unchanged at 63.
+
+### Real-host health and served bytes
+
+All runs used this task's private HOME/XDG_* / OPENCODE_DB / context directories,
+with lsof over the whole process group. Every database/sidecar descriptor was
+under the resolved task root. Host stores were **synthetic**; no live OpenCode
+store was copied. Old-holder checks and worker loading were not bypassed.
+
+| Real host | Observed v95 transaction | Health probes | Longest successful-response gap |
+| --- | ---: | ---: | ---: |
+| OpenCode 1.18.30, final bundles | 1,918.5 ms writer hold | 94, all HTTP 200 | **666.877 ms** across the entire measured startup |
+| OpenCode 2.0.22, final bundles | 321 ms in current worker log | 11, all HTTP 200; 1 overlaps v95 | **251 ms** overlapping migration; **363 ms** entire startup |
+
+The worker start/apply logs name v95 and neither successful lane fell back to
+main-thread migration. Health is sampled independently every 250 ms with a
+1-second request timeout; current-run wall timestamps bracket the v95 log
+interval. One earlier whole-startup v2 run under heavier load recorded four
+timeouts. That sampler lacked wall correlation, so those cannot honestly be
+assigned to or excluded from the migration. The instrument was improved to
+record both whole-startup failures and the precise current-run migration
+interval; the final lane has **zero failures even over whole startup**. It was
+not made green by raising the timeout, ignoring a timed-out migration probe, or
+changing production startup code. Initial v2 probe setup also needed its normal
+directory-shaped module wrapper and actual activation wait; an absent plugin's
+healthy host was correctly rejected.
+
+Literal provider bodies match for **five requests on each host**: three growing
+tail defers after restoring the same warmed v94 host/context snapshots, a priced
+flush, and a second host process's restart defer. Both head hashes and the
+materialization stamp remain unchanged during the pure defers and restart;
+restart applies no migration. Session ids, reply ids and project paths are
+preserved across arms. No byte normalization or field/hint stripping is used.
+
+For deterministic replay, both fixtures explicitly set
+`memory.auto_search.enabled=false` as well as disabling inference/background
+features. Auto-search is independent of memory.enabled: an earlier default-hint
+restart comparison differed only in a timing-dependent hint about the current
+prompt; the four pre-restart requests were identical. The final comparison
+**opts out symmetrically via the existing setting**, not by deleting the hint
+from a captured request. This is replay evidence, not a claim that asynchronous
+search hints are deterministic under all timing schedules.
+
+| Host | Request | Bytes | Equal SHA-256 |
+| --- | ---: | ---: | --- |
+| 1.18.30 | 0 | 47,330 | `a7a8b7c8335e180c1f49debf22a6b5edbba8e8a0459533996c2fbd4561c2392c` |
+| 1.18.30 | 1 | 47,473 | `86af95231ab98b905d0c15c5a8e78d688b7e10c4b940b3bf6313efdda0205580` |
+| 1.18.30 | 2 | 47,616 | `60f81178b20b86207154607cab06ce8eaa3e74db770b584689dcb3f24914cc57` |
+| 1.18.30 | 3 | 47,765 | `77598e3115caba7f412607a5ad23d049efe7dbfcb77221896e7b4ab6ee0c8228` |
+| 1.18.30 | 4 | 47,916 | `c011be94c40a4ca16d98ba924a2a941a85100d9c6148944c300eb352c8d30095` |
+| 2.0.22 | 0 | 36,849 | `0c760ade68d63e4a2196cba92c218e2a1cb9cae8466d3b65760c2205a4914f54` |
+| 2.0.22 | 1 | 37,100 | `9dead67b17258ee038560973301d22da7ebf66694c0f26cc55baaaaeaa186227` |
+| 2.0.22 | 2 | 37,351 | `697278ed19a9f63696fea491c84705216362dd823d28fd5ed487c9389ea7c24b` |
+| 2.0.22 | 3 | 37,607 | `6dfa74cb0492a9dba749127ff13918a10852afde884f632b153e1dbf367cd89f` |
+| 2.0.22 | 4 | 37,866 | `888702d442a9f64b599796ad80781f0da9c5163e0d9afa8341f0586c3d61a3f0` |
+
+### Gates, fixes and limits
+
+- Bun 1.4.2, TypeScript 5.9.3, Node v24.16.0 (SQLite 3.53.0), Bun SQLite 3.54.0,
+  Biome 2.5.1, cargo/rustc 1.99.0, rustfmt 1.10.0.
+- Final plugin lint checked **1,221 files**, with only one pre-existing warning
+  and two pre-existing infos in unrelated files. Scoped AFT inspection had no
+  TypeScript errors but remained partial for Biome and Rust metadata; the real
+  package commands provide the verification evidence.
+- Plugin package typecheck passes all three tsc projects. Full plugin suite:
+  **6,877 passed / 4 skipped / 3 failed** initially. All three failures were
+  migration-test obligations: v38 still asserted the intentionally retired
+  prefix index twice, and the armed step-through lacked a v95 population arm.
+  They now assert the replacement retention index and continue checking all
+  original data/authority properties; v94 seeds a real git row for v95 and an
+  independent claimed-arm signature prevents silent empty coverage. The focused
+  rerun is **11 passed / 0 failed** (these three plus eight v95 cases). No test
+  was rewritten to accept opposite served/recovery behavior. Another focused
+  storage/git/fence run passed **92 tests**; worker/trim/fence run had 18 passes
+  plus the stale numeric fence assertion, subsequently corrected and passed.
+- Pi typecheck and complete serial suite: **1,524 passed / 3 skipped / 0 failed**.
+  Both package test scripts' frozen installs checked 995 installs / 1,250 packages
+  without manifest/lock changes.
+- Actual v95 helper bundled for Node, not a second copy of its SQL: **9 checks
+  passed**, including gapped/duplicate/NULL FTS rowids, amend/delete/REPLACE,
+  actual virtual rowid capture, autocommit index discovery, no-op install and
+  failed inventory replay. Earlier design-only Node checks are not substituted
+  for this runtime check.
+- `bun run build:dists` passed, including **4/4** v2 loader tests and all **3**
+  load probes. An import-graph check of OpenCode 1/2 and Pi **six entry/worker
+  graphs** finds only fence **95** in reachable chunks (63/18, 55/17, 33/12 files
+  respectively). Unreferenced stale chunks were not counted as shipped code.
+- Rust package compilation succeeded, then the correctly selected ceiling test
+  passed **1/1** and HostStore tests **29 passed / 2 ignored**; fmt check passed.
+  The initial `--exact` filter selected zero tests and is explicitly **not** test
+  evidence. A sibling path dependency advanced cortexkit-store 0.2.0→0.2.1 during
+  the queued build, so subsequent --locked commands/LSP metadata failed. The
+  scoped rerun used temporary **offline** lock resolution, then restored the
+  staged original Cargo.lock; no dependency/lock upgrade is included in this
+  branch. The regenerated fixture exposed the two index-sensitive fingerprints,
+  which were corrected before the green rerun. No broad native host/daemon suite
+  or clippy run is claimed.
+- Four independent controls reddened only their named v95 test, with **7 peer
+  tests passing** each: FTS full-scan delete, missing retention index,
+  rollback-local index-name caching, and omitted existing-map validation.
+  Every control used staged live state, a nonempty mutant diff, checkout/touch
+  restore, and an empty working diff. No mutant was built or retained.
+- The large specimen, its working copies/sidecars and throwaway host roots are
+  deleted after connections close. No binary placement or live migration is
+  performed. ARCHITECTURE.md, STRUCTURE.md, compaction-marker-manager.ts,
+  compartment-storage.ts and selection/config files remain unchanged.
