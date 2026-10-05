@@ -834,6 +834,21 @@
             ]
         },
         {
+            "path": "tests/opencode2/execute-threshold-model.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "OpenCode v2 lane: with execute_threshold_percentage {default 50, the session's model 20}, a pass at 31% on that model executes and the proactive historian floor derives from 20%, read from the plugin's per-pass threshold and scheduler logs; before the context hook supplied the draft model key it deferred against the default. The v2 lane runs from its own invocation (bun test tests/opencode2)",
+            "contract_refs": [
+                "OC2-S1"
+            ],
+            "hosts": [
+                "opencode2"
+            ]
+        },
+        {
             "path": "tests/opencode2/execute-threshold-tokens.test.ts",
             "tier": "excluded",
             "invocation": {
