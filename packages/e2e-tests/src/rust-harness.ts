@@ -224,8 +224,8 @@ export class RustTestHarness {
 
     /**
      * Preflight the lane. Cheap and never throws — call it in a describe-level
-     * guard so a machine without cargo / the subconscious sibling / a supported
-     * platform SKIPs with a printed reason instead of failing or hanging.
+     * guard so a machine without Cargo, without a lock-pinned daemon source or
+     * prebuilt binaries, or on an unsupported platform SKIPs with a printed reason.
      */
     static detectPrereqs(): RustModePrereqs {
         return detectRustModePrereqs();
@@ -233,7 +233,7 @@ export class RustTestHarness {
 
     static async create(options: RustTestHarnessOptions = {}): Promise<RustTestHarness> {
         const prereqs = detectRustModePrereqs();
-        if (!prereqs.ok || !prereqs.subconsciousRoot) {
+        if (!prereqs.ok) {
             throw new Error(
                 `RustTestHarness prerequisites unmet: ${prereqs.skipReason ?? "unknown"}. ` +
                     "Guard the suite with RustTestHarness.detectPrereqs() and skip instead of creating.",

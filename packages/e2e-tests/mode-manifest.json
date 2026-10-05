@@ -1,6 +1,6 @@
 {
     "schema": 1,
-    "header": "CI push workflows run the manifest-derived TypeScript suites and the Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh. The tag release workflow also runs the Rust invocation; both Rust lanes require public sibling path dependencies (../commons and ../subconscious).",
+    "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. The mc-module daemon tests and hermetic binary builder check out the locked subconscious source only to build ck-subc; test shards consume its prebuilt artifact.",
     "entries": [
         {
             "path": "tests/subagent-write-tools.test.ts",

@@ -168,10 +168,10 @@ daemon's `XDG_RUNTIME_DIR` there so its connection file lands exactly where the
 plugin looks. The module opens its own store under the same data dir (the
 production shared-cortexkit layout).
 
-Environment honesty: `RustTestHarness.detectPrereqs()` preflights the stack
-(cargo present, sibling `subconscious` workspace present, supported platform) and
-the suite SKIPs with a printed reason when any is missing — never green-washing,
-never hanging.
+Environment honesty: `RustTestHarness.detectPrereqs()` preflights Cargo and either the
+locked sibling `subconscious` source needed to build `ck-subc` or a complete set of
+prebuilt binaries. The suite SKIPs with a printed reason when inputs are missing or
+the platform is unsupported — never green-washing, never hanging.
 
 ### Rust build-lock contention drill
 
