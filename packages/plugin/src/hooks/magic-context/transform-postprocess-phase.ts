@@ -2174,7 +2174,7 @@ export async function runPostTransformPhase(
     let explicitMaterializedSuccessfully = false;
     let deferredMaterializedSuccessfully = false;
     let pendingOpsDidMutate = false;
-    let protectedToolTags = new Set<number>();
+    const protectedToolTags = protectedToolTagNumbers(args.tags, args.protectedTools);
     // First application is an edit; restoring the same frozen choice from raw
     // history is replay. Telemetry and signed-thinking invalidation consume the
     // same edit record so a strip cannot silently escape either accounting lane.
@@ -2249,7 +2249,10 @@ export async function runPostTransformPhase(
                 args.sessionId,
                 args.db,
                 args.targets,
-                args.contextUsage.percentage >= 95 ? new Set<number>() : args.protectedTagIds,
+                new Set([
+                    ...(args.contextUsage.percentage >= 95 ? [] : args.protectedTagIds),
+                    ...protectedToolTags,
+                ]),
                 undefined,
                 pendingOps,
                 [],
@@ -2266,10 +2269,6 @@ export async function runPostTransformPhase(
             }
             logTransformTiming(args.sessionId, "applyPendingOperations", tApply);
         }
-        protectedToolTags = protectedToolTagNumbers(
-            shouldApplyPendingOps ? getActiveTagsBySession(args.db, args.sessionId) : args.tags,
-            args.protectedTools,
-        );
         if (shouldRunHeuristics) {
             const t5 = performance.now();
             // Caveman config is only passed through for primary sessions when

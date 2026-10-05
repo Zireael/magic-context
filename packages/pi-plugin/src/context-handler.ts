@@ -1235,9 +1235,7 @@ export interface PiSchedulerOptions {
 export interface PiContextHandlerOptions {
 	cacheTtlConfig?: import("@magic-context/core/shared/model-cache-ttl").CacheTtlConfig;
 	db: ContextDatabase;
-	/** Smart-drops (experimental, default off): also reclaim tool output that a
-	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
-	 *  sent to the model are byte-identical to the age-based-only behavior. */
+	/** Deprecated caller input, ignored. Supersession always rides an existing rebuild. */
 	smartDrops?: boolean;
 	protectedTools?: Readonly<Record<string, number>>;
 	/**
@@ -6053,6 +6051,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const pendingOps = shouldReadPendingOps
 		? getPendingOps(args.db, args.sessionId)
 		: [];
+	const protectedToolTags = protectedToolTagNumbers(
+		getActiveTagsBySession(args.db, args.sessionId),
+		args.protectedTools,
+	);
 	const protectionWindowForPass = getProtectionWindowForSession(
 		args.db,
 		args.sessionId,
@@ -6109,9 +6111,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.sessionId,
 				args.db,
 				targets,
-				args.contextUsage.percentage >= 95
-					? new Set<number>()
-					: protectedTagNumbersForPass,
+				new Set([
+					...(args.contextUsage.percentage >= 95
+						? []
+						: protectedTagNumbersForPass),
+					...protectedToolTags,
+				]),
 				pendingOperationTags,
 				pendingOps,
 				[],
@@ -6300,10 +6305,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// active projection; Channel-1 baseline construction reuses the full set.
 	const allTagsForPass = getPiTagSnapshot(args.db, args.sessionId);
 	const activeTags = allTagsForPass.filter((tag) => tag.status === "active");
-	const protectedToolTags = protectedToolTagNumbers(
-		activeTags,
-		args.protectedTools,
-	);
 	logTransformTiming(
 		args.sessionId,
 		"getTagsBySessionSnapshot",

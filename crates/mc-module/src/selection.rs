@@ -1168,10 +1168,15 @@ fn select_agent_drops(
     ctx: &SelectionContext,
     live_ids: &HashSet<String>,
     frozen: &HashSet<String>,
+    protected_tools: &HashSet<String>,
     out: &mut Vec<ReductionDecision>,
 ) {
     for id in &ctx.agent_drop_ids {
-        if frozen.contains(id) || !live_ids.contains(id) || ctx.block_is_protected(id) {
+        if frozen.contains(id)
+            || !live_ids.contains(id)
+            || ctx.block_is_protected(id)
+            || protected_tools.contains(id)
+        {
             continue;
         }
         // Queued drops consume permission; neither pressure nor another command creates it.
@@ -1620,7 +1625,13 @@ pub(crate) fn select_reductions_with_outcome(
     };
     // Apply the same arc guards to queued drops as to automatic reductions.
     let mut agent_decisions = Vec::new();
-    select_agent_drops(ctx, &live_ids, frozen_keys, &mut agent_decisions);
+    select_agent_drops(
+        ctx,
+        &live_ids,
+        frozen_keys,
+        &protected_tool_block_ids,
+        &mut agent_decisions,
+    );
     agent_decisions.retain(|decision| arc_allows_reduction(&decision.target_id));
     let two_pass_batch_can_apply = two_pass_batch_can_apply(ctx);
     let reasoning_adjacency_collapse_arcs = reasoning_adjacency_collapse_arc_ids(items);
@@ -1868,7 +1879,13 @@ pub(crate) fn select_reductions_with_outcome(
 
     // ctx_reduce agent drops stay block-granular, but pass-through carriers are absent
     // from live_ids so Media and Opaque can never become reduction targets.
-    select_agent_drops(ctx, &live_ids, frozen_keys, &mut out);
+    select_agent_drops(
+        ctx,
+        &live_ids,
+        frozen_keys,
+        &protected_tool_block_ids,
+        &mut out,
+    );
 
     // Agent-directed ids can name either half of a tool arc, so apply the same whole-message
     // guard after their block-granular decisions have been added.
@@ -5275,10 +5292,118 @@ mod tests {
         assert!(!decisions
             .iter()
             .any(|decision| decision.target_id == "todo-3#1"));
-        // Explicit drops remain an agent choice, even inside the protected window.
+        // Agent drops share the protected count and remain queued until rotation.
         ctx.agent_drop_ids = vec!["todo-3#1".to_string()];
-        assert!(select_reductions(&items, &frozen, &ctx, &cfg)
+        assert!(!select_reductions(&items, &frozen, &ctx, &cfg)
             .iter()
             .any(|decision| decision.target_id == "todo-3#1"));
+    }
+
+    #[test]
+    fn protected_tool_agent_drop_shared_hold_rotation_golden() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            label: String,
+            tools: Vec<String>,
+            protected_tools: std::collections::BTreeMap<String, usize>,
+            drop: usize,
+            new_tool: String,
+            #[serde(default)]
+            historian: bool,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/protected-tool-holds.json"))
+                .unwrap();
+        for case in cases {
+            let mut items = Vec::new();
+            for (i, name) in case.tools.iter().enumerate() {
+                let id = format!("hold-{}", i + 1);
+                items.push(tool_call(&id, i as u64 + 1, name, serde_json::json!({}), 0));
+                items.push(tool_result(&id, i as u64 + 1, name, 100));
+            }
+            let target = format!("hold-{}#1", case.drop);
+            let cfg = SelectionConfig {
+                protected_tools: case.protected_tools,
+                ..SelectionConfig::default()
+            };
+            let mut ctx = base_ctx(PassClass::Execute);
+            ctx.pass_already_busting = true;
+            ctx.emergency_window_yields = true;
+            ctx.agent_drop_ids = vec![target.clone()];
+            for _ in 0..2 {
+                let selected = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+                assert!(
+                    !selected.iter().any(|decision| decision.target_id == target),
+                    "{} remains held",
+                    case.label
+                );
+            }
+            if case.historian {
+                let covered_arc = format!("hold-{}#0", case.drop);
+                items.retain(|item| item.arc_id.as_deref() != Some(covered_arc.as_str()));
+                let after_trim =
+                    select_reductions_with_outcome(&items, &HashSet::new(), &ctx, &cfg);
+                assert!(!after_trim
+                    .decisions
+                    .iter()
+                    .any(|decision| decision.target_id == target));
+                assert!(after_trim.protected_tool_block_ids.contains("hold-1#1"));
+                continue;
+            }
+            items.push(tool_call(
+                "arriving",
+                200,
+                &case.new_tool,
+                serde_json::json!({}),
+                0,
+            ));
+            items.push(tool_result("arriving", 200, &case.new_tool, 100));
+            ctx.pass_class = PassClass::Defer;
+            assert!(select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty());
+            ctx.pass_class = PassClass::Execute;
+            let selected = select_reductions(&items, &HashSet::new(), &ctx, &cfg);
+            assert!(
+                selected.iter().any(|decision| decision.target_id == target),
+                "{} applies after rotation",
+                case.label
+            );
+            let frozen = HashSet::from([target.clone()]);
+            assert!(
+                !select_reductions(&items, &frozen, &ctx, &cfg)
+                    .iter()
+                    .any(|decision| decision.target_id == target),
+                "{} never resurrects",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn protected_tool_historian_queued_drop_holds_until_fold_trim() {
+        let mut items = vec![
+            tool_call("older", 1, "custom", serde_json::json!({}), 0),
+            tool_result("older", 1, "custom", 100),
+            tool_call("covered", 2, "custom", serde_json::json!({}), 0),
+            tool_result("covered", 2, "custom", 100),
+        ];
+        let cfg = SelectionConfig {
+            protected_tools: [("custom".to_string(), 1)].into(),
+            ..SelectionConfig::default()
+        };
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.pass_already_busting = true;
+        // The durable queue has the same selection semantics regardless of who
+        // published it. A fold's trim later removes the covered arc from the tail.
+        ctx.agent_drop_ids = vec!["covered#1".to_string()];
+        assert!(!select_reductions(&items, &HashSet::new(), &ctx, &cfg)
+            .iter()
+            .any(|decision| decision.target_id == "covered#1"));
+        items.retain(|item| !item.id.starts_with("covered#"));
+        let outcome = select_reductions_with_outcome(&items, &HashSet::new(), &ctx, &cfg);
+        assert!(outcome.protected_tool_block_ids.contains("older#1"));
+        assert!(!outcome
+            .decisions
+            .iter()
+            .any(|decision| decision.target_id == "covered#1"));
     }
 }

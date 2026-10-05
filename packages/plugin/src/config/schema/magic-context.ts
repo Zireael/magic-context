@@ -1452,7 +1452,7 @@ export const MagicContextConfigSchema = z
             .default({ ...DEFAULT_PROTECTED_TOOLS })
             .transform((map) => mergeProtectedTools(map))
             .describe(
-                "Keep each tool's newest N still-active results in every automatic drop lane (issue 621). User and project maps merge over defaults {todowrite: 1, ctx_reduce: 3}; 0 turns protection off. Names are case-insensitive and ignore leading mcp_. Holds even at 95% pressure, with no byte cap: large protected outputs can reach refusal sooner. Explicit ctx_reduce, historian summaries and frozen strips are unaffected. Changes and rotation only affect later cache-rebuilding passes; dropped results are never restored.",
+                "Keep each tool's newest N still-active results in every automatic drop lane (issue 621). User and project maps merge over defaults {todowrite: 1, ctx_reduce: 3}; 0 turns protection off. Names are case-insensitive and ignore leading mcp_. Holds even at 95% pressure, with no byte cap: large protected outputs can reach refusal sooner. Queued drops, from the agent or historian publication, are held until newer calls displace the result and a later cache-rebuilding pass applies them. The historian's summary is unaffected; the raw result leaves at the next fold. Frozen strips are unaffected. Changes and rotation never originate a bust; dropped results are never restored.",
             ),
         caveman_text_compression: z
             .object({

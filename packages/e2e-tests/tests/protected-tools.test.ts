@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createOpencodeClient } from "@opencode-ai/sdk";
@@ -64,7 +64,21 @@ test("OpenCode 1.18.30 custom protected tool keeps newest two through emergency"
         expect(wire).toContain("CUSTOM_RESULT_3");
         expect(wire).not.toContain("CUSTOM_RESULT_2");
         expect(wire).not.toContain("CUSTOM_RESULT_1");
-        const log = readFileSync(join(env.dataDir, "cortexkit", "magic-context-e2e.log"), "utf8");
+        const logPath = join(env.dataDir, "cortexkit", "magic-context-e2e.log");
+        // Provider completion can precede the asynchronous diagnostic append.
+        // Observe its file event before killing the host instead of racing the log.
+        await new Promise<void>((resolveLog, rejectLog) => {
+            const watcher = watch(logPath, () => {
+                if (readFileSync(logPath, "utf8").includes("emergency tiered drop:")) finish();
+            });
+            const timer = setTimeout(() => finish(new Error("Emergency diagnostic did not flush")), 10000);
+            const finish = (error?: Error) => {
+                watcher.close(); clearTimeout(timer);
+                if (error) rejectLog(error); else resolveLog();
+            };
+            if (readFileSync(logPath, "utf8").includes("emergency tiered drop:")) finish();
+        });
+        const log = readFileSync(logPath, "utf8");
         expect(log).toContain("emergency tiered drop:");
         console.log("protected_tools emergency lane confirmed in host log; newest two visible, third-newest removed");
         containment();

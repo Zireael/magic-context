@@ -3614,6 +3614,47 @@ describe("ride-only supersession reclaim", () => {
         expect(tagStatuses(sessionId).get(24)).toBe("active");
     });
 
+    it("queued protected tool drop stays held at 95 until rotation and a rebuilding pass", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-held-protected-todo";
+        const { trigger, older, newer, recentTail } = seedTodowriteSession(sessionId);
+        queuePendingOp(db, sessionId, 3, "drop", 1);
+        const messages = [trigger, older, newer, ...recentTail];
+        const targets = new Map([
+            [1, makeDropTarget(trigger)],
+            [2, makeDropTarget(older)],
+            [3, makeDropTarget(newer)],
+        ]);
+        const run = () =>
+            runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    schedulerDecision: "execute",
+                    pendingMaterializationSessions: new Set([sessionId]),
+                    contextUsage: { percentage: 95, inputTokens: 95000 },
+                    targets,
+                    tags: getActiveTagsBySession(db, sessionId),
+                    sessionMeta: getOrCreateSessionMeta(db, sessionId),
+                }),
+            );
+        await run();
+        expect(tagStatuses(sessionId).get(3)).toBe("active");
+        expect(getPendingOps(db, sessionId).some((op) => op.tagId === 3)).toBe(true);
+        await run();
+        expect(tagStatuses(sessionId).get(3)).toBe("active");
+        const arriving = structuredClone(newer);
+        arriving.info.id = "tool-24";
+        insertTag(db, sessionId, "tool-24", "tool", 4000, 24, 0, "todowrite", 0, "tool-24");
+        messages.push(arriving);
+        targets.set(24, makeDropTarget(arriving));
+        expect(tagStatuses(sessionId).get(3)).toBe("active");
+        await run();
+        expect(tagStatuses(sessionId).get(3)).toBe("dropped");
+        expect(getPendingOps(db, sessionId).some((op) => op.tagId === 3)).toBe(false);
+        await run();
+        expect(tagStatuses(sessionId).get(3)).toBe("dropped");
+    });
+
     it("ON: superseded todowrite is dropped, newest kept, on a mutating execute pass", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);

@@ -66,7 +66,7 @@ Supersession always adds content-aware reclaim on busting passes (`supersession-
 
 Supersession ignores tool calls owned by the newest 20 distinct messages (`SUPERSESSION_RECENT_MESSAGE_WINDOW`), derived from persisted tag order so the protection does not shift when the provider-visible array contracts and re-expands.
 
-All automatic lanes also honour `protected_tools`, a user/project map merged over `{todowrite: 1, ctx_reduce: 3}`. A shared active-population snapshot protects each tool's newest N tag ordinals, with case-insensitive and leading-`mcp_` matching. This protection holds at 95%, unlike the token window and tier reserve, and applies to edit markers and dedup too. Explicit agent drops, historian summaries and frozen strips are independent. Map changes and rotation never originate a bust or restore dropped results.
+All automatic lanes also honour `protected_tools`, a user/project map merged over `{todowrite: 1, ctx_reduce: 3}`. A shared active-population snapshot protects each tool's newest N tag ordinals, with case-insensitive and leading-`mcp_` matching. This protection holds at 95%, unlike the token window and tier reserve, and applies to edit markers and dedup too. Queued drops from the agent or historian publication are held by that same set until newer calls displace the result and a rebuilding pass applies the drop. The historian's summary is unaffected and the raw result leaves at the next fold. Frozen strips remain independent. Map changes and rotation never originate a bust or restore dropped results.
 
 ## Heuristic cleanup and emergency drops
 

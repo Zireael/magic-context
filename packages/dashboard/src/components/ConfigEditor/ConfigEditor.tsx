@@ -2008,7 +2008,8 @@ function ConfigForm(props: {
                       ≥ 0). Merges over todowrite: 1 and ctx_reduce: 3; 0 disables protection. Names
                       ignore case and leading mcp_. Applies even at 95% pressure, with no byte cap:
                       large protected outputs can reach refusal sooner. Changes only affect later
-                      cache-rebuilding passes; explicit drops and frozen strips are unaffected.
+                      cache-rebuilding passes. Queued drops are held until newer calls displace the
+                      result; frozen strips are unaffected.
                     </span>
                     <textarea
                       class="code-editor"

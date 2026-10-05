@@ -1826,6 +1826,9 @@ async function startPiMagicContextRuntime(
 		// Dreamer tasks, a separate security concern.)
 		memoryToolEnabled: true,
 		protectedTags: config.protected_tags ?? 20,
+		protectedTools: config.protected_tools,
+		resolveProtectedTools: (ctx) =>
+			resolveCurrentProjectDeps(ctx).config.protected_tools,
 		resolveProtectedTags: (ctx) =>
 			resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
 		resolveProjectIdentity: (ctx) =>

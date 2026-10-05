@@ -45,7 +45,7 @@ use crate::scheduler::{
 use crate::selection::{
     dropped_input_payload, filter_reasoning_ineligible_decisions, is_reclaim_hint_excluded_tool,
     resolve_tool_tier, select_reductions_with_outcome, PassClass, SelItem, SelKind, SelMessageRole,
-    SelectionConfig, SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
+    SelectionConfig, SelectionContext, AGE_RECLAIM_MIN_TOKENS,
 };
 use crate::tail_hygiene::{
     channel1_refire_tokens, effective_tail_hygiene, hygiene_band,
@@ -4819,7 +4819,9 @@ fn apply_once(
             timings.emergency_reasoning_exclusions = excluded_arcs;
         }
     }
-    let selection_outcome = if producer_gate {
+    // The same pure selection pass computes protection for acknowledgements on
+    // defer too. Its Defer class emits no reductions and never prices a rewrite.
+    let selection_outcome = {
         let frozen = frozen_red_targets(&loaded.core);
         // No per-request gate here: producer_gate already requires
         // tail_reclaim_enabled, which is the profile default. Gating again on the
@@ -4876,8 +4878,6 @@ fn apply_once(
                 protected_tools: ctx.protected_tools.clone(),
             },
         )
-    } else {
-        SelectionOutcome::default()
     };
     timings.selection = elapsed_ms(selection_started_at);
     protected_block_ids.extend(selection_outcome.protected_tool_block_ids.iter().cloned());
@@ -5057,6 +5057,11 @@ fn apply_once(
     let mut core = loaded.core.clone();
     log_reasoning_drop_seed_skips(&core, &live, &req.session_id);
     let mut meta = loaded.meta.clone();
+    meta.protected_tool_block_ids = selection_outcome
+        .protected_tool_block_ids
+        .iter()
+        .cloned()
+        .collect();
     // Persist an equivalent revision written by an older digest format. This changes only
     // stored metadata; the served bytes are decided by the plan above.
     meta.m1_revision = applied_m1_revision;
@@ -18649,6 +18654,55 @@ pub(crate) mod tests {
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.smart_drops = true;
         ctx
+    }
+
+    #[test]
+    fn protected_tool_snapshot_is_the_selection_set_and_rotation_does_not_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.protected_tools.insert("probe".to_string(), 1);
+        let mut request = req(
+            "protected-snapshot",
+            "cfg0",
+            vec![
+                wire_tool_call("owner", 1, "call_result"),
+                wire_tool_result(
+                    "result",
+                    2,
+                    json!({"kind":{"type":"text", "text":"protected output"}}),
+                ),
+            ],
+        );
+        request.tool_present = true;
+        transform(&s, &request, &ctx).unwrap();
+        let before = transform(&s, &request, &ctx).unwrap();
+        assert!(s
+            .load("protected-snapshot")
+            .unwrap()
+            .meta
+            .protected_tool_block_ids
+            .contains("result#0"));
+        request
+            .messages
+            .push(wire_tool_call("new-owner", 3, "call_new-result"));
+        request.messages.push(wire_tool_result(
+            "new-result",
+            4,
+            json!({"kind":{"type":"text", "text":"new output"}}),
+        ));
+        let after = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(after.action, "SOFT+");
+        let before_messages = before.ck_messages.as_ref().unwrap();
+        let after_messages = after.ck_messages.as_ref().unwrap();
+        assert_eq!(after_messages[..before_messages.len()], before_messages[..]);
+        let held = &s
+            .load("protected-snapshot")
+            .unwrap()
+            .meta
+            .protected_tool_block_ids;
+        assert!(held.contains("new-result#0"));
+        assert!(!held.contains("result#0"));
     }
 
     fn seed_unrelated_hint_candidates(store: &McStore) {

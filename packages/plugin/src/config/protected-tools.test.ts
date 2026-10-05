@@ -30,6 +30,17 @@ it("protected_tools defaults, validation, active-only ordinals and zero override
     expect(MagicContextConfigSchema.safeParse({ smart_drops: "ignored" }).success).toBe(true);
 });
 
+it("protected_tools does not treat inherited object keys as configured tools", () => {
+    const tags = ["constructor", "__proto__"].map((toolName, i) => ({
+        tagNumber: i + 1,
+        toolName,
+        type: "tool",
+        status: "active",
+    }));
+    expect([...protectedToolTagNumbers(tags)]).toEqual([]);
+    expect([...protectedToolTagNumbers(tags, { constructor: 1 })]).toEqual([1]);
+});
+
 it("protected_tools merges normalized project keys over user and shipped defaults", () => {
     const dir = createTestTempDirFromPath(join(tmpdir(), "protected-tools-config-"));
     const old = process.env.XDG_CONFIG_HOME;

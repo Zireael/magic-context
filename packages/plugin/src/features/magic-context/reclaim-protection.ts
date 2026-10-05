@@ -24,7 +24,7 @@ export function protectedToolTagNumbers(
         if (tag.status !== undefined && tag.status !== "active") continue;
         if (tag.type !== undefined && tag.type !== "tool") continue;
         const name = normalizeProtectedToolName(tag.toolName);
-        if ((counts[name] ?? 0) <= 0) continue;
+        if (!Object.hasOwn(counts, name) || counts[name] <= 0) continue;
         protectedTags.add(tag.tagNumber);
         counts[name] -= 1;
     }
