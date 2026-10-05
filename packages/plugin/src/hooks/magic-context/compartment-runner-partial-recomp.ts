@@ -434,7 +434,8 @@ export async function executePartialRecompInternal(
                 return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
             }
 
-            // v2 bounded reference model: 4 rotating seeds + last-6 recency
+            // Bounded calibration: 3 seeds + 3 diverse older + 4 recent examples.
+            // Recent scores are hidden to prevent anchoring in one-compartment runs
             // (the compartments rebuilt so far in this partial-recomp run provide
             // continuity). Structural rebuild → no <project-memory> dedup block.
             const prompt = buildCompartmentAgentPrompt({

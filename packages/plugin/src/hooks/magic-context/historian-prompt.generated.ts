@@ -2,7 +2,7 @@
 // DO NOT EDIT BY HAND. Regenerate: bun run packages/plugin/scripts/build-historian-prompt.ts
 //
 // The v8.7.5 historian system prompt (validated in the replay experiments,
-// reconciled to the 4-seed permanent-floor reference model). Edit the .md
+// reconciled to a permanent calibration floor). Edit the .md
 // source, not this file.
 
 export const COMPARTMENT_AGENT_SYSTEM_PROMPT = `# Historian
