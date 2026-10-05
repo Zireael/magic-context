@@ -387,8 +387,7 @@ describe("Rust mode authority adapter", () => {
                 captureCompleted = false;
                 const oldRepresentation = step === 1 || (queueOldCapture && step === 2);
                 return {
-                    decision:
-                        deferRebuild || (queueOldCapture && step === 2) ? "SOFT+" : "HARD",
+                    decision: deferRebuild || (queueOldCapture && step === 2) ? "SOFT+" : "HARD",
                     scheduler_decision: queueOldCapture && step === 2 ? "defer" : "execute",
                     row_version: step,
                     native_messages: oldRepresentation
