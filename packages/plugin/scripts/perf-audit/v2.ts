@@ -1,7 +1,8 @@
 import { Database } from "bun:sqlite";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 // Keep configuration, log and SQLite probes away from the operator's stores.
 const root = mkdtempSync(join(tmpdir(), "mc-perf-v2-"));
@@ -10,7 +11,7 @@ for (const key of ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
     mkdirSync(process.env[key]!, { recursive: true });
 }
 process.env.MAGIC_CONTEXT_STORAGE_DIR = join(root, "mc");
-const { V2StoreReader, V2StoreReaderPool } = await import("../../src/v2/store-reader");
+const { V2StoreReader, V2StoreReaderPool, getV2StoreReaderDebugCounters } = await import("../../src/v2/store-reader");
 const { isAdmittedSynthetic, syntheticCandidates } = await import("../../src/v2/hooks/channel2");
 const { startUpdateChecks } = await import("../../src/v2/hooks/update-check");
 const { FoldOwner } = await import("../../src/v2/fold/owner");
@@ -21,6 +22,9 @@ const { recordV2ToolDefinitions } = await import("../../src/v2/hooks/context");
 const { sanitizeDiagnosticText, sanitizeConfigValue } = await import("../../src/shared/redaction");
 const { loadPluginConfigDetailed } = await import("../../src/config");
 const { MagicContextRpcClient } = await import("../../src/shared/rpc-client");
+const { MagicContextRpcServer } = await import("../../src/shared/rpc-server");
+const { setupWithJsx } = await import("../../src/v2/tui/index");
+import type { V2TuiContext } from "../../src/v2/tui/types";
 type Draft = Parameters<typeof adaptPayload>[0];
 
 async function measure(name: string, passes: number, run: () => unknown) {
@@ -76,11 +80,24 @@ try {
         await measure(`V2-4 ${size} CAST query`, 5, () => cast.all());
         await measure(`V2-4 ${size} octet query`, 5, () => octet.all());
         const restored = new RestoredRowCache();
+        restored.rows(reader, "s", 0, size);
+        const beforeRestore = getV2StoreReaderDebugCounters().decodedRows;
         await measure(`V2-4 ${size} warm restore`, 3, () => restored.rows(reader, "s", 0, size));
+        console.log(`V2-4 warm restore decoded rows=${getV2StoreReaderDebugCounters().decodedRows - beforeRestore}`);
         const draft: Draft = { sessionID: "s", model: { providerID: "p", id: "m" }, agent: "build", system: [], tools: {}, options: {}, messages: Array.from({ length: size }, (_, i) => ({ id: `m${i}`, role: "user", content: [{ type: "text", text }] })) };
         await measure(`V2-6 ${size} adapt+commit`, 3, () => adaptPayload({ ...draft, messages: [...draft.messages] }).commit());
         const replay = new V2GenerateReplay();
         await measure(`V2-6/7 ${size} replay capture`, 3, () => replay.capture(draft, `m${size - 1}`));
+        console.log(`V2-7 ${size} retained replay serialized messages=${Buffer.byteLength(JSON.stringify(draft.messages))} bytes/session (not a heap estimate)`);
+        const memoryReplay = new V2GenerateReplay();
+        Bun.gc(true);
+        const heapBefore = process.memoryUsage().heapUsed;
+        memoryReplay.capture(draft, `m${size - 1}`);
+        Bun.gc(true);
+        const heapCaptured = process.memoryUsage().heapUsed;
+        memoryReplay.forget("s");
+        Bun.gc(true);
+        console.log(`V2-7 ${size} capture heap delta=${heapCaptured - heapBefore} bytes; forget released=${heapCaptured - process.memoryUsage().heapUsed} bytes (GC-sensitive)`);
         const owner = new FoldOwner(storage);
         const summary = text.repeat(10);
         const rendered = { id: "cut", role: "user", content: [{ type: "text", text: summary }] };
@@ -106,6 +123,9 @@ try {
         pool.close(); reader.close(); writer.close(); storageDB.close();
     }
     const toolDraft: Draft = { sessionID: "t", model: { providerID: "perf", id: "m" }, agent: "build", system: [], messages: [], options: {}, tools: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`t${i}`, { description: "tool description ".repeat(40), input: { type: "object", properties: Object.fromEntries(Array.from({ length: 20 }, (_, j) => [`p${j}`, { type: "string", description: "parameter documentation" }])) } }])) };
+    class Asset { bytes = new Uint8Array(1024 * 1024); }
+    const mediaDraft = { ...toolDraft, tools: {}, messages: Array.from({ length: 10 }, (_, i) => ({ id: `asset${i}`, role: "user", content: [{ type: "media", media: new Asset() }] })) };
+    await measure("V2-6 10 class-backed 1MiB assets adapt+commit", 5, () => adaptPayload({ ...mediaDraft, messages: [...mediaDraft.messages] }).commit());
     await measure("V2-11 40 tools/20 properties", 100, () => recordV2ToolDefinitions(toolDraft));
     await measure("V2-12 22 log lines", 100, () => { for (let i = 0; i < 22; i++) sanitizeDiagnosticText("[transform] timing /tmp/example 1.25 ms"); });
     await measure("V2-12 50 objects", 100, () => sanitizeConfigValue(Array.from({ length: 50 }, () => ({ path: "/tmp/example", message: "safe diagnostic text" }))));
@@ -114,6 +134,53 @@ try {
     await measure("V2-13 three boot loads", 20, () => { for (let i = 0; i < 3; i++) loadPluginConfigDetailed(configDir, false); });
     const rpc = new MagicContextRpcClient(join(root, "mc"), configDir);
     await measure("V2-5 unavailable startup RPC", 1, () => rpc.call("config.get", {}).catch(() => null));
-    console.log("V2-10 event projection retains all session events (see sidebar-mount.ts:108-123); refresh counts require host event burst probe.");
+    const tuiSource = readFileSync(new URL("../../src/tui/index.tsx", import.meta.url), "utf8");
+    const register = "api.slots.register(sidebarSlot)";
+    const begin = tuiSource.indexOf("initRpcClient(directory)");
+    const startup = tuiSource.slice(begin, tuiSource.indexOf(register, begin) + register.length);
+    for (const [label, fragment] of [["baseline await", startup.replace("void refreshToastDurationMs()", "await refreshToastDurationMs()")], ["current", startup]]) {
+        let registeredAt = -1;
+        const start = performance.now();
+        // Evaluate the actual registration block, giving RPC a controlled 50ms delay.
+        const run = new Function("initRpcClient", "directory", "refreshToastDurationMs", "createSidebarContentSlot", "api", `return (async () => { ${fragment} })()`);
+        await run(() => {}, configDir, () => new Promise(resolve => setTimeout(resolve, 50)), () => ({}), { slots: { register() { registeredAt = performance.now() - start; } } });
+        if (registeredAt < 0) throw new Error("Startup probe did not register the sidebar");
+        console.log(`V2-5 ${label} registration with 50ms RPC: ${registeredAt.toFixed(3)} ms`);
+    }
+    const rpcServer = new MagicContextRpcServer(join(root, "mc"), configDir);
+    let snapshots = 0;
+    rpcServer.handle("sidebar-snapshot", async () => { snapshots++; return { sessionId: "s" }; });
+    await rpcServer.start();
+    let listener: ((event: { details: unknown }) => void) | undefined;
+    const tui: V2TuiContext = {
+        location: { directory: configDir }, renderer: { requestRender() {} },
+        data: { location: { default: () => ({ directory: configDir }) }, listen: (handler) => { listener = handler; return () => {}; } },
+        keymap: { layer() {} },
+        storage: { memory: <T extends object>(_key: string, options: { initial: T }) => [options.initial, (mutation: (draft: T) => void) => mutation(options.initial)] as const },
+        ui: { router: { current: () => ({ type: "session", sessionID: "s" }) }, slot: () => () => {}, toast: { show() {} }, dialog: { async alert() {}, async confirm() { return false; } } },
+    };
+    const cleanup = await setupWithJsx(tui, () => null);
+    try {
+        for (const size of [1000, 10000, 60000]) {
+            const start = performance.now(), before = snapshots;
+            for (let i = 0; i < size; i++) listener?.({ details: { type: "session.status", data: { sessionID: "s" } } });
+            // Drain local RPC I/O once, rather than measuring only its scheduling.
+            await rpc.resolveEndpoint();
+            await new Promise(resolve => setTimeout(resolve, 100));
+            console.log(`V2-10 ${size} event burst: ${(performance.now() - start - 100).toFixed(3)} ms dispatch/I/O, ${snapshots - before} snapshot RPCs`);
+        }
+    } finally { cleanup(); rpcServer.stop(); }
+    if (process.argv[2]) {
+        for (const [label, path] of [["baseline bundle", process.argv[2]], ["current bundle", new URL("../../dist/index.js", import.meta.url).pathname]]) {
+            const times: number[] = [];
+            for (let i = 0; i < 5; i++) {
+                const child = spawnSync(process.execPath, ["-e", `const t=performance.now(); await import(${JSON.stringify(resolve(path!))}); console.log(performance.now()-t)`], { env: process.env, encoding: "utf8", timeout: 30000 });
+                if (child.status !== 0) throw new Error(child.stderr);
+                times.push(Number(child.stdout.trim()));
+            }
+            times.sort((a,b) => a-b);
+            console.log(`V2-16 ${label} cold import median=${times[2]?.toFixed(3)} ms, runs=${times.map(t=>t.toFixed(3)).join(",")}`);
+        }
+    } else console.log("V2-16: pass a preserved baseline dist/index.js to compare cold bundle imports");
     console.log("V2-15 Windows tasklist unavailable on this platform; no Windows cost inferred.");
 } finally { rmSync(root, { recursive: true, force: true }); }
