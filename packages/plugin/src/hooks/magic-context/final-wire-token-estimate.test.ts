@@ -9,6 +9,7 @@ import {
     estimateFinalWireInputTokens,
     type FinalWireTokenEstimate,
 } from "./final-wire-token-estimate";
+import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 
 const MODEL = { providerID: "test-provider", modelID: "test-model", agentName: "build" };
@@ -40,6 +41,22 @@ function toolMessage(output: string): MessageLike {
 }
 
 describe("final outgoing-wire token estimate", () => {
+    it("invalidates exact-content counts for in-place historical text and nested tool edits", () => {
+        const row = toolMessage("cache original");
+        const state = (row.parts[0] as { state: { input: { path: string }; output: string } })
+            .state;
+        const first = estimate([row]);
+        expect(estimate(structuredClone([row]))).toEqual(first);
+        state.input.path = "different/new/path.ts";
+        state.output = "edited output with many additional words";
+        expect(estimate([row]).messageTokens.toolCall).toBe(
+            estimateTokens(JSON.stringify(state.input)) + estimateTokens(state.output),
+        );
+        state.output = "cache original";
+        state.input.path = "large.log";
+        expect(estimate([row])).toEqual(first);
+    });
+
     it("counts attachments still sent with a legacy dropped skeleton", () => {
         const row = toolMessage("[dropped §7§]");
         const state = (row.parts[0] as { state: { attachments?: unknown[] } }).state;

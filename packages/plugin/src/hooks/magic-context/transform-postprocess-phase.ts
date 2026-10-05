@@ -169,7 +169,7 @@ import {
 } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
 import {
-    assertTailHygieneContentUnchanged,
+    assertTailHygieneContentUnchangedIfEnabled,
     countRealUserMessages,
     effectiveTailHygiene,
     formatTailHygienePrefixMismatch,
@@ -3983,14 +3983,12 @@ export async function runPostTransformPhase(
                 error,
             );
         }
-        if (process.env.NODE_ENV !== "production") {
-            assertTailHygieneContentUnchanged({
-                messages: args.messages,
-                tags: assertedBaseline.tags,
-                protectedTagNumbers: assertedBaseline.protectedTagNumbers,
-                expectedSignature: assertedBaseline.contentSignature,
-            });
-        }
+        assertTailHygieneContentUnchangedIfEnabled({
+            messages: args.messages,
+            tags: assertedBaseline.tags,
+            protectedTagNumbers: assertedBaseline.protectedTagNumbers,
+            expectedSignature: assertedBaseline.contentSignature,
+        });
     }
 
     logTransformTiming(args.sessionId, "pp.tailGuard", tTailGuard);

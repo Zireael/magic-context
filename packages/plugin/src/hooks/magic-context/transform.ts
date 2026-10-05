@@ -3077,13 +3077,17 @@ export function createTransform(deps: TransformDeps) {
             string,
             { conversation: number; toolCall: number; hasNull: boolean }
         >();
-        const hasUncachedMessageId = messages.some((message) => {
+        const uncachedMessageIds = messages.flatMap((message) => {
             const messageId = (message.info as { id?: string }).id;
-            return messageId !== undefined && !msgTokens.has(messageId);
+            return messageId !== undefined && !msgTokens.has(messageId) ? [messageId] : [];
         });
-        if (hasUncachedMessageId) {
+        if (uncachedMessageIds.length > 0) {
             try {
-                storedByMessage = getActiveTagTokenTotalsByMessage(db, sessionId);
+                storedByMessage = getActiveTagTokenTotalsByMessage(
+                    db,
+                    sessionId,
+                    uncachedMessageIds,
+                );
             } catch {
                 storedByMessage = new Map();
             }

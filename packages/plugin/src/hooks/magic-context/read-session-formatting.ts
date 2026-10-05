@@ -413,6 +413,38 @@ export function estimateTokens(text: string): number {
     }
 }
 
+/** Exact-content, bounded counts; fallback invalidates counts from the previous tokenizer. */
+export function createTokenCountMemo(
+    maxEntries: number,
+    maxBytes: number,
+): (text: string) => number {
+    const counts = new Map<
+        string,
+        { tokenizer: ReturnType<typeof getTokenizer>; tokens: number }
+    >();
+    let bytes = 0;
+    return (text) => {
+        const cached = counts.get(text);
+        if (cached && cached.tokenizer === getTokenizer()) return cached.tokens;
+        const tokens = estimateTokens(text);
+        if (cached) {
+            bytes -= text.length * 2;
+            counts.delete(text);
+        }
+        if (text.length * 2 <= maxBytes) {
+            while (counts.size >= maxEntries || bytes + text.length * 2 > maxBytes) {
+                const oldest = counts.keys().next().value;
+                if (oldest === undefined) break;
+                bytes -= oldest.length * 2;
+                counts.delete(oldest);
+            }
+            counts.set(text, { tokenizer: getTokenizer(), tokens });
+            bytes += text.length * 2;
+        }
+        return tokens;
+    };
+}
+
 const promptTokenCounts = new Map<
     string,
     { tokenizer: ReturnType<typeof getTokenizer>; tokens: number }

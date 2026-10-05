@@ -441,17 +441,66 @@ export function getTriggerTagTokenUpperBound(
     return { bound: row?.bound ?? 0, nullCount: row?.null_count ?? 0 };
 }
 
+const scopedActiveTokenTotalStatements = new WeakMap<Database, PreparedStatement>();
+
 export function getActiveTagTokenTotalsByMessage(
     db: Database,
     sessionId: string,
+    messageIds?: readonly string[],
 ): Map<string, MessageTokenTotal> {
-    const rows = db
-        .prepare(
-            `SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
+    if (messageIds?.length === 0) return new Map();
+    const fields =
+        "id, tag_number, type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count"
+            .split(", ")
+            .map((field) => `tags.${field}`)
+            .join(", ");
+    let scoped = scopedActiveTokenTotalStatements.get(db);
+    if (messageIds && !scoped) {
+        // Seek exact owners through existing indexes. Do not use a tag-number
+        // floor: a visible result can belong to an older invocation below it.
+        // UNION includes id so overlapping owner ranges cannot double-count a row.
+        scoped = db.prepare(`
+            SELECT ${fields} FROM json_each(?) AS owners
+            CROSS JOIN tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND tags.type != 'tool' AND +status = 'active'
+              AND message_id >= owners.value || ':' AND message_id < owners.value || ';'
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND type != 'tool' AND +status = 'active'
+              AND message_id IN (SELECT value FROM json_each(?))
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_pi_fallback_tool_owner
+            WHERE session_id = ? AND type = 'tool' AND +status = 'active'
+              AND tool_owner_message_id IN (SELECT value FROM json_each(?))
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND type = 'tool' AND +status = 'active'
+              AND tool_owner_message_id IS NULL AND message_id IN (SELECT value FROM json_each(?))
+            ORDER BY tag_number, id`);
+        scopedActiveTokenTotalStatements.set(db, scoped);
+    }
+    const owners = messageIds ? new Set(messageIds) : undefined;
+    const encoded = owners ? JSON.stringify([...owners]) : "";
+    const rows = (
+        messageIds && scoped
+            ? scoped.all(
+                  encoded,
+                  sessionId,
+                  sessionId,
+                  encoded,
+                  sessionId,
+                  encoded,
+                  sessionId,
+                  encoded,
+              )
+            : db
+                  .prepare(
+                      `SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
              FROM tags
              WHERE session_id = ? AND status = 'active'`,
-        )
-        .all(sessionId) as Array<{
+                  )
+                  .all(sessionId)
+    ) as Array<{
         type: string;
         message_id: string;
         tool_owner_message_id: string | null;
@@ -462,6 +511,7 @@ export function getActiveTagTokenTotalsByMessage(
     const out = new Map<string, MessageTokenTotal>();
     for (const row of rows) {
         const owner = ownerMessageIdForTagRow(row);
+        if (owners && !owners.has(owner)) continue;
         let entry = out.get(owner);
         if (!entry) {
             entry = { conversation: 0, toolCall: 0, toolOutput: 0, hasNull: false };
@@ -757,7 +807,9 @@ function getTagNumberByMessageIdStatement(db: Database): PreparedStatement {
     let stmt = getTagNumberByMessageIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT tag_number FROM tags WHERE session_id = ? AND message_id = ? ORDER BY tag_number ASC LIMIT 1",
+            // Without the owner index SQLite may walk the entire session in tag
+            // order to satisfy LIMIT, making repeated whitespace probes quadratic.
+            "SELECT tag_number FROM tags INDEXED BY idx_tags_session_message_id WHERE session_id = ? AND message_id = ? ORDER BY tag_number ASC LIMIT 1",
         );
         getTagNumberByMessageIdStatements.set(db, stmt);
     }
@@ -968,6 +1020,8 @@ export function markWhitespaceAssistantTagInert(
     );
 }
 
+const inertWhitespaceStatements = new WeakMap<Database, PreparedStatement>();
+
 /** Load legacy whitespace tags for cache-stable prefix replay; these rows are never active. */
 export function getInertWhitespaceAssistantTags(
     db: Database,
@@ -977,25 +1031,35 @@ export function getInertWhitespaceAssistantTags(
     if (messageIds) {
         // The fingerprint index lets the wire reader seek each visible owner instead
         // of scanning every compacted tag. Keep the unscoped API for reduction tools.
-        const statement = db.prepare(
-            `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
-             FROM tags
-             WHERE session_id = ? AND type = 'message' AND status = 'compacted'
-               AND entry_fingerprint >= ? AND entry_fingerprint < ?`,
-        );
-        return [...new Set(messageIds)].flatMap((messageId) => {
-            const prefix = `${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}${messageId}:p`;
-            const rows = statement.all(sessionId, prefix, `${prefix.slice(0, -1)}q`) as Array<{
-                tagNumber: number;
-                entryFingerprint: string;
-            }>;
-            return rows.map((row) => ({
-                tagNumber: row.tagNumber,
-                contentId: row.entryFingerprint.slice(
-                    WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
-                ),
-            }));
-        });
+        let statement = inertWhitespaceStatements.get(db);
+        if (!statement) {
+            // CROSS JOIN keeps the small owner list outside the fingerprint index
+            // seek, rather than scanning every retired row in a long session.
+            statement = db.prepare(
+                `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
+                 FROM json_each(?) AS owners CROSS JOIN tags
+                 WHERE tags.session_id = ? AND tags.type = 'message' AND tags.status = 'compacted'
+                   AND entry_fingerprint >= ? || owners.value || ':p'
+                   AND entry_fingerprint < ? || owners.value || ':q'
+                 ORDER BY CAST(owners.key AS INTEGER), entry_fingerprint, tags.id`,
+            );
+            inertWhitespaceStatements.set(db, statement);
+        }
+        const rows = statement.all(
+            JSON.stringify([...new Set(messageIds)]),
+            sessionId,
+            WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX,
+            WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX,
+        ) as Array<{
+            tagNumber: number;
+            entryFingerprint: string;
+        }>;
+        return rows.map((row) => ({
+            tagNumber: row.tagNumber,
+            contentId: row.entryFingerprint.slice(
+                WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
+            ),
+        }));
     }
     const rows = db
         .prepare(
@@ -2334,6 +2398,8 @@ export function getTagsByNumbers(
     return rows.map(toTagEntry);
 }
 
+const droppedNumberStatements = new WeakMap<Database, PreparedStatement>();
+
 /** Return only dropped tags whose numbers are visible replay targets. */
 export function getDroppedTagsByNumbers(
     db: Database,
@@ -2350,13 +2416,14 @@ export function getDroppedTagsByNumbers(
         return all;
     }
 
-    const placeholders = tagNumbers.map(() => "?").join(",");
-    const rows = db
-        .prepare(
-            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' AND tag_number IN (${placeholders}) ORDER BY tag_number ASC, id ASC`,
-        )
-        .all(sessionId, ...tagNumbers)
-        .filter(isTagRow);
+    let statement = droppedNumberStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' AND tag_number IN (SELECT value FROM json_each(?)) ORDER BY tag_number ASC, id ASC`,
+        );
+        droppedNumberStatements.set(db, statement);
+    }
+    const rows = statement.all(sessionId, JSON.stringify(tagNumbers)).filter(isTagRow);
 
     return rows.map(toTagEntry);
 }
@@ -2375,10 +2442,17 @@ export function getMaxDroppedTagNumber(db: Database, sessionId: string): number 
     return isMaxTagNumberRow(row) ? row.max_tag_number : 0;
 }
 
+const tagByIdStatements = new WeakMap<Database, PreparedStatement>();
+
 export function getTagById(db: Database, sessionId: string, tagId: number): TagEntry | null {
-    const result = db
-        .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND tag_number = ?`)
-        .get(sessionId, tagId);
+    let statement = tagByIdStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND tag_number = ?`,
+        );
+        tagByIdStatements.set(db, statement);
+    }
+    const result = statement.get(sessionId, tagId);
 
     if (!isTagRow(result)) {
         return null;
