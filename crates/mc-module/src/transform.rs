@@ -82,6 +82,9 @@ use crate::ck_wire::{
 };
 
 #[cfg(test)]
+#[path = "tests/perf_audit_identity.rs"]
+mod perf_audit_identity;
+#[cfg(test)]
 #[path = "tests/perf_audit_metadata.rs"]
 pub(crate) mod perf_audit_metadata;
 
@@ -14135,16 +14138,7 @@ fn message_output_identity(
 
     for block in blocks {
         digest_field(&mut hasher, block.id.as_bytes());
-        for value in [
-            tag_overlay
-                .and_then(|overlay| overlay.tag_by_block_id.get(&block.id))
-                .map(ToString::to_string),
-            tag_overlay.and_then(|overlay| overlay.temporal_by_block_id.get(&block.id).cloned()),
-            tag_overlay.and_then(|overlay| overlay.user_hint_by_block_id.get(&block.id).cloned()),
-            tag_overlay.and_then(|overlay| overlay.channel1_by_block_id.get(&block.id).cloned()),
-        ] {
-            digest_field(&mut hasher, value.as_deref().unwrap_or_default().as_bytes());
-        }
+        digest_overlay_identity_fields(&mut hasher, tag_overlay, &block.id);
         let full_drop = match &block.wire_shape().kind {
             ck_wire::CkKind::ToolCall { id, .. } | ck_wire::CkKind::ToolResult { id, .. } => {
                 full_drop_ids.contains(id)
@@ -14153,7 +14147,25 @@ fn message_output_identity(
         };
         digest_field(&mut hasher, &[full_drop as u8]);
     }
-    format!("{:x}", hasher.finalize())
+    crate::digest::hex(&hasher.finalize())
+}
+
+fn digest_overlay_identity_fields(
+    hasher: &mut Sha256,
+    overlay: Option<&TagOverlayState>,
+    block_id: &str,
+) {
+    let tag = overlay
+        .and_then(|overlay| overlay.tag_by_block_id.get(block_id))
+        .map(ToString::to_string);
+    digest_field(hasher, tag.as_deref().unwrap_or_default().as_bytes());
+    for value in [
+        overlay.and_then(|overlay| overlay.temporal_by_block_id.get(block_id)),
+        overlay.and_then(|overlay| overlay.user_hint_by_block_id.get(block_id)),
+        overlay.and_then(|overlay| overlay.channel1_by_block_id.get(block_id)),
+    ] {
+        digest_field(hasher, value.map_or("", String::as_str).as_bytes());
+    }
 }
 
 fn cached_output_item(
