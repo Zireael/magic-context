@@ -4784,6 +4784,7 @@ impl McHandler {
                 temporal_awareness: true,
                 prompt_surface_guidance_override: None,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
             },
         )
@@ -7719,6 +7720,15 @@ impl McHandler {
             };
         }
 
+        let protected_tool_snapshot = match store.load_meta(session_id) {
+            Ok(snapshot) => snapshot.meta.protected_tool_block_ids,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_write_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
         match store.append_pending_agent_drops_with_command(
             session_id,
             Some(&command_id),
@@ -7731,6 +7741,18 @@ impl McHandler {
             }
             Ok(outcome) => {
                 let mut resp = json!({ "ok": true, "queued": outcome.queued });
+                let (held, immediate): (Vec<_>, Vec<_>) = tags
+                    .iter()
+                    .filter(|tag| drop_ids.contains(&tag.block_id))
+                    .partition(|tag| protected_tool_snapshot.contains(&tag.block_id));
+                if !held.is_empty() {
+                    resp["held_tag_numbers"] =
+                        json!(held.iter().map(|tag| tag.tag_number).collect::<Vec<_>>());
+                    resp["immediate_tag_numbers"] = json!(immediate
+                        .iter()
+                        .map(|tag| tag.tag_number)
+                        .collect::<Vec<_>>());
+                }
                 if let Some(disposition) = &outcome.disposition {
                     resp["disposition"] = json!(disposition);
                 }
@@ -10335,6 +10357,7 @@ impl McHandler {
                 // additive-only memory/docs transform for every consumer profile.
                 compaction_enabled: binding.config.compaction_enabled,
                 smart_drops: binding.config.smart_drops,
+                protected_tools: binding.config.protected_tools.clone(),
                 // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the
                 // request's model while retaining whether the walk actually matched an entry.
                 cache_ttl: resolved_cache_ttl.value,
@@ -12948,6 +12971,9 @@ impl McHandler {
                     .tag_numbers
                     .tag_numbers
                     .contains(&protection_window::TagNumber(*number as i64))
+                    || by_number.get(number).is_some_and(|tag| {
+                        loaded.meta.protected_tool_block_ids.contains(&tag.block_id)
+                    })
             });
         let mut details = Vec::new();
         if !immediate.is_empty() {
@@ -21600,6 +21626,7 @@ mod tests {
             temporal_awareness: true,
             prompt_surface_guidance_override: None,
             smart_drops: false,
+            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
         }
     }
@@ -30417,6 +30444,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn protected_tool_ctx_reduce_ack_reuses_selection_snapshot() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let tags = (1..=6)
+            .map(|number| TagMintInput {
+                block_id: format!("m{number}#0"),
+                kind: "tool_result".to_string(),
+                token_count: 8000,
+                source_bytes: b"output".to_vec(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &tags, 1000).unwrap();
+        let mut loaded = store.load("ses").unwrap();
+        loaded
+            .meta
+            .protected_tool_block_ids
+            .insert("m2#0".to_string());
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({"drop":"2"})).await);
+        assert!(
+            ack.contains("Held: §2§ is inside the protected working set"),
+            "{ack}"
+        );
+        let delivery = tool_body(handler.handle_agent_drops_value(
+            7,
+            json!({"session_id":"ses", "drop":"2", "command_id":"held-tool-command"}),
+        ));
+        assert_eq!(delivery["held_tag_numbers"], json!([2]));
+        assert_eq!(delivery["queued"], 1);
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+    }
+
     #[test]
     fn expand_output_is_bounded_to_the_typescript_token_budget() {
         let output = truncate_expand_output("x".repeat(CTX_EXPAND_BYTE_BUDGET * 2));
@@ -36389,6 +36455,7 @@ mod tests {
                 protected_tokens_provenance: "derived",
                 compaction_enabled: true,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,
@@ -37372,6 +37439,7 @@ mod tests {
                 protected_tokens_provenance: "derived",
                 compaction_enabled: true,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,

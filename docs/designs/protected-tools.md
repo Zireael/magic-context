@@ -31,10 +31,10 @@ Every automatic lane that removes or shrinks a tool result:
 
 All four already pass candidates through one eligibility check (`canDrop` in TypeScript and Pi, the automatic-reduction filter in Rust), next to the user-answer rule from issue 581. Protection is added there, once.
 
-Not affected:
+Agent-directed and non-tool policies:
 
-- `ctx_reduce`: an explicit drop by the agent still works.
-- The historian: summarised results leave the prompt as usual.
+- Queued drops of a protected result, from the agent or from historian publication, are held; the historian's summary is unaffected, and the raw result leaves at the next fold.
+- Agent drops apply on a later cache-rebuilding pass once newer calls displace the result from its tool's protected count; already-dropped results are never restored. Compacted results are no longer active and stop counting toward N.
 - The frozen strips (old images, stale `ctx_reduce` calls, placeholder-only messages), which don't select tool results by name.
 
 ## At 95% and above

@@ -4925,6 +4925,11 @@ pub struct ModuleMeta {
     /// asynchronous reduction acknowledgements use the same floor as transforms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected_tokens_effective: Option<u64>,
+    /// The selection helper's latest protected-tool projection. Tool acknowledgements
+    /// reuse it without reconstructing names from tag rows, which store output text only.
+    /// This is decision metadata, never a render identity or cache-bust trigger.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub protected_tool_block_ids: std::collections::BTreeSet<String>,
     /// Decision calibration frozen at the last authorized bust. Absent legacy state stays
     /// neutral until the next bust so a binary table update cannot alter a defer decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -20016,6 +20021,35 @@ mod tests {
             .remove("protected_tokens_effective");
         let legacy: ModuleMeta = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.protected_tokens_effective, None);
+    }
+
+    #[test]
+    fn protected_tool_selection_snapshot_round_trips_without_a_schema_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let expected = std::collections::BTreeSet::from(["result#0".to_string()]);
+        {
+            let store = McStore::open_for_test(&descriptor).unwrap();
+            let meta = ModuleMeta {
+                protected_tool_block_ids: expected.clone(),
+                ..ModuleMeta::default()
+            };
+            store
+                .commit("held-tool", None, &CoreState::default(), &meta)
+                .unwrap();
+        }
+        let restarted = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            restarted
+                .load("held-tool")
+                .unwrap()
+                .meta
+                .protected_tool_block_ids,
+            expected
+        );
+        let legacy: ModuleMeta =
+            serde_json::from_value(serde_json::to_value(ModuleMeta::default()).unwrap()).unwrap();
+        assert!(legacy.protected_tool_block_ids.is_empty());
     }
 
     #[test]

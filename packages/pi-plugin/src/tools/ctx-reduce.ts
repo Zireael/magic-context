@@ -17,6 +17,7 @@ import {
 	readEpochFloorSnapshot,
 } from "@magic-context/core/features/magic-context/protection-window";
 import { parseRangeString } from "@magic-context/core/features/magic-context/range-parser";
+import { protectedToolTagNumbers } from "@magic-context/core/features/magic-context/reclaim-protection";
 import {
 	type ContextDatabase,
 	getOrCreateSessionMeta,
@@ -61,6 +62,10 @@ function formatIds(ids: number[]): string {
 }
 
 export interface CtxReduceToolDeps {
+	protectedTools?: Readonly<Record<string, number>>;
+	resolveProtectedTools?: (ctx: {
+		cwd: string;
+	}) => Readonly<Record<string, number>> | undefined;
 	db: ContextDatabase;
 	protectedTags?: number;
 	floor?: number;
@@ -126,7 +131,7 @@ export function createCtxReduceTool(
 				effectiveFloor,
 			);
 			const hasToolTags = allTags.some((t) => t.type === "tool");
-			const protectedSet = hasToolTags
+			const windowSet = hasToolTags
 				? windowResult.tagNumberSet.tagNumbers
 				: typeof deps.protectedTags === "number" && deps.protectedTags > 0
 					? new Set(
@@ -136,6 +141,13 @@ export function createCtxReduceTool(
 								.slice(0, deps.protectedTags),
 						)
 					: new Set<number>();
+			const protectedSet = new Set([
+				...windowSet,
+				...protectedToolTagNumbers(
+					activeTags,
+					deps.resolveProtectedTools?.(ctx) ?? deps.protectedTools,
+				),
+			]);
 
 			const tagStatusMap = new Map(
 				allTags.map((tag) => [tag.tagNumber, tag.status]),
@@ -246,8 +258,14 @@ export function createCtxReduceTool(
 				parts.push(`drop ${formatIds(immediateDropIds)}`);
 			if (deferredDropIds.length > 0)
 				parts.push(`deferred drop ${formatIds(deferredDropIds)}`);
+			const held =
+				deferredDropIds.length === 1
+					? `Held: §${deferredDropIds[0]} is inside the protected working set; it applies once newer work displaces it.`
+					: deferredDropIds.length > 1
+						? `Held: ${deferredDropIds.map((id) => `§${id}`).join(", ")} are inside the protected working set; they apply once newer work displaces them.`
+						: "";
 			return ok(
-				`Queued: ${parts.join(", ")}.${skippedNote ? ` ${skippedNote}` : ""}${inertNote ? ` ${inertNote}` : ""}`,
+				`Queued: ${parts.join(", ")}.${held ? ` ${held}` : ""}${skippedNote ? ` ${skippedNote}` : ""}${inertNote ? ` ${inertNote}` : ""}`,
 			);
 		},
 	};

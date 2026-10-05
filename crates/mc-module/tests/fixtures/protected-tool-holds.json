@@ -1,0 +1,6 @@
+[
+  {"label":"custom normalized tool drop waits for rotation","tools":["custom","mcp_CUSTOM","custom"],"protected_tools":{"MCP_CUSTOM":2},"drop":2,"new_tool":"CUSTOM"},
+  {"label":"default todowrite drop waits for rotation","tools":["todowrite","TODOWRITE"],"protected_tools":{},"drop":2,"new_tool":"mcp_todowrite"},
+  {"label":"newest three ctx_reduce results hold agent drops","tools":["ctx_reduce","ctx_reduce","MCP_CTX_REDUCE","ctx_reduce"],"protected_tools":{},"drop":2,"new_tool":"ctx_reduce"},
+  {"label":"historian queued protected drop holds until fold trim","tools":["custom","custom"],"protected_tools":{"custom":1},"drop":2,"new_tool":"custom","historian":true}
+]

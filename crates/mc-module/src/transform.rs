@@ -45,7 +45,7 @@ use crate::scheduler::{
 use crate::selection::{
     dropped_input_payload, filter_reasoning_ineligible_decisions, is_reclaim_hint_excluded_tool,
     resolve_tool_tier, select_reductions_with_outcome, PassClass, SelItem, SelKind, SelMessageRole,
-    SelectionConfig, SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
+    SelectionConfig, SelectionContext, AGE_RECLAIM_MIN_TOKENS,
 };
 use crate::tail_hygiene::{
     channel1_refire_tokens, effective_tail_hygiene, hygiene_band,
@@ -596,8 +596,9 @@ pub struct ProducerContext<'a> {
     /// Whether the full compaction pipeline is enabled. When false, the module emits only
     /// additive m0/m1 memory and project-doc blocks ahead of the unchanged live array.
     pub compaction_enabled: bool,
-    /// Smart-drop selector gate frozen at route bind.
+    /// Deprecated caller input, ignored by selection.
     pub smart_drops: bool,
+    pub protected_tools: std::collections::BTreeMap<String, usize>,
     /// Effective cache TTL used by the host-side idle predicate.
     pub cache_ttl: String,
     /// Whether the model-resolution walk selected a per-model entry or fell through to the default.
@@ -4805,7 +4806,7 @@ fn apply_once(
                 .map(|block| block.id.clone())
         })
         .collect::<HashSet<_>>();
-    let protected_block_ids = tag_window_protected_block_ids
+    let mut protected_block_ids = tag_window_protected_block_ids
         .union(&exempt_message_protected_block_ids)
         .cloned()
         .collect::<HashSet<_>>();
@@ -4818,7 +4819,9 @@ fn apply_once(
             timings.emergency_reasoning_exclusions = excluded_arcs;
         }
     }
-    let selection_outcome = if producer_gate {
+    // The same pure selection pass computes protection for acknowledgements on
+    // defer too. Its Defer class emits no reductions and never prices a rewrite.
+    let selection_outcome = {
         let frozen = frozen_red_targets(&loaded.core);
         // No per-request gate here: producer_gate already requires
         // tail_reclaim_enabled, which is the profile default. Gating again on the
@@ -4872,12 +4875,12 @@ fn apply_once(
             },
             &SelectionConfig {
                 smart_drops: ctx.smart_drops,
+                protected_tools: ctx.protected_tools.clone(),
             },
         )
-    } else {
-        SelectionOutcome::default()
     };
     timings.selection = elapsed_ms(selection_started_at);
+    protected_block_ids.extend(selection_outcome.protected_tool_block_ids.iter().cloned());
     let count_to_u64 =
         |count: Option<usize>| count.map(|value| u64::try_from(value).unwrap_or(u64::MAX));
     let eligible_supersession_count = count_to_u64(selection_outcome.eligible_supersession_count);
@@ -5054,6 +5057,11 @@ fn apply_once(
     let mut core = loaded.core.clone();
     log_reasoning_drop_seed_skips(&core, &live, &req.session_id);
     let mut meta = loaded.meta.clone();
+    meta.protected_tool_block_ids = selection_outcome
+        .protected_tool_block_ids
+        .iter()
+        .cloned()
+        .collect();
     // Persist an equivalent revision written by an older digest format. This changes only
     // stored metadata; the served bytes are decided by the plan above.
     meta.m1_revision = applied_m1_revision;
@@ -18629,6 +18637,7 @@ pub(crate) mod tests {
             protected_tokens_provenance: "derived",
             compaction_enabled: true,
             smart_drops: false,
+            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
             cache_ttl_provenance: CacheTtlProvenance::Default,
             model_key: None,
@@ -18645,6 +18654,106 @@ pub(crate) mod tests {
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.smart_drops = true;
         ctx
+    }
+
+    #[test]
+    fn protected_tool_snapshot_is_the_selection_set_and_rotation_does_not_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.protected_tools.insert("probe".to_string(), 1);
+        let mut request = req(
+            "protected-snapshot",
+            "cfg0",
+            vec![
+                wire_tool_call("owner", 1, "call_result"),
+                wire_tool_result(
+                    "result",
+                    2,
+                    json!({"kind":{"type":"text", "text":"protected output"}}),
+                ),
+            ],
+        );
+        request.tool_present = true;
+        transform(&s, &request, &ctx).unwrap();
+        let before = transform(&s, &request, &ctx).unwrap();
+        assert!(s
+            .load("protected-snapshot")
+            .unwrap()
+            .meta
+            .protected_tool_block_ids
+            .contains("result#0"));
+        request
+            .messages
+            .push(wire_tool_call("new-owner", 3, "call_new-result"));
+        request.messages.push(wire_tool_result(
+            "new-result",
+            4,
+            json!({"kind":{"type":"text", "text":"new output"}}),
+        ));
+        let after = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(after.action, "SOFT+");
+        let before_messages = before.ck_messages.as_ref().unwrap();
+        let after_messages = after.ck_messages.as_ref().unwrap();
+        assert_eq!(after_messages[..before_messages.len()], before_messages[..]);
+        let held = &s
+            .load("protected-snapshot")
+            .unwrap()
+            .meta
+            .protected_tool_block_ids;
+        assert!(held.contains("new-result#0"));
+        assert!(!held.contains("result#0"));
+    }
+
+    #[test]
+    fn protected_tool_queued_drop_persists_until_rotation_and_a_priced_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let context = smart_pctx();
+        let mut messages = vec![item("a", 1, "raw")];
+        messages.extend(todowrite_arc("held", 2));
+        // Separate the result from the independent protected token tail.
+        for n in 0..3 {
+            messages.push(assistant_tool_call(
+                &format!("bash-{n}"),
+                4 + n * 2,
+                &format!("bash-call-{n}"),
+            ));
+            messages.push(tool_result(
+                &format!("bash-result-{n}"),
+                5 + n * 2,
+                &format!("bash-call-{n}"),
+                &"payload ".repeat(8000),
+            ));
+        }
+        let mut request = with_usage(active_cc_req("ses", "cfg0", messages), 10_000, 100_000);
+        request.protected_tokens_effective = Some(4000);
+        transform(&s, &request, &context).unwrap();
+        // Agent and historian publication share this durable, origin-free queue.
+        s.append_pending_agent_drops("ses", &["held_result#0".to_string()], 1)
+            .unwrap();
+        for config in ["cfg1", "cfg2"] {
+            request.render_config = config.to_string();
+            let response = transform(&s, &request, &context).unwrap();
+            assert_eq!(s.load_pending_agent_drops("ses").unwrap().len(), 1);
+            assert!(serde_json::to_string(&response.ck_messages)
+                .unwrap()
+                .contains("todo output"));
+            assert!(!frozen_red_targets(&s.load("ses").unwrap().core).contains("held_result#0"));
+        }
+        // Rotation alone must not rewrite the cached output or drain the queue.
+        request.messages.extend(todowrite_arc("newest", 10));
+        let defer = transform(&s, &request, &context).unwrap();
+        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(s.load_pending_agent_drops("ses").unwrap().len(), 1);
+        assert!(!frozen_red_targets(&s.load("ses").unwrap().core).contains("held_result#0"));
+        request.render_config = "cfg3".to_string();
+        transform(&s, &request, &context).unwrap();
+        assert!(s.load_pending_agent_drops("ses").unwrap().is_empty());
+        assert!(frozen_red_targets(&s.load("ses").unwrap().core).contains("held_result#0"));
+        transform(&s, &request, &context).unwrap();
+        assert!(frozen_red_targets(&s.load("ses").unwrap().core).contains("held_result#0"));
     }
 
     fn seed_unrelated_hint_candidates(store: &McStore) {
@@ -20883,7 +20992,10 @@ pub(crate) mod tests {
             &items,
             &HashSet::new(),
             &ctx,
-            &SelectionConfig { smart_drops: false },
+            &SelectionConfig {
+                smart_drops: false,
+                ..SelectionConfig::default()
+            },
         );
         let mut applied = first
             .decisions
@@ -20928,7 +21040,10 @@ pub(crate) mod tests {
             &items,
             &applied,
             &ctx,
-            &SelectionConfig { smart_drops: false },
+            &SelectionConfig {
+                smart_drops: false,
+                ..SelectionConfig::default()
+            },
         );
         assert!(still_protected.decisions.is_empty());
 
@@ -20957,7 +21072,10 @@ pub(crate) mod tests {
             &items,
             &applied,
             &ctx,
-            &SelectionConfig { smart_drops: false },
+            &SelectionConfig {
+                smart_drops: false,
+                ..SelectionConfig::default()
+            },
         );
         // The later bust may also reclaim unprotected call blocks automatically;
         // count the explicit queue targets separately from those arc decisions.

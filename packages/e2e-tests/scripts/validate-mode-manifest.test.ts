@@ -32,12 +32,12 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(54);
+        expect(ts).toHaveLength(55);
         expect(rust).toHaveLength(57);
         expect(rust).toContain("tests/idle-ttl-restart.test.ts");
         expect(rust).toContain("tests/subagent-behavior.test.ts");
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(3);
-        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(39);
+        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(40);
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(27);
         expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(32);
         // These OpenCode 2 files are ts-only with hosts ["opencode2"], so only the

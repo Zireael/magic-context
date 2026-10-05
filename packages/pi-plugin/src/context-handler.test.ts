@@ -103,6 +103,7 @@ import {
 	toolResultMessage,
 	userMessage,
 } from "./test-utils.test";
+import { createCtxReduceTool } from "./tools/ctx-reduce";
 import { createPiTranscript } from "./transcript-pi";
 
 describe("Pi context project identity cache", () => {
@@ -447,6 +448,93 @@ describe("Pi scheduler decision observability", () => {
 			expect(consumeDeferredMaterialization(sessionId)).toBe(false);
 		} finally {
 			restoreObserver();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("Pi pipeline holds a queued protected tool through priced passes and releases after rotation", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-held-rotation";
+		const fake = createFakePi();
+		registerPiContextHandler(fake.pi as never, {
+			db,
+			protectedTools: { custom: 2 },
+			protectedTokens: 4000,
+			protectedTags: 0,
+			heuristics: {},
+			injection: { injectionBudgetTokens: 10000 },
+		});
+		const handler = fake.handlers.get("context") as Parameters<
+			typeof runPass
+		>[0];
+		const messages = [userMessage("start", 1)];
+		for (let n = 1; n <= 3; n++) {
+			messages.push(assistantToolCall(`custom-${n}`, "custom", {}, n * 2), {
+				...toolResultMessage(`custom-${n}`, `custom result ${n}`, n * 2 + 1),
+				toolName: "custom",
+			});
+		}
+		for (let n = 1; n <= 3; n++) {
+			const output = Array.from(
+				{ length: 3000 },
+				(_, i) => `${i * 7919 + n * 104729}:${i * 3571}!`,
+			).join(" ");
+			messages.push(assistantToolCall(`bash-${n}`, "bash", {}, 10 + n * 2), {
+				...toolResultMessage(`bash-${n}`, output, 11 + n * 2),
+				toolName: "bash",
+			});
+		}
+		for (let n = 20; n < 40; n++)
+			messages.push(userMessage(`later work ${n}`, n));
+		try {
+			await runPass(handler, sessionId, structuredClone(messages));
+			const tag = getTagsBySession(db, sessionId).find(
+				(tag) => tag.messageId === "custom-2" && tag.type === "tool",
+			);
+			expect(tag).toBeDefined();
+			if (!tag) throw new Error("The protected tool result was not tagged");
+			const ack = await createCtxReduceTool({
+				db,
+				protectedTools: { custom: 2 },
+				floor: 4000,
+			}).execute(
+				"held-tool",
+				{ drop: String(tag.tagNumber) },
+				new AbortController().signal,
+				undefined,
+				fakeContext(sessionId) as never,
+			);
+			expect((ack.content[0] as { text: string }).text).toContain(
+				`Held: §${tag.tagNumber} is inside the protected working set`,
+			);
+			const status = () =>
+				getTagsBySession(db, sessionId).find(
+					(row) => row.tagNumber === tag.tagNumber,
+				)?.status;
+			for (let n = 0; n < 2; n++) {
+				signalPiPendingMaterialization(sessionId);
+				await runPass(handler, sessionId, structuredClone(messages));
+				expect(status()).toBe("active");
+			}
+			expect(
+				getPendingOps(db, sessionId).some((op) => op.tagId === tag.tagNumber),
+			).toBe(true);
+			messages.push(assistantToolCall("custom-4", "custom", {}, 50), {
+				...toolResultMessage("custom-4", "new custom result", 51),
+				toolName: "custom",
+			});
+			await runPass(handler, sessionId, structuredClone(messages));
+			expect(status()).toBe("active");
+			signalPiPendingMaterialization(sessionId);
+			await runPass(handler, sessionId, structuredClone(messages));
+			expect(status()).toBe("dropped");
+			expect(
+				getPendingOps(db, sessionId).some((op) => op.tagId === tag.tagNumber),
+			).toBe(false);
+			await runPass(handler, sessionId, structuredClone(messages));
+			expect(status()).toBe("dropped");
+		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
 		}
