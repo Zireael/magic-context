@@ -341,59 +341,53 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - name: Read the pinned Rust crate provenance
+      - name: Resolve Cargo.lock crate pins
         id: cargo-pins
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import os
-          import tomllib
-          from pathlib import Path
+          python3 scripts/cargo-lock-pins.py --self-test
+          pins="$(python3 scripts/cargo-lock-pins.py)"
+          printf '%s\n' "$pins" >> "$GITHUB_OUTPUT"
+          locked_crates="$(printf '%s\n' "$pins" | sed -n 's/^locked_crates=//p')"
+          echo "Cargo.lock pins: $locked_crates" >> "$GITHUB_STEP_SUMMARY"
 
-          packages = tomllib.loads(Path("Cargo.lock").read_text())["package"]
-          pinned = []
-          git_revisions = {}
-          for package in packages:
-              if not package["name"].startswith(("cortexkit-", "subc-")):
-                  continue
-              source = package.get("source", "")
-              if source.startswith("git+"):
-                  revision = source.rsplit("#", 1)[-1]
-                  pinned.append(f"{package['name']}={package['version']}@{revision}")
-                  git_revisions.setdefault(package["name"], set()).add(revision)
-              else:
-                  pinned.append(f"{package['name']}={package['version']}")
-          expected_git_crates = {"cortexkit-cache-core", "subc-core"}
-          if set(git_revisions) != expected_git_crates or any(len(revisions) != 1 for revisions in git_revisions.values()):
-              raise SystemExit(f"expected one locked revision each for {sorted(expected_git_crates)}, got {git_revisions}")
-          subc_revision = next(iter(git_revisions["subc-core"]))
-          locked_crates = ','.join(sorted(pinned))
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              print(f"subc_revision={subc_revision}", file=output)
-              print(f"locked_crates={locked_crates}", file=output)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              print(f"Cargo.lock pins: {locked_crates}", file=summary)
-          PY
 
       # Cargo builds the locked subc-core library as a dependency but not its daemon
       # binary target. Keep this checkout only in the artifact builder that produces
       # ck-subc; the parallel e2e shards download and execute that binary.
-      - name: Check out locked subconscious source for ck-subc
+      - name: Check out Cargo.lock-pinned subconscious source for ck-subc
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
           path: .siblings/subconscious
           ref: ${{ steps.cargo-pins.outputs.subc_revision }}
 
+      - name: Record locked daemon source revision
+        id: daemon-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git -C "$GITHUB_WORKSPACE/.siblings/subconscious" rev-parse HEAD)"
+          expected="${{ steps.cargo-pins.outputs.subc_revision }}"
+          if [[ "$sha" != "$expected" ]]; then
+            echo "checked out daemon source $sha, expected Cargo.lock revision $expected" >&2
+            exit 1
+          fi
+          summary="ck-subc source pinned by Cargo.lock: $sha"
+          echo "$summary"
+          echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Derive hermetic Cargo cache key
         id: cargo-cache-key
         shell: bash
         run: |
           set -euo pipefail
-          # Cargo.lock records the resolved published crate versions and both exact
-          # git revisions; hash the full graph instead of sibling manifests/locks.
-          digest="$(sha256sum Cargo.lock | sha256sum | awk '{print $1}')"
+          # Include the resolved graph and the exact daemon source revision.
+          lock_digest="$(sha256sum Cargo.lock | awk '{print $1}')"
+          source_sha="${{ steps.daemon-source.outputs.sha }}"
+          digest="$(printf '%s\n%s\n' "$lock_digest" "$source_sha" | sha256sum | awk '{print $1}')"
           echo "key=rust-hermetic-${RUNNER_OS}-${RUNNER_ARCH}-${digest}" >> "$GITHUB_OUTPUT"
       - name: Restore ck-subc and ckdev-mc-e2e Cargo target cache
         uses: actions/cache@v4

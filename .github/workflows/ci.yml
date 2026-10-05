@@ -32,14 +32,16 @@ env:
 #
 # Docker e2e was previously in a separate workflow (e2e-docker.yml). Folding it here means
 # every master/main push exercises the full unit → Docker → host gauntlet. The
-# Rust jobs run on every push and scheduled run, checking the Cargo.lock-pinned crates:
+# Rust jobs run on every push and scheduled run. Pushes use Cargo.lock-pinned crates;
+# the scheduled hermetic build additionally probes the subconscious default branch:
 #
 #   rust-crates          cargo fmt / clippy --all-targets / cargo test, including every
 #                        integration target under crates/*/tests
 #   e2e-rust-hermetic-build → e2e-rust-hermetic (4 shards)
 #
-# The daemon integration tests build ck-subc from the exact subconscious revision in
-# Cargo.lock. The hermetic test shards consume binaries built from that same revision.
+# The mc-module integration tests always build ck-subc from its Cargo.lock revision.
+# Hermetic push builds use that same revision; the nightly build intentionally builds
+# subconscious default-branch HEAD and reports it as drift in the job summary.
 
 jobs:
   check-plugin:
@@ -533,8 +535,8 @@ jobs:
     # Published commons and subconscious crates resolve from this repository's
     # Cargo.lock, so there is no commons checkout or floating crate source here.
     #
-    # It exists because NOTHING ran `cargo test` in this workflow: the drift leg
-    # below builds the crates only as a side effect of the hermetic harness, so an
+    # It exists because no other CI job runs cargo test; the hermetic build below
+    # compiles the crates only as part of producing its Rust test binaries, so an
     # integration test under crates/*/tests could fail unobserved. It depends on the
     # no other suite, so a Rust regression is reported even
     # when an unrelated host suite is red.
@@ -557,40 +559,16 @@ jobs:
       - name: Install CLI dependencies
         run: bun install --frozen-lockfile
 
-      - name: Read the pinned Rust crate provenance
+      - name: Resolve Cargo.lock crate pins
         id: cargo-pins
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import os
-          import tomllib
-          from pathlib import Path
-
-          packages = tomllib.loads(Path("Cargo.lock").read_text())["package"]
-          pinned = []
-          git_revisions = {}
-          for package in packages:
-              if not package["name"].startswith(("cortexkit-", "subc-")):
-                  continue
-              source = package.get("source", "")
-              if source.startswith("git+"):
-                  revision = source.rsplit("#", 1)[-1]
-                  pinned.append(f"{package['name']}={package['version']}@{revision}")
-                  git_revisions.setdefault(package["name"], set()).add(revision)
-              else:
-                  pinned.append(f"{package['name']}={package['version']}")
-          expected_git_crates = {"cortexkit-cache-core", "subc-core"}
-          if set(git_revisions) != expected_git_crates or any(len(revisions) != 1 for revisions in git_revisions.values()):
-              raise SystemExit(f"expected one locked revision each for {sorted(expected_git_crates)}, got {git_revisions}")
-          subc_revision = next(iter(git_revisions["subc-core"]))
-          locked_crates = ','.join(sorted(pinned))
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              print(f"subc_revision={subc_revision}", file=output)
-              print(f"locked_crates={locked_crates}", file=output)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              print(f"Cargo.lock pins: {locked_crates}", file=summary)
-          PY
+          python3 scripts/cargo-lock-pins.py --self-test
+          pins="$(python3 scripts/cargo-lock-pins.py)"
+          printf '%s\n' "$pins" >> "$GITHUB_OUTPUT"
+          locked_crates="$(printf '%s\n' "$pins" | sed -n 's/^locked_crates=//p')"
+          echo "Cargo.lock pins: $locked_crates" >> "$GITHUB_STEP_SUMMARY"
 
       # real_daemon.rs builds ck-subc and checks its launch-nonce history; this
       # exact locked checkout is therefore needed only by this integration-test job.
@@ -636,7 +614,8 @@ jobs:
 
   e2e-rust-hermetic-build:
     name: E2E (Rust hermetic build)
-    # Cargo.lock pins the published crate versions and the two git dependency revisions.
+    # Cargo.lock pins the published crate versions and both git dependency revisions.
+    # On schedule the daemon checkout below intentionally switches to upstream HEAD.
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -650,59 +629,60 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Read the pinned Rust crate provenance
+      - name: Resolve Cargo.lock crate pins
         id: cargo-pins
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import os
-          import tomllib
-          from pathlib import Path
+          python3 scripts/cargo-lock-pins.py --self-test
+          pins="$(python3 scripts/cargo-lock-pins.py)"
+          printf '%s\n' "$pins" >> "$GITHUB_OUTPUT"
+          locked_crates="$(printf '%s\n' "$pins" | sed -n 's/^locked_crates=//p')"
+          echo "Cargo.lock pins: $locked_crates" >> "$GITHUB_STEP_SUMMARY"
 
-          packages = tomllib.loads(Path("Cargo.lock").read_text())["package"]
-          pinned = []
-          git_revisions = {}
-          for package in packages:
-              if not package["name"].startswith(("cortexkit-", "subc-")):
-                  continue
-              source = package.get("source", "")
-              if source.startswith("git+"):
-                  revision = source.rsplit("#", 1)[-1]
-                  pinned.append(f"{package['name']}={package['version']}@{revision}")
-                  git_revisions.setdefault(package["name"], set()).add(revision)
-              else:
-                  pinned.append(f"{package['name']}={package['version']}")
-          expected_git_crates = {"cortexkit-cache-core", "subc-core"}
-          if set(git_revisions) != expected_git_crates or any(len(revisions) != 1 for revisions in git_revisions.values()):
-              raise SystemExit(f"expected one locked revision each for {sorted(expected_git_crates)}, got {git_revisions}")
-          subc_revision = next(iter(git_revisions["subc-core"]))
-          locked_crates = ','.join(sorted(pinned))
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              print(f"subc_revision={subc_revision}", file=output)
-              print(f"locked_crates={locked_crates}", file=output)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              print(f"Cargo.lock pins: {locked_crates}", file=summary)
-          PY
-
-      # Cargo resolves subc-core as a library dependency but does not build its
-      # ck-subc binary target. This single checkout supplies that daemon binary;
-      # the parallel test shards consume the artifact and need no sibling source.
-      - name: Check out locked subconscious source for ck-subc
+      # Cargo can resolve subc-core as a library dependency but does not build its
+      # ck-subc binary target. Pushes use the root lockfile revision; only the scheduled
+      # run deliberately checks the subconscious default branch for upstream drift.
+      - name: Check out Cargo.lock-pinned subconscious source for ck-subc
+        if: ${{ github.event_name != 'schedule' }}
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
           path: .siblings/subconscious
           ref: ${{ steps.cargo-pins.outputs.subc_revision }}
 
+      - name: Check out subconscious default branch for scheduled drift
+        if: ${{ github.event_name == 'schedule' }}
+        uses: actions/checkout@v5
+        with:
+          repository: cortexkit/subconscious
+          path: .siblings/subconscious
+
+      - name: Record ck-subc source revision
+        id: daemon-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git -C "$GITHUB_WORKSPACE/.siblings/subconscious" rev-parse HEAD)"
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            summary="ck-subc source drift: subconscious default-branch HEAD $sha"
+          else
+            summary="ck-subc source pinned by Cargo.lock: $sha"
+          fi
+          echo "$summary"
+          echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Derive hermetic Cargo cache key
         id: cargo-cache-key
         shell: bash
         run: |
           set -euo pipefail
-          # The complete root lock records crates.io versions and both pinned git
-          # revisions, so key on it rather than sibling manifests or lockfiles.
-          digest="$(sha256sum Cargo.lock | sha256sum | awk '{print $1}')"
+          # Key on the resolved Cargo graph plus the exact daemon source, including
+          # nightly HEAD, so pinned and drift builds never reuse one another's cache.
+          lock_digest="$(sha256sum Cargo.lock | awk '{print $1}')"
+          source_sha="${{ steps.daemon-source.outputs.sha }}"
+          digest="$(printf '%s\n%s\n' "$lock_digest" "$source_sha" | sha256sum | awk '{print $1}')"
           echo "key=rust-hermetic-${RUNNER_OS}-${RUNNER_ARCH}-${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Restore ck-subc and ckdev-mc-e2e Cargo target cache
