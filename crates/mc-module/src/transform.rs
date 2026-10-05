@@ -4960,6 +4960,7 @@ fn apply_once(
         planned_reasoning_cutoff,
         non_tool_bust_opportunity,
         lineage_anchor_mid,
+        &selection_outcome.protected_tool_block_ids,
     );
     let reclaim_pending_now = reductions_pending_now
         || !planned_caveman_units.is_empty()
@@ -13105,6 +13106,7 @@ fn new_frozen_strip_units(
     reasoning_clear_cutoff: Option<u64>,
     is_bust_pass: bool,
     lineage_anchor_mid: Option<&str>,
+    protected_tools: &HashSet<String>,
 ) -> Vec<FrozenUnit> {
     if !is_bust_pass {
         return Vec::new();
@@ -13155,6 +13157,9 @@ fn new_frozen_strip_units(
             continue;
         }
         let blocks = message.ck.content.as_slice();
+        let protected_reduce = blocks.iter().enumerate().any(|(index, block)| {
+            is_reduce_block(block) && protected_tools.contains(&format!("{}#{index}", message.mid))
+        });
         if message.ck.role == "assistant" {
             // The reverse image scan in TS treats any assistant message as evidence
             // that older user content has already reached the model.
@@ -13210,6 +13215,7 @@ fn new_frozen_strip_units(
             if request_accepts_empty_content(req)
                 && index < protected_start
                 && blocks.iter().any(is_reduce_block)
+                && !protected_reduce
             {
                 let unit = strip_unit("stale_reduce", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
@@ -13226,7 +13232,8 @@ fn new_frozen_strip_units(
         }
         let is_stale_reduce = request_accepts_empty_content(req)
             && index < protected_start
-            && blocks.iter().any(is_reduce_block);
+            && blocks.iter().any(is_reduce_block)
+            && !protected_reduce;
         if is_stale_reduce {
             let unit = strip_unit("stale_reduce", &message.mid, &sentinel);
             if !existing_keys.contains(unit.key.as_str()) {
@@ -18739,6 +18746,58 @@ pub(crate) mod tests {
             .protected_tool_block_ids;
         assert!(held.contains("new-result#0"));
         assert!(!held.contains("result#0"));
+    }
+
+    #[test]
+    fn protected_ctx_reduce_stale_detection_and_frozen_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut ctx = smart_pctx();
+        ctx.protected_tools.insert("ctx_reduce".into(), 6);
+        let mut messages = Vec::new();
+        for n in 0..6 {
+            let mut call = wire_tool_call(
+                &format!("owner-{n}"),
+                n * 2 + 1,
+                &format!("call_result-{n}"),
+            );
+            if let ck_wire::CkKind::ToolCall { name, .. } = &mut call.ck.content[0].kind {
+                *name = "ctx_reduce".into();
+            }
+            let mut result = wire_tool_result(
+                &format!("result-{n}"),
+                n * 2 + 2,
+                json!({"kind":{"type":"text","text":"reduce result"}}),
+            );
+            if let ck_wire::CkKind::ToolResult { tool_name, .. } = &mut result.ck.content[0].kind {
+                *tool_name = "ctx_reduce".into();
+            }
+            messages.extend([call, result]);
+        }
+        messages.extend((0..45).map(|n| item(&format!("later-{n}"), n + 20, "later work")));
+        let mut request = req("ses", "cfg0", messages);
+        request.provider_id = Some("anthropic".into());
+        transform(&s, &request, &ctx).unwrap();
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .all(|unit| !unit.key.starts_with("strip:stale_reduce:")));
+        ctx.protected_tools.insert("ctx_reduce".into(), 0);
+        request.render_config = "cfg1".into();
+        let stripped = transform(&s, &request, &ctx).unwrap();
+        assert!(s
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key.starts_with("strip:stale_reduce:")));
+        ctx.protected_tools.insert("ctx_reduce".into(), 6);
+        let replay = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(stripped.ck_messages, replay.ck_messages);
     }
 
     #[test]

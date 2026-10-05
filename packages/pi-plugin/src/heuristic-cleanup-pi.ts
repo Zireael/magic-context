@@ -33,7 +33,10 @@
  */
 
 import { freezePiContentDecision } from "@magic-context/core/features/magic-context/pi-content-decisions";
-import { protectedToolTagNumbers } from "@magic-context/core/features/magic-context/reclaim-protection";
+import {
+	CTX_REDUCE_KEEP,
+	protectedToolTagNumbers,
+} from "@magic-context/core/features/magic-context/reclaim-protection";
 import { sessionDecisionCalibration } from "@magic-context/core/features/magic-context/session-decision-calibration";
 import {
 	type ContextDatabase,
@@ -72,7 +75,7 @@ import { sessionLog } from "@magic-context/core/shared/logger";
  * Pi names its built-in tools bare (`read`, `grep`), so the bare names
  * are what match; the `mcp_` forms cover MCP servers using that prefix.
  */
-export const PI_CTX_REDUCE_KEEP = 3;
+export const PI_CTX_REDUCE_KEEP = CTX_REDUCE_KEEP;
 
 const DEDUP_SAFE_TOOLS = new Set([
 	"grep",
@@ -285,14 +288,10 @@ function collectStaleReduceCallIds(
 		if (left.composite === right.composite) return 0;
 		return left.composite < right.composite ? 1 : -1;
 	});
-	const protectedComposite = new Set(
-		newestFirst.slice(0, PI_CTX_REDUCE_KEEP).map((call) => call.composite),
-	);
 	const composite = new Set<string>();
 	const bareCallIds = new Set<string>();
 	for (const call of newestFirst) {
-		if (call.maxTag > toolAgeCutoff || protectedComposite.has(call.composite))
-			continue;
+		if (call.maxTag > toolAgeCutoff) continue;
 		composite.add(call.composite);
 		bareCallIds.add(call.callId);
 	}
@@ -355,8 +354,7 @@ export function applyPiHeuristicCleanup(
 			? maxTag + 1
 			: (config.protectedCutoff ?? maxTag - config.protectedTags);
 	const routine = config.routine !== false;
-	// Stale ctx_reduce removal uses the protected-tail window after first retaining
-	// the newest housekeeping exemplars; only older calls can become stale.
+	// Stale detection uses the same effective per-tool set as other result lanes.
 	const toolAgeCutoff = protectedCutoff;
 
 	let droppedTools = 0;
@@ -489,6 +487,7 @@ export function applyPiHeuristicCleanup(
 			for (const tag of tags) {
 				if (tag.status !== "active") continue;
 				if (tag.type !== "tool") continue;
+				if (protectedTools.has(tag.tagNumber)) continue;
 				if (!tag.messageId) continue;
 				// Composite match for tags carrying an owner — prevents a reused
 				// callId in a fresh turn from being dropped by a stale call in an

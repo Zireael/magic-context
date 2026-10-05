@@ -35,7 +35,7 @@ Agent-directed and non-tool policies:
 
 - Queued drops of a protected result, from the agent or from historian publication, are held; the historian's summary is unaffected, and the raw result leaves at the next fold.
 - Agent drops apply on a later cache-rebuilding pass once newer calls displace the result from its tool's protected count; already-dropped results are never restored. Compacted results are no longer active and stop counting toward N.
-- The frozen strips (old images, stale `ctx_reduce` calls, placeholder-only messages), which don't select tool results by name.
+- First detection of stale `ctx_reduce` stripping honours the effective protected tool set, just like other automatic result removal. Frozen strip replay is immutable: changing the map never resurrects an already-stripped result. Image and placeholder-only strips keep their separate structural policies.
 
 ## At 95% and above
 

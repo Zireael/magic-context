@@ -10969,3 +10969,32 @@ it("impossible protected reclaim refuses an over-limit wire before provider reje
         }).shouldAbort,
     ).toBe(true);
 });
+it("newest protected ctx_reduce results survive automatic stale stripping", async () => {
+    const id = "protected-stale-reduce";
+    const { add } = seedProtectedReviewSession(id, "ctx_reduce");
+    const messages = [
+        add(1),
+        add(2),
+        add(3),
+        ...Array.from(
+            { length: 30 },
+            (_, n) =>
+                ({
+                    info: { id: `later-${n}`, role: n % 2 ? "assistant" : "user" },
+                    parts: [{ type: "text", text: `later unrelated message ${n}` }],
+                }) as MessageLike,
+        ),
+    ];
+    const before = JSON.stringify(messages.slice(0, 3));
+    await runPostTransformPhase(
+        basePostTransformArgs(db, id, messages, {
+            tags: getActiveTagsBySession(db, id),
+            schedulerDecision: "execute",
+            pendingMaterializationSessions: new Set([id]),
+            protectedCount: 20,
+            resolvedProviderID: "anthropic",
+        }),
+    );
+    expect(getTagsBySession(db, id).every((tag) => tag.status === "active")).toBe(true);
+    expect(JSON.stringify(messages.slice(0, 3))).toBe(before);
+});

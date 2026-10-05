@@ -50,3 +50,18 @@ Its old 2048-message byte-identity fixture was over the former artificial window
 the fixture now supplies an isolated SDK window large enough for its unchanged
 ballast. Its exact SHA256 assertions remain unchanged and all three pass classes
 pass, while the separate over-limit regression proves refusal.
+
+## Stale result stripping
+
+First detection in OpenCode, Pi and ck-mc consumes the effective per-tool
+selection set. Pi's old hardcoded newest-three selector is removed; its exported
+default-count alias is only fixture metadata. A zero override permits stale
+selection, while custom counts above three hold all requested results. Frozen
+replay is unchanged and cannot resurrect a previously stripped result. The
+design document now describes that distinction accurately.
+
+The two executed review regressions are in the postprocess and Pi cleanup
+suites. A real native transform verifies held detection, a zero-count priced
+strip, and byte-identical frozen replay after protection is restored. All three
+guards were individually neutralized and each exact regression reddened; restored
+checks passed (266 Bun tests and one native integration-style unit test).

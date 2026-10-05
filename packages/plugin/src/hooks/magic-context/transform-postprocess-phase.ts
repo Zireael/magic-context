@@ -2783,6 +2783,11 @@ export async function runPostTransformPhase(
             const staleReduceResult = dropStaleReduceCalls(args.messages, frozenStaleReduceIds, {
                 detect: isCacheBustingPass,
                 protectedCount: args.protectedCount,
+                protectedCallIds: new Set(
+                    args.tags
+                        .filter((tag) => protectedToolTags.has(tag.tagNumber))
+                        .map((tag) => tag.messageId),
+                ),
                 onFirstApplication: recordFirstApplicationAt,
             });
             if (isCacheBustingPass && staleReduceResult.newlyStrippedIds.length > 0) {
