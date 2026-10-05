@@ -1,6 +1,6 @@
 # UI performance audit — partial delivery
 
-Baseline: `ee9d82912cd8105322672a1f5dd1bbb7172a2f46`. No dashboard or CLI production code was changed. The native dashboard baseline build could not finish within its 1,200-second outer timeout: the machine's six shared compile slots were occupied, and the build spent most of its time queued. This prevents native before/after polling/render measurements and the required Rust verification. The remainder of the audit is **blocked, not completed**.
+Baseline: `ee9d82912cd8105322672a1f5dd1bbb7172a2f46`. The verified production fixes are UI-16 (retina quiet polling) and UI-17 (request-scoped doctor identity probes). No dashboard production code was committed. After the first 1,200-second native timeout, the dashboard build was resumed in the background with a **10,800-second** outer timeout, as requested. It still exited 124 after three hours, with no dashboard unit-test binary produced. The machine's six shared compile slots remained congested. This prevents native before/after polling/render measurements and required Rust verification. The remainder of the audit is **blocked, not completed**.
 
 ## Measurements and disposition
 
@@ -24,9 +24,9 @@ The SQL numbers below are measured SQL/JavaScript lower bounds, **not** timings 
 | UI-14 | Unmeasured / blocked | — | none | native probe not reached | Must retain legacy path-to-identity matching for workspace members. |
 | UI-15 | Unmeasured / blocked | — | none | render baseline unavailable | No frontend changes. |
 | UI-16 | CONFIRMED; quiet-poll ancestry fixed | 3 → 2 git processes per unchanged descendant poll (90 → 60 over 30 polls); loaded-machine medians 93.066 → 51.986 ms | `22c6e2110d` | `unchanged git_commit_after validates refs but skips the ancestry process`; `retina-poll.ts` | Both refs are still validated every poll, preserving errors for deleted/moved bases. Initial baseline median was 52.259 ms and the first post-change run was 76.788 ms: host contention makes wall times noisy; the deterministic improvement is one fewer process/path revalidation per quiet poll. |
-| UI-17 | Unmeasured / remaining | — | none | not run | No claim of completion. |
-| UI-18 | Unmeasured / remaining | — | none | not run | No npm/registry behavior changed. |
-| UI-19 | Unmeasured / remaining | — | none | not run | No migration or boundary-remapping change made. |
+| UI-17 | CONFIRMED; fixed | 1k: 24.945 → 1.638 ms; 10k: 213.768 → 10.742 ms; 60k: 1,289.542 → 69.646 ms | `d25ac8b241` | `cli-probes.ts` calls the actual routine; `identity inspections reuse path and count probes only within one request` | Resolve repeated directory spellings once, reuse count statements/results and git roots within the inspection only. Tests preserve read-only output and prove the next inspection sees changed data. |
+| UI-18 | POLICY; unchanged by parent decision | Local registry: npm 216.727–307.771 ms versus direct fetch 0.153–0.467 ms | none | `npm-probe.ts`, npm 11.13.0 | npm's config loader preserves .npmrc/private-registry authentication; the OpenCode fetch helper is env-registry-only. Parent chose to preserve registry/auth behavior: about 250 ms once per doctor run is not worth a diagnostic contract change. |
+| UI-19 | NEGLIGIBLE; unchanged | 0.258 ms per worst-case missing boundary on 60k IDs (200 repetitions) | none | `cli-probes.ts` executes the actual extracted routine | Below 1 ms per boundary. No migration or remapping change made. |
 
 “Unmeasured” is intentionally not one of the audit's five measured classifications. A blocked experiment is not evidence for NEGLIGIBLE or NOT REPRODUCIBLE.
 
@@ -66,3 +66,22 @@ No transform-path code changed, so pure-replay differential is not applicable. T
 - `todowrite` was not exposed in the worker tool set.
 
 Comments in the staged production/test/script changes were reviewed before committing: they explain why refs remain validated, why only quiet-poll ancestry is skipped, and explicitly distinguish SQL lower bounds from native/render measurements.
+
+## Resumed work and next action
+
+The second attempt ran `timeout 10800 cargo test --locked --manifest-path packages/dashboard/src-tauri/Cargo.toml -p magic-context-dashboard --no-run` in the background. Compilation progressed through substantial Tauri/WRY, ICU, serde and Tokio dependency work, but produced **no** `magic_context_dashboard_lib-*` executable. An OS process-exit event waiter, rather than polling/sleeping, awaited the original compiler's exit and checked for a binary before running any native or browser probe. It exited 124 without starting those probes. No Rust test or clippy pass is claimed.
+
+The UI-1 change was prepared while compilation queued: drop `raw_json` from the message IPC DTO and TS type, avoid Pi's raw JSON clone, and deserialize OpenCode metadata only for fallback previews. Reading the raw string still preserves storage-type errors. Two additional Rust regressions cover exact DTO fields, legacy previews, V2 control rows, malformed metadata and NULL storage errors. Because native verification remains unavailable, the preparation is preserved as **`UI-1-pending.patch`**, not applied production code.
+
+The patch also contains an ignored native benchmark with frozen pre-change V1/V2 query/DTO implementations, displayed-field parity, real IPC sizes/serde timings, project/Dreamer/poll/paging/stats measurements, workspace enrichment, log tails, mock catalog CLI process counts, Broca grouped scans, and JSONL append costs at 1k/10k/60k. It is **not yet Rust-typechecked or executed**. `dashboard-browser.ts` is TypeScript-checked but not executed; it renders the actual built Solid app in an isolated Chrome profile against native captured DTOs and checks displayed-text identity. `isolate-dashboard-paths.ts` was executed on the copy and rerooted 6,408 recorded filesystem pointers so native discovery cannot read original project config directories. New snapshots were scrubbed/read-only and subsequently deleted, along with the rerooted directories.
+
+Once native compilation is available:
+
+1. `git apply --check packages/plugin/scripts/perf-audit/UI-1-pending.patch`, then apply the patch.
+2. Recreate scrubbed copies under a throwaway root, chmod them read-only, then run `timeout 180 bun packages/plugin/scripts/perf-audit/isolate-dashboard-paths.ts "$THROWAWAY"`.
+3. Run the ignored `native_dashboard_audit` with HOME, XDG roots, MAGIC_CONTEXT_STORAGE_DIR, OPENCODE_DB, Pi roots, BROCA_STATE_ROOT and TMPDIR all redirected into that root; select the real session using PERF_UI_SESSION and set PERF_UI_ROOT. Run `timeout 600 bun packages/plugin/scripts/perf-audit/dashboard-browser.ts "$THROWAWAY"` after native DTO capture.
+4. Run dashboard typecheck/lint/tests/build and package-scoped Rust tests/clippy before committing UI-1. Resume remaining findings from those actual native/render measurements, not the SQL lower bounds.
+
+Additional completed gates: CLI full suite (635 passed / 2 skipped across its five runner phases, 2,050 assertions), CLI TypeScript 5.9.3 typecheck, lint and build (398 bundled modules). The identity memo test was mutation checked: disabling realpath reuse made exactly that test fail (expected one call, received three), while the two existing identity tests passed; restoring from the index yielded an empty diff and a green three-test run. A first narrow invocation from repository root triggered the storage preload's broad-root leak detector on the intentional snapshot; the definitive red/green checks used the CLI package working directory. No existing tests were rewritten.
+
+Dashboard preparation passed frontend typecheck, lint (63 files), tests (106 tests / 359 assertions), and Vite build (66 modules), but this does **not** substitute for native verification. Existing unrelated Rust formatting drift was reverted rather than bundled into the payload change. All additional TS audit scripts passed the plugin script typecheck and lint; no package manifest, lockfile, config schema, cache format or public CLI flag changed.
