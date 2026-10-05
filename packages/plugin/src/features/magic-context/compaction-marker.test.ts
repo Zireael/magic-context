@@ -1,9 +1,10 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as logger from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -12,6 +13,7 @@ import {
     findBoundaryUserMessage,
     generateMessageId,
     injectCompactionMarker,
+    isOpenCodeGapHistorianAbsent,
 } from "./compaction-marker";
 
 const tempDirs: string[] = [];
@@ -34,6 +36,10 @@ function createOpenCodeDb(dataHome: string): Database {
     db.exec(
         "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
     );
+    // Exact message/part index definitions from a fresh OpenCode 1.18.30 store.
+    db.exec(`CREATE INDEX message_session_time_created_id_idx ON message(session_id, time_created, id);
+        CREATE INDEX part_message_id_id_idx ON part(message_id, id);
+        CREATE INDEX part_session_idx ON part(session_id);`);
     return db;
 }
 
@@ -60,6 +66,46 @@ afterEach(() => {
 });
 
 describe("findBoundaryUserMessage", () => {
+    it("uses message-indexed part probes for boundary and gap lookups on OpenCode 1.18.30", () => {
+        const dataHome = useTempDataHome("marker-indexed-probes-");
+        const db = createOpenCodeDb(dataHome);
+        insertMessage(db, "msg_prior", "user", 100);
+        insertMessage(db, "msg_synthetic", "user", 200);
+        insertMessage(db, "msg_target", "assistant", 300);
+        db.prepare("INSERT INTO part VALUES (?, ?, 'ses-1', 200, 200, ?)").run(
+            "prt_synthetic",
+            "msg_synthetic",
+            '{"type":"text","synthetic":true}',
+        );
+        const prepare = spyOn(Database.prototype, "prepare");
+        try {
+            expect(findBoundaryUserMessage("ses-1", "msg_target")?.id).toBe("msg_prior");
+            expect(isOpenCodeGapHistorianAbsent("ses-1", "msg_prior", "msg_target")).toBe(true);
+            const queries = prepare.mock.calls
+                .map(([sql]) => sql)
+                .filter((sql) => sql.includes("EXISTS (SELECT 1 FROM part p"));
+            expect(queries).toHaveLength(2);
+            const binds = [
+                ["ses-1", 300, 300, "msg_target"],
+                ["ses-1", 100, 100, "msg_prior", 300, 300, "msg_target"],
+            ];
+            for (const [index, query] of queries.entries()) {
+                const plan = db
+                    .prepare(`EXPLAIN QUERY PLAN ${query}`)
+                    .all(...binds[index]) as Array<{ detail: string }>;
+                const partProbes = plan.filter((row) => /SEARCH p /.test(row.detail));
+                expect(partProbes).toHaveLength(2);
+                expect(
+                    partProbes.every((row) =>
+                        row.detail.includes("part_message_id_id_idx (message_id=?)"),
+                    ),
+                ).toBe(true);
+            }
+        } finally {
+            prepare.mockRestore();
+            closeQuietly(db);
+        }
+    });
     it("skips a synthetic-only user row even when it already carries a marker", () => {
         const dataHome = useTempDataHome("marker-synthetic-boundary-");
         const db = createOpenCodeDb(dataHome);
@@ -153,6 +199,38 @@ describe("findBoundaryUserMessage", () => {
 });
 
 describe("injectCompactionMarker", () => {
+    it("logs marker acquire, hold, work and transaction-end time separately", () => {
+        const dataHome = useTempDataHome("marker-writer-timing-");
+        const db = createOpenCodeDb(dataHome);
+        insertMessage(db, "msg_user", "user", 100);
+        closeQuietly(db);
+        const logged = spyOn(logger, "log").mockImplementation(() => {});
+        const times = [0, 70, 370, 390];
+        const clock = spyOn(performance, "now").mockImplementation(() => times.shift() ?? 390);
+        try {
+            expect(
+                injectCompactionMarker({
+                    sessionId: "ses-1",
+                    endOrdinal: 1,
+                    endMessageId: "msg_user",
+                    summaryText: "summary placeholder",
+                    directory: dataHome,
+                    resolvedBoundary: { id: "msg_user", timeCreated: 100 },
+                }),
+            ).not.toBeNull();
+            const lines = logged.mock.calls
+                .map(([message]) => String(message))
+                .filter((message) =>
+                    message.includes("sqlite writer site=compaction-marker-inject"),
+                );
+            expect(lines).toEqual([
+                "[magic-context] sqlite writer site=compaction-marker-inject db=opencode acquire_ms=70 hold_ms=320 work_ms=300 end_ms=20 outcome=committed",
+            ]);
+        } finally {
+            clock.mockRestore();
+            logged.mockRestore();
+        }
+    });
     it("writes a completed summary timestamp for OpenCode 2 conversion", () => {
         const dataHome = useTempDataHome("marker-inject-completed-");
         const db = createOpenCodeDb(dataHome);

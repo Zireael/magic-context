@@ -58,6 +58,9 @@ if (!counts.messages) {
         if (statSync(path).size > 4_500_000_000) throw new Error("Synthetic DB exceeded size budget");
     }
 }
+// The checkpoint exercise below temporarily changes these fixture-owned rows.
+// Heal an interrupted prior probe before comparing the independent baseline.
+db.prepare("UPDATE part SET time_updated=time_created WHERE id >= 'prt_probe_0000000' AND id < 'prt_probe_0005000'").run();
 const lsof = spawnSync("timeout", ["10s", "lsof", "-p", String(process.pid), "-Fn"], { encoding: "utf8" });
 if (lsof.status !== 0) throw new Error("lsof failed");
 const stores = lsof.stdout.split("\n").filter(line => /^n.*\.db(?:$|-)/.test(line));
@@ -78,7 +81,9 @@ NativeDatabase.prototype.prepare = function (this: NativeDatabase, ...args: Para
             if (phase === "idle") return Reflect.apply(execute, statement, params);
             // EXPLAIN uses the independent probe handle; never runs the statement.
             const planStatement = Reflect.apply(nativePrepare, db, [`EXPLAIN QUERY PLAN ${sql}`]);
-            const plan = Reflect.apply(planStatement.all, planStatement, params);
+            let plan: unknown[];
+            try { plan = Reflect.apply(planStatement.all, planStatement, params); }
+            finally { planStatement.finalize(); }
             const started = performance.now();
             try { return Reflect.apply(execute, statement, params); }
             finally { samples.push({ phase, sql, method, ms: performance.now() - started, plan }); }
@@ -89,6 +94,7 @@ NativeDatabase.prototype.prepare = function (this: NativeDatabase, ...args: Para
 NativeDatabase.prototype.exec = function (this: NativeDatabase, sql: string) {
     const started = performance.now();
     try { return Reflect.apply(nativeExec, this, [sql]); }
+    catch (error) { throw new Error(`Probe exec failed: ${sql}`, { cause: error }); }
     finally { if (phase !== "idle") samples.push({ phase, sql, method: "exec", ms: performance.now() - started }); }
 };
 // Import after installing native instrumentation so it observes the real plugin,
@@ -146,11 +152,34 @@ if (signal.done || !new TextDecoder().decode(signal.value).includes("locked")) t
 const contended = timed("concurrent-writer", () => marker.replaceCompactionMarker(replacement.marker, { ...oldArgs, resolvedBoundary: oldBoundary }));
 await reader.cancel();
 if (await writer.exited !== 0) throw new Error("Concurrent writer failed");
-const checkpoint = timed("explicit-passive-checkpoint", () => db.query("PRAGMA wal_checkpoint(PASSIVE)").get());
+function checkpointProbe(mode: "PASSIVE" | "TRUNCATE"): unknown {
+    const connection = new NativeDatabase(path);
+    const statement = Reflect.apply(nativePrepare, connection, [`PRAGMA wal_checkpoint(${mode})`]);
+    try { return statement.all()[0]; }
+    finally { statement.finalize(); connection.close(); }
+}
+const checkpoint = timed("explicit-passive-checkpoint", () => checkpointProbe("PASSIVE"));
+// Prime a WAL beyond SQLite's default 1000-page auto-checkpoint threshold on
+// this connection (which has auto-checkpoint disabled), then let the plugin's
+// next COMMIT encounter it. Restore the synthetic host rows afterwards.
+checkpointProbe("TRUNCATE");
+db.exec("PRAGMA wal_autocheckpoint=0");
+db.query("UPDATE part SET time_updated=time_updated+1 WHERE id >= 'prt_probe_0000000' AND id < 'prt_probe_0005000'").run();
+const primedWalBytes = statSync(`${path}-wal`).size;
+const checkpointMarker = timed("checkpoint-triggering-retry", () => marker.replaceCompactionMarker(
+    contended.kind === "committed" ? contended.marker : replacement.marker,
+    { ...(contended.kind === "committed" ? oldArgs : args), resolvedBoundary: contended.kind === "committed" ? oldBoundary : boundary },
+));
+if (checkpointMarker.kind !== "committed") throw new Error("Checkpoint probe did not commit");
+const checkpointAfter = timed("post-commit-passive-checkpoint", () => checkpointProbe("PASSIVE"));
+const restore = Reflect.apply(nativePrepare, db, ["UPDATE part SET time_updated=time_created WHERE id >= 'prt_probe_0000000' AND id < 'prt_probe_0005000'"]);
+restore.run();
+restore.finalize();
+checkpointProbe("TRUNCATE");
 marker.closeCompactionMarkerDb();
 NativeDatabase.prototype.prepare = nativePrepare;
 NativeDatabase.prototype.exec = nativeExec;
-const result = { bun: Bun.version, sqlite: db.query("SELECT sqlite_version() AS version").get(), schemaSource: "fresh OpenCode 1.18.30", messageCount, partCount, dbBytes: statSync(path).size, totals, paritySha256: hash.digest("hex"), contendedOutcome: contended.kind, checkpoint, samples };
+const result = { bun: Bun.version, sqlite: db.query("SELECT sqlite_version() AS version").get(), schemaSource: "fresh OpenCode 1.18.30", messageCount, partCount, dbBytes: statSync(path).size, totals, paritySha256: hash.digest("hex"), contendedOutcome: contended.kind, checkpoint, primedWalBytes, checkpointAfter, samples };
 const label = process.env.MARKER_PROBE_LABEL ?? "run";
 if (label !== "baseline") {
     const baseline = JSON.parse(readFileSync(join(dirname(path), "marker-probe-baseline.json"), "utf8")) as { paritySha256: string };

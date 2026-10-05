@@ -21,7 +21,7 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
  * find a target.
  */
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,6 +36,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { createTagger } from "../../features/magic-context/tagger";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
+import * as logger from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -914,15 +915,24 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
         const locker = new Database(join(dataHome, "opencode", "opencode.db"));
         locker.exec("BEGIN IMMEDIATE");
+        const logged = spyOn(logger, "log").mockImplementation(() => {});
         try {
             const startedAt = Date.now();
             const outcome = applyDeferredCompactionMarker(db, "ses-lock", makePending(), dataHome);
             expect(outcome.kind).toBe("retryable-failure");
             expect(outcome).toMatchObject({ cut: "definitely-no-cut" });
-            // This OpenCode-owned handle is not routed by the shared SQLite wrapper.
-            // Its native timeout expires before the deferred marker is retried.
-            expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4500);
+            // Marker publication is retryable; a busy host must not stall the
+            // consuming pass for the old five-second native timeout.
+            expect(Date.now() - startedAt).toBeLessThan(1000);
+            expect(
+                logged.mock.calls.some(([message]) =>
+                    /sqlite writer site=compaction-marker-replace .*acquire_ms=\d+ hold_ms=0 .*outcome=not_acquired/.test(
+                        String(message),
+                    ),
+                ),
+            ).toBe(true);
         } finally {
+            logged.mockRestore();
             locker.exec("ROLLBACK");
             closeQuietly(locker);
         }
@@ -940,6 +950,12 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         ).toEqual({ n: 2 });
         closeQuietly(inspect);
         expect(getPersistedCompactionMarkerState(db, "ses-lock")).toEqual(oldState);
+        // Releasing the competing writer allows the unchanged request to heal
+        // on the next pass, rather than losing the marker publication.
+        expect(applyDeferredCompactionMarker(db, "ses-lock", makePending(), dataHome).kind).toBe(
+            "applied",
+        );
+        expect(getPersistedCompactionMarkerState(db, "ses-lock")?.boundaryOrdinal).toBe(10);
     }, 10_000);
 
     it("rolls direct publication replacement back when insertion fails", () => {
