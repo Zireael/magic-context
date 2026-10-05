@@ -96,22 +96,85 @@ and a local Responses provider. Every HOME/XDG/store/agent root is throwaway.
 `lsof -p` captures assert that every database handle is below that root.
 
 - `bun packages/e2e-tests/scripts/pi-temporal-drain-probe.ts --handoff` starts
-  with the actual old handler, verifies that it stored no temporal decisions,
+  with the actual old handler and storage code, verifies schema v94 and the
+  absence of the temporal table,
   terminates that host, then resumes the same journal/database in a new Pi
-  process with the current handler. The warm handoff preserves cached m0/m1
+  process with the current handler and verifies migration to v95. The warm handoff preserves cached m0/m1
   and all 69 existing input objects, 39,336 bytes.
 - The ordinary probe still executes a physical drain followed by a deferred
   pass and compares every existing provider input object without normalizing
   content or fields: 19 objects, 13,492 bytes.
 
-Before mutation testing, the successful handoff root was
+Before mutation testing, the successful renderer handoff against a prepared
+v95 store was
 `$TMPDIR/magic-context/pi-temporal-drain/host-SmCXbC/` (old/new PIDs 98,941 and
 6,185), hash `7ec3edae2beabc8a8afcb87cac09727b448da7fe1603d0bdcb58f17ab3ea7ff2`.
 The drain root was `host-Zh1JFg/` (PID 7,220), hash
 `64d5a8bad81c60116fa5f51e3af26d54be81d2c5162f67ed0acd19439bb852ae`.
 Both lsof captures list only their throwaway context.db, WAL and SHM.
 
+The final, stronger v94-to-v95 restart proof passed after all mutations were
+restored at `host-xZeUxl/` (old/new PIDs 83,425 and 95,674), with 69 matching
+objects and 39,336 bytes; hash
+`d69427ecbe9a20fb405e4c4f92966fb5db9584d3d53e329d71ad8b56cf1a57eb`.
+The final physical-drain replay passed at `host-cps5eS/` (PID 96,943), with
+19 matching objects and 13,492 bytes; hash
+`49b56043f00ec93d6202590932245ff57ae47a92fc86fe7ad4780b17269ccef3`.
+Both final runs again captured only throwaway database handles. Within-run
+hashes are compared, not the hashes of unrelated sessions with new timestamps.
+
 The first handoff attempt failed during fixture loading because Pi's extension
 loader relocated import metadata. The probe now explicitly supplies its worktree
 repository root to the immutable-source fixture loader; the rerun above passed.
 That unsuccessful attempt also used isolated host roots.
+
+## Mutation evidence
+
+Every control was staged before mutation, run with an observable non-empty
+working diff, restored from the index and touched. Every restore left an empty
+working diff; no mutant is delivered. Each target run below had exactly one
+named failed test/check, not an unrelated timeout or compile failure.
+
+| Neutralized control | Exact red test/check | Named control that stayed green |
+| --- | --- | --- |
+| Historical adoption | `Pi upgrade preserves every previously served marker on the first defer` | `new deferred messages stay pending across repeated passes until a rebuilding decision` |
+| Historical adoption under OC1 dependencies | `OpenCode 1 upgrade preserves every previously served marker on the first defer` | `new deferred messages stay pending across repeated passes until a rebuilding decision` |
+| Historical adoption under OC2 dependencies | `OpenCode 2 upgrade preserves every previously served marker on the first defer` | `new deferred messages stay pending across repeated passes until a rebuilding decision` |
+| Historical adoption in the actual v94-to-v95 host restart | `Old/new handoff wire prefix changed` | `new deferred messages stay pending across repeated passes until a rebuilding decision` |
+| New-message pending row | `new deferred messages stay pending across repeated passes until a rebuilding decision` | `Pi upgrade preserves every previously served marker on the first defer` |
+| Served LKG projection | `Pi adopts a persisted pre-ownership LKG marker at a changed cut seam` | `temporal choices freeze absence as well as marker bytes and preserve other replay entries` |
+| v95/fresh table installation | `migration 95 > v95 installs indexed temporal decisions and extracts only prerelease temporal entries` | all ten `formatGap` tests, including `returns null below threshold` |
+| Clone/fork temporal copying | `seedV2ForkFromParent > forks indexed temporal choices by mapped identity, retaining pending and empty rows` | `buildForkIdMap > pairs each copied row with the parent row of the same seq, type and creation time` |
+| Permanent-message deletion | `message.removed prunes the removed temporal identity but preserves surviving choices` (removed row remained) | `temporal choices freeze absence as well as marker bytes and preserve other replay entries` |
+| Session-scoped deletion | `message.removed prunes the removed temporal identity but preserves surviving choices` (session clear left a row) | `temporal choices freeze absence as well as marker bytes and preserve other replay entries` |
+
+The Pi adoption mutant lost both historical `+5m` and `+10m` bytes with the
+synthetic history unchanged. The OpenCode mutants instead failed the newly
+required persisted-adoption assertion; their incidental source replay still
+preserved text, which is why their wire results are not mislabeled as Pi's bug.
+The real host mutation rejected the changed old/new input prefix. Omitting v95
+table creation failed against the real migrated database, not a schema proxy.
+
+## Final verification
+
+- Bun 1.4.2 root build passed, including all four v2 loader tests.
+- TypeScript 5.9.3 package typechecks and focused probe typecheck passed.
+- Shared OpenCode transform/event/schema/clone/fork selection: 479 tests passed.
+- Pi context/LKG/degraded/replay/clone selection: 215 tests passed; the new
+  handoff test initially exceeded Bun's bare 5-second test/cleanup budget under
+  filesystem pressure. It passed with the repository's 30-second hook timeout
+  and an explicit bounded archive-test budget. The four OpenCode temporal tests
+  also passed after using that archive budget.
+- Biome 2.5.1 targeted checks passed (16 shared files and four Pi files).
+- Cargo 1.99.0: all 16 temporal tests passed, including the actual Rust transform
+  on the common session fixture. The domain-fingerprint snapshot test passed.
+  `cargo fmt -p mc-module -- --check` passed with rustfmt 1.10.0.
+- Both final real Pi host probes passed with the isolation evidence above.
+
+No package manifests or lockfiles changed. Cargo's generated lockfile drift
+from prepared sibling path dependencies was reverted. Native commands remained
+serialized, package-scoped and limited to two jobs under outer timeouts. The
+workspace-wide native suite was not rerun for this follow-up: its production
+Rust renderer is unchanged, and the changed native test/snapshot targets were
+checked directly. The earlier full-module run is historical evidence, not
+relabeled as a post-merge full-suite pass.

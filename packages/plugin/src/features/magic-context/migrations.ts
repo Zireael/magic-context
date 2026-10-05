@@ -3206,7 +3206,7 @@ export const MIGRATIONS: Migration[] = [
     {
         version: 95,
         description:
-            "cover cleanup and retention reads, remove redundant indexes and index git FTS rowids",
+            "cover cleanup and retention reads, index git FTS rowids and store temporal replay decisions",
         up(db: Database): void {
             installV95PerfSchema(db, true);
         },

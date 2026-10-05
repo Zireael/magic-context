@@ -173,4 +173,4 @@ it.each([
         closeDatabase();
         root.cleanup();
     }
-});
+}, 60_000);

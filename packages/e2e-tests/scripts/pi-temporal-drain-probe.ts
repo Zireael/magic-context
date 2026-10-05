@@ -92,7 +92,8 @@ try {
     if (handoff) {
         child.kill(); await child.exited; await stderrTask;
         const db = new Database(join(root, "storage/context.db"), { readonly: true });
-        if ((db.query("SELECT COUNT(*) AS n FROM temporal_decisions").get() as { n: number }).n !== 0) throw new Error("Old host unexpectedly stored temporal decisions");
+        if (db.query("SELECT name FROM sqlite_master WHERE name='temporal_decisions'").get()) throw new Error("Old host unexpectedly installed temporal decisions");
+        if ((db.query("SELECT MAX(version) AS v FROM schema_migrations WHERE version<10000").get() as { v: number }).v !== 94) throw new Error("Old host did not create the pre-v95 schema");
         oldPrefix = db.query("SELECT cached_m0_bytes,cached_m1_bytes FROM session_meta WHERE session_id=?").get(sessionId);
         db.close();
         child = spawn(false);
@@ -119,6 +120,7 @@ try {
     if (handoff) {
         const db = new Database(join(root, "storage/context.db"), { readonly: true });
         const after = db.query("SELECT cached_m0_bytes,cached_m1_bytes FROM session_meta WHERE session_id=?").get(sessionId);
+        if ((db.query("SELECT MAX(version) AS v FROM schema_migrations WHERE version<10000").get() as { v: number }).v !== 95) throw new Error("New host did not migrate the schema to v95");
         db.close();
         if (JSON.stringify(after) !== JSON.stringify(oldPrefix)) throw new Error("Handoff rebuilt the frozen history prefix");
     }

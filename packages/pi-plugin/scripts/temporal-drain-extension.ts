@@ -9,7 +9,9 @@ import { temporalLegacyTree } from "@magic-context/core/shared/temporal-legacy-t
 export default async function temporalDrainExtension(pi: ExtensionAPI) {
     const root = process.env.MC_TEMPORAL_ROOT;
     if (!root) throw new Error("MC_TEMPORAL_ROOT must name the isolated probe root");
-    const db = openDatabase(join(root, "storage/context.db"));
+    const legacyTree = process.env.MC_TEMPORAL_LEGACY === "1" ? temporalLegacyTree(process.env.MC_TEMPORAL_REPO) : undefined;
+    const storage = legacyTree ? await import(join(legacyTree, "packages/plugin/src/features/magic-context/storage.ts")) : { openDatabase };
+    const db = storage.openDatabase(join(root, "storage/context.db"));
     if (!db) throw new Error("Probe database unavailable");
     let pass = Number(process.env.MC_TEMPORAL_START_PASS ?? 0);
     pi.on("context", (_event, ctx) => {
@@ -29,8 +31,8 @@ export default async function temporalDrainExtension(pi: ExtensionAPI) {
             updateSessionMeta(db, sessionId, { lastResponseTime: Date.now(), cacheTtl: "59m", lastContextPercentage: 10, lastInputTokens: 10_000 });
         }
     });
-    const register = process.env.MC_TEMPORAL_LEGACY === "1"
-        ? (await import(join(temporalLegacyTree(process.env.MC_TEMPORAL_REPO), "packages/pi-plugin/src/context-handler.ts"))).registerPiContextHandler
+    const register = legacyTree
+        ? (await import(join(legacyTree, "packages/pi-plugin/src/context-handler.ts"))).registerPiContextHandler
         : registerPiContextHandler;
     register(pi, { db, protectedTags: 0, scheduler: { executeThresholdPercentage: 65 }, injection: { injectionBudgetTokens: 10_000, memoryEnabled: false, injectDocs: false, temporalAwareness: true } });
 }
