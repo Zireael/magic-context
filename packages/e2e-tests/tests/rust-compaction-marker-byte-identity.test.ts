@@ -2,9 +2,10 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { moduleRawBlockMappings } from "../../plugin/src/hooks/magic-context/module-wire";
 import { RustTestHarness } from "../src/rust-harness";
 import { rustPrereqs } from "../src/rust-scenario-support";
 
@@ -15,6 +16,26 @@ interface SqliteRow {
     time_created: number;
     time_updated: number;
     data: string;
+}
+
+const FOLD_CONFIG = {
+    execute_threshold_tokens: { default: 20_000 },
+    protected_tokens: 4_000,
+    cache_ttl: "0",
+    compressor: { enabled: false },
+};
+
+function assertHermeticStores(h: RustTestHarness): void {
+    const pidFile = JSON.parse(readFileSync(join(h.env.dataDir, "cortexkit", "rust-e2e-pids.json"), "utf8")) as { pids: Array<{ pid: number }> };
+    const pids = [h.opencode.pid, ...pidFile.pids.map(row => row.pid)];
+    const files = spawnSync("timeout", ["20s", "lsof", "-p", pids.join(","), "-Fn"], { encoding: "utf8" });
+    expect(files.status).toBe(0);
+    const stores = [...new Set(files.stdout.split("\n").filter(line => /^n.*\.db(?:$|-)/.test(line)).map(line => line.slice(1)))];
+    expect(stores.length).toBeGreaterThan(0);
+    expect(stores.every(path => path.startsWith(`${h.env.dataDir}/`))).toBe(true);
+    expect(stores.some(path => path.endsWith("opencode.db"))).toBe(true);
+    expect(stores.some(path => path.endsWith("store.db"))).toBe(true);
+    console.log(`lsof pids=${pids.join(",")} isolated stores=${JSON.stringify(stores.filter(path => path.endsWith(".db")))}`);
 }
 
 function sha256(value: string): string {
@@ -38,131 +59,71 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
 
     beforeEach(async () => {
         h = await RustTestHarness.create({
-            modelContextLimit: 30_000,
-            // The historian gets its own 128k mock model: the 30k session window
-            // builds pressure quickly but cannot hold a historian prompt.
-            historianModelContextLimit: 128_000,
-            magicContextConfig: {
-                execute_threshold_percentage: 25,
-                protected_tags: 1,
-                compressor: { enabled: false },
-            },
+            modelContextLimit: 1_000_000,
+            historianModelContextLimit: 1_000_000,
+            magicContextConfig: FOLD_CONFIG,
         });
+        h.subc.writeModuleConfig(FOLD_CONFIG);
     });
 
     afterEach(async () => {
+        if (h) {
+            console.log(h.diagnosticLog().split("\n").filter(line => /rust pass:|compaction-marker drain:|rust transform failed/.test(line)).slice(-4).join("\n"));
+            console.log(h.subc.moduleLog().split("\n").filter(line => /ERROR|historian firing failed/.test(line)).slice(-4).join("\n"));
+        }
         await h?.dispose();
     });
 
     it(
-        "serves identical serialized arrays with the marker applied and deliberately absent",
+        "advances indexed Rust markers on busts and resyncs a 12900-message cut without changing ordinary wire bytes",
         async () => {
+            const health = await fetch(`${h.opencode.url}/global/health`).then(response => response.json()) as { version: string };
+            expect(health.version).toMatch(/^1\./);
             const sessionId = await h.createSession();
+            await h.sendPrompt(sessionId, "seed the long session");
+            assertHermeticStores(h);
+            h.setSessionCacheTtl(sessionId, "0");
+            h.appendSyntheticHistory(sessionId, { count: 12_900, textBytes: 64 });
+            // These rows precede the seed. Refresh raw ordinals before the module
+            // starts folding, rather than presenting a reordered incremental tail.
+            await h.restart({ rust: true, magicContextConfig: FOLD_CONFIG });
+            assertHermeticStores(h);
+            console.log(`OpenCode ${health.version}`);
             const opencodeDb = new Database(join(h.env.dataDir, "opencode", "opencode.db"));
             // The harness's OpenCode server writes this database concurrently; bun:sqlite
             // defaults to no busy wait, so the marker deletes below would fail on the
             // first overlapping host write (seen as SQLITE_BUSY in release run r2).
             opencodeDb.exec("PRAGMA busy_timeout = 30000");
 
-            for (let turn = 1; turn <= 20; turn += 1) {
+            const markerOrdinals = new Set<number>();
+            for (let turn = 1; turn <= 90; turn += 1) {
                 h.mock.setDefault({
                     text: `fold reply ${turn}`,
                     usage: {
-                        input_tokens: 3_000 * turn,
+                        input_tokens: 60_000,
                         output_tokens: 20,
                         cache_creation_input_tokens: 2_000,
                     },
                 });
-                await h.sendPrompt(sessionId, `marker fold turn ${turn}: ${h.ballast(6_000)}`);
-                const markerCount = (
-                    opencodeDb
-                        .prepare(
-                            `SELECT COUNT(*) AS count
-                               FROM part
-                              WHERE session_id = ?
-                                AND json_extract(data, '$.type') = 'compaction'
-                                AND json_extract(data, '$.auto') = 1`,
-                        )
-                        .get(sessionId) as { count: number }
-                ).count;
-                if (
-                    markerCount > 0 ||
-                    h.readRustPasses().some((pass) => pass.reason === "coverage_fold")
-                ) {
-                    break;
-                }
-                await Bun.sleep(200);
+                await h.sendPrompt(sessionId, `marker fold turn ${turn}: ${h.ballast(400)}`, { timeoutMs: 300_000 });
+                const row = h.contextDb().query("SELECT compaction_marker_state FROM session_meta WHERE session_id=?").get(sessionId) as { compaction_marker_state: string };
+                const ordinal = row.compaction_marker_state ? (JSON.parse(row.compaction_marker_state) as { boundaryOrdinal: number }).boundaryOrdinal : 0;
+                if (ordinal > 0) markerOrdinals.add(ordinal);
+                const published = (h.contextDb().query("SELECT count(*) AS n FROM compartments WHERE session_id=?").get(sessionId) as { n: number }).n;
+                if (turn >= 4 && published >= 3) expect(markerOrdinals.size).toBeGreaterThan(0);
+                if (turn % 10 === 0) console.log(`fold turn=${turn} ordinal=${ordinal}; compartments=${JSON.stringify(h.contextDb().query("SELECT sequence,end_message,end_block_index FROM compartments WHERE session_id=? ORDER BY sequence DESC LIMIT 3").all(sessionId))}`);
+                if (markerOrdinals.size >= 3 && ordinal > 12_700) break;
+                await Bun.sleep(100);
             }
 
-            // Native markers discard an entire message; an indexed end normally forbids
-            // that. Prove this fixture's end is the message's final CK block before
-            // setting NULL to declare whole-message coverage. No suffix is discarded.
-            h.mock.setDefault({ text: "whole-boundary probe", usage: { input_tokens: 500, output_tokens: 20 } });
-            const contextWriter = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
-            contextWriter.exec("PRAGMA busy_timeout=5000");
-            try {
-                for (let attempt = 0; attempt < 5; attempt++) {
-                    await Bun.sleep(100);
-                    const raw = await h.listMessages(sessionId);
-                    const rows = contextWriter.query("SELECT id,end_message_id,end_block_index FROM compartments WHERE session_id=? AND end_block_index IS NOT NULL").all(sessionId) as Array<{id:number,end_message_id:string,end_block_index:number}>;
-                    for (const row of rows) {
-                        const message = raw.find(message => message.info.id === row.end_message_id);
-                        expect(message).toBeDefined();
-                        const parts = message!.parts.filter(part => part.type !== "step-start" && part.type !== "step-finish");
-                        expect(parts.length).toBeGreaterThan(0);
-                        expect(parts.every(part => part.type === "text")).toBe(true);
-                        expect(row.end_block_index).toBe(moduleRawBlockMappings({ id: message!.info.id, role: message!.info.role, parts: message!.parts } as never).at(-1)?.blockIndex);
-                        contextWriter.query("UPDATE compartments SET end_block_index=NULL WHERE id=?").run(row.id);
-                    }
-                    // Restart the host so state_sync refreshes its cache after the fixture change.
-                    await h.restart({ rust: true });
-                    await h.sendPrompt(sessionId, `publish certified whole-message marker ${attempt}`);
-                    const count = (opencodeDb.query("SELECT count(*) AS n FROM part WHERE session_id=? AND json_extract(data,'$.type')='compaction' AND json_extract(data,'$.auto')=1").get(sessionId) as {n:number}).n;
-                    if (count > 0) break;
-                }
-            } finally { contextWriter.close(); }
-
-            const summaryRows = opencodeDb
-                .prepare(
-                    `SELECT * FROM message
-                      WHERE session_id = ?
-                        AND json_extract(data, '$.summary') = 1
-                        AND json_extract(data, '$.providerID') = 'magic-context'`,
-                )
-                .all(sessionId) as SqliteRow[];
-            const compactionRows = opencodeDb
-                .prepare(
-                    `SELECT * FROM part
-                      WHERE session_id = ?
-                        AND json_extract(data, '$.type') = 'compaction'
-                        AND json_extract(data, '$.auto') = 1`,
-                )
-                .all(sessionId) as SqliteRow[];
-            if (summaryRows.length !== 1 || compactionRows.length !== 1) {
-                const pluginLog = await Bun.file(h.logPath).text();
-                throw new Error(
-                    `expected one applied marker; summary=${summaryRows.length} compaction=${compactionRows.length}\n` +
-                        `rust passes=${JSON.stringify(h.readRustPasses())}\n` +
-                        `marker logs=${pluginLog
-                            .split("\n")
-                            .filter((line) => line.includes("compaction-marker"))
-                            .join("\n")}\n` +
-                        `module log tail=${h.subc.moduleLog().slice(-8_000)}`,
-                );
-            }
-            const summaryPartRows = opencodeDb
-                .prepare("SELECT * FROM part WHERE session_id = ? AND message_id = ?")
-                .all(sessionId, summaryRows[0]!.id) as SqliteRow[];
-
-            // For the baseline run, temporarily remove OpenCode's compaction-marker and summary
-            // rows so the host supplies no marker. Restore them before the restart comparison
-            // while leaving the module's durable fold unchanged.
-            opencodeDb.transaction(() => {
-                for (const row of [...compactionRows, ...summaryPartRows]) {
-                    opencodeDb.prepare("DELETE FROM part WHERE id = ?").run(row.id);
-                }
-                opencodeDb.prepare("DELETE FROM message WHERE id = ?").run(summaryRows[0]!.id);
-            })();
+            expect(markerOrdinals.size).toBeGreaterThanOrEqual(3);
+            const indexedCount = (h.contextDb().query("SELECT count(*) AS n FROM compartments WHERE session_id=? AND end_block_index IS NOT NULL").get(sessionId) as { n: number }).n;
+            expect(indexedCount).toBeGreaterThanOrEqual(3);
+            console.log(`indexed compartments=${indexedCount}; marker ordinals=${JSON.stringify([...markerOrdinals])}`);
+            h.mock.setDefault({ text: "ordinary probe", usage: { input_tokens: 500, output_tokens: 20 } });
+            h.setSessionCacheTtl(sessionId, "5m");
+            const ordinaryConfig = { ...FOLD_CONFIG, cache_ttl: "5m", execute_threshold_tokens: { default: 800_000 } };
+            h.subc.writeModuleConfig(ordinaryConfig);
 
             // The three probe passes below must all render the same session history.
             // A historian run still in flight when the fixture loop above stops (on a
@@ -170,9 +131,8 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             // compartment between the control pass and the marker pass, and the two
             // would differ by that compartment rather than by the marker. Let every
             // run finish, then stop the producer so no later run can publish while
-            // the passes are compared, and restart the module so the control pass,
-            // like the marker pass, is rendered by a module that has just read the
-            // store.
+            // the passes are compared. Keep the module running so the one-step host
+            // cut exercises its full-resync path rather than a cold module boot.
             const historianDeadline = Date.now() + 120_000;
             let historianState: string | undefined;
             while (Date.now() < historianDeadline) {
@@ -186,7 +146,44 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             expect(historianState).toBe("idle");
             h.subc.killProducer();
             await h.subc.waitForProducerDeath();
-            await h.subc.restartModule();
+            // Runtime config is also sent by the host; changing only the module's
+            // file would leave the host's zero-TTL bust permission in force.
+            await h.restart({ rust: true, magicContextConfig: ordinaryConfig });
+            assertHermeticStores(h);
+            // TTL policy freezes on the first model pass, independently of the
+            // config file. End the fixture's zero-TTL setup explicitly so the
+            // comparison really observes ordinary passes, not repeated idle busts.
+            const contextWriter = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
+            try {
+                contextWriter.exec("PRAGMA busy_timeout=5000");
+                contextWriter.query(`UPDATE session_meta SET cache_ttl='5m',
+                    trailing_blank_decisions=json_set(trailing_blank_decisions,
+                        '$.cacheTtlPolicy.value', '5m', '$.cacheTtlPolicy.config', '5m')
+                    WHERE session_id=?`).run(sessionId);
+            } finally { contextWriter.close(); }
+            // A publication can finish after the last fold turn. Consume that
+            // coverage on its bust before taking the marker snapshot, or the first
+            // comparison would measure a new history render instead of SOFT+ replay.
+            const settlingPasses = h.readRustPasses().length;
+            await h.sendPrompt(sessionId, "settle the last published coverage");
+            await h.waitForRustPasses(settlingPasses + 1);
+            const summaryRows = opencodeDb.query(`SELECT * FROM message
+                WHERE session_id=? AND json_extract(data, '$.summary')=1
+                AND json_extract(data, '$.providerID')='magic-context'`).all(sessionId) as SqliteRow[];
+            const compactionRows = opencodeDb.query(`SELECT * FROM part
+                WHERE session_id=? AND json_extract(data, '$.type')='compaction'
+                AND json_extract(data, '$.auto')=1`).all(sessionId) as SqliteRow[];
+            expect(summaryRows).toHaveLength(1);
+            expect(compactionRows).toHaveLength(1);
+            const summaryPartRows = opencodeDb.query("SELECT * FROM part WHERE session_id=? AND message_id=?").all(sessionId, summaryRows[0]!.id) as SqliteRow[];
+            // Simulate the frozen host cut without altering any indexed ends or
+            // module state. Restoring these same rows is the one-step input shrink.
+            opencodeDb.transaction(() => {
+                for (const row of [...compactionRows, ...summaryPartRows]) {
+                    opencodeDb.prepare("DELETE FROM part WHERE id=?").run(row.id);
+                }
+                opencodeDb.prepare("DELETE FROM message WHERE id=?").run(summaryRows[0]!.id);
+            })();
             const publishedHistory = () =>
                 contextHistoryRows(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"), sessionId);
             const historyBeforeComparison = publishedHistory();
@@ -200,6 +197,11 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             const controlInput = controlPasses.at(-1)!.inputCount;
             const controlSerialized = h.lastMainWireSerialized();
             const controlHash = sha256(controlSerialized);
+            const exactPrefix = () => {
+                const body = h.mainRequests().at(-1)!.body;
+                return JSON.stringify({ system: body.system, messages: body.messages });
+            };
+            const exactControl = exactPrefix();
             const controlProbe = (await h.listMessages(sessionId))
                 .filter(
                     (message) =>
@@ -234,7 +236,6 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
                 }
             })();
 
-            await h.subc.restartModule();
             await Bun.sleep(700);
             const markerPassesBefore = h.readRustPasses().length;
             await h.sendPrompt(sessionId, probe, { messageID: probeMessageId });
@@ -242,6 +243,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             const markerInput = markerPasses.at(-1)!.inputCount;
             const markerSerialized = h.lastMainWireSerialized();
             const markerHash = sha256(markerSerialized);
+            const exactMarker = exactPrefix();
             const markerProbe = (await h.listMessages(sessionId))
                 .filter(
                     (message) =>
@@ -257,15 +259,43 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             const replayPasses = await h.waitForRustPasses(replayPassesBefore + 1);
             const replaySerialized = h.lastMainWireSerialized();
             const replayHash = sha256(replaySerialized);
+            expect(exactMarker).toBe(exactControl);
+            expect(exactPrefix()).toBe(exactControl);
 
             // No compartment may land while the passes are compared; the producer is
             // gone, so a change here means the drain above missed a run.
             expect(publishedHistory()).toEqual(historyBeforeComparison);
             console.log(`rust marker byte identity control sha256=${controlHash}`);
-            console.log(`rust marker byte identity post-restart-1 sha256=${markerHash}`);
-            console.log(`rust marker byte identity post-restart-2 sha256=${replayHash}`);
+            console.log(`rust marker byte identity post-cut-1 sha256=${markerHash}`);
+            console.log(`rust marker byte identity post-cut-2 sha256=${replayHash}`);
             expect(controlInput).toBeGreaterThan(markerInput);
+            expect(controlInput).toBeGreaterThan(12_900);
+            expect(markerInput).toBeLessThan(400);
             expect(replayPasses.at(-1)!.inputCount).toBe(markerInput);
+            const comparedPasses = [controlPasses.at(-1)!, markerPasses.at(-1)!, replayPasses.at(-1)!];
+            expect(comparedPasses.every(pass => pass.applied && pass.servedFrom === "transform")).toBe(true);
+            expect(comparedPasses.every(pass => pass.decision === "SOFT+" || pass.decision === "DEFER")).toBe(true);
+            // The first smaller input is sent whole, not mistaken for an append
+            // delta against the thousands of messages the module saw before it.
+            expect(markerPasses.at(-1)!.wireMessages).toBe(markerInput);
+            const ordinaryBefore = h.readRustPasses().length;
+            await h.sendPrompt(sessionId, "ordinary append after the input cut");
+            const ordinaryPass = (await h.waitForRustPasses(ordinaryBefore + 1)).at(-1)!;
+            expect(ordinaryPass.servedFrom).toBe("transform");
+            expect(ordinaryPass.applied).toBe(true);
+            expect(ordinaryPass.decision).toBe("SOFT+");
+            expect(ordinaryPass.wireMessages).toBeLessThanOrEqual(4);
+            const replayArray = JSON.parse(replaySerialized) as unknown[];
+            expect((JSON.parse(h.lastMainWireSerialized()) as unknown[]).slice(0, replayArray.length)).toEqual(replayArray);
+            const sessionLines = h.diagnosticLog().split("\n").filter(line => line.includes(`[${sessionId}]`));
+            const moves = sessionLines.flatMap((line, index) => line.includes("compaction-marker drain: applied") ? [index] : []);
+            expect(moves.length).toBeGreaterThanOrEqual(3);
+            for (const index of moves) {
+                const consumingPass = sessionLines.slice(index + 1).find(line => line.includes("rust pass:"));
+                expect(consumingPass).toMatch(/decision=(?:HARD|SOFT)\s/);
+            }
+            expect(sessionLines.filter(line => /rust transform failed|lkg_replay_served|mc_rust_\w*refusal|served_from=refused|replaying LKG/.test(line))).toEqual([]);
+            console.log(`one-step input shrink=${controlInput}->${markerInput}; full cut send=${markerPasses.at(-1)!.wireMessages}; next ordinary delta=${ordinaryPass.wireMessages}`);
             if (controlHash !== markerHash || markerHash !== replayHash) {
                 const firstDifference =
                     controlHash !== markerHash
@@ -284,6 +314,6 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             }
             opencodeDb.close();
         },
-        300_000,
+        600_000,
     );
 });

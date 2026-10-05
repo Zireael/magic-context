@@ -1614,6 +1614,17 @@ describe("deferred compaction marker representation", () => {
                 info: { id: "msg-partial", role: "assistant", sessionID: sessionId },
                 parts: [
                     { type: "text", text: "covered block" },
+                    {
+                        type: "tool_use",
+                        id: "call-kept",
+                        name: "read",
+                        input: { path: "README.md" },
+                    },
+                    {
+                        type: "tool_result",
+                        tool_use_id: "call-kept",
+                        content: "unsummarized result",
+                    },
                     { type: "text", text: "uncovered block" },
                 ],
             },
