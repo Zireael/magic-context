@@ -2901,6 +2901,7 @@ pub(crate) fn backup_files(options: &EngineOptions) -> Result<(), EngineError> {
             file_len(source) as f64 / 1e9
         );
         let conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        mc_store::single_store_domain::set_synchronous_normal_if_wal(&conn)?;
         conn.busy_timeout(std::time::Duration::from_millis(u64::from(
             CONTEXT_BUSY_TIMEOUT_MS,
         )))?;
@@ -2913,6 +2914,7 @@ pub(crate) fn backup_files(options: &EngineOptions) -> Result<(), EngineError> {
             let digest = scope.spawn(|| sha256_file(&target));
             let check = (|| -> rusqlite::Result<(String, i64)> {
                 let copy = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                mc_store::single_store_domain::set_synchronous_normal_if_wal(&copy)?;
                 let check: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
                 let version = if name == "context.db" {
                     context_version(&copy)?

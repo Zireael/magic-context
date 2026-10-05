@@ -129,34 +129,6 @@ impl SqliteContextDomain {
     }
 }
 
-#[cfg(test)]
-mod durability_tests {
-    use super::*;
-
-    #[test]
-    fn freshly_opened_context_connections_use_wal_normal() {
-        let dir = tempfile::tempdir().unwrap();
-        let domain = SqliteContextDomain::open(&dir.path().join("context.db")).unwrap();
-        for connection in [&domain.reader, &domain.writer] {
-            let conn = connection.lock().unwrap();
-            let journal: String = conn
-                .pragma_query_value(None, "journal_mode", |row| row.get(0))
-                .unwrap();
-            let synchronous: i64 = conn
-                .pragma_query_value(None, "synchronous", |row| row.get(0))
-                .unwrap();
-            assert_eq!(journal, "wal");
-            assert_eq!(synchronous, 1);
-        }
-    }
-
-    #[test]
-    fn normal_policy_refuses_a_non_wal_connection() {
-        let conn = Connection::open_in_memory().unwrap();
-        assert!(set_wal_synchronous_normal(&conn).is_err());
-    }
-}
-
 impl ContextDomain for SqliteContextDomain {
     fn read(
         &self,
@@ -212,4 +184,32 @@ pub fn create_test_context_db(path: &Path) -> Result<(), McStoreError> {
     )
     .map_err(context_sql_error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    #[test]
+    fn freshly_opened_context_connections_use_wal_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = SqliteContextDomain::open(&dir.path().join("context.db")).unwrap();
+        for connection in [&domain.reader, &domain.writer] {
+            let conn = connection.lock().unwrap();
+            let journal: String = conn
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .unwrap();
+            let synchronous: i64 = conn
+                .pragma_query_value(None, "synchronous", |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal, "wal");
+            assert_eq!(synchronous, 1);
+        }
+    }
+
+    #[test]
+    fn normal_policy_refuses_a_non_wal_connection() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(set_wal_synchronous_normal(&conn).is_err());
+    }
 }
