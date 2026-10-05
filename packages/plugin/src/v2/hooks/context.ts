@@ -119,8 +119,14 @@ import { seedV2ForkFromParent, sessionHasMagicContextState } from "../fork-inher
 import { cleanupLegacyHiddenChildren } from "../hidden-child-cleanup";
 import { nativeSessionRemove } from "../hidden-child-native";
 import { createLateHiddenExecutor, createV2HiddenCompletionExecutor } from "../hidden-completion";
-import { gaDatabasePath, V2StoreReader } from "../store-reader";
-import { deliverPendingChannel2, deliverSynthetic, isAdmittedSynthetic } from "./channel2";
+import { gaDatabasePath, type V2StoreReader, V2StoreReaderPool } from "../store-reader";
+import {
+    clearSyntheticCandidates,
+    deliverPendingChannel2,
+    deliverSynthetic,
+    isAdmittedSynthetic,
+    syntheticCandidates,
+} from "./channel2";
 import { registerV2Commands } from "./commands";
 import { DeletedSessionTombstones } from "./deleted-session-tombstones";
 import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
@@ -709,6 +715,9 @@ export async function registerContext(context: V2Context) {
     });
     await registerHiddenChildAgents(context.agent);
     let hiddenAgentsReady: Promise<void> | undefined;
+    const readerPool = new V2StoreReaderPool();
+    const openStoreReader = () =>
+        readerPool.open(gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"));
     const createHiddenExecutor = async (database: NonNullable<typeof db>) => {
         await cleanupLegacyOnce(database);
         return createV2HiddenCompletionExecutor(
@@ -743,10 +752,7 @@ export async function registerContext(context: V2Context) {
                 keepSubagents: config.keep_subagents === true,
                 ensureAgent: () => (hiddenAgentsReady ??= context.agent.reload()),
                 modelCatalog: () => Promise.resolve(context.model.list()),
-                openReader: () =>
-                    new V2StoreReader(
-                        gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
-                    ),
+                openReader: openStoreReader,
             },
         );
     };
@@ -868,8 +874,6 @@ export async function registerContext(context: V2Context) {
             log("[magic-context] v2 Channel 2 delivery deferred", error);
         }
     });
-    const openStoreReader = () =>
-        new V2StoreReader(gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"));
     const pagedRead = createV2RawMessageReader(openStoreReader);
     if (db && isDatabasePersisted(db)) {
         const backfillDb = db;
@@ -983,9 +987,7 @@ export async function registerContext(context: V2Context) {
             await storage.probe();
             db = storage.require();
             getOrCreateSessionMeta(db, draft.sessionID);
-            const reader = new V2StoreReader(
-                gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
-            );
+            const reader = openStoreReader();
             try {
                 const latest = reader.latestAssistant(draft.sessionID);
                 const draftModelKey = `${draft.model.providerID}/${draft.model.id}`;
@@ -1168,9 +1170,7 @@ export async function registerContext(context: V2Context) {
         // Leaving `result` unset hands the request back to the host, exactly as if
         // no hook were registered.
         if (compactionOff) return;
-        const reader = new V2StoreReader(
-            gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
-        );
+        const reader = openStoreReader();
         try {
             const watermark = reader.latestSequenceForIds(
                 draft.sessionID,
@@ -1495,16 +1495,23 @@ export async function registerContext(context: V2Context) {
                 ...createHostSeams(context, readAllForConversion, pagedRead, liveModels),
             });
             const admitted = new Set<string>();
-            for (const message of draft.messages) {
-                if (message.id && (await isAdmittedSynthetic(context, draft.sessionID, message.id)))
-                    admitted.add(message.id);
-            }
-            const reader = new V2StoreReader(
-                gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
-            );
+            const reader = openStoreReader();
             let checkpoint: SessionContext["messages"][number] | undefined;
             let submitted: string | undefined;
             try {
+                const candidates = syntheticCandidates(
+                    context,
+                    draft.sessionID,
+                    reader.syntheticMessageIDs(draft.sessionID),
+                );
+                for (const message of draft.messages) {
+                    if (
+                        message.id &&
+                        candidates.has(message.id) &&
+                        (await isAdmittedSynthetic(context, draft.sessionID, message.id))
+                    )
+                        admitted.add(message.id);
+                }
                 const cut = reader.latestCompaction(draft.sessionID);
                 // Before anything restores or trims against the history boundary,
                 // make sure the host store still has it. Only TypeScript mode keeps
@@ -1976,6 +1983,8 @@ export async function registerContext(context: V2Context) {
             for (const release of rawProviders.values()) release();
             rawProviders.clear();
             restoredRows.clear();
+            readerPool.close();
+            clearSyntheticCandidates(context);
         },
     };
 }
