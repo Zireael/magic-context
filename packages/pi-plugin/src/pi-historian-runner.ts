@@ -873,9 +873,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			}
 
 			// v2 (E6 parity): bounded reference blocks replace the unbounded
-			// existing-state dump: 4 rotating cross-project seed examples
-			// (importance-band calibration) + the last 6 same-session
-			// compartments (continuity) + <project-memory> for fact dedup, so
+			// existing-state dump: 3 seeds + 3 diverse older + 4 recent session
+			// examples. Recent scores are hidden to prevent anchoring in
+			// one-compartment runs. Add <project-memory> for fact dedup, so
 			// memories written by OpenCode show up in this Pi historian run. The
 			// memory block is id-free because the historian dedups by content;
 			// byte-parity with the Rust port is pinned by the historian prompt

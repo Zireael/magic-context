@@ -20,7 +20,7 @@ use crate::historian::{
 use crate::historian_prompt::{
     build_compartment_agent_prompt, order_historian_memories, render_historian_memory_block,
     render_seed_examples_block, render_session_references_block_window, select_seeds,
-    CompartmentPromptInputs, ReferenceCompartment, SEED_FLOOR, SESSION_REF_WINDOW,
+    select_session_references, CompartmentPromptInputs, ReferenceCompartment, SEED_FLOOR,
 };
 use crate::historian_validate::{
     ChunkLine, HistorianChunk, MessageRange, StoredCompartmentRange, ValidateOptions,
@@ -846,19 +846,26 @@ struct HistorianPromptFitInput<'a> {
 
 /// Size the historian prompt to the producer window: reserve the system prompt,
 /// the fixed user-prompt blocks and the output first, and give the chunk what
-/// remains. When the full requested chunk does not fit, trim recent compartments
-/// (oldest first), then project-memory lines (lowest priority first), then seed
+/// remains. When the full requested chunk does not fit, trim diverse older
+/// compartments before recent compartments (oldest first), then project-memory
+/// lines (lowest priority first), then seed
 /// examples, and only then shrink the chunk. When not even a minimal chunk fits,
 /// the untrimmed blocks are returned so the firing's admission check refuses the
 /// prompt and records the failure with a backoff. Untrimmed blocks are
 /// byte-identical to the ones the prompt golden pins.
 fn fit_historian_prompt(input: &HistorianPromptFitInput<'_>) -> HistorianPromptFit {
     let seeds = select_seeds(input.session_id, input.chunk_start as i64, SEED_FLOOR);
+    let references = select_session_references(
+        input.compartments,
+        &seeds,
+        input.session_id,
+        input.chunk_start as i64,
+    );
     let memories = order_historian_memories(input.memories);
     let render = |refs: usize, memory_count: usize, seed_count: usize| {
         (
             render_seed_examples_block(&seeds[..seed_count]),
-            render_session_references_block_window(input.compartments, refs),
+            render_session_references_block_window(&references, refs),
             render_historian_memory_block(&memories[..memory_count]),
         )
     };
@@ -871,14 +878,14 @@ fn fit_historian_prompt(input: &HistorianPromptFitInput<'_>) -> HistorianPromptF
             session_references,
             memory_block,
             kept: (refs, memory_count, seed_count),
-            trimmed: refs < SESSION_REF_WINDOW
+            trimmed: refs < references.len()
                 || memory_count < memories.len()
                 || seed_count < seeds.len(),
         }
     };
     let untrimmed = || {
         accept(
-            SESSION_REF_WINDOW,
+            references.len(),
             memories.len(),
             seeds.len(),
             input.requested,
@@ -938,8 +945,8 @@ fn fit_historian_prompt(input: &HistorianPromptFitInput<'_>) -> HistorianPromptF
         room(refs, memory_count, seed_count).is_some_and(|room| room >= input.requested)
     };
 
-    // 1. Recent compartments, oldest dropped first.
-    for refs in (0..=SESSION_REF_WINDOW).rev() {
+    // 1. Diverse compartments first, then recent compartments oldest first.
+    for refs in (0..=references.len()).rev() {
         if has_room(refs, memories.len(), seeds.len()) {
             return accept(refs, memories.len(), seeds.len(), input.requested);
         }
@@ -2392,9 +2399,10 @@ mod tests {
             "producer must receive the whole formatted component"
         );
         let prompt_hash = format!("{:x}", sha2::Sha256::digest(firing.prompt.as_bytes()));
+        // Calibration uses three seeds; the transcript component itself is unchanged.
         assert_eq!(
             prompt_hash,
-            "90e949d5ecab64b27a84497213d8aa03b450b025d2bf301e0d61593d98f2de27"
+            "1b08d1670ba7beb7434d8d8140a74d7037b9a271c31088b731b3326786f76e5c"
         );
         let validated = crate::historian_validate::validate_historian_output(
             &historian_output(1, 3, 4),
@@ -3439,8 +3447,72 @@ mod prompt_fit_tests {
         let (fit, limit, sent) = fit_with(1_000_000, 8_000, &memories, &compartments);
         assert!(!fit.trimmed);
         assert_eq!(fit.chunk_tokens, 10_000);
-        assert_eq!(fit.kept, (SESSION_REF_WINDOW, 300, SEED_FLOOR));
+        assert_eq!(fit.kept, (compartments.len(), 300, SEED_FLOOR));
         assert!(sent <= limit as f64);
+    }
+
+    #[test]
+    fn fit_drops_diverse_before_recent_and_oldest_recent_first() {
+        let mut compartments = compartments();
+        // Twelve distinct rows give three diverse older examples and four recent.
+        while compartments.len() < 12 {
+            let i = compartments.len();
+            let mut row = compartments[0].clone();
+            row.start_message = i as i64 * 10 + 1;
+            row.end_message = i as i64 * 10 + 10;
+            row.title = format!("Compartment {i}");
+            compartments.push(row);
+        }
+        let seeds = select_seeds("ses-fit", 61, SEED_FLOOR);
+        let refs = select_session_references(&compartments, &seeds, "ses-fit", 61);
+        assert_eq!(refs.len(), 7);
+        let seed = DecisionCalibration::for_model(Some(MODEL));
+        let system_tokens =
+            estimate_tokens(crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT) as f64;
+        for remaining in [6, 4, 3] {
+            let expected = render_session_references_block_window(&refs, remaining);
+            let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
+                seed_examples: &render_seed_examples_block(&seeds),
+                session_references: &expected,
+                project_memory: "",
+                input_source: "Messages 61-400:\n\n",
+                memory_enabled: true,
+                extraction_free: false,
+            });
+            let limit = seed
+                .provider_mass(
+                    LocalMass {
+                        system: system_tokens,
+                        prose: (estimate_tokens(&prompt) + 10_000 + PROMPT_FIT_SLACK_TOKENS) as f64,
+                        tools: 0.0,
+                    },
+                    true,
+                )
+                .ceil() as usize;
+            let fit = fit_historian_prompt(&HistorianPromptFitInput {
+                session_id: "ses-fit",
+                chunk_start: 61,
+                last_ordinal: 400,
+                compartments: &compartments,
+                memories: &[],
+                memory_enabled: true,
+                extraction_free: false,
+                limit: Some(limit),
+                seed: &seed,
+                system_tokens,
+                requested: 10_000,
+            });
+            assert_eq!(fit.kept, (remaining, 0, 3));
+            assert_eq!(fit.session_references, expected);
+            for i in (12 - remaining.min(4))..12 {
+                assert!(fit
+                    .session_references
+                    .contains(&format!("title=\"Compartment {i}\"")));
+            }
+            if remaining == 3 {
+                assert!(!fit.session_references.contains("title=\"Compartment 8\""));
+            }
+        }
     }
 
     #[test]
@@ -3453,8 +3525,13 @@ mod prompt_fit_tests {
         let full = build_compartment_agent_prompt(&CompartmentPromptInputs {
             seed_examples: &render_seed_examples_block(&select_seeds("ses-fit", 61, SEED_FLOOR)),
             session_references: &render_session_references_block_window(
-                &compartments,
-                SESSION_REF_WINDOW,
+                &select_session_references(
+                    &compartments,
+                    &select_seeds("ses-fit", 61, SEED_FLOOR),
+                    "ses-fit",
+                    61,
+                ),
+                crate::historian_prompt::SESSION_REF_LIMIT,
             ),
             project_memory: &render_historian_memory_block(&memories),
             input_source: "Messages 61-400:\n\n",

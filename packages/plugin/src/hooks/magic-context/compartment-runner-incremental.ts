@@ -730,9 +730,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         deps.onHistorianRunStarted?.();
 
         // v2 bounded reference model (replaces the unbounded existing_state dump):
-        //   - 4 rotating cross-project seeds + last-6 recency compartments (no
-        //     embedding at historian time), built from this session's prior
-        //     compartments.
+        //   - 3 rotating seeds + 3 diverse older + 4 recent session compartments
+        //     (no embedding at historian time). Only seeds and diverse references
+        //     show scores, preventing recent-score anchoring in one-compartment runs.
         //   - <project-memory> for fact dedup, rendered id-free because the
         //     historian dedups by content and never addresses a memory by id.
         //     Byte-parity with the Rust port is pinned by the historian prompt

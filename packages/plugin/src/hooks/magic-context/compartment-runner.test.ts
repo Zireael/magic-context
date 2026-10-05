@@ -2438,7 +2438,7 @@ describe("runCompartmentAgent", () => {
         expect(sentPrompt).toContain("[4] A: three");
         expect(sentPrompt).not.toContain("msg_");
         // v2: the unbounded existing_state dump is gone. Prior compartments now
-        // appear in the bounded <session_references> recency block (last 6),
+        // appear in <session_references> (3 diverse older + 4 recent examples),
         // and facts are no longer dumped/replaced — they dedup against
         // <project-memory>. The prior compartment is still shown for continuity.
         expect(sentPrompt).toContain("<session_references>");

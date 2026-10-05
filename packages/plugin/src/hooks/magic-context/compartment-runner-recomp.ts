@@ -472,7 +472,8 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
             }
 
-            // v2 bounded reference model: 4 rotating seeds + last-6 recency
+            // Bounded calibration: 3 seeds + 3 diverse older + 4 recent examples.
+            // Recent scores are hidden to prevent anchoring in one-compartment runs
             // (the compartments built so far in THIS recomp run provide
             // continuity). Recomp is a structural rebuild and emits no durable
             // facts (see below), so <project-memory> is omitted — there's

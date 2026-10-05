@@ -2,9 +2,10 @@
 //! SAME file compiles and runs on the base commit `991046ca` as well as here.
 //!
 //! The acceptance bar for the host-runner slice was "with the default runner,
-//! nothing changed". The shared historian prompt now intentionally asks for
-//! subjectless user observations, so its request digest is pinned to the current
-//! prompt while the served-byte digest remains the base-tree comparison.
+//! nothing changed". The historian's calibration examples now intentionally use
+//! three seeds plus diverse older and recent session references, so its request
+//! digest is pinned to the current prompt while the served-byte digest remains
+//! the base-tree comparison.
 //!
 //! - The historian request digest covers exactly what leaves the module for the
 //!   completion provider: the system prompt, the user prompt, and the model.
@@ -19,10 +20,11 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-/// The historian request bytes pinned after the shared prompt switched to
-/// subjectless, verb-first user-observation examples.
+/// The historian request bytes pinned after calibration switched to three seeds
+/// plus diverse older and recent session examples. Main-session bytes stay pinned
+/// separately by BASELINE_SERVED_DIGEST.
 const EXPECTED_REQUEST_DIGEST: &str =
-    "85aaf981b26d8f720ee76c91ddea59b003cf619fbfb353ff1e40cb337f7fbca5";
+    "a2e70c1e70fd85b1b442c69a6e312a3595b2f97953f2de01ab64b892dd914320";
 
 /// The array a fold pass serves, recorded the same way.
 const BASELINE_SERVED_DIGEST: &str =
