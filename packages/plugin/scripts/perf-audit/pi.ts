@@ -4,8 +4,15 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { generateSyntheticFixture } from "../../../pi-plugin/scripts/experiments/perf/fixtures";
-import type { PerfRunReport } from "../../../pi-plugin/scripts/experiments/perf/run";
+
+// Load sibling-package sources at runtime: their aliases and compilation root
+// belong to Pi, not to the core package's scripts TypeScript project.
+const piModule = (file: string) => import(join(import.meta.dir, "../../../pi-plugin", file));
+const { generateSyntheticFixture } = await piModule("scripts/experiments/perf/fixtures.ts");
+interface Fixture { entries: { id: string; type: string; message?: unknown }[]; }
+interface PerfRunReport {
+ passes: { inputMessages: number; phases: unknown; stages: {stage:string;elapsedMs:number;extra?:string}[]; dbQueries: {sql:string;elapsedMs:number;operations:number}[] }[];
+}
 
 console.log(`Bun ${Bun.version}; median of 5 warm samples, 1k/10k/60k Pi messages`);
 const reportIndex = process.argv.indexOf("--report");
@@ -31,20 +38,19 @@ const { getOrCreateSessionMeta } = await import("../../src/features/magic-contex
 const { getMemoriesByProject } = await import("../../src/features/magic-context/memory/storage-memory");
 const { stripSystemInjection } = await import("../../src/hooks/magic-context/system-injection-stripper");
 const { lkgContentFields } = await import("../../src/hooks/magic-context/lkg-slot");
-const { capturePiServedArray, flushPiServedArrayLedger } = await import("../../../pi-plugin/src/served-array-ledger");
-const { createPiLkgCoordinator, clearPiLkgSessionState } = await import("../../../pi-plugin/src/pi-lkg");
-const { measurePiTailHygiene, assertPiTailHygieneContentUnchanged, clearPiTailHygieneContentMemo, __test: hygieneTest } = await import("../../../pi-plugin/src/tail-hygiene-walk-pi");
-const { tokenizePiMessages } = await import("../../../pi-plugin/src/tokenize-pi-messages");
-const { createPiTagSnapshotReader } = await import("../../../pi-plugin/src/tag-snapshot-pi");
-const { readPiSessionMessages } = await import("../../../pi-plugin/src/read-session-pi");
-const { convertPiAssistantEntryById } = await import("../../../pi-plugin/src/read-session-pi");
+const { capturePiServedArray, flushPiServedArrayLedger } = await piModule("src/served-array-ledger.ts");
+const { createPiLkgCoordinator, clearPiLkgSessionState } = await piModule("src/pi-lkg.ts");
+const { measurePiTailHygiene, assertPiTailHygieneContentUnchanged, clearPiTailHygieneContentMemo, __test: hygieneTest } = await piModule("src/tail-hygiene-walk-pi.ts");
+const { tokenizePiMessages } = await piModule("src/tokenize-pi-messages.ts");
+const { createPiTagSnapshotReader } = await piModule("src/tag-snapshot-pi.ts");
+const { readPiSessionMessages, convertPiAssistantEntryById } = await piModule("src/read-session-pi.ts");
 const { hasPiFallbackMessageTags, hasPiFallbackToolOwnerTags } = await import("../../src/features/magic-context/storage-tags");
-const { hasPiFallbackMessageTags: cachedMessageProbe, hasPiFallbackToolOwnerTags: cachedToolProbe } = await import("../../../pi-plugin/src/fallback-tag-probes-pi");
-const { runPiDebugAssertion } = await import("../../../pi-plugin/src/debug-assertions-pi");
-const { __test: handlerTest, clearContextHandlerSession } = await import("../../../pi-plugin/src/context-handler");
-const { createPiTranscript } = await import("../../../pi-plugin/src/transcript-pi");
-const { createPiM0M1PassSnapshot } = await import("../../../pi-plugin/src/inject-compartments-pi");
-const { findFirstKeptEntryId } = await import("../../../pi-plugin/src/pi-historian-runner");
+const { hasPiFallbackMessageTags: cachedMessageProbe, hasPiFallbackToolOwnerTags: cachedToolProbe } = await piModule("src/fallback-tag-probes-pi.ts");
+const { runPiDebugAssertion } = await piModule("src/debug-assertions-pi.ts");
+const { __test: handlerTest, clearContextHandlerSession, collectMessageEntryIdsByRef } = await piModule("src/context-handler.ts");
+const { createPiTranscript } = await piModule("src/transcript-pi.ts");
+const { createPiM0M1PassSnapshot } = await piModule("src/inject-compartments-pi.ts");
+const { findFirstKeptEntryId } = await piModule("src/pi-historian-runner.ts");
 
 function median(run: () => unknown): number {
  run();
@@ -56,7 +62,7 @@ try {
  for (const size of [1000, 10000, 60000]) {
   const db = new Database(join(root, `context-${size}.db`));
   initializeDatabase(db); runMigrations(db); getOrCreateSessionMeta(db, "audit");
-  const fixture = generateSyntheticFixture({ messages: size });
+  const fixture: Fixture = generateSyntheticFixture({ messages: size });
   const messages = fixture.entries.map(e => (e as unknown as {message: unknown}).message);
   const ids = fixture.entries.map(e => e.id);
   // The host's usual ~4 KiB read result and occasional screenshot dominate bytes.
@@ -74,13 +80,14 @@ try {
   const coordinator = createPiLkgCoordinator(db, () => {});
   const begin = () => coordinator.beginPass({ sessionId: "audit", messages, entryIds: ids, modelKey: "anthropic/audit", providerKey: "anthropic" });
   const snapshot = begin();
-  let serializedOutput: unknown;
+  let serializedOutput: ReturnType<typeof coordinator.captureAppliedPass>;
   const capture = () => { serializedOutput = coordinator.captureAppliedPass({ snapshot, outputMessages: messages, outputEntryIds: ids, cacheBusting: false }); };
-  const cache = new Map();
+  const cache = new Map<string, unknown>();
   const idByRef = new Map(messages.map((m,i)=>[m,ids[i]!]));
   const tokenOptions = { cache, stableId: (m:unknown) => idByRef.get(m) };
   tokenizePiMessages(messages, tokenOptions);
   const ctx = { sessionManager: { getBranch: () => fixture.entries, getSessionId: () => "audit", getSessionFile: () => undefined } };
+  const clonedMessages = structuredClone(messages);
   const transcript = createPiTranscript(messages, `identity-${size}`, ids);
   const assignments = new Map<string,number>();
   db.transaction(() => {
@@ -102,7 +109,7 @@ try {
   const timings = {
    ledger: median(() => capturePiServedArray("audit", messages, { storageDir: root })),
    lkgInput: median(begin), lkgOutput: median(capture),
-   ledgerWithLkg: median(() => capturePiServedArray("audit-reuse", messages, { storageDir: root, serializedOutput } as never)),
+   ledgerWithLkg: median(() => capturePiServedArray("audit-reuse", messages, { storageDir: root, serializedOutput })),
    detachedFields: median(() => messages.map(lkgContentFields)),
    hygiene: median(() => measurePiTailHygiene(hygieneInput)),
    assertion: median(() => assertPiTailHygieneContentUnchanged({ ...hygieneInput, expectedSignature: measured.contentSignature })),
@@ -115,6 +122,8 @@ try {
    tagSnapshot: median(() => readTags("audit")),
    branchConversion: median(() => readPiSessionMessages(ctx as never)),
    branchSingleAssistant: median(() => convertPiAssistantEntryById(fixture.entries, ids.at(-1)!)),
+   referenceMapping: median(() => collectMessageEntryIdsByRef(ctx,messages,undefined,fixture.entries)),
+   clonedReferenceMapping: median(() => collectMessageEntryIdsByRef(ctx,clonedMessages,undefined,fixture.entries)),
    tokenCacheHit: median(() => tokenizePiMessages(messages,tokenOptions)),
    tokenUncached: median(() => tokenizePiMessages(messages)),
    prefixCloneTwice: median(() => { const prefix=[{role:"user",content:"history ".repeat(size)}]; structuredClone(prefix); structuredClone(prefix); }),

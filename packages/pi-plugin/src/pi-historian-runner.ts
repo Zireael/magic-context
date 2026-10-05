@@ -1891,7 +1891,9 @@ export function findFirstKeptEntryId(
 	lastCompactedOrdinal: number,
 ): string | null {
 	const target = lastCompactedOrdinal + 1;
-	const afterOrdinal = Number.isNaN(lastCompactedOrdinal) ? 0 : Math.max(0, lastCompactedOrdinal);
+	const afterOrdinal = Number.isNaN(lastCompactedOrdinal)
+		? 0
+		: Math.max(0, lastCompactedOrdinal);
 	for (const message of iterateEntriesToRawMessageRange(
 		entries,
 		afterOrdinal,
