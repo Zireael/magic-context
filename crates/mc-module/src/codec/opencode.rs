@@ -77,11 +77,13 @@ pub fn decode_opencode_with_sidecar_and_base(
             .or_else(|| integer_field(info, "time_completed"))
             .or_else(|| integer_field(info, "timeCompleted"));
         let origin = opencode_origin(info).or_else(|| opencode_origin(raw_message));
+        profile_start!(perf_parts_copy, "rt07_parts_copy");
         let parts = raw_message
             .get("parts")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        profile_end!(perf_parts_copy);
 
         let mut content = Vec::new();
         let mut block_metas = Vec::new();

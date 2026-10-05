@@ -6295,13 +6295,16 @@ impl McHandler {
                 .lock()
                 .expect("boundary token cache mutex")
                 .prime_from_persisted_tags(&parsed.session_id, tags.as_slice());
-        } else if let Ok(tags) = store.load_tags_for_session(&parsed.session_id) {
-            // Malformed-lineage and compaction-off paths return before normal tag hydration.
-            // Preserve their fail-open tokenization behavior rather than treating absence as empty.
-            self.boundary_tokens
-                .lock()
-                .expect("boundary token cache mutex")
-                .prime_from_persisted_tags(&parsed.session_id, &tags);
+        } else {
+            profile_start!(_perf_fallback, "rt19_fallback_tag_load");
+            if let Ok(tags) = store.load_tags_for_session(&parsed.session_id) {
+                // Malformed-lineage and compaction-off paths return before normal tag hydration.
+                // Preserve their fail-open tokenization behavior rather than treating absence as empty.
+                self.boundary_tokens
+                    .lock()
+                    .expect("boundary token cache mutex")
+                    .prime_from_persisted_tags(&parsed.session_id, &tags);
+            }
         }
         let CachedBoundaryMessages {
             messages: boundary_messages,
@@ -14351,6 +14354,10 @@ fn json_type_name(value: &Value) -> &'static str {
 /// first materialization freezes it into meta); every later pass reads the frozen value,
 /// never this, so expiry never drifts the rendered bytes between passes.
 fn now_ms() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = tests::per_pass_fixed_now_ms() {
+        return now;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -18820,10 +18827,14 @@ mod tests {
     mod gate_a2;
     mod guidance_get_golden;
     mod per_pass_cost;
+    mod perf_audit_wire;
     // Only the profiling harness can construct the scoped override. Differential
     // predicates can read it without exposing a switch to other test suites.
     pub(crate) fn per_pass_differentials_disabled() -> bool {
         per_pass_cost::differentials_disabled()
+    }
+    pub(crate) fn per_pass_fixed_now_ms() -> Option<i64> {
+        per_pass_cost::fixed_now_ms()
     }
     mod single_store_drill;
     mod tool_catalog;

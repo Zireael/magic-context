@@ -14,6 +14,7 @@ use serde::Serialize;
 pub(crate) struct Cost {
     pub wall_ms: f64,
     pub thread_cpu_ms: f64,
+    pub calls: u64,
 }
 
 thread_local! {
@@ -26,6 +27,29 @@ pub(crate) fn begin_pass() {
 
 pub(crate) fn end_pass() -> BTreeMap<&'static str, Cost> {
     COSTS.with(|costs| costs.borrow_mut().take().expect("profiling pass active"))
+}
+
+pub(crate) fn report_clock_overhead() {
+    let mut inclusive = Vec::new();
+    let mut recorded = Vec::new();
+    for _ in 0..23 {
+        begin_pass();
+        let before = ThreadTime::now().as_duration();
+        for _ in 0..23_000 {
+            finish(start("empty"));
+        }
+        let elapsed = ThreadTime::now().as_duration().saturating_sub(before);
+        let costs = end_pass();
+        inclusive.push(elapsed.as_secs_f64() * 1_000.0 / 23_000.0);
+        recorded.push(costs["empty"].thread_cpu_ms / 23_000.0);
+    }
+    inclusive.sort_by(f64::total_cmp);
+    recorded.sort_by(f64::total_cmp);
+    println!(
+        "COST_CLOCK {}",
+        serde_json::json!({"n":23,"spans_per_sample":23_000,
+        "inclusive_cpu_ms_per_span":inclusive[11],"recorded_cpu_ms_per_span":recorded[11]})
+    );
 }
 
 // `ThreadTime` is deliberately !Send, and spans live across awaits in the
@@ -65,6 +89,7 @@ impl Drop for Span {
                 let cost = costs.entry(self.name).or_default();
                 cost.wall_ms += wall_ms;
                 cost.thread_cpu_ms += cpu_ms;
+                cost.calls += 1;
             }
         });
     }

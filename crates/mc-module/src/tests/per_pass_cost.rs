@@ -5,6 +5,7 @@
 //! sized from tag sources. Keep the real frozen-unit/overlay state. This is a
 //! scale experiment, not an exact replay of the private host's requests.
 
+use super::perf_audit_wire;
 use super::*;
 use crate::per_pass_profile;
 use std::cell::Cell;
@@ -14,6 +15,31 @@ use std::rc::Rc;
 
 thread_local! {
     static DIFFERENTIALS_DISABLED: Cell<bool> = const { Cell::new(false) };
+    static FIXED_NOW_MS: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
+pub(super) fn fixed_now_ms() -> Option<i64> {
+    FIXED_NOW_MS.get()
+}
+
+struct FixedClock {
+    previous: Option<i64>,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl FixedClock {
+    fn new() -> Self {
+        Self {
+            previous: FIXED_NOW_MS.replace(Some(1_791_072_000_000)),
+            _thread_bound: PhantomData,
+        }
+    }
+}
+
+impl Drop for FixedClock {
+    fn drop(&mut self) {
+        FIXED_NOW_MS.set(self.previous);
+    }
 }
 
 pub(super) fn differentials_disabled() -> bool {
@@ -259,11 +285,269 @@ fn native(messages: &[CkIngressMessage], session: &str) -> Vec<Value> {
         .collect()
 }
 
-fn output_bytes(response: &Value) -> Vec<u8> {
-    // Timings, clocks, pass row versions and diagnostic metadata are not
-    // provider input. Compare the complete CK and native arrays themselves.
-    serde_json::to_vec(&json!({"ck":response["ck_messages"], "native":response["native_messages"]}))
+// Only this store-clock bookkeeping column is excluded. Module-owned timestamps
+// are frozen by FixedClock, including timestamps embedded in trace JSON. Keep
+// unknown columns: they might feed a decision or a later served response.
+const PERSISTED_BOOKKEEPING_EXCLUSIONS: &[(&str, &str)] = &[("mc_cache_state", "last_activity_at")];
+
+#[test]
+fn fixed_profile_clock_is_scoped_and_thread_local() {
+    assert_eq!(fixed_now_ms(), None);
+    {
+        let _clock = FixedClock::new();
+        assert_eq!(crate::now_ms(), 1_791_072_000_000);
+        assert_eq!(std::thread::spawn(fixed_now_ms).join().unwrap(), None);
+    }
+    assert_eq!(fixed_now_ms(), None);
+    let unwind = std::panic::catch_unwind(|| {
+        let _clock = FixedClock::new();
+        panic!("exercise clock cleanup");
+    });
+    assert!(unwind.is_err());
+    assert_eq!(fixed_now_ms(), None);
+}
+
+#[test]
+fn persisted_profile_digest_checks_raw_rows_and_only_named_bookkeeping_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE mc_cache_state (session_id TEXT, core_state TEXT, last_activity_at INTEGER);
+         CREATE TABLE mc_pass_trace_history (session_id TEXT, entry TEXT);
+         INSERT INTO mc_cache_state VALUES ('s', '{\"n\":1}', 1);
+         INSERT INTO mc_pass_trace_history VALUES ('s', 'received');",
+    )
+    .unwrap();
+    let before = persisted_bytes_digest(&path, "s");
+    conn.execute("UPDATE mc_cache_state SET last_activity_at=2", [])
+        .unwrap();
+    assert_eq!(before, persisted_bytes_digest(&path, "s"));
+    conn.execute("UPDATE mc_cache_state SET core_state='{\"n\":1.0}'", [])
+        .unwrap();
+    let raw_change = persisted_bytes_digest(&path, "s");
+    assert_ne!(
+        before, raw_change,
+        "logically equal JSON is not byte-identical"
+    );
+    conn.execute("UPDATE mc_pass_trace_history SET entry='completed'", [])
+        .unwrap();
+    assert_ne!(
+        raw_change,
+        persisted_bytes_digest(&path, "s"),
+        "trace contents are compared too"
+    );
+}
+
+fn measure_value_costs(session: &str, store: &McStore, request: &Value) {
+    let state = store.load(session).unwrap();
+    let compartments: Vec<_> = store.load_compartments(session).unwrap().into_iter().map(|row| {
+        json!({"seq":row.sequence,"start_message":row.start_message,"end_message":row.end_message,
+            "end_message_id":row.end_message_id,"title":row.title,"p1":row.p1.unwrap_or(row.content),
+            "p2":row.p2,"p3":row.p3,"p4":row.p4,"importance":row.importance,
+            "episode_type":row.episode_type,"start_date":row.start_date,"end_date":row.end_date})
+    }).collect();
+    let imported = json!({"v":1,"session_id":session,"import_id":"profile-import",
+        "batch_seq":0,"batch_count":1,"compartments":compartments});
+    let drops: Vec<_> = state
+        .core
+        .frozen_units
+        .iter()
+        .filter_map(|unit| {
+            let target = unit.key.strip_prefix("red:")?;
+            Some(json!({"block_id":target,"drop_mode":unit.kind,"payload":unit.frozen_payload}))
+        })
+        .collect();
+    let sync = json!({"method":"state_sync","session_id":session,"shadow_generation":1,
+        "expected_shadow_seq":0,"drop_seeds":drops});
+    for (shape, value) in [
+        ("transform", request),
+        ("state_import", &imported),
+        ("state_sync", &sync),
+    ] {
+        let mut measurements = Vec::new();
+        let mut byte_costs = Vec::new();
+        let mut decode_costs = Vec::new();
+        for sample in 0..23 {
+            per_pass_profile::begin_pass();
+            profile_start!(perf_bytes, "rt14_byte_length");
+            std::hint::black_box(serde_json::to_vec(std::hint::black_box(value)).unwrap());
+            profile_end!(perf_bytes);
+            profile_start!(perf_decode, "rt14_cloned_decode");
+            match shape {
+                "state_import" => {
+                    std::hint::black_box(serde_json::from_value::<StateImportWire>(value.clone()).unwrap());
+                }
+                "state_sync" => {
+                    std::hint::black_box(serde_json::from_value::<ModuleStateSyncWire>(value.clone()).unwrap());
+                }
+                _ => {
+                    std::hint::black_box(
+                        serde_json::from_value::<TransformRequest>(value.clone()).unwrap(),
+                    );
+                }
+            }
+            profile_end!(perf_decode);
+            profile_start!(perf_value, "rt14_canonical_value");
+            std::hint::black_box(canonical_value(std::hint::black_box(value)));
+            profile_end!(perf_value);
+            let costs = per_pass_profile::end_pass();
+            if sample >= 3 {
+                measurements.push(costs["rt14_canonical_value"].thread_cpu_ms);
+                byte_costs.push(costs["rt14_byte_length"].thread_cpu_ms);
+                decode_costs.push(costs["rt14_cloned_decode"].thread_cpu_ms);
+            }
+        }
+        println!(
+            "COST_MICRO {}",
+            json!({"session":session,"shape":shape,
+            "finding":"RT-14","n":measurements.len(),"bytes":serde_json::to_vec(value).unwrap().len(),
+                "thread_cpu_p50_ms":median(&mut measurements),
+                "byte_length_cpu_p50_ms":median(&mut byte_costs),
+                "cloned_decode_cpu_p50_ms":median(&mut decode_costs)})
+        );
+    }
+}
+
+fn measure_tokenizer_cost(session: &str, store: &McStore, messages: &[CkIngressMessage]) {
+    let coverage = store.load(session).unwrap().meta.coverage_ordinal;
+    let projection = ck_wire::project_messages(messages).unwrap();
+    let blocks: Vec<_> = projection
+        .blocks
+        .iter()
+        .filter(|block| coverage.is_none_or(|coverage| block.ordinal > coverage))
+        .collect();
+    let mut measurements = Vec::new();
+    for sample in 0..23 {
+        per_pass_profile::begin_pass();
+        profile_start!(perf_tokens, "rt06_live_block_tokenization");
+        for block in &blocks {
+            std::hint::black_box(mc_tokenizer::estimate_tokens(std::hint::black_box(
+                &block.bytes,
+            )));
+        }
+        profile_end!(perf_tokens);
+        let costs = per_pass_profile::end_pass();
+        if sample >= 3 {
+            measurements.push(costs["rt06_live_block_tokenization"].thread_cpu_ms);
+        }
+    }
+    println!(
+        "COST_MICRO {}",
+        json!({"session":session,"finding":"RT-6",
+        "shape":"live_projected_blocks","blocks":blocks.len(),"n":measurements.len(),
+        "bytes":blocks.iter().map(|block| block.bytes.len()).sum::<usize>(),
+        "thread_cpu_p50_ms":median(&mut measurements)})
+    );
+}
+
+fn prove_scratch_database_opens(root: &Path) {
+    let output = Command::new("lsof")
+        .args(["-a", "-p", &std::process::id().to_string(), "-Fn"])
+        .output()
+        .expect("lsof is required for the isolation check");
+    assert!(output.status.success(), "lsof failed");
+    let output = String::from_utf8(output.stdout).unwrap();
+    let mut databases = Vec::new();
+    for line in output.lines().filter_map(|line| line.strip_prefix('n')) {
+        if line.ends_with(".db") || line.ends_with(".db-wal") || line.ends_with(".db-shm") {
+            let path = Path::new(line);
+            assert!(path.starts_with(root), "database outside scratch: {line}");
+            databases.push(path.strip_prefix(root).unwrap().display().to_string());
+        }
+    }
+    assert!(
+        !databases.is_empty(),
+        "lsof must observe the open scratch store"
+    );
+    println!(
+        "COST_OPEN_FILES {}",
+        json!({"pid":std::process::id(),"databases":databases})
+    );
+}
+
+// Hash actual stored JSON strings, chunk bodies and row values without decoding
+// or re-encoding them. Physical SQLite pages/WAL layout are not row-state bytes.
+fn persisted_bytes_digest(path: &Path, session: &str) -> String {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
         .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut hash = Sha256::new();
+    let field = |hash: &mut Sha256, bytes: &[u8]| {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    };
+    for table in tables {
+        let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+        let columns = conn
+            .prepare(&format!("PRAGMA table_info({quoted})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        if !columns.iter().any(|column| column == "session_id") {
+            continue;
+        }
+        let columns: Vec<_> = columns
+            .into_iter()
+            .filter(|column| {
+                !PERSISTED_BOOKKEEPING_EXCLUSIONS.contains(&(table.as_str(), column.as_str()))
+            })
+            .collect();
+        field(&mut hash, table.as_bytes());
+        for column in &columns {
+            field(&mut hash, column.as_bytes());
+        }
+        let selection = columns
+            .iter()
+            .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let ordering = (1..=columns.len())
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut query = conn
+            .prepare(&format!(
+                "SELECT {selection} FROM {quoted} WHERE session_id=?1 ORDER BY {ordering}"
+            ))
+            .unwrap();
+        let mut rows = query.query([session]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            hash.update(b"R");
+            for column in 0..columns.len() {
+                use rusqlite::types::ValueRef;
+                match row.get_ref(column).unwrap() {
+                    ValueRef::Null => hash.update(b"N"),
+                    ValueRef::Integer(value) => {
+                        hash.update(b"I");
+                        hash.update(value.to_le_bytes());
+                    }
+                    ValueRef::Real(value) => {
+                        hash.update(b"F");
+                        hash.update(value.to_bits().to_le_bytes());
+                    }
+                    ValueRef::Text(value) => {
+                        hash.update(b"T");
+                        field(&mut hash, value);
+                    }
+                    ValueRef::Blob(value) => {
+                        hash.update(b"B");
+                        field(&mut hash, value);
+                    }
+                }
+            }
+        }
+    }
+    format!("{:x}", hash.finalize())
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -284,7 +568,13 @@ async fn copied_sessions_per_pass_cost() {
     }
     let references = references_enabled(std::env::var("MC_PER_PASS_REFERENCES").ok().as_deref());
     let _differentials = DifferentialOverride::new(references);
-    println!("COST_CONFIG {}", json!({"references": references}));
+    let _clock = FixedClock::new();
+    println!(
+        "COST_CONFIG {}",
+        json!({"references": references,
+        "persisted_bookkeeping_exclusions":PERSISTED_BOOKKEEPING_EXCLUSIONS})
+    );
+    per_pass_profile::report_clock_overhead();
     let temp = std::env::temp_dir().canonicalize().unwrap();
     let root = temp.join("magic-context/ckmc-perf").canonicalize().expect(
         "copy-only profile needs existing scrubbed backups; never recreate from live stores",
@@ -359,8 +649,11 @@ async fn copied_sessions_per_pass_cost() {
             Arc::new(MissingSessionResolver),
         );
         handler.store.set(Arc::clone(&store)).ok().unwrap();
-        let project = dir.path().join("empty-project");
-        std::fs::create_dir(&project).unwrap();
+        // The route root is persisted with accepted passes. Keep it identical
+        // between runs while the writable database clones remain throwaway.
+        let project = root.join("audit-empty-project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(std::fs::read_dir(&project).unwrap().next().is_none());
         let mut route = binding_with_harness(project.to_str().unwrap(), "opencode", session);
         route.config.inject_docs = false;
         handler.bind_route(7, route);
@@ -375,7 +668,22 @@ async fn copied_sessions_per_pass_cost() {
         request["messages"] = serde_json::to_value(&messages).unwrap();
         request["native_messages"] = json!(native(&messages, session));
         request["full_array_fingerprint"] = json!("normalize");
-        let initial = call_transform_request_on_channel(&handler, 7, request).await;
+        measure_value_costs(session, &store, &request);
+        let initial_raw = match handler.handle_transform_for_test(7, request).await {
+            HandlerOutcome::Response(bytes) => bytes,
+            other => panic!("unexpected handler outcome: {other:?}"),
+        };
+        let initial: Value = serde_json::from_slice(&initial_raw).unwrap();
+        let mut served_native_raw =
+            perf_audit_wire::items(perf_audit_wire::field(&initial_raw, "native_messages"));
+        prove_scratch_database_opens(&root);
+        println!(
+            "COST_IDENTITY {}",
+            json!({"session":session,"mode":"normalize","pass":0,
+            "wire_sha256":sha256_hex(&perf_audit_wire::output(&initial_raw, &served_native_raw)),
+            "state_sha256":persisted_bytes_digest(&dir.path().join("store.db"),session),
+            "context_sha256":persisted_bytes_digest(&dir.path().join("context.db"),session)})
+        );
         let mut served_native = initial["native_messages"].as_array().unwrap().clone();
         // Normalizing render identity can HARD-fold and retire historical units.
         // Restore the original historical vector plus the normalized frames so
@@ -403,6 +711,17 @@ async fn copied_sessions_per_pass_cost() {
                 &normalized.meta,
             )
             .unwrap();
+        measure_tokenizer_cost(session, &store, &messages);
+        let state = store.load(session).unwrap();
+        let mut full = base.clone();
+        full["messages"] = serde_json::to_value(&messages).unwrap();
+        let full = serde_json::from_value::<TransformRequest>(full).unwrap();
+        transform::perf_audit_metadata::measure_fixture(
+            &full,
+            &state.core,
+            &state.meta,
+            &store.load_tags_for_session(session).unwrap(),
+        );
         let mut expected = Vec::new();
         let mut after = "normalize".to_string();
         for mode in ["warm_delta", "warm_full", "evicted_full"] {
@@ -439,12 +758,33 @@ async fn copied_sessions_per_pass_cost() {
                 }
                 request["native_messages"] = json!(native_messages);
                 per_pass_profile::begin_pass();
-                let mut response = call_transform_request_on_channel(&handler, 7, request).await;
+                // Include the transport's capability probe and Value decode, which
+                // the ordinary typed test helper bypasses. Request serialization
+                // is performed by the caller, outside the profiled handler.
+                let body = serde_json::to_vec(&request).unwrap();
+                profile_start!(perf_cap, "rt01_byte_cap");
+                assert!(enforce_request_byte_cap(&body).is_ok());
+                profile_end!(perf_cap);
+                profile_start!(perf_reply, "rt01_reply_capability");
+                let _ = reply_pages::accepts_reply_pages(&body);
+                profile_end!(perf_reply);
+                profile_start!(perf_value, "rt01_value_decode");
+                let request = serde_json::from_slice::<Value>(&body).unwrap();
+                profile_end!(perf_value);
+                let response_raw = match handler
+                    .handle_transform_for_test_with_body_size(7, request, body.len())
+                    .await
+                {
+                    HandlerOutcome::Response(bytes) => bytes,
+                    other => panic!("unexpected handler outcome: {other:?}"),
+                };
+                let mut response = serde_json::from_slice::<Value>(&response_raw).unwrap();
                 let costs = per_pass_profile::end_pass();
                 if !references {
                     assert!(
                         !costs.contains_key("projection_differential")
-                            && !costs.contains_key("native_differential"),
+                            && !costs.contains_key("native_differential")
+                            && !costs.contains_key("output_differential"),
                         "production-equivalent profile must not include correctness references"
                     );
                 }
@@ -459,6 +799,10 @@ async fn copied_sessions_per_pass_cost() {
                 assert!(response["ck_messages"].is_array());
                 if let Some(full) = response["native_messages"].as_array() {
                     served_native = full.clone();
+                    served_native_raw = perf_audit_wire::items(perf_audit_wire::field(
+                        &response_raw,
+                        "native_messages",
+                    ));
                 } else {
                     let delta = &response["native_messages_delta"];
                     assert_eq!(delta["after"], after);
@@ -466,15 +810,29 @@ async fn copied_sessions_per_pass_cost() {
                     assert!(cut <= served_native.len());
                     served_native.truncate(cut);
                     served_native.extend(delta["messages"].as_array().unwrap().iter().cloned());
+                    served_native_raw.truncate(cut);
+                    served_native_raw.extend(perf_audit_wire::items(perf_audit_wire::field(
+                        perf_audit_wire::field(&response_raw, "native_messages_delta"),
+                        "messages",
+                    )));
                 }
                 // Compare complete provider arrays, not a full response with a
                 // delta envelope or an absent native_messages placeholder.
                 response["native_messages"] = json!(served_native);
                 after = fingerprint;
+                let bytes = perf_audit_wire::output(&response_raw, &served_native_raw);
+                let state_digest = persisted_bytes_digest(&dir.path().join("store.db"), session);
+                let context_digest =
+                    persisted_bytes_digest(&dir.path().join("context.db"), session);
+                println!(
+                    "COST_IDENTITY {}",
+                    json!({"session":session,"mode":mode,"pass":pass,
+                        "wire_sha256":sha256_hex(&bytes),"state_sha256":state_digest,
+                        "context_sha256":context_digest})
+                );
                 if pass < 3 {
                     continue;
                 }
-                let bytes = output_bytes(&response);
                 if mode == "warm_delta" {
                     expected.push(bytes.clone());
                 } else {
@@ -499,10 +857,12 @@ async fn copied_sessions_per_pass_cost() {
                 .map(|(stage, costs)| {
                     let mut wall: Vec<_> = costs.iter().map(|c| c.wall_ms).collect();
                     let mut cpu: Vec<_> = costs.iter().map(|c| c.thread_cpu_ms).collect();
+                    let mut calls: Vec<_> = costs.iter().map(|c| c.calls as f64).collect();
                     (
                         stage,
                         json!({"n":costs.len(),"wall_p50_ms":median(&mut wall),
-                    "thread_cpu_p50_ms":median(&mut cpu),"wall_max_ms":wall.last()}),
+                    "thread_cpu_p50_ms":median(&mut cpu),"calls_p50":median(&mut calls),
+                    "wall_max_ms":wall.last()}),
                     )
                 })
                 .collect();

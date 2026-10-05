@@ -197,6 +197,7 @@ impl AlignmentScore {
 }
 
 pub(crate) fn decoded_block_fingerprint(block: &CkWireBlock) -> String {
+    profile_start!(_perf_fingerprint, "rt07_decode_fingerprint");
     let mut canonical = block.clone();
     canonical.provider_extras.remove(BLOCK_IDENTITY_NAMESPACE);
     canonical.mark_modified();

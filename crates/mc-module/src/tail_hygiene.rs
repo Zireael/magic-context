@@ -229,14 +229,17 @@ fn part_measurement(
         TailHygienePartKind::File => "file",
         TailHygienePartKind::Excluded => "excluded",
     };
+    profile_start!(perf_hash, "rt03_part_hash");
     let mut hash_input = String::with_capacity(kind_name.len() + content.len() + 1);
     hash_input.push_str(kind_name);
     hash_input.push('\0');
     hash_input.push_str(content);
+    let content_hash = hex_digest(hash_input);
+    profile_end!(perf_hash);
     let active = tag_number.is_some() && !queued_for_drop;
     TailHygienePartMeasurement {
         key,
-        content_hash: hex_digest(hash_input),
+        content_hash,
         kind,
         tokens,
         u_tokens: if active && !protected { tokens } else { 0 },
