@@ -4,7 +4,10 @@ Baseline: `ee9d82912cd8105322672a1f5dd1bbb7172a2f46`. Measurements preceded the
 corresponding production edits. Bun 1.4.2, TypeScript 5.9.3, macOS. No live host,
 live database, credentials, config, cache epoch, or persisted format was changed.
 
-**Blocked on required Rust verification. Do not treat this as a green Rust lane.**
+**Initial delivery was blocked on required Rust verification.** The ordinary
+prebuilt lane is now green; see the follow-up record below. Specialized fixtures,
+served-wire differential and the Pi startup investigation are still pending in
+this checkpoint, so it is not yet a full green-lane claim.
 Five narrow optimizations are committed; several expensive findings remain
 unchanged because the proposed shortcut breaks an identity/isolation fence or
 changes request bytes. The table distinguishes those from the actual fixes.
@@ -140,3 +143,45 @@ AFT inspect returned PARTIAL because it could not locate Biome through its
 daemon environment and Tier-2 analysis was unavailable. The real package lint
 and typecheck commands above are authoritative. No todowrite tool was exposed
 in this worker's tool set.
+
+## Follow-up: ordinary prebuilt Rust lane
+
+The ordinary lane completed in the background in **1,623 seconds**, exit 0:
+**108 pass, 154 mode-inapplicable skips, 0 fail across 54 manifest files**.
+There were no recovered retries. Every file ran through
+`scripts/run-rust-hermetic-e2e.sh`, selected sequentially with its existing
+`MC_E2E_SHARD=i/57` seam. The three specialized fixture files were deferred, not
+silently removed from the required coverage: rust-timeout-double-hard,
+rust-timeout-epoch-recovery, and rust-oversize-reply.
+
+The parent authorized the installed default module build
+`49a120bd771d42f0ec7b780d8a1f43b2c557ad24`. The supplied `magic-context.current`
+pointer had been renamed; the versioned staging binary was copied instead.
+`git diff ee9d829 49a120bd -- crates` confirms that only a test comment differs.
+Both executables were copied into this worktree's ignored throwaway `tmp/` root
+before execution; no binary was run from staging:
+
+- `MC_E2E_CK_MC_PREBUILT_BIN`: copied default module, SHA-256
+  `93cb867a9500bae09fd4b73fe3a62905856d6cf13a43274c1d679fe998711567`.
+- `MC_E2E_CK_SUBC_BIN`: copied installed ck-subc 0.20.55, SHA-256
+  `4a352dc54897efa6e39fb71e48216e8d9d4a20e1bc4b832526fff3a200d95fb9`.
+
+`lsof -p 76293 -Fn` on an OpenCode host descended from this lane's own runner
+showed only throwaway `opencode-e2e-joDhE0/data/` database descriptors (OpenCode
+and Magic Context context.db, including WAL/SHM). A checked denylist found no
+live OpenCode/Magic Context store or user config descriptors.
+
+The parent then authorized one package-scoped build of the two missing fixture
+binaries. `cargo build --release --locked -p mc-module --features drive-fault
+--bin ck-mc --example slow_transform_probe` completed successfully with cargo
+1.99.0 and both artifacts were copied into the same throwaway root. The build
+was not cut off and does not need restarting. No other crate/package build ran
+concurrently with it. Fixture SHA-256 values:
+
+- drive-fault module:
+  `11886e4f4fc621406ba730879f98fdac00688cf56abb978d3a5df7b1e1155a70`.
+- delayed synchronous-dispatch probe:
+  `674cf1a43f6eee6b0b205b5a9550c40278217829cba20b167943e7466fa3eac9`.
+
+The production module is not substituted for either fault/probe fixture. The
+next verification phases will run sequentially with their actual artifacts.
