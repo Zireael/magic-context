@@ -13,6 +13,8 @@ timeout 1800s bun packages/plugin/scripts/reasoning-resend-cost/analyze.ts \
   2026-09-27T00:00:00Z 2026-10-04T23:59:59.999Z
 timeout 120s bun test packages/plugin/scripts/reasoning-resend-cost/analysis.test.ts
 timeout 300s bun run --cwd packages/plugin typecheck
+timeout 120s python3 packages/plugin/scripts/reasoning-resend-cost/verify-report.py \
+  "${TMPDIR%/}/magic-context/reasoning-diff" docs/reports/reasoning-resend-cost.md
 ```
 
 Use a background execution facility with a long timeout for analysis, not a

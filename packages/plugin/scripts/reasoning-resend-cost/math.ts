@@ -15,6 +15,11 @@ export function quantile(values: number[], p: number): number | null {
     return sorted[lo] + (sorted[Math.ceil(at)] - sorted[lo]) * (at - lo);
 }
 
+export function exampleIndices(length: number): number[] {
+    if (length <= 0) return [];
+    return [...new Set([0.1, 0.5, 0.9].map((p) => Math.round((length - 1) * p)))];
+}
+
 export function fit(rows: Observation[]) {
     if (rows.length < 3) return null;
     const mx = rows.reduce((a, b) => a + b.x, 0) / rows.length;

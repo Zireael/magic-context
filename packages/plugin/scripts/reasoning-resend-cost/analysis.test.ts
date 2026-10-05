@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { estimateTokens, preloadTokenizer } from "../../src/hooks/magic-context/read-session-formatting";
 import { estimatePair, oc1Content, piContent, total, type Usage } from "./analyze";
-import { fit, fitLag, quantile } from "./math";
+import { exampleIndices, fit, fitLag, quantile } from "./math";
 
 beforeAll(async () => { expect(await preloadTokenizer()).toBe(true); });
 const usage = (input: number, output = 100, reasoning: number | null = 60, read = 0, write = 0): Usage => ({ input, output, reasoning, read, write });
@@ -54,6 +54,12 @@ describe("reasoning resend offline accounting", () => {
     });
 });
 describe("regression does not build its answer from reported reasoning", () => {
+    test("example selection covers small samples without inventing empty rows", () => {
+        expect(exampleIndices(0)).toEqual([]);
+        expect(exampleIndices(1)).toEqual([0]);
+        expect(exampleIndices(2)).toEqual([0, 1]);
+        expect(exampleIndices(3)).toEqual([0, 1, 2]);
+    });
     test("recovers known slope and intercept with independent sessions", () => {
         const result = fit([10, 30, 60, 120].map((x, i) => ({ session: String(i), x, y: 2 * x + 7, body: 0, wrappers: 0 })));
         expect(result?.k).toBeCloseTo(2, 10);

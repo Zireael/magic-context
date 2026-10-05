@@ -12,7 +12,7 @@ import {
     CALIBRATION_TABLE_REVISION,
     resolveModelCalibration,
 } from "../../src/hooks/magic-context/tokenizer-calibration";
-import { fit, fitLag, type Observation, quantile } from "./math";
+import { exampleIndices, fit, fitLag, type Observation, quantile } from "./math";
 
 type Json = Record<string, unknown>;
 export interface Usage { input: number; output: number; reasoning: number | null; read: number; write: number }
@@ -303,7 +303,7 @@ function summarize(key: string, g: Group) {
     const mainFit = fit(main);
     const zero = g.rows.filter((r) => r.gap <= 128 && r.body <= 512 && r.x === 0 && r.reasoningLocal === 0);
     const examples = [...main].sort((a, b) => a.x - b.x);
-    const indices = [...new Set([0.1, 0.5, 0.9].map((p) => Math.floor((examples.length - 1) * p)))];
+    const indices = exampleIndices(examples.length);
     return {
         key, steps: g.steps, reportedReasoningSteps: g.reportedReasoningSteps,
         candidates: g.candidates, exclusions: g.exclusions,
