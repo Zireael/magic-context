@@ -3942,6 +3942,7 @@ fn apply_once(
     } else {
         Vec::new()
     };
+    let persisted_temporal_marks = temporal_marks.clone();
     profile_end!(perf_overlay_inputs);
     profile_start!(perf_coverage, "coverage_and_reconciliation");
 
@@ -5187,6 +5188,14 @@ fn apply_once(
     // until the scheduler selects a prefix mutation pass. Use the plan, not `is_bust_pass`,
     // because subagent execute passes are Soft even though they are not billed as a module bust.
     let prefix_replay_must_be_preserved = !is_provider_prefix_mutation_pass;
+    if prefix_replay_must_be_preserved {
+        // Observe candidates before planning, but never adopt new gap bytes on
+        // a defer, including on its newly appended tail.
+        temporal_marks = persisted_temporal_marks;
+        pending_overlays.temporal_marks.clear();
+        pending_overlays.rewrite_temporal_marks = false;
+        pending_overlays.max_seen_ordinal = None;
+    }
     if !prefix_replay_must_be_preserved {
         meta.pending_tag_block_ids.clear();
     } else if matches!(
@@ -10141,7 +10150,8 @@ fn temporal_parity_transition_needed(
     timestamp_temporal_marks(req, projection, mutation_exempt_mid, lineage_anchor_mid)
         .into_iter()
         .any(|mark| match stored.get(mark.block_id.as_str()) {
-            Some(marker_text) => *marker_text != mark.marker_text.as_str(),
+            // A cut changes the candidate, not the already served decision.
+            Some(_) => false,
             None => {
                 !mark.marker_text.is_empty()
                     && (overlay_frontier.is_some_and(|frontier| mark.ordinal <= frontier)
@@ -10589,10 +10599,9 @@ fn first_minted_text_block(
 }
 
 /// Reconcile the canonical timestamp marks with the stored temporal rows. A mark whose block
-/// already has a row keeps that row's text unless a temporal rewrite is in progress; a mark
+/// already has a row always keeps that row's text; a mark
 /// without a row is stored only when it is past the overlay frontier or a rewrite is in
-/// progress. Every existing mark is checked regardless of its age. Returns the marks this pass
-/// decided or rewrote, in canonical order.
+/// progress. Returns only previously undecided marks, in canonical order.
 fn reconcile_canonical_temporal_marks(
     temporal_rows: &mut Vec<TemporalMarkRow>,
     canonical_marks: Vec<TemporalMarkInput>,
@@ -10611,12 +10620,7 @@ fn reconcile_canonical_temporal_marks(
             .or_insert(index);
     }
     for mark in canonical_marks {
-        if let Some(&index) = temporal_row_by_block.get(mark.block_id.as_str()) {
-            let existing = &mut temporal_rows[index];
-            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
-                existing.marker_text = mark.marker_text.clone();
-                temporal_marks.push(mark);
-            }
+        if temporal_row_by_block.contains_key(mark.block_id.as_str()) {
             continue;
         }
         let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
@@ -17926,14 +17930,10 @@ pub(crate) mod tests {
     ) -> Vec<TemporalMarkInput> {
         let mut temporal_marks = Vec::new();
         for mark in canonical_marks {
-            if let Some(existing) = temporal_rows
-                .iter_mut()
-                .find(|row| row.block_id == mark.block_id)
+            if temporal_rows
+                .iter()
+                .any(|row| row.block_id == mark.block_id)
             {
-                if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
-                    existing.marker_text = mark.marker_text.clone();
-                    temporal_marks.push(mark);
-                }
                 continue;
             }
             let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
@@ -17952,7 +17952,7 @@ pub(crate) mod tests {
     }
 
     /// Indexed temporal overlays must reproduce the scanning implementation exactly: the
-    /// canonical marks, the reconciled rows (including rewrites of old marks far behind the
+    /// canonical marks, the reconciled rows (including frozen old marks far behind the
     /// frontier, duplicate stored rows and rows for absent blocks), the decided set, and the
     /// timestamp-free first-minted-text-block choice for every message.
     #[test]
@@ -33811,6 +33811,88 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn temporal_gap_cut_keeps_the_persisted_message_decision() {
+        let mut prior = wire_item("assistant", "prior", 1, &["answer"]);
+        prior.ck.meta.created_at_ms = Some(100_000);
+        prior.ck.meta.completed_at_ms = Some(300_000);
+        let mut user = wire_item("user", "user", 2, &["question"]);
+        user.ck.meta.created_at_ms = Some(600_000);
+        let before = active_opencode_req("temporal-cut", "cfg0", vec![prior, user.clone()]);
+        let projection = project_messages(&before.messages).unwrap();
+        let marks = timestamp_temporal_marks(&before, &projection, None, None);
+        assert_eq!(marks[0].marker_text, "<!-- +5m -->\n");
+        let mut rows = vec![TemporalMarkRow {
+            block_id: marks[0].block_id.clone(),
+            marker_text: marks[0].marker_text.clone(),
+            created_at: 1,
+        }];
+        // A host compaction summary replaces the predecessor, but is not a new
+        // timestamp observation for the surviving user message.
+        let mut summary = wire_item("assistant", "summary", 1, &["history"]);
+        summary.ck.meta.created_at_ms = Some(600_000);
+        summary.ck.meta.synthetic = true;
+        let after = active_opencode_req("temporal-cut", "cfg0", vec![summary, user]);
+        let projection = project_messages(&after.messages).unwrap();
+        assert!(!temporal_parity_transition_needed(
+            &after,
+            &projection,
+            &rows,
+            Some(2),
+            true,
+            None,
+            None
+        ));
+        let mut decided = HashSet::from([rows[0].block_id.clone()]);
+        reconcile_canonical_temporal_marks(
+            &mut rows,
+            timestamp_temporal_marks(&after, &projection, None, None),
+            true,
+            Some(2),
+            2,
+            &mut decided,
+        );
+        assert_eq!(rows[0].marker_text, "<!-- +5m -->\n");
+    }
+
+    #[test]
+    fn temporal_gap_first_appears_on_rebuild_then_replays_after_predecessor_change() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let mut start = wire_item("user", "start", 1, &["start"]);
+            start.ck.meta.created_at_ms = Some(100_000);
+            let baseline = active_opencode_req("temporal-priced", "cfg0", vec![start.clone()]);
+            let ctx = pctx("git:proj", "/nonexistent-docs", 1_000);
+            transform(&s, &baseline, &ctx).unwrap();
+            transform(&s, &baseline, &ctx).unwrap();
+            let mut prior = wire_item("assistant", "prior", 2, &["answer"]);
+            prior.ck.meta.created_at_ms = Some(200_000);
+            prior.ck.meta.completed_at_ms = Some(300_000);
+            let mut user = wire_item("user", "user", 3, &["question"]);
+            user.ck.meta.created_at_ms = Some(600_000);
+            let mut request =
+                active_opencode_req("temporal-priced", "cfg0", vec![start, prior, user]);
+            let defer = transform(&s, &request, &ctx).unwrap();
+            assert_eq!(defer.action, "SOFT+");
+            assert!(!tail_bytes(&defer, "user").contains("<!-- +"));
+            assert!(s
+                .load_temporal_marks("temporal-priced")
+                .unwrap()
+                .iter()
+                .all(|row| row.block_id != "user#0"));
+            request.render_config = "cfg1".to_string();
+            let rebuild = transform(&s, &request, &ctx).unwrap();
+            assert_eq!(tail_bytes(&rebuild, "user"), "§3§ <!-- +5m -->\nquestion");
+            request.messages[1].ck.meta.completed_at_ms = Some(600_000);
+            let replay = transform(&s, &request, &ctx).unwrap();
+            assert_eq!(replay.action, "SOFT+");
+            // CK carries the host's refreshed completion metadata. The frozen
+            // model-visible text must not change with that observation.
+            assert_eq!(tail_bytes(&replay, "user"), tail_bytes(&rebuild, "user"));
+        });
+    }
+
+    #[test]
     fn temporal_gap_dump_golden_backfills_all_historical_markers_in_one_transition() {
         run_active_surface_test(|| {
             let golden: Value =
@@ -33834,8 +33916,12 @@ pub(crate) mod tests {
                 message.ck.meta.completed_at_ms = None;
             }
             let baseline_request = active_opencode_req("temporal-dump-golden", "cfg0", untimed);
-            run(&s, &baseline_request, &spine());
-            run(&s, &baseline_request, &spine());
+            // A legacy session without temporal decisions may backfill on a
+            // rebuild. Existing decisions, even empty ones, are never replaced.
+            let mut baseline_ctx = pctx("git:proj", "/nonexistent-docs", 1_000);
+            baseline_ctx.temporal_awareness = false;
+            transform(&s, &baseline_request, &baseline_ctx).unwrap();
+            transform(&s, &baseline_request, &baseline_ctx).unwrap();
 
             let request = active_opencode_req("temporal-dump-golden", "cfg0", messages.clone());
             let transitioned = transform(
@@ -33921,7 +34007,7 @@ pub(crate) mod tests {
 
             let mut complete = with_assistant;
             complete.push(wire_item("user", "m3", 3, &["question"]));
-            let mut active = active_cc_req("temporal", "cfg0", complete.clone());
+            let mut active = active_cc_req("temporal", "cfg1", complete.clone());
             active.prev_response_completed_at_ms = Some(10_000);
             // Ingress-time basis: the module clock runs 2h LATER than the proxy's
             // ingress observation (queue plus blocking-arm delay). A now-basis
@@ -33977,7 +34063,7 @@ pub(crate) mod tests {
 
             let mut request = active_cc_req(
                 "temporal-system-tail",
-                "cfg0",
+                "cfg1",
                 vec![
                     first.messages[0].clone(),
                     wire_item("assistant", "m2", 2, &["answer"]),
@@ -34016,7 +34102,7 @@ pub(crate) mod tests {
 
             let mut request = active_cc_req(
                 "temporal-user-reminder",
-                "cfg0",
+                "cfg1",
                 vec![
                     first.messages[0].clone(),
                     wire_item("assistant", "m2", 2, &["answer"]),
@@ -34086,6 +34172,7 @@ pub(crate) mod tests {
                 .retain(|unit| !unit.key.starts_with("red:"));
             s.commit("temporal-frontier", loaded.row_version, &core, &loaded.meta)
                 .unwrap();
+            gap_request.render_config = "cfg1".to_string();
             let minted = transform(
                 &s,
                 &gap_request,
@@ -34111,7 +34198,7 @@ pub(crate) mod tests {
                 first_messages[0].clone(),
                 wire_item("user", "m3", 3, &["later"]),
             ];
-            let sparse_request = active_cc_req("temporal-sparse", "cfg0", sparse.clone());
+            let sparse_request = active_cc_req("temporal-sparse", "cfg1", sparse.clone());
             let first = transform(
                 &s,
                 &sparse_request,
@@ -34123,7 +34210,7 @@ pub(crate) mod tests {
 
             let restored = active_cc_req(
                 "temporal-sparse",
-                "cfg0",
+                "cfg1",
                 vec![
                     sparse[0].clone(),
                     wire_item("assistant", "m2", 2, &["restored"]),
@@ -34145,7 +34232,7 @@ pub(crate) mod tests {
 
             let near = active_cc_req(
                 "temporal-sparse",
-                "cfg0",
+                "cfg2",
                 vec![
                     sparse[0].clone(),
                     restored.messages[1].clone(),

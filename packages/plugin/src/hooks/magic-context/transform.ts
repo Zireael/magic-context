@@ -54,6 +54,7 @@ import {
     rebaseSessionCoordinatesAsync,
 } from "../../features/magic-context/store-generation-rebase";
 import type { Tagger } from "../../features/magic-context/tagger";
+import { getTemporalDecisions } from "../../features/magic-context/temporal-decisions";
 import {
     clearOpenCodePendingTransformDecision,
     normalizeMaterializeReason,
@@ -151,7 +152,7 @@ import {
     snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
 } from "./strip-content";
-import { injectTemporalMarkers } from "./temporal-awareness";
+import { collectTemporalCandidates, injectTemporalMarkers } from "./temporal-awareness";
 import { createPreAdoptionToolSweepResolver, useScopedToolSweep } from "./tool-sweep-policy";
 import { historianJoinFailClosedMessage, runCompartmentPhase } from "./transform-compartment-phase";
 import {
@@ -713,6 +714,9 @@ export function createTransform(deps: TransformDeps) {
         if (!sessionId) {
             return;
         }
+        const temporalCandidates = deps.experimentalTemporalAwareness
+            ? collectTemporalCandidates(messages)
+            : undefined;
         logTransformTiming(sessionId, "findSessionId", tSessionId, `messages=${messages.length}`);
         const tLkgEntry = performance.now();
         // The Rust adapter captures its own last-known-good input snapshot and returns
@@ -2099,32 +2103,11 @@ export function createTransform(deps: TransformDeps) {
         let messageTagNumbers = new Map<MessageLike, number>();
         let batch: { finalize: () => void } | null = null;
         let hasRecentReduceCall = false;
-        // Inject temporal markers before tagging so the §N§ tag prefix wraps
-        // around our marker.
-        //
-        // Intentional — this runs on EVERY transform pass, including defer /
-        // cache-safe passes that are otherwise gated. Three invariants make
-        // that safe:
-        //   1. Idempotent: injectTemporalMarkers detects existing markers by
-        //      regex and will not double-prefix.
-        //   2. Deterministic: the marker value derives from immutable
-        //      message.time.created / time.completed timestamps — same input,
-        //      same output, every pass.
-        //   3. Required every pass: OpenCode rebuilds the messages array from
-        //      its DB for every transform, so markers must be re-applied on
-        //      each pass or they would disappear on defer passes. Skipping
-        //      defer passes here would cause the marker to flicker in/out and
-        //      bust cache when it reappeared.
-        //
-        // The retroactive-on-flag-flip behavior is the same mechanism — when
-        // the flag turns on, the first pass marks every eligible user message
-        // and subsequent passes just observe the already-marked content.
-        // Compaction-off: temporal markers/overlays are part of the gated
-        // compaction surface (additive but mode-owned), so the wire stays
-        // untouched in this mode.
+        // Replay before tagging. New choices wait for the independently priced
+        // rebuild permission in postprocess; a cut never recomputes an old gap.
         if (deps.experimentalTemporalAwareness && !compactionOff) {
             const tTemporal = performance.now();
-            const injected = injectTemporalMarkers(messages);
+            const injected = injectTemporalMarkers(messages, getTemporalDecisions(db, sessionId));
             if (injected > 0) {
                 sessionLog(sessionId, `temporal: injected ${injected} gap markers`);
             }
@@ -2626,6 +2609,7 @@ export function createTransform(deps: TransformDeps) {
             schedulerDecision,
             schedulerDeferReason,
             fullFeatureMode,
+            temporalCandidates,
             compactionOff,
             canRunCompartments,
             awaitedCompartmentRun,

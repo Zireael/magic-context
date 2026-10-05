@@ -18,6 +18,7 @@ import {
     readReplayDocument,
     writeReplayDocument,
 } from "./storage-replay-document";
+import { decodeTemporalDecision, encodeTemporalDecision } from "./temporal-decisions";
 
 export interface CloneCompartmentRow {
     sequence: number;
@@ -154,6 +155,17 @@ function clonePiContentDecisions(
         if (typeof entry !== "string") continue;
         if (isReservedLedgerControlEntry(entry)) {
             copied.push(entry);
+            continue;
+        }
+        const temporal = decodeTemporalDecision(entry);
+        if (temporal) {
+            if (filter.includeMessageId(temporal[0]))
+                copied.push(
+                    encodeTemporalDecision(
+                        mapMessageId(filter, temporal[0]) ?? temporal[0],
+                        temporal[1],
+                    ),
+                );
             continue;
         }
         const decision = decodePiContentDecision(entry);

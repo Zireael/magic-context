@@ -55,8 +55,9 @@ import {
 } from "@magic-context/core/features/magic-context/message-index-async";
 import { isPrefixBoundThinkingModel } from "@magic-context/core/features/magic-context/overflow-detection";
 import {
+	decodePiContentDecision,
 	encodePiContentDecision,
-	freezePiContentDecision,
+	getPiContentDecisions,
 } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import {
 	computeProtectionWindow,
@@ -129,6 +130,10 @@ import {
 	createTagger,
 	type Tagger,
 } from "@magic-context/core/features/magic-context/tagger";
+import {
+	freezeTemporalDecisions,
+	getTemporalDecisions,
+} from "@magic-context/core/features/magic-context/temporal-decisions";
 import {
 	findNewestPiAssistantEntryId,
 	normalizeMaterializeReason,
@@ -353,6 +358,7 @@ import {
 	refreshPiTailHygieneBaseline,
 } from "./tail-hygiene-walk-pi";
 import {
+	collectPiTemporalCandidates,
 	injectPiTemporalMarkers,
 	stripPiLeadingTemporalMarker,
 	withoutPiLeadingTemporalMarker,
@@ -5376,6 +5382,13 @@ async function runCompactionOffPipeline(
 
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.compactionOff) return runCompactionOffPipeline(args);
+	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
+		resolvePiStableId(
+			msg,
+			index,
+			args.entryIds,
+			args.entryIdByRef ?? undefined,
+		);
 	let foldingSystemState: PiEffectiveSystemState | null = null;
 	try {
 		// Capture the provider-visible system state before transforming the served
@@ -5497,16 +5510,27 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const deferredHistoryWasPendingAtPassStart =
 		deferredHistoryRefreshSessions.has(args.sessionId);
 
-	// 0. Inject temporal `<!-- +Xm -->` markers into user messages
-	// BEFORE tagging so the §N§ tag prefix wraps around our marker on
-	// re-tagging. Idempotent: existing markers are detected by regex
-	// and skipped. Same invariants as OpenCode's `injectTemporalMarkers`
-	// at transform.ts:648 — runs on every pass, deterministic from
-	// timestamps, retroactive when the flag flips.
+	// Observe candidates before any history cut. Replay only durable decisions
+	// until the independently priced rebuild permission below is known.
+	const temporalCandidates = args.temporalAwareness
+		? collectPiTemporalCandidates(args.messages, args.entryIds ?? [])
+		: new Map<string, string>();
+	// Older versions removed a gap at a compaction seam. Preserve those already
+	// served choices; new seams no longer create a position-dependent removal.
+	for (const entry of getPiContentDecisions(args.db, args.sessionId)) {
+		const decision = decodePiContentDecision(entry);
+		if (decision?.[0] === "seam-temporal-strip")
+			temporalCandidates.set(decision[1], "");
+	}
+	let temporalDecisions = getTemporalDecisions(args.db, args.sessionId);
 	if (args.temporalAwareness) {
 		const tTemporal = performance.now();
 		try {
-			const injected = injectPiTemporalMarkers(args.messages);
+			const injected = injectPiTemporalMarkers(
+				args.messages,
+				temporalDecisions,
+				stableIdResolver,
+			);
 			if (injected > 0) {
 				sessionLog(
 					args.sessionId,
@@ -5570,13 +5594,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// hits). Reasoning runs on `workingMessages` where tagging may have cloned
 	// working[i] → entryIdByRef misses those, so positional args.entryIds is the
 	// mandatory fallback (same precedence resolvePiStableId enforces).
-	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
-		resolvePiStableId(
-			msg,
-			index,
-			args.entryIds,
-			args.entryIdByRef ?? undefined,
-		);
 	const currentTurnId = (() => {
 		const ids = buildPiMessageIdByIndex(
 			args.messages as PiAgentMessage[],
@@ -5818,6 +5835,22 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				(canConsumeDeferredLate && deferredHistoryWasPendingAtPassStart)),
 	};
 	const isCacheBustingPass = hasReclaimRide(rideSignals);
+	if (args.temporalAwareness && isCacheBustingPass) {
+		temporalDecisions = freezeTemporalDecisions(
+			args.db,
+			args.sessionId,
+			temporalCandidates,
+		);
+		if (
+			injectPiTemporalMarkers(
+				args.messages,
+				temporalDecisions,
+				stableIdResolver,
+			) > 0
+		) {
+			recordFirstApplicationWireEdit(true);
+		}
+	}
 	const publishedWorkDrainAllowed = isCacheBustingPass;
 	const usesTokenProtection =
 		args.protectedTokenTierOverrides !== undefined ||
@@ -6920,38 +6953,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						m0ModelKeyNew: preFoldInjectionResult.m0ModelKeyNew ?? null,
 					}
 				: wireInjectionResult;
-			// Temporal markers are derived before history injection trims raw messages.
-			// If that trim promotes a user message to the raw-history head, its marker
-			// was based on a predecessor that is no longer visible. Remove it now so the
-			// marker-applying pass matches the next pass, where trimming happens first.
-			if (
-				args.temporalAwareness &&
-				isCacheBustingPass &&
-				injectionResult.skippedVisibleMessages > 0
-			) {
-				const firstRetainedMessage =
-					args.messages[injectionResult.syntheticLeadingCount];
-				const id =
-					firstRetainedMessage && typeof firstRetainedMessage === "object"
-						? postCommitStableIdByRef.get(firstRetainedMessage)
-						: undefined;
-				if (
-					id &&
-					firstRetainedMessage !== null &&
-					typeof firstRetainedMessage === "object" &&
-					stripPiLeadingTemporalMarker({ ...firstRetainedMessage }) &&
-					freezePiContentDecision(
-						args.db,
-						args.sessionId,
-						"seam-temporal-strip",
-						id,
-					)
-				) {
-					contentDecisions.add(
-						encodePiContentDecision("seam-temporal-strip", id),
-					);
-				}
-			}
 			// A prior trim's marker removal remains authoritative after caveman
 			// restores pre-trim source, even when this pass trims nothing late.
 			for (const message of args.messages) {
@@ -7189,6 +7190,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		"batchFinalize:heuristics",
 		performance.now(),
 	);
+	if (args.temporalAwareness) {
+		injectPiTemporalMarkers(args.messages, temporalDecisions, (message) =>
+			message && typeof message === "object"
+				? postCommitStableIdByRef.get(message)
+				: undefined,
+		);
+	}
 
 	const outputMessages = transcript.getOutputMessages();
 
