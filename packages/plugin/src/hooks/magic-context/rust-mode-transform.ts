@@ -25,6 +25,7 @@ import {
     getChannel2NudgeState,
     getEmergencyRecoveryArmedAt,
     getOverflowState,
+    getPendingCompactionMarkerState,
     getPersistedCompactionMarkerState,
     getPersistedTodoPermissionDenied,
     isEmergencyRecoveryArmed,
@@ -40,6 +41,10 @@ import {
     GLOBAL_USER_PROFILE_PROJECT_PATH,
     getProjectState,
 } from "../../features/magic-context/storage-project-state";
+import {
+    isRustMarkerAdmissionFenced,
+    setRustMarkerAdmissionFence,
+} from "../../features/magic-context/storage-replay-document";
 import { writeRustTransformDecision } from "../../features/magic-context/transform-decision-log";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { canonicalModelIdentity } from "../../shared/harness-provider-map";
@@ -83,7 +88,7 @@ import {
 } from "./event-resolvers";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
 import { createHistorianHostRunner } from "./historian-host-runner";
-import { saveLkgSlotToDb } from "./lkg-persist";
+import { clearPersistedLkgSlotStrict, saveLkgSlotToDb } from "./lkg-persist";
 import {
     coldStartRawServedIndex,
     coldStartUncapturedReplay,
@@ -404,6 +409,9 @@ interface RustSessionState extends ModuleStateSyncState {
     lkgLastServedCaptureSequence: number | null;
     lkgLastCapturedRowVersion: number;
     lkgSyncCaptureRequired: boolean;
+    /** Old replay is fenced until a rebuilding pass is fully admitted. */
+    markerAdmissionFenced: boolean;
+    lastPassMarkerApplyAttempted: boolean;
     lkgAcceptedCapture?: {
         inputs: readonly LkgInputSnapshot[];
         captureSequence: number;
@@ -1062,6 +1070,8 @@ function ensureState(states: Map<string, RustSessionState>, sessionId: string): 
             lkgLastServedCaptureSequence: null,
             lkgLastCapturedRowVersion: 0,
             lkgSyncCaptureRequired: false,
+            markerAdmissionFenced: false,
+            lastPassMarkerApplyAttempted: false,
             lkgRepresentationFrozen: false,
             lkgFrozenHealthyPasses: 0,
             lkgFrozenAtInputCount: null,
@@ -1962,6 +1972,15 @@ export function createRustModeTransform(
         output: { messages: unknown[] },
         systemPromptTokens: number,
     ): boolean => {
+        try {
+            if (
+                states.get(sessionId)?.markerAdmissionFenced ||
+                isRustMarkerAdmissionFenced(deps.db, sessionId)
+            )
+                return false;
+        } catch {
+            return false;
+        }
         const slot = getSlot(sessionId);
         if (!slot) {
             const state = states.get(sessionId);
@@ -2049,6 +2068,26 @@ export function createRustModeTransform(
         modelFromMessages(messages) ??
         deps.liveModelBySession?.get(sessionId) ??
         hostModelFallback(sessionId);
+
+    const fenceMarkerAdmission = (sessionId: string, state: RustSessionState): void => {
+        state.markerAdmissionFenced = true;
+        state.forceFullWire = true;
+        // A queued defer capture from before the cut must not resurrect old
+        // durable bytes after this pass fails before preparing its new capture.
+        state.lkgCaptureSequence += 1;
+        state.lkgLastServedCaptureSequence = null;
+        // This is strict, not best-effort dropSlot: a host cut must not be
+        // attempted if the old durable request could survive a process restart.
+        deps.db
+            .transaction(() => {
+                setRustMarkerAdmissionFence(deps.db, sessionId, true);
+                clearPersistedLkgSlotStrict(deps.db, sessionId);
+            })
+            .immediate();
+        dropSlot(sessionId, "rust_marker_admission_fenced");
+        state.lkgAcceptedCapture = undefined;
+        state.lkgSyncCaptureRequired = true;
+    };
 
     /**
      * On this process's first applied pass for a session, find whether a previous
@@ -2144,6 +2183,17 @@ export function createRustModeTransform(
         },
         emergencyFailClosed: (sessionId, inputMessages) => {
             try {
+                const state = ensureState(states, sessionId);
+                if (
+                    state.lastPassMarkerApplyAttempted ||
+                    state.markerAdmissionFenced ||
+                    isRustMarkerAdmissionFenced(deps.db, sessionId)
+                ) {
+                    // The outer storage-busy wrapper is not allowed to turn a
+                    // post-cut failure into an old-prefix/raw serve either.
+                    fenceMarkerAdmission(sessionId, state);
+                    return true;
+                }
                 const model = resolveReplayModel(sessionId, inputMessages) ?? undefined;
                 const modelKey = model
                     ? canonicalModelIdentity(resolveModelKey(model.providerID, model.modelID) ?? "")
@@ -2295,6 +2345,8 @@ export function createRustModeTransform(
         const passStartedAt = performance.now();
         const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
+        let markerApplyAttempted = false;
+        state.lastPassMarkerApplyAttempted = false;
         // Only the path that captures the array it serves sets this again, so every
         // other way out of this pass leaves the next pass unable to trust the slot.
         const lastServedCaptureSequence = state.lkgLastServedCaptureSequence;
@@ -2350,6 +2402,20 @@ export function createRustModeTransform(
         const passUsageSnapshot = loadContextUsage(deps.contextUsageMap, deps.db, sessionId);
         requestInputTokens = Math.max(0, Math.floor(passUsageSnapshot.inputTokens));
         let preflightError: unknown;
+        let markerAdmissionRecovery = state.markerAdmissionFenced;
+        try {
+            markerAdmissionRecovery ||= isRustMarkerAdmissionFenced(deps.db, sessionId);
+        } catch (error) {
+            preflightError = error;
+        }
+        if (markerAdmissionRecovery) {
+            state.markerAdmissionFenced = true;
+            state.lastPassMarkerApplyAttempted = true;
+            state.forceFullWire = true;
+            state.parked = false;
+            state.lkgRepresentationFrozen = false;
+            state.lkgColdStartCheckPending = false;
+        }
         let model = modelFromMessages(messages) ?? deps.liveModelBySession?.get(sessionId);
         if (!model) {
             try {
@@ -2405,6 +2471,23 @@ export function createRustModeTransform(
         }));
         const serveRawFallback = (cause?: unknown): void => {
             servedFrom = "refused";
+            let admissionFenced: boolean;
+            try {
+                admissionFenced =
+                    state.markerAdmissionFenced || isRustMarkerAdmissionFenced(deps.db, sessionId);
+            } catch (error) {
+                // Preserve the ordinary unreadable-storage refusal contract;
+                // unknown admission state still cannot authorize raw fallback.
+                throw new RawFallbackContextLimitError(Number.POSITIVE_INFINITY, 0, {
+                    cause: error,
+                });
+            }
+            if (admissionFenced) {
+                throw new EmergencyFailClosedError(
+                    "Magic Context cannot serve raw history after a failed boundary rebuild. Retry to recompose from the new boundary.",
+                    { cause },
+                );
+            }
             // A lost transform reply cannot authorize unmanaged history, even when
             // compaction is disabled; only a verified last-good replay may continue.
             if (moduleFailureCode(cause) === "transform_transport_interrupted") {
@@ -3530,6 +3613,22 @@ export function createRustModeTransform(
                 }
                 return result.response;
             };
+            if (markerAdmissionRecovery) {
+                // A prior rebuilding pass failed after it could change the cut.
+                // Recompose the full NEW cut; this is recovery, not a timer that
+                // grants ordinary queued markers their own independent bust.
+                const flushed = await options.moduleClient.call({
+                    sessionId,
+                    projectRoot,
+                    method: "session.flush",
+                    body: { v: 1, session_id: sessionId },
+                    timeoutMs: options.moduleTimeoutMs,
+                });
+                if (!isRecord(flushed) || flushed.ok !== true)
+                    throw new RustTransformProtocolError(
+                        "rust marker admission recovery: module did not acknowledge rebuilding the new cut",
+                    );
+            }
             let response = await sendTransformSeriesWithSingleRestart(body);
             let servedFinalWireEstimate:
                 | ReturnType<typeof estimateFinalWireInputTokens>
@@ -3731,6 +3830,10 @@ export function createRustModeTransform(
             // pass priced, but it changes bytes only from the first message the freeze
             // served raw, so it is not a permission to rewrite from the start.
             const moduleDecisionBusts = cacheBustingPass;
+            if (markerAdmissionRecovery && !moduleDecisionBusts)
+                throw new RustTransformProtocolError(
+                    "rust marker admission recovery: module did not return a rebuilding decision",
+                );
             // Read the freeze flag before the deferred m0/m1 divergence below can set it, so
             // `passStartedFrozen` records only a freeze an earlier pass entered.
             const passStartedFrozen = state.lkgRepresentationFrozen;
@@ -3786,6 +3889,36 @@ export function createRustModeTransform(
                 );
                 let appliedMessages = moduleMessages;
                 let replayedFrozenRepresentation = false;
+                const boundaryId = response.boundary_id;
+                if (typeof boundaryId === "string" && boundaryId.length > 0) {
+                    // Validate the producer's head before marker-changing
+                    // postprocess can write anything into the host's store.
+                    assertNativeBoundary(moduleMessages, sessionId, boundaryId);
+                }
+                const markerCandidate =
+                    moduleDecisionBusts &&
+                    !deps.compactionOff &&
+                    !sessionMeta.isSubagent &&
+                    (materializedBoundary !== undefined ||
+                        getPendingCompactionMarkerState(deps.db, sessionId) !== null);
+                if (markerCandidate) {
+                    const ids = messages.map((message) => message.info.id);
+                    if (
+                        ids.length === 0 ||
+                        ids.some((id) => typeof id !== "string") ||
+                        new Set(ids).size !== ids.length ||
+                        pendingWireCache.rawContentSnapshots.length !== ids.length
+                    ) {
+                        throw new RustTransformProtocolError(
+                            "rust transform wire invariant failed: cannot prepare coherent priced capture inputs before marker application",
+                        );
+                    }
+                    if (measureAgainstLimit(moduleMessages, contextLimit) !== "under") {
+                        throw new RustTransformProtocolError(
+                            "rust transform wire invariant failed: native output admission was not proven before marker application",
+                        );
+                    }
+                }
                 // The slot a previous process captured from a frozen serve, when this is
                 // this process's first applied pass and that pass is a module bust: the
                 // bust replaces messages the provider last saw raw, so the thinking strip
@@ -3934,6 +4067,11 @@ export function createRustModeTransform(
                         projectPath: memoryProjectPath,
                         sessionDirectory: directory,
                         materializedBoundary,
+                        beforeMarkerApply: () => {
+                            markerApplyAttempted = true;
+                            state.lastPassMarkerApplyAttempted = true;
+                            fenceMarkerAdmission(sessionId, state);
+                        },
                         compactionMarkerStrategy: deps.compactionMarkerStrategy,
                         fullFeatureMode: !sessionMeta.isSubagent,
                         compactionOff: deps.compactionOff,
@@ -3965,9 +4103,19 @@ export function createRustModeTransform(
                     thinkingBindingRecovery = postprocess.thinkingBindingRecovery;
                     markerAt = postprocess.markerAt;
                 }
-                const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
                     assertNativeBoundary(appliedMessages, sessionId, boundaryId);
+                }
+                if (
+                    (markerApplyAttempted || markerAdmissionRecovery) &&
+                    measureAgainstLimit(appliedMessages, contextLimit) !== "under"
+                ) {
+                    // Host canonicalization can add reminders/summary bytes. A
+                    // final fit failure after the cut is a refusal, never an
+                    // excuse to serve the previous representation.
+                    throw new RustTransformProtocolError(
+                        "rust marker rebuilding request failed final output admission",
+                    );
                 }
                 if (!sessionMeta.isSubagent) {
                     mirrorRustSyntheticTodoAnchor({
@@ -4246,7 +4394,33 @@ export function createRustModeTransform(
                 sessionLog(sessionId, "single-store embedding drain failed (ignored):", error);
             });
             finishPass(true);
+            // Last fallible admission step: all validation, installation,
+            // priced capture and bookkeeping have completed. Until this strict
+            // clear succeeds a restart must request a rebuilding pass, not LKG.
+            if (state.markerAdmissionFenced) {
+                setRustMarkerAdmissionFence(deps.db, sessionId, false);
+                state.markerAdmissionFenced = false;
+            }
         } catch (error) {
+            if (markerApplyAttempted || markerAdmissionRecovery || state.markerAdmissionFenced) {
+                state.markerAdmissionFenced = true;
+                state.forceFullWire = true;
+                state.parked = false;
+                servedFrom = "refused";
+                decision = "error";
+                materializeReason = "marker_admission_failed";
+                // The cut may have committed even if its context-state mirror
+                // failed. Never replay LKG or raw input from before that cut.
+                try {
+                    finishPass(false, false);
+                } catch {
+                    /* refusal must survive diagnostic/storage failures */
+                }
+                throw new EmergencyFailClosedError(
+                    "Magic Context could not safely admit a history-boundary rebuild. This turn was not sent; retry to recompose from the current boundary.",
+                    { cause: error },
+                );
+            }
             if (error instanceof FrozenReplayOverProvenLimitRefusal) {
                 decision = "error";
                 materializeReason = "frozen_over_proven_limit";
@@ -4381,7 +4555,13 @@ export function createRustModeTransform(
                 // looking right after one is when there is most likely something to
                 // take. Never awaited: the fold the loop picks up takes minutes and the
                 // response this pass just built is already correct without it.
-                void withoutSqliteTransformPass(() => resolveHostRunner()?.pump(sessionId));
+                try {
+                    void withoutSqliteTransformPass(() => resolveHostRunner()?.pump(sessionId));
+                } catch (error) {
+                    // Background launch is not allowed to reject an already
+                    // admitted post-cut representation after the fence cleared.
+                    sessionLog(sessionId, "rust host runner launch failed (ignored):", error);
+                }
             }
         },
         async clearSession(sessionId: string): Promise<void> {

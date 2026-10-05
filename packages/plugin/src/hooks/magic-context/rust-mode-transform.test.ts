@@ -43,6 +43,7 @@ import {
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
+import { isRustMarkerAdmissionFenced } from "../../features/magic-context/storage-replay-document";
 import { createTagger } from "../../features/magic-context/tagger";
 import {
     __resetToolDefinitionMeasurements,
@@ -68,6 +69,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
+import { applyDeferredCompactionMarker } from "./compaction-marker-manager";
 import { primeCtxReduceSpawnPermission } from "./ctx-reduce-availability";
 import { autoEmbedAttemptedBySession } from "./embed-session-state";
 import {
@@ -75,7 +77,7 @@ import {
     ENGINE_RECONNECTING_USER_MESSAGE,
 } from "./emergency-fail-closed";
 import { getVisibleMemoryIds } from "./inject-compartments";
-import { createDbLkgPersistence } from "./lkg-persist";
+import { createDbLkgPersistence, loadPersistedLkgSlot } from "./lkg-persist";
 import * as lkgSlot from "./lkg-slot";
 import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
 import { MODULE_ORDINAL_PAGE_SIZE, MODULE_PAGE_MAX_BYTES } from "./module-wire";
@@ -93,9 +95,11 @@ import {
     RUST_PARK_RETRY_INTERVAL,
     type RustModeModuleClient,
 } from "./rust-mode-transform";
+import { StorageBusyRefusalError } from "./storage-busy-refusal";
 import type { TransformDeps } from "./transform";
 import { createTransform } from "./transform";
 import type { MessageLike } from "./transform-operations";
+import { reconcileMarkerRepresentation } from "./transform-postprocess-phase";
 
 const createRustModeTransform = (
     deps: TransformDeps,
@@ -334,6 +338,321 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 }
 
 describe("Rust mode authority adapter", () => {
+    function markerFaultFixture(
+        fault: "after-marker" | "capture" | "bookkeeping",
+        queueOldCapture = false,
+    ) {
+        const sid = `marker-admission-${fault}-${Date.now()}`;
+        sessions.push(sid);
+        installRawProvider(sid);
+        installAvailabilityDb(sid);
+        const oc = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        oc.exec(
+            "CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        oc.prepare("INSERT INTO message VALUES ('m1', ?, 1, 1, ?)").run(sid, '{"role":"user"}');
+        oc.close();
+        let db = makeFileDb();
+        const path = (
+            db.prepare("PRAGMA database_list").all() as Array<{ name: string; file: string }>
+        ).find((row) => row.name === "main")!.file;
+        appendCompartments(db, sid, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "m1",
+                endMessageId: "m1",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "indexed",
+                content: "indexed",
+            },
+        ]);
+        registerLkgPersistence(createDbLkgPersistence(db));
+        let step = 0;
+        let fail = true;
+        let captureCompleted = false;
+        const queuedCaptures: Array<() => void> = [];
+        const calls: string[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                calls.push(method);
+                if (method !== "transform") return { ok: true };
+                step++;
+                captureCompleted = false;
+                const oldRepresentation = step === 1 || (queueOldCapture && step === 2);
+                return {
+                    decision: queueOldCapture && step === 2 ? "SOFT+" : "HARD",
+                    scheduler_decision: queueOldCapture && step === 2 ? "defer" : "execute",
+                    row_version: step,
+                    native_messages: oldRepresentation
+                        ? makeMessages(sid)
+                        : [
+                              {
+                                  info: { role: "user", sessionID: sid },
+                                  parts: [
+                                      {
+                                          type: "text",
+                                          text: "<session-history>new admitted prefix</session-history>",
+                                          synthetic: true,
+                                      },
+                                  ],
+                              },
+                              ...makeMessages(sid),
+                          ],
+                    ...(!oldRepresentation
+                        ? { committed: true, coverage_ordinal: 1, boundary_id: "m1#0" }
+                        : {}),
+                };
+            },
+        };
+        let prepareSpy: ReturnType<typeof spyOn> | undefined;
+        const build = () => {
+            const originalPrepare = db.prepare.bind(db);
+            prepareSpy = spyOn(db, "prepare").mockImplementation((sql) => {
+                if (
+                    fault === "bookkeeping" &&
+                    fail &&
+                    step >= 2 &&
+                    captureCompleted &&
+                    String(sql).startsWith(
+                        "SELECT detected_context_limit, detected_context_limit_model_key",
+                    )
+                )
+                    throw new Error("injected late overflow bookkeeping failure");
+                return originalPrepare(sql);
+            });
+            const deps = makeDeps(db, moduleClient);
+            deps.tagger = createTagger();
+            deps.compactionMarkerStrategy = {
+                applyDeferred: (...args) => {
+                    const outcome = applyDeferredCompactionMarker(...args);
+                    if (fault === "after-marker" && fail && outcome.kind === "applied")
+                        throw new Error("injected after irreversible marker write");
+                    return outcome;
+                },
+                reconcile: reconcileMarkerRepresentation,
+            };
+            return createRustModeTransform(deps, {
+                moduleClient,
+                ...(queueOldCapture
+                    ? {
+                          scheduleLkgCapture: (capture: () => void) => {
+                              queuedCaptures.push(capture);
+                          },
+                      }
+                    : {}),
+                onLkgCaptureForTests: () => {
+                    if (fault === "capture" && fail && step >= 2)
+                        throw new Error("injected priced LKG capture failure");
+                    captureCompleted = true;
+                },
+            });
+        };
+        let transform = build();
+        const invoke = async (output: { messages: unknown[] }) => {
+            const input = makeMessages(sid);
+            await transform.run(sid, input, output, makeMeta(db, sid));
+        };
+        const serve = async () => {
+            const output = { messages: [...makeMessages(sid)] as unknown[] };
+            await invoke(output);
+            return JSON.stringify(output.messages);
+        };
+        return {
+            sid,
+            get db() {
+                return db;
+            },
+            calls,
+            serve,
+            invoke,
+            queuedCaptures,
+            stopFault: () => {
+                fail = false;
+            },
+            restart: () => {
+                transform.dispose();
+                prepareSpy?.mockRestore();
+                closeQuietly(db);
+                resetLkgSlotsForTest();
+                db = new Database(path) as ContextDatabase;
+                databases.push(db);
+                registerLkgPersistence(createDbLkgPersistence(db));
+                transform = build();
+            },
+            dispose: () => {
+                transform.dispose();
+                prepareSpy?.mockRestore();
+            },
+        };
+    }
+
+    for (const fault of ["after-marker", "capture", "bookkeeping"] as const) {
+        it(`post-cut ${fault} fault refuses instead of old replay, then recomposes successfully`, async () => {
+            const fixture = markerFaultFixture(fault);
+            try {
+                const old = await fixture.serve();
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeDefined();
+                await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                expect(
+                    getPersistedCompactionMarkerState(fixture.db, fixture.sid)?.boundaryOrdinal,
+                ).toBe(1);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+                fixture.stopFault();
+                const rebuilt = await fixture.serve();
+                expect(rebuilt).not.toBe(old);
+                expect(rebuilt).toContain("new admitted prefix");
+                expect(fixture.calls).toContain("session.flush");
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(rebuilt);
+            } finally {
+                fixture.dispose();
+            }
+        });
+    }
+
+    it("persistent post-cut capture faults refuse every rebuilding pass without old LKG or raw fallback", async () => {
+        const fixture = markerFaultFixture("capture");
+        try {
+            await fixture.serve();
+            for (let pass = 0; pass < 4; pass++) {
+                await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+            }
+            fixture.stopFault();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("post-cut outer storage-busy wrapper cannot replay old bytes and re-arms rebuilding admission", async () => {
+        const fixture = markerFaultFixture("after-marker");
+        try {
+            await fixture.serve();
+            fixture.stopFault();
+            const replayed = mock(() => {});
+            const wrapper = createMessagesTransformHandler({
+                magicContext: {
+                    "experimental.chat.messages.transform": async (_input, output) => {
+                        await fixture.invoke(output);
+                        throw Object.assign(new Error("outer post-cut storage failure"), {
+                            code: "SQLITE_BUSY",
+                        });
+                    },
+                },
+                onLkgReplay: replayed,
+            });
+            const output = { messages: makeMessages(fixture.sid) };
+            await expect(wrapper({}, output)).rejects.toBeInstanceOf(StorageBusyRefusalError);
+            expect(replayed).not.toHaveBeenCalled();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("post-cut refusal fence survives a new adapter and file connection without hydrating old LKG", async () => {
+        const fixture = markerFaultFixture("capture");
+        try {
+            await fixture.serve();
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            fixture.restart();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+            expect(getSlot(fixture.sid)).toBeUndefined();
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            fixture.stopFault();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("a queued pre-cut defer capture cannot resurrect old LKG after a marker fault", async () => {
+        const fixture = markerFaultFixture("after-marker", true);
+        try {
+            const old = await fixture.serve();
+            expect(await fixture.serve()).toBe(old);
+            expect(fixture.queuedCaptures).toHaveLength(1);
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            fixture.queuedCaptures[0]!();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+            expect(
+                (
+                    fixture.db
+                        .prepare("SELECT count(*) AS n FROM lkg_slots WHERE session_id=?")
+                        .get(fixture.sid) as { n: number }
+                ).n,
+            ).toBe(0);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+            fixture.stopFault();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+        } finally {
+            fixture.dispose();
+        }
+    });
+    it("r2 proof: a rejected HARD output cannot move the host marker before LKG replay", async () => {
+        const sid = `r2-rejected-hard-${Date.now()}`;
+        sessions.push(sid);
+        installRawProvider(sid);
+        installAvailabilityDb(sid);
+        const oc = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        oc.exec(
+            "CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        oc.prepare("INSERT INTO message VALUES ('m1', ?, 1, 1, ?)").run(sid, '{"role":"user"}');
+        oc.close();
+        const db = makeDb();
+        appendCompartments(db, sid, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "m1",
+                endMessageId: "m1",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "indexed",
+                content: "indexed",
+            },
+        ]);
+        let step = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                step++;
+                return {
+                    decision: "HARD",
+                    scheduler_decision: "execute",
+                    row_version: step,
+                    native_messages: makeMessages(sid),
+                    ...(step === 2
+                        ? { committed: true, coverage_ordinal: 1, boundary_id: "m1#0" }
+                        : {}),
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const serve = async () => {
+            const input = makeMessages(sid);
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sid, input, output, makeMeta(db, sid));
+            return JSON.stringify(output.messages);
+        };
+        const first = await serve(); // fresh makeMessages input/output + makeMeta each call
+        expect(await serve()).toBe(first);
+        expect(transform.getState(sid).lkgRepresentationFrozen).toBe(true);
+        expect(getPersistedCompactionMarkerState(db, sid)).toBeNull();
+    });
     it("retains pending indexed markers while a healthy SOFT+ serves the frozen representation", async () => {
         const sessionId = `rust-frozen-marker-${Date.now()}`;
         sessions.push(sessionId);

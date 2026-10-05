@@ -224,11 +224,24 @@ function boundaryWouldDiscardUncoveredMessage(
     ordinal: number,
     boundaryMessageId: string,
 ): boolean {
-    const current = getPersistedCompactionMarkerState(db, sessionId)?.boundaryOrdinal ?? -1;
-    const partials = getUncoveredCompartmentEndsThrough(db, sessionId, ordinal, current);
+    const current = getPersistedCompactionMarkerState(db, sessionId);
+    const partials = getUncoveredCompartmentEndsThrough(db, sessionId, ordinal);
     // Unknown raw ordering is not proof of coverage. The boundary is kept by
     // filterCompacted, so an indexed end at/after it is safe, not a blanket veto.
     for (const partial of partials) {
+        // boundaryOrdinal is the summary target, not the retained user. An
+        // assistant target and the rest of its turn can still be in host input.
+        // Only a strict canonical comparison to the actual old cut proves an
+        // endpoint already discarded; equality and unknown ordering stay guarded.
+        if (
+            current &&
+            compareOpenCodeMessagesByCanonicalOrder(
+                sessionId,
+                partial.endMessageId,
+                current.boundaryMessageId,
+            ) === -1
+        )
+            continue;
         const ordering = compareOpenCodeMessagesByCanonicalOrder(
             sessionId,
             boundaryMessageId,

@@ -761,6 +761,8 @@ function isSqliteLockContentionError(error: unknown): boolean {
 export function applyRustModeDeferredCompactionMarker(args: {
     /** The served HARD/SOFT permission, never scheduler-execute or commit alone. */
     cacheBustingPass: boolean;
+    /** Fence old replay before a host strategy may commit an irreversible cut. */
+    beforeApply?: () => void;
     db: ContextDatabase;
     sessionId: string;
     boundary?: RustMaterializedCompactionBoundary;
@@ -850,6 +852,7 @@ export function applyRustModeDeferredCompactionMarker(args: {
                   endMessageId: boundary.endMessageId,
               }
             : undefined;
+    args.beforeApply?.();
     const outcome = (args.applyDeferred ?? applyDeferredCompactionMarker)(
         args.db,
         args.sessionId,
@@ -1003,6 +1006,7 @@ export function runRustModePostprocess(args: {
     projectPath?: string;
     sessionDirectory?: string;
     materializedBoundary?: RustMaterializedCompactionBoundary;
+    beforeMarkerApply?: () => void;
     compactionMarkerStrategy?: CompactionMarkerStrategy;
     fullFeatureMode: boolean;
     compactionOff?: boolean;
@@ -1078,6 +1082,7 @@ export function runRustModePostprocess(args: {
     if (args.cacheBustingPass) {
         applyRustModeDeferredCompactionMarker({
             cacheBustingPass: true,
+            beforeApply: args.beforeMarkerApply,
             ...(args.compactionMarkerStrategy
                 ? { applyDeferred: args.compactionMarkerStrategy.applyDeferred }
                 : {}),

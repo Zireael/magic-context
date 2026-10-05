@@ -209,6 +209,64 @@ afterEach(() => {
 });
 
 describe("applyDeferredCompactionMarker — outcomes", () => {
+    it("r2 proof: a retained partial at the prior target ordinal still vetoes the next cut", () => {
+        const home = useTempDataHome("r2-retained-partial-");
+        const sid = "ses-r2-retained";
+        const oc = createOpenCodeDb(home);
+        insertUserMessage(oc, "turn-user", sid, 7);
+        insertMessage(oc, "partial", sid, 8, "assistant");
+        oc.prepare("INSERT INTO part VALUES ('partial-p','partial',?,8,8,?)").run(
+            sid,
+            JSON.stringify({ type: "text", text: "covered then UNCOVERED_SUFFIX" }),
+        );
+        insertMessage(oc, "real-gap", sid, 9, "assistant");
+        insertUserMessage(oc, "next-start", sid, 10);
+        insertUserMessage(oc, "target", sid, 20);
+        const db = openDatabase();
+        appendCompartments(db, sid, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 8,
+                startMessageId: "older",
+                endMessageId: "partial",
+                endBlockIndex: 0,
+                title: "partial",
+                content: "covered",
+            },
+        ]);
+        db.prepare("INSERT INTO session_meta(session_id) VALUES (?)").run(sid);
+        expect(
+            applyDeferredCompactionMarker(
+                db,
+                sid,
+                makePending({ ordinal: 8, endMessageId: "partial" }),
+                home,
+            ),
+        ).toEqual({ kind: "applied", markerOrdinal: 8 });
+        expect(getPersistedCompactionMarkerState(db, sid)?.boundaryMessageId).toBe("turn-user");
+        appendCompartments(db, sid, [
+            {
+                sequence: 1,
+                startMessage: 10,
+                endMessage: 20,
+                startMessageId: "next-start",
+                endMessageId: "target",
+                endBlockIndex: 0,
+                title: "later",
+                content: "later",
+            },
+        ]);
+        oc.close();
+        expect(
+            applyDeferredCompactionMarker(
+                db,
+                sid,
+                makePending({ ordinal: 20, endMessageId: "target" }),
+                home,
+            ),
+        ).toEqual({ kind: "stale-skip", reason: "partial-message-boundary" });
+    });
     it("lock-contention diagnostics promise the next cache-busting pass, not the next ordinary pass", () => {
         expect(RUST_MARKER_LOCK_SKIP_LOG).toContain("next cache-busting pass retries");
         expect(RUST_MARKER_LOCK_SKIP_LOG).not.toContain("next pass retries");
@@ -216,6 +274,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
     it("does not let already-cut indexed ends behind the current marker veto an advance", () => {
         const dataHome = useTempDataHome("marker-old-gap-");
         const oc = createOpenCodeDb(dataHome);
+        insertMessage(oc, "gone-end", "ses-old-gap", 8, "assistant");
         insertUserMessage(oc, "current", "ses-old-gap", 10);
         insertUserMessage(oc, "target", "ses-old-gap", 20);
         const db = openDatabase();
@@ -260,6 +319,56 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
                 dataHome,
             ),
         ).toEqual({ kind: "applied", markerOrdinal: 20 });
+    });
+
+    it("unknown canonical order of an older endpoint stays protected rather than trusting its target ordinal", () => {
+        const home = useTempDataHome("marker-unknown-old-order-");
+        const sid = "ses-unknown-old-order";
+        const oc = createOpenCodeDb(home);
+        insertUserMessage(oc, "old-user", sid, 10);
+        insertUserMessage(oc, "target", sid, 20);
+        const db = openDatabase();
+        appendCompartments(db, sid, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 8,
+                startMessageId: "old-start",
+                endMessageId: "absent-end",
+                endBlockIndex: 0,
+                title: "old",
+                content: "old",
+            },
+            {
+                sequence: 1,
+                startMessage: 11,
+                endMessage: 20,
+                startMessageId: "next",
+                endMessageId: "target",
+                title: "new",
+                content: "new",
+            },
+        ]);
+        const state = {
+            boundaryMessageId: "old-user",
+            boundaryOrdinal: 10,
+            targetEndMessageId: "old-user",
+            summaryMessageId: "old-summary",
+            summaryPartId: "old-summary-part",
+            compactionPartId: "old-compaction",
+        };
+        insertMarkerRows(oc, sid, state);
+        setPersistedCompactionMarkerState(db, sid, state);
+        oc.close();
+        expect(
+            applyDeferredCompactionMarker(
+                db,
+                sid,
+                makePending({ ordinal: 20, endMessageId: "target" }),
+                home,
+            ),
+        ).toEqual({ kind: "stale-skip", reason: "partial-message-boundary" });
+        expect(getPersistedCompactionMarkerState(db, sid)?.boundaryMessageId).toBe("old-user");
     });
 
     it("advances ALF's seven sparse successor gaps only when the remaining raw coordinates are historian-synthetic", () => {
@@ -315,7 +424,8 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
                         content: "right",
                     },
                 ]);
-                if (end <= marker.boundaryOrdinal) continue; // The host already cut these ids away.
+                // A native cut filters these older rows from input; it does not
+                // erase them from raw storage. Keep canonical proof of their order.
                 insertMessage(oc, `end-${end}`, sessionId, end, "assistant");
                 oc.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)").run(
                     `covered-${end}`,
