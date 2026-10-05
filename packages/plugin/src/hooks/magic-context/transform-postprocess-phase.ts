@@ -88,7 +88,11 @@ import {
     rearmChannel2AfterCoverageAdvancingHardFold,
     rearmChannel2AfterMeasuredCollapse,
 } from "./channel2-cycle";
-import { applyDeferredCompactionMarker, MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
+import {
+    applyDeferredCompactionMarker,
+    MARKER_SUMMARY_TEXT,
+    type MarkerUpdateOutcome,
+} from "./compaction-marker-manager";
 import { getActiveCompartmentRun } from "./compartment-runner";
 import type {
     CtxReduceAvailabilityVerdict,
@@ -736,7 +740,7 @@ export interface RustMaterializedCompactionBoundary {
 
 /** Logged when another process holds the write lock past busy_timeout. */
 export const RUST_MARKER_LOCK_SKIP_LOG =
-    "rust compaction-marker: pending target write skipped on lock contention; next pass retries";
+    "rust compaction-marker: pending target write skipped on lock contention; next cache-busting pass retries";
 
 /**
  * SQLITE_BUSY, SQLITE_LOCKED and their extended codes such as SQLITE_BUSY_SNAPSHOT.
@@ -756,12 +760,23 @@ function isSqliteLockContentionError(error: unknown): boolean {
 }
 
 /**
- * Use the boundary carried in the module response as OpenCode's compaction target;
- * do not replace it with a target read later from status. Store that target in the
- * local pending blob, advance it only forward in session metadata, and clear it only
- * when compare-and-swap confirms that the pending value has not changed.
+ * Use the compaction target from this Rust response, not a later status read
+ * that may describe different history. Save the target in session metadata and
+ * clear it only if no newer request replaced it. Targets move only forward.
+ * SOFT+ leaves the target and retry counters unchanged, including when the
+ * module commits metadata without rebuilding messages. Retry on a HARD/SOFT
+ * cache bust, never a timer or frozen last-known-good request (LKG) replay.
  */
 export function applyRustModeDeferredCompactionMarker(args: {
+    /**
+     * True for a Rust HARD/SOFT message rebuild; scheduler execute or a metadata
+     * write alone does not permit changing the compaction marker.
+     */
+    cacheBustingPass: boolean;
+    /** Block replay of the previous request before the host may omit earlier history. */
+    beforeApply?: () => void;
+    /** Report whether the marker moved, or may have moved, before later state writes can fail. */
+    afterApply?: (outcome: MarkerUpdateOutcome) => void;
     db: ContextDatabase;
     sessionId: string;
     boundary?: RustMaterializedCompactionBoundary;
@@ -773,6 +788,7 @@ export function applyRustModeDeferredCompactionMarker(args: {
      */
     applyDeferred?: CompactionMarkerStrategy["applyDeferred"];
 }): void {
+    if (!args.cacheBustingPass) return;
     const { boundary } = args;
     if (boundary) {
         if (
@@ -826,7 +842,7 @@ export function applyRustModeDeferredCompactionMarker(args: {
                 .immediate();
         } catch (error) {
             // This marker bookkeeping runs after the module already produced a valid
-            // transform, and every Rust-mode pass records the boundary again. A lock
+            // transform, and the next cache-busting pass records the boundary again. A lock
             // held past busy_timeout therefore skips this pass's recording and drain
             // instead of failing the pass into LKG or raw fallback.
             if (!isSqliteLockContentionError(error)) throw error;
@@ -850,6 +866,7 @@ export function applyRustModeDeferredCompactionMarker(args: {
                   endMessageId: boundary.endMessageId,
               }
             : undefined;
+    args.beforeApply?.();
     const outcome = (args.applyDeferred ?? applyDeferredCompactionMarker)(
         args.db,
         args.sessionId,
@@ -857,6 +874,7 @@ export function applyRustModeDeferredCompactionMarker(args: {
         args.sessionDirectory,
         trustedBoundary,
     );
+    args.afterApply?.(outcome);
     switch (outcome.kind) {
         case "applied":
         case "already-current":
@@ -1003,6 +1021,8 @@ export function runRustModePostprocess(args: {
     projectPath?: string;
     sessionDirectory?: string;
     materializedBoundary?: RustMaterializedCompactionBoundary;
+    beforeMarkerApply?: () => void;
+    afterMarkerApply?: (outcome: MarkerUpdateOutcome) => void;
     compactionMarkerStrategy?: CompactionMarkerStrategy;
     fullFeatureMode: boolean;
     compactionOff?: boolean;
@@ -1072,15 +1092,23 @@ export function runRustModePostprocess(args: {
             getDeferredClearedCompactionMarkerState(args.db, args.sessionId),
         ]);
     const servedMarkerBefore = servedMarkerRecord();
-    applyRustModeDeferredCompactionMarker({
-        ...(args.compactionMarkerStrategy
-            ? { applyDeferred: args.compactionMarkerStrategy.applyDeferred }
-            : {}),
-        db: args.db,
-        sessionId: args.sessionId,
-        boundary: args.materializedBoundary,
-        sessionDirectory: args.sessionDirectory,
-    });
+    // Retry marker updates left by an upgrade or locked store only on a HARD/SOFT
+    // cache bust. Moving one on SOFT+ would make the next host input omit earlier
+    // messages while m[0]/m[1] still replay unchanged.
+    if (args.cacheBustingPass) {
+        applyRustModeDeferredCompactionMarker({
+            cacheBustingPass: true,
+            beforeApply: args.beforeMarkerApply,
+            afterApply: args.afterMarkerApply,
+            ...(args.compactionMarkerStrategy
+                ? { applyDeferred: args.compactionMarkerStrategy.applyDeferred }
+                : {}),
+            db: args.db,
+            sessionId: args.sessionId,
+            boundary: args.materializedBoundary,
+            sessionDirectory: args.sessionDirectory,
+        });
+    }
     (args.compactionMarkerStrategy?.reconcile ?? reconcileMarkerRepresentation)(
         args.messages,
         getPersistedCompactionMarkerState(args.db, args.sessionId),
