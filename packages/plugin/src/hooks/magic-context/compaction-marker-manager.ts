@@ -95,7 +95,11 @@ export type MarkerUpdateOutcome =
     | {
           kind: "retryable-failure";
           error: Error;
-          /** Omitted means uncertain; only verified non-commit authorizes old replay. */
+          /**
+           * Omitted means the host marker's commit status is unknown. Only a confirmed
+           * unchanged marker keeps the previous last-known-good request (LKG)
+           * eligible for replay.
+           */
           cut?: "definitely-no-cut" | "uncertain";
       };
 
@@ -239,13 +243,14 @@ function boundaryWouldDiscardUncoveredMessage(
 ): boolean {
     const current = getPersistedCompactionMarkerState(db, sessionId);
     const partials = getUncoveredCompartmentEndsThrough(db, sessionId, ordinal);
-    // Unknown raw ordering is not proof of coverage. The boundary is kept by
-    // filterCompacted, so an indexed end at/after it is safe, not a blanket veto.
+    // OpenCode keeps the boundary user message and everything after it. A partly
+    // summarized message at or after that user stays visible, so it need not
+    // prevent this marker move. Unknown message order is not proof of safety.
     for (const partial of partials) {
-        // boundaryOrdinal is the summary target, not the retained user. An
-        // assistant target and the rest of its turn can still be in host input.
-        // Only a strict canonical comparison to the actual old cut proves an
-        // endpoint already discarded; equality and unknown ordering stay guarded.
+        // boundaryOrdinal is the summary target, not where OpenCode starts its input.
+        // For an assistant target, OpenCode also retains the preceding user and rest
+        // of that turn. Ignore an old summary end only if timestamp/ID order proves
+        // it is strictly before the old retained user; equal or unknown order stays checked.
         if (
             current &&
             compareOpenCodeMessagesByCanonicalOrder(
@@ -261,9 +266,9 @@ function boundaryWouldDiscardUncoveredMessage(
             partial.endMessageId,
         );
         if (ordering !== null && ordering <= 0) continue;
-        // Successors advance to the next PRESENT ordinal, not necessarily end+1.
-        // Missing successors/anchors never prove coverage. Background notices are
-        // absent only by the same synthetic policy the real historian uses.
+        // The next summary can start beyond end+1 because the historian skips
+        // synthetic messages. Require both recorded message IDs to exist, and
+        // check that every intervening message would be skipped by the historian.
         if (
             partial.successorStartMessageId &&
             partial.successorStartMessage !== null &&
@@ -361,10 +366,10 @@ export function applyDeferredCompactionMarker(
             };
         }
 
-        // Resolve from the partial message itself: the nearest user at or before
-        // it keeps that entire tool turn raw. Older indexed ends only veto the cut
-        // when their successor has not covered the remainder and they lie before
-        // the user boundary. Rust's last-block anchors alone do not make a gap.
+        // Keep the user at or before a partly summarized message so its entire tool
+        // turn remains visible. Reject a later user boundary if it would discard parts
+        // not covered by a following summary. Rust records the final block of fully
+        // summarized messages too; a block index alone does not prove missing coverage.
         if (boundaryWouldDiscardUncoveredMessage(db, sessionId, pending.ordinal, boundary.id)) {
             sessionLog(
                 sessionId,

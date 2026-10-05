@@ -536,6 +536,7 @@ describe("Rust mode authority adapter", () => {
         };
     }
 
+    // Allow time for the separate process's seven-second SQLite write lock to release.
     it("a busy host cut followed by priced capture failure retains still-safe LKG across restart", async () => {
         const fixture = markerFaultFixture("host-lock-capture");
         try {
@@ -558,7 +559,7 @@ describe("Rust mode authority adapter", () => {
             await fixture.waitForHostLock();
             fixture.dispose();
         }
-    });
+    }, 30_000);
 
     for (const outcome of [
         { kind: "already-current" },
@@ -808,7 +809,9 @@ describe("Rust mode authority adapter", () => {
             await transform.run(sid, input, output, makeMeta(db, sid));
             return JSON.stringify(output.messages);
         };
-        const first = await serve(); // fresh makeMessages input/output + makeMeta each call
+        // Each call recreates raw input, output and session metadata to compare the
+        // last-known-good request (LKG) without reusing messages edited by the previous pass.
+        const first = await serve();
         expect(await serve()).toBe(first);
         expect(transform.getState(sid).lkgRepresentationFrozen).toBe(true);
         expect(getPersistedCompactionMarkerState(db, sid)).toBeNull();

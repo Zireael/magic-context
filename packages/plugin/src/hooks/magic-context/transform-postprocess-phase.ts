@@ -755,19 +755,22 @@ function isSqliteLockContentionError(error: unknown): boolean {
 }
 
 /**
- * Use the boundary carried in the module response as OpenCode's compaction target;
- * do not replace it with a target read later from status. Store that target in the
- * local pending blob, advance it only forward in session metadata, and clear it only
- * when compare-and-swap confirms that the pending value has not changed.
- * SOFT+ (including committed metadata-only executes and frozen replay) holds the
- * blob and its health untouched; there is no independent marker retry timer.
+ * Use the compaction target from this Rust response, not a later status read
+ * that may describe different history. Save the target in session metadata and
+ * clear it only if no newer request replaced it. Targets move only forward.
+ * SOFT+ leaves the target and retry counters unchanged, including when the
+ * module commits metadata without rebuilding messages. Retry on a HARD/SOFT
+ * cache bust, never a timer or frozen last-known-good request (LKG) replay.
  */
 export function applyRustModeDeferredCompactionMarker(args: {
-    /** The served HARD/SOFT permission, never scheduler-execute or commit alone. */
+    /**
+     * True for a Rust HARD/SOFT message rebuild; scheduler execute or a metadata
+     * write alone does not permit changing the compaction marker.
+     */
     cacheBustingPass: boolean;
-    /** Fence old replay before a host strategy may commit an irreversible cut. */
+    /** Block replay of the previous request before the host may omit earlier history. */
     beforeApply?: () => void;
-    /** Report the cut outcome before subsequent pending-state bookkeeping can fail. */
+    /** Report whether the marker moved, or may have moved, before later state writes can fail. */
     afterApply?: (outcome: MarkerUpdateOutcome) => void;
     db: ContextDatabase;
     sessionId: string;
@@ -1084,9 +1087,9 @@ export function runRustModePostprocess(args: {
             getDeferredClearedCompactionMarkerState(args.db, args.sessionId),
         ]);
     const servedMarkerBefore = servedMarkerRecord();
-    // A retained retry can survive an upgrade or a host-store lock. It still
-    // needs the same bust permission as a new marker: draining on SOFT+ would
-    // change the host's next input cut while its cached history stays frozen.
+    // Retry marker updates left by an upgrade or locked store only on a HARD/SOFT
+    // cache bust. Moving one on SOFT+ would make the next host input omit earlier
+    // messages while m[0]/m[1] still replay unchanged.
     if (args.cacheBustingPass) {
         applyRustModeDeferredCompactionMarker({
             cacheBustingPass: true,

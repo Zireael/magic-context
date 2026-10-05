@@ -57,10 +57,11 @@ export function applyDeferredPiCompactionMarker(
 			return { kind: "stale-skip", reason: "target-superseded" };
 		}
 
-		// Pi keeps ordinal + 1, unlike OpenCode's user turn at/before the end.
-		// An uncovered indexed end would therefore be discarded, including blocks
-		// never summarized. Check even precomputed entry ids from older publishes;
-		// contiguous successors release older indexed ends by the shared rule.
+		// Pi keeps the first entry after the summarized range, not OpenCode's
+		// earlier user turn. A summary ending within a message could hide its
+		// remaining parts. Require the next summary to continue it at a later block
+		// or start at the next message ordinal, even if publication already chose
+		// which entry to keep.
 		if (
 			getUncoveredCompartmentEndThrough(deps.db, sessionId, pending.ordinal)
 		) {

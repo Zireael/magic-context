@@ -6,7 +6,11 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 const CAS_RETRY_LIMIT = 5;
 const MISSING_REPLAY_DOCUMENT_COLUMN = Symbol("missing replay document column");
 
-/** A marker cut is not replay-safe until its rebuilding request is admitted. */
+/**
+ * A marker may make the host omit earlier messages on its next request.
+ * Block last-known-good request (LKG) replay until that change is proven not to
+ * have happened, or a rebuilt request passes all send checks and is saved.
+ */
 export function isRustMarkerAdmissionFenced(db: Database, sessionId: string): boolean {
     const row = db
         .prepare(
