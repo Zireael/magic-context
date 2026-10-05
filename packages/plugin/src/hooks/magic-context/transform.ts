@@ -54,7 +54,7 @@ import {
     rebaseSessionCoordinatesAsync,
 } from "../../features/magic-context/store-generation-rebase";
 import type { Tagger } from "../../features/magic-context/tagger";
-import { getTemporalDecisions } from "../../features/magic-context/temporal-decisions";
+import { observeTemporalDecisions } from "../../features/magic-context/temporal-decisions";
 import {
     clearOpenCodePendingTransformDecision,
     normalizeMaterializeReason,
@@ -153,6 +153,7 @@ import {
     stripClearedReasoning,
 } from "./strip-content";
 import { collectTemporalCandidates, injectTemporalMarkers } from "./temporal-awareness";
+import { readServedTemporalDecisions } from "./temporal-served-projection";
 import { createPreAdoptionToolSweepResolver, useScopedToolSweep } from "./tool-sweep-policy";
 import { historianJoinFailClosedMessage, runCompartmentPhase } from "./transform-compartment-phase";
 import {
@@ -716,6 +717,9 @@ export function createTransform(deps: TransformDeps) {
         }
         const temporalCandidates = deps.experimentalTemporalAwareness
             ? collectTemporalCandidates(messages)
+            : undefined;
+        const temporalReplayIds = temporalCandidates
+            ? messages.flatMap((message) => (message.info.id ? [message.info.id] : []))
             : undefined;
         logTransformTiming(sessionId, "findSessionId", tSessionId, `messages=${messages.length}`);
         const tLkgEntry = performance.now();
@@ -2107,7 +2111,14 @@ export function createTransform(deps: TransformDeps) {
         // rebuild permission in postprocess; a cut never recomputes an old gap.
         if (deps.experimentalTemporalAwareness && !compactionOff) {
             const tTemporal = performance.now();
-            const injected = injectTemporalMarkers(messages, getTemporalDecisions(db, sessionId));
+            const frozen = observeTemporalDecisions(
+                db,
+                sessionId,
+                temporalCandidates ?? new Map(),
+                () => readServedTemporalDecisions(db, sessionId, "opencode"),
+                temporalReplayIds,
+            );
+            const injected = injectTemporalMarkers(messages, frozen);
             if (injected > 0) {
                 sessionLog(sessionId, `temporal: injected ${injected} gap markers`);
             }
@@ -2610,6 +2621,7 @@ export function createTransform(deps: TransformDeps) {
             schedulerDeferReason,
             fullFeatureMode,
             temporalCandidates,
+            temporalReplayIds,
             compactionOff,
             canRunCompartments,
             awaitedCompartmentRun,

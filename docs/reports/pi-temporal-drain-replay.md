@@ -1,5 +1,10 @@
 # Frozen idle-gap replay after a history cut
 
+The initial implementation described here was reviewed at `fdd3ea1556`.
+Its legacy-adoption and blob-storage shortcomings are corrected in
+[the follow-up](temporal-markers-follow-up.md); that report supersedes the
+storage and upgrade-policy descriptions below.
+
 ## Observed incident
 
 The Pi cache analyzer was run before source inspection, with session

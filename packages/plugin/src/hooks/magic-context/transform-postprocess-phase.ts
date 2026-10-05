@@ -1573,6 +1573,7 @@ interface RunPostTransformPhaseArgs {
     /** Raw harness observations captured before any Magic Context insertion or sentinelization. */
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     temporalCandidates?: ReadonlyMap<string, string>;
+    temporalReplayIds?: readonly string[];
     passOutcome?: PassOutcome;
     historyRefreshSessions?: Set<string>;
     m0M1?: {
@@ -2090,13 +2091,20 @@ export async function runPostTransformPhase(
     const isCacheBustingPass = publishedWorkDrainAllowed;
     const previousTemporalDecisions =
         args.temporalCandidates && !compactionOff
-            ? getTemporalDecisions(args.db, args.sessionId)
+            ? getTemporalDecisions(
+                  args.db,
+                  args.sessionId,
+                  args.temporalReplayIds ?? args.temporalCandidates.keys(),
+              )
             : undefined;
     const temporalDecisions =
         args.temporalCandidates && !compactionOff
             ? isCacheBustingPass
-                ? freezeTemporalDecisions(args.db, args.sessionId, args.temporalCandidates)
-                : getTemporalDecisions(args.db, args.sessionId)
+                ? new Map([
+                      ...(previousTemporalDecisions ?? []),
+                      ...freezeTemporalDecisions(args.db, args.sessionId, args.temporalCandidates),
+                  ])
+                : previousTemporalDecisions
             : undefined;
     const temporalInjected = temporalDecisions
         ? injectTemporalMarkers(args.messages, temporalDecisions)

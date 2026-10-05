@@ -132,7 +132,7 @@ import {
 } from "@magic-context/core/features/magic-context/tagger";
 import {
 	freezeTemporalDecisions,
-	getTemporalDecisions,
+	observeTemporalDecisions,
 } from "@magic-context/core/features/magic-context/temporal-decisions";
 import {
 	findNewestPiAssistantEntryId,
@@ -205,6 +205,7 @@ import {
 import { stripSystemInjection } from "@magic-context/core/hooks/magic-context/system-injection-stripper";
 import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import { formatTailHygienePrefixMismatch } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
+import { readServedTemporalDecisions } from "@magic-context/core/hooks/magic-context/temporal-served-projection";
 import {
 	advanceToolReclaimWatermarkToCurrentMax,
 	buildSyntheticToolReclaimOps,
@@ -5522,7 +5523,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		if (decision?.[0] === "seam-temporal-strip")
 			temporalCandidates.set(decision[1], "");
 	}
-	let temporalDecisions = getTemporalDecisions(args.db, args.sessionId);
+	let temporalDecisions = args.temporalAwareness
+		? observeTemporalDecisions(
+				args.db,
+				args.sessionId,
+				temporalCandidates,
+				() => readServedTemporalDecisions(args.db, args.sessionId, "pi"),
+			)
+		: new Map<string, string>();
 	if (args.temporalAwareness) {
 		const tTemporal = performance.now();
 		try {

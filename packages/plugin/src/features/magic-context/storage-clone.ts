@@ -18,7 +18,6 @@ import {
     readReplayDocument,
     writeReplayDocument,
 } from "./storage-replay-document";
-import { decodeTemporalDecision, encodeTemporalDecision } from "./temporal-decisions";
 
 export interface CloneCompartmentRow {
     sequence: number;
@@ -155,17 +154,6 @@ function clonePiContentDecisions(
         if (typeof entry !== "string") continue;
         if (isReservedLedgerControlEntry(entry)) {
             copied.push(entry);
-            continue;
-        }
-        const temporal = decodeTemporalDecision(entry);
-        if (temporal) {
-            if (filter.includeMessageId(temporal[0]))
-                copied.push(
-                    encodeTemporalDecision(
-                        mapMessageId(filter, temporal[0]) ?? temporal[0],
-                        temporal[1],
-                    ),
-                );
             continue;
         }
         const decision = decodePiContentDecision(entry);
@@ -475,6 +463,7 @@ export function copySessionStateForClone(
         if (
             countRows(db, "compartments", destinationSessionId) > 0 ||
             countRows(db, "tags", destinationSessionId) > 0 ||
+            countRows(db, "temporal_decisions", destinationSessionId) > 0 ||
             (filter.copySessionNotesAndFacts === true &&
                 ((tableExists(db, "notes") && countRows(db, "notes", destinationSessionId) > 0) ||
                     (tableExists(db, "session_facts") &&
@@ -672,6 +661,21 @@ export function copySessionStateForClone(
                     row.harness,
                 );
             }
+        }
+
+        const temporalRows = db
+            .prepare("SELECT message_id,marker FROM temporal_decisions WHERE session_id=?")
+            .all(sourceSessionId) as Array<{ message_id: string; marker: string | null }>;
+        const insertTemporal = db.prepare(
+            "INSERT INTO temporal_decisions(session_id,message_id,marker) VALUES (?,?,?)",
+        );
+        for (const row of temporalRows) {
+            if (filter.includeMessageId(row.message_id))
+                insertTemporal.run(
+                    destinationSessionId,
+                    mapMessageId(filter, row.message_id),
+                    row.marker,
+                );
         }
 
         const inherited =

@@ -2535,6 +2535,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // An upgrade changes indexes/triggers only inside the migration transaction.
     // Fresh/current schemas share the same installer, without rescanning FTS on open.
     const version = getPersistedSchemaVersion(db);
+    // Fresh stores include the v95 temporal decision table. Older stores wait
+    // for the same migration step rather than installing a new schema lane.
     if (version === 0 || version >= 95) installV95PerfSchema(db, false, version === 0);
 }
 

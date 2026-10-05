@@ -4,11 +4,15 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MockProvider } from "../src/mock-provider/server";
 import { PI_CLI, PI_PACKAGE_JSON } from "../src/pi-runner/spawn";
+import { Database } from "bun:sqlite";
+
+const handoff = process.argv.includes("--handoff");
 
 const base = join(tmpdir(), "magic-context/pi-temporal-drain");
 mkdirSync(base, { recursive: true });
 const root = realpathSync(mkdtempSync(join(base, "host-")));
 const env: Record<string, string> = { PATH: process.env.PATH!, HOME: root, TMPDIR: root, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", MC_TEMPORAL_ROOT: root };
+env.MC_TEMPORAL_REPO = resolve(import.meta.dir, "../../..");
 for (const key of ["XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "MAGIC_CONTEXT_STORAGE_DIR", "PI_CODING_AGENT_DIR"]) {
     env[key] = join(root, key === "MAGIC_CONTEXT_STORAGE_DIR" ? "storage" : key);
     mkdirSync(env[key], { recursive: true });
@@ -41,7 +45,7 @@ for (let ordinal = 1; ordinal <= 320; ordinal++) {
 writeFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
 const mock = new MockProvider();
 const { baseURL } = await mock.start();
-mock.enqueue({ text: "baseline answer", usage: { input_tokens: 70_000, output_tokens: 10 } });
+mock.enqueue({ text: "baseline answer", usage: { input_tokens: handoff ? 10_000 : 70_000, output_tokens: 10 } });
 mock.enqueue({ text: "drain answer", usage: { input_tokens: 10_000, output_tokens: 10 } });
 mock.setDefault({ text: "deferred answer", usage: { input_tokens: 10_000, output_tokens: 10 } });
 writeFileSync(join(env.PI_CODING_AGENT_DIR, "models.json"), JSON.stringify({ providers: { mock: { api: "openai-responses", baseUrl: baseURL, apiKey: "mock-key", models: [{ id: "mock-model", name: "Mock", reasoning: false, input: ["text"], contextWindow: 100_000, maxTokens: 8192, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
@@ -51,9 +55,10 @@ let child: Bun.Subprocess<"pipe", "pipe", "pipe"> | undefined;
 const events: unknown[] = [];
 let stderr = "";
 try {
-    child = Bun.spawn([process.execPath, PI_CLI, "--mode", "rpc", "--provider", "mock", "--model", "mock-model", "--session", sessionFile, "-e", extension], { cwd: root, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    const stderrTask = new Response(child.stderr).text().then((text) => { stderr = text; });
-    const iterator = child.stdout.getReader();
+    const spawn = (legacy: boolean) => Bun.spawn([process.execPath, PI_CLI, "--mode", "rpc", "--provider", "mock", "--model", "mock-model", "--session", sessionFile, "-e", extension], { cwd: root, env: { ...env, MC_TEMPORAL_LEGACY: legacy ? "1" : "0", MC_TEMPORAL_START_PASS: handoff && !legacy ? "2" : "0" }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    child = spawn(handoff);
+    let stderrTask = new Response(child.stderr).text().then((text) => { stderr += text; });
+    let iterator = child.stdout.getReader();
     let pending = "";
     async function turn(message: string) {
         child!.stdin.write(JSON.stringify({ type: "prompt", message }) + "\n");
@@ -74,26 +79,51 @@ try {
         }
     }
     await turn("baseline turn");
-    const lsof = Bun.spawnSync(["lsof", "-p", String(child.pid)]).stdout.toString();
-    writeFileSync(join(root, "lsof.txt"), lsof);
-    const databases = lsof.split("\n").filter((line) => /\.db(?:\s|$|-)/.test(line));
-    if (!databases.length || databases.some((line) => !line.includes(root + "/"))) throw new Error("Database isolation failed: " + databases.join("\n"));
-    await turn("drain turn");
-    await turn("deferred turn");
+    const isolatedDatabases: string[] = [];
+    const isolation = (name: string) => {
+        const lsof = Bun.spawnSync(["lsof", "-p", String(child!.pid)]).stdout.toString();
+        writeFileSync(join(root, name + "-lsof.txt"), lsof);
+        const databases = lsof.split("\n").filter((line) => /\.db(?:\s|$|-)/.test(line));
+        if (!databases.length || databases.some((line) => !line.includes(root + "/"))) throw new Error("Database isolation failed: " + databases.join("\n"));
+        isolatedDatabases.push(...databases);
+    };
+    isolation(handoff ? "old" : "host");
+    let oldPrefix: unknown;
+    if (handoff) {
+        child.kill(); await child.exited; await stderrTask;
+        const db = new Database(join(root, "storage/context.db"), { readonly: true });
+        if ((db.query("SELECT COUNT(*) AS n FROM temporal_decisions").get() as { n: number }).n !== 0) throw new Error("Old host unexpectedly stored temporal decisions");
+        oldPrefix = db.query("SELECT cached_m0_bytes,cached_m1_bytes FROM session_meta WHERE session_id=?").get(sessionId);
+        db.close();
+        child = spawn(false);
+        stderrTask = new Response(child.stderr).text().then((text) => { stderr += text; });
+        iterator = child.stdout.getReader(); pending = "";
+        await turn("deferred handoff turn");
+        isolation("new");
+    } else {
+        await turn("drain turn");
+        await turn("deferred turn");
+    }
     const requests = mock.requests();
     writeFileSync(join(root, "requests.json"), JSON.stringify(requests, null, 2));
-    if (requests.length !== 3) throw new Error(`Expected 3 provider requests, got ${requests.length}`);
+    if (requests.length !== (handoff ? 2 : 3)) throw new Error(`Unexpected provider request count ${requests.length}`);
     // Responses transport has no moving Anthropic cache_control breakpoint;
     // compare the actual input objects, without normalizing any content bytes.
-    const drain = (requests[1].body as { input: unknown[] }).input;
-    const replay = (requests[2].body as { input: unknown[] }).input.slice(0, drain.length);
+    const drain = (requests[handoff ? 0 : 1].body as { input: unknown[] }).input;
+    const replay = (requests[handoff ? 1 : 2].body as { input: unknown[] }).input.slice(0, drain.length);
     const text = JSON.stringify(drain);
     if (!text.includes("FIRST_KEPT_USER") || !text.includes("<!-- +10m -->")) throw new Error("The retained user's marker was not exercised");
     const raw = readFileSync(sessionFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
-    if (!raw.some((entry) => entry.type === "compaction" && entry.fromHook && entry.firstKeptEntryId === "seed0308")) throw new Error("No physical marker drain occurred");
-    if (JSON.stringify(drain) !== JSON.stringify(replay)) throw new Error("Drain/defer wire prefix changed");
+    if (!handoff && !raw.some((entry) => entry.type === "compaction" && entry.fromHook && entry.firstKeptEntryId === "seed0308")) throw new Error("No physical marker drain occurred");
+    if (JSON.stringify(drain) !== JSON.stringify(replay)) throw new Error(handoff ? "Old/new handoff wire prefix changed" : "Drain/defer wire prefix changed");
+    if (handoff) {
+        const db = new Database(join(root, "storage/context.db"), { readonly: true });
+        const after = db.query("SELECT cached_m0_bytes,cached_m1_bytes FROM session_meta WHERE session_id=?").get(sessionId);
+        db.close();
+        if (JSON.stringify(after) !== JSON.stringify(oldPrefix)) throw new Error("Handoff rebuilt the frozen history prefix");
+    }
     const sha = createHash("sha256").update(JSON.stringify(drain)).digest("hex");
-    console.log(JSON.stringify({ root, host: JSON.parse(readFileSync(PI_PACKAGE_JSON, "utf8")).version, requests: requests.length, comparedMessages: drain.length, comparedBytes: Buffer.byteLength(JSON.stringify(drain)), sha256: sha, isolatedDatabases: databases }, null, 2));
+    console.log(JSON.stringify({ root, handoff, host: JSON.parse(readFileSync(PI_PACKAGE_JSON, "utf8")).version, requests: requests.length, comparedMessages: drain.length, comparedBytes: Buffer.byteLength(JSON.stringify(drain)), sha256: sha, isolatedDatabases }, null, 2));
     child.kill(); await child.exited; await stderrTask;
 } finally {
     child?.kill();

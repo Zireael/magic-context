@@ -33811,6 +33811,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn temporal_shared_session_serves_the_same_user_bytes_as_pi_and_typescript() {
+        run_active_surface_test(|| {
+            let fixture: Value = serde_json::from_str(include_str!(
+                "../../../testdata/temporal-session-parity.json"
+            ))
+            .unwrap();
+            let messages = fixture["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let mut message = wire_item(
+                        row["role"].as_str().unwrap(),
+                        row["id"].as_str().unwrap(),
+                        index as u64 + 1,
+                        &[row["text"].as_str().unwrap()],
+                    );
+                    message.ck.meta.created_at_ms = row["created"].as_i64();
+                    message.ck.meta.completed_at_ms = row["completed"].as_i64();
+                    message
+                })
+                .collect();
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let request = active_opencode_req("temporal-shared-rust", "cfg0", messages);
+            let ctx = pctx("git:proj", "/nonexistent-docs", 1_000);
+            let served = transform(&s, &request, &ctx).unwrap();
+            let users = ["user", "later", "near"].map(|mid| tail_bytes(&served, mid).to_string());
+            assert_eq!(
+                serde_json::to_value(users).unwrap(),
+                fixture["served_users"]
+            );
+            let replay = transform(&s, &request, &ctx).unwrap();
+            let replay_users =
+                ["user", "later", "near"].map(|mid| tail_bytes(&replay, mid).to_string());
+            assert_eq!(
+                serde_json::to_value(replay_users).unwrap(),
+                fixture["served_users"]
+            );
+        });
+    }
+
+    #[test]
     fn temporal_gap_cut_keeps_the_persisted_message_decision() {
         let mut prior = wire_item("assistant", "prior", 1, &["answer"]);
         prior.ck.meta.created_at_ms = Some(100_000);

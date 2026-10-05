@@ -2,13 +2,15 @@
  * Pi-side temporal-marker injection — mirrors OpenCode's
  * `injectTemporalMarkers` (packages/plugin/src/hooks/magic-context/temporal-awareness.ts).
  *
- * Behaves identically to OpenCode at the agent-visible layer: when the
+ * For authored user messages, uses the same gap formatting as OpenCode: when the
  * gap between the previous message's effective end time and the current
  * user message's creation time exceeds TEMPORAL_AWARENESS_THRESHOLD_SECONDS
  * (5 minutes), prepends an HTML-comment marker to the user message's
  * first text content (`<!-- +12m -->\n`, `<!-- +2h 15m -->\n`, etc.).
  *
  * Pi differences:
+ *   - The legacy Pi surface also annotated transport-only user messages. An
+ *     upgrade replays those bytes rather than silently changing eligibility.
  *   - Pi messages carry a single `timestamp` (number, ms epoch). Pi has
  *     no separate created/completed fields the way OpenCode does — the
  *     timestamp is when the message was emitted. We use that for both

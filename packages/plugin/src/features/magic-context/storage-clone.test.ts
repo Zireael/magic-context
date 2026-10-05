@@ -9,7 +9,7 @@ import { encodePiContentDecision } from "./pi-content-decisions";
 import { type CloneSessionStateFilter, copySessionStateForClone } from "./storage-clone";
 import { initializeDatabase } from "./storage-db";
 import { applyStrippedPlaceholderDelta, getHiddenSeamPlaceholderIds } from "./storage-meta";
-import { encodeTemporalDecision } from "./temporal-decisions";
+import { freezeTemporalDecisions, getTemporalDecisions } from "./temporal-decisions";
 
 const SOURCE = "ses_source";
 const DESTINATION = "ses_destination";
@@ -178,14 +178,20 @@ describe("copySessionStateForClone", () => {
             "msg_gone",
             `${MERGED_REASONING_PARTS_PREFIX}${JSON.stringify(["msg_gone", [0]])}`,
             encodePiContentDecision("reminder-strip", "msg_a:p0"),
-            encodeTemporalDecision("msg_a", "<!-- +5m -->\n"),
-            encodeTemporalDecision("msg_gone", ""),
             "binding_mismatch:msg_a",
             "binding_mismatch:msg_gone",
         ];
         db.prepare(
             "UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
         ).run(JSON.stringify(ledger), SOURCE);
+        freezeTemporalDecisions(
+            db,
+            SOURCE,
+            new Map([
+                ["msg_a", "<!-- +5m -->\n"],
+                ["msg_gone", ""],
+            ]),
+        );
 
         copySessionStateForClone(
             db,
@@ -208,9 +214,11 @@ describe("copySessionStateForClone", () => {
             "msg_a_clone",
             `${MERGED_REASONING_PARTS_PREFIX}${JSON.stringify(["msg_a_clone", ["prt_1_clone", 2]])}`,
             encodePiContentDecision("reminder-strip", "msg_a_clone:p0"),
-            encodeTemporalDecision("msg_a_clone", "<!-- +5m -->\n"),
             "binding_mismatch:msg_a_clone",
         ]);
+        expect(getTemporalDecisions(db, DESTINATION)).toEqual(
+            new Map([["msg_a_clone", "<!-- +5m -->\n"]]),
+        );
     });
 
     it("clones the rest of the session when the reasoning ledger is corrupt", () => {

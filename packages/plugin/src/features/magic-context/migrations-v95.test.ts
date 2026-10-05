@@ -15,6 +15,7 @@ import { insertTag, markTagsCompactedByMessageIds, updateTagStatus } from "./sto
 function v94(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
+    db.exec("DROP TABLE IF EXISTS temporal_decisions");
     for (const name of [
         "idx_message_fts_rowid_map_session_rowid",
         "idx_transform_decisions_retention",
@@ -64,6 +65,49 @@ const identities = (db: Database) =>
     db.prepare("SELECT rowid,sha FROM git_commits_fts ORDER BY rowid").all();
 
 describe("migration 95", () => {
+    test("v95 installs indexed temporal decisions and extracts only prerelease temporal entries", () => {
+        const db = v94();
+        try {
+            getOrCreateSessionMeta(db, "temporal");
+            const entries = [
+                "assistant-reasoning",
+                'temporal-message-v1:["user","<!-- +5m -->\\n"]',
+                'temporal-message-v1:["none",""]',
+            ];
+            db.prepare(
+                "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id=?",
+            ).run(JSON.stringify(entries), "temporal");
+            runMigrations(db);
+            expect(
+                db
+                    .prepare(
+                        "SELECT message_id,marker FROM temporal_decisions WHERE session_id=? ORDER BY message_id",
+                    )
+                    .all("temporal"),
+            ).toEqual([
+                { message_id: "none", marker: "" },
+                { message_id: "user", marker: "<!-- +5m -->\n" },
+            ]);
+            expect(
+                db
+                    .prepare(
+                        "SELECT merged_reasoning_stripped_ids AS entries FROM session_meta WHERE session_id=?",
+                    )
+                    .get("temporal"),
+            ).toEqual({ entries: JSON.stringify(["assistant-reasoning"]) });
+            const plan = db
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT marker FROM temporal_decisions WHERE session_id=? AND message_id=?",
+                )
+                .all("temporal", "user") as Array<{ detail: string }>;
+            expect(plan.some((row) => row.detail.includes("PRIMARY KEY"))).toBe(true);
+            const changes = db.prepare("SELECT total_changes() AS n").get();
+            installV95PerfSchema(db);
+            expect(db.prepare("SELECT total_changes() AS n").get()).toEqual(changes);
+        } finally {
+            db.close();
+        }
+    });
     test("populated v94 preserves metadata, tags and ordered FTS bytes through v95", () => {
         const db = v94();
         try {
