@@ -61,7 +61,7 @@ pub const SINGLE_STORE_CAPABLE: bool = mc_store::SINGLE_STORE_CAPABLE;
 /// this binary was built; whether that migration changed anything these writers depend
 /// on is answered per table by the fingerprints, so a migration that touched only tables
 /// the module never writes does not stop the module writing.
-pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 93;
+pub const BUILT_CONTEXT_FENCE_VERSION: i64 = 95;
 
 /// Versions at or above this number belong to downstream forks and are excluded when
 /// reading the persisted lane, matching the host's own fence arithmetic.
@@ -315,7 +315,7 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     ),
     (
         "compartments",
-        "b1ced2e8c3bdb5d1872054ff46d170295f40d6babdb27059a51ea172843d7d70",
+        "849679458a3d6f4a495e336221c770066806aba16794f36ee79fbdcd3e32e89c",
     ),
     (
         "context_privilege_state",
@@ -347,7 +347,7 @@ pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     ),
     (
         "user_memory_candidates",
-        "95439b71b9b3bf11af21a75f092c8978d732e00be1a833b61214e81852dd83cc",
+        "1d918414e8a99614d6fb0b72a55ae40b2006c46dbf7303d4fe5546feff2e182e",
     ),
 ];
 
@@ -2202,7 +2202,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fixture_db(dir.path(), "context.db");
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("DROP TRIGGER compartment_history_ai; DROP TRIGGER compartment_history_au; DROP TRIGGER compartment_history_ad; DROP TABLE compartment_history_versions; DELETE FROM schema_migrations WHERE version=93").unwrap();
+        conn.execute_batch("DROP TRIGGER compartment_history_ai; DROP TRIGGER compartment_history_au; DROP TRIGGER compartment_history_ad; DROP TABLE compartment_history_versions; DELETE FROM schema_migrations WHERE version>=93").unwrap();
         let mut store = HostStore::open(&path).unwrap();
         assert_eq!(store.fence().persisted_version, 92);
         assert!(store.writable_tables().contains(&"memories"));

@@ -63,12 +63,13 @@ import {
     LKG_SLOTS_DDL,
     SESSION_REPLAY_DECISIONS_DDL,
 } from "./migration-v94-write-split";
+import { installV95PerfSchema } from "./migration-v95-perf-indexes";
 import { runMigrationsOffThread } from "./migration-worker-client";
 import {
     FORK_MIGRATION_VERSION_FLOOR,
+    getMainThreadMigrationBodyCount,
     hasPendingMigrations,
     runMigrations,
-    runMigrationsWithRetry,
 } from "./migrations";
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
@@ -160,7 +161,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastUnconfirmedMigrationHolders = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 94;
+export const LATEST_SUPPORTED_VERSION = 95;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -185,6 +186,8 @@ export interface DatabaseBootTimings {
 }
 
 export interface OpenDatabaseOptions {
+    /** Host-side synchronous reads may reuse/open only an already-current schema. */
+    allowMigrations?: boolean;
     dbPath?: string;
     latestSupportedVersion?: number;
     /** Test/diagnostic override; production uses BOOT_SQLITE_BUSY_TIMEOUT_MS. */
@@ -1190,7 +1193,6 @@ export function initializeDatabase(
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
-    CREATE INDEX IF NOT EXISTS idx_compartments_session ON compartments(session_id);
 
     CREATE TABLE IF NOT EXISTS compartment_chunk_embeddings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1251,7 +1253,6 @@ export function initializeDatabase(
       harness TEXT NOT NULL DEFAULT 'opencode',
       PRIMARY KEY(session_id, message_ordinal)
     );
-    CREATE INDEX IF NOT EXISTS idx_compression_depth_session ON compression_depth(session_id);
 
     CREATE TABLE IF NOT EXISTS session_facts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1557,7 +1558,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       stale_reason           TEXT,
       PRIMARY KEY (project_path, path)
     );
-    CREATE INDEX IF NOT EXISTS idx_project_key_files_project ON project_key_files(project_path);
     CREATE INDEX IF NOT EXISTS idx_project_key_files_generated_at ON project_key_files(project_path, generated_at);
 
     CREATE TABLE IF NOT EXISTS project_key_files_version (
@@ -1942,10 +1942,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       input_tokens       INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (session_id, harness, message_id)
     );
-    CREATE INDEX IF NOT EXISTS idx_transform_decisions_session_harness
-      ON transform_decisions(session_id, harness);
 
-    CREATE INDEX IF NOT EXISTS idx_tags_session_tag_number ON tags(session_id, tag_number);
     CREATE INDEX IF NOT EXISTS idx_tags_session_message_id ON tags(session_id, message_id);
 
     -- Clone/import paths can write tags before session bootstrap. Keep trigger-created
@@ -1991,9 +1988,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       WHERE NEW.session_id != OLD.session_id
       ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
     END;
-    CREATE INDEX IF NOT EXISTS idx_pending_ops_session ON pending_ops(session_id);
     CREATE INDEX IF NOT EXISTS idx_pending_ops_session_tag_id ON pending_ops(session_id, tag_id);
-    CREATE INDEX IF NOT EXISTS idx_source_contents_session ON source_contents(session_id);
     
     CREATE TABLE IF NOT EXISTS recomp_compartments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2483,8 +2478,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         input_tokens       INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (session_id, harness, message_id)
       );
-      CREATE INDEX IF NOT EXISTS idx_transform_decisions_session_harness
-        ON transform_decisions(session_id, harness);
     `);
 
     // transform_decisions existed before comparison telemetry was introduced.
@@ -2539,6 +2532,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // here. Migration v6 handles `notes` separately (see migrations.ts).
     // notes.anchor_ordinal is added by migration v29 for the same reason — it
     // cannot go here because the table doesn't exist yet on a fresh DB.
+    // An upgrade changes indexes/triggers only inside the migration transaction.
+    // Fresh/current schemas share the same installer, without rescanning FTS on open.
+    const version = getPersistedSchemaVersion(db);
+    if (version === 0 || version >= 95) installV95PerfSchema(db, false, version === 0);
 }
 
 const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
@@ -2673,12 +2670,24 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             closeQuietly(db);
             return null;
         }
+        if (options?.allowMigrations === false && hasPendingMigrations(db)) {
+            log(
+                `[magic-context] storage not ready: pending migrations at ${dbPath}; host callers must await the async opener`,
+            );
+            closeQuietly(db);
+            return null;
+        }
         if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
             closeQuietly(db);
             return null;
         }
         initializeDatabase(db, busyTimeoutMs);
-        runMigrations(db);
+        if (options?.allowMigrations === false) {
+            if (hasPendingMigrations(db)) {
+                closeQuietly(db);
+                return null;
+            }
+        } else runMigrations(db);
         ensureContextStoreUuid(db);
         return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
     } catch (error) {
@@ -2693,6 +2702,11 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
         );
     }
+}
+
+/** Tool/RPC/timer access must not turn an earlier async boot failure into a synchronous upgrade. */
+export function openCurrentDatabase(options: OpenDatabaseOptions = {}): Database | null {
+    return openDatabase({ ...options, allowMigrations: false });
 }
 
 /**
@@ -2732,6 +2746,7 @@ export async function openDatabaseAsync(
 
     const opening = (async (): Promise<Database | null> => {
         let db: Database | undefined;
+        const mainThreadBodiesBefore = getMainThreadMigrationBodyCount();
         const openStartedAt = performance.now();
         let openMs = 0;
         let guardMs = 0;
@@ -2778,17 +2793,31 @@ export async function openDatabaseAsync(
             // worker has committed, so no caller can read a half-migrated schema.
             // With nothing pending, nothing is started and the open costs what it
             // did before.
-            if (isFileBackedPath(dbPath) && hasPendingMigrations(db)) {
+            if (hasPendingMigrations(db)) {
+                if (!isFileBackedPath(dbPath)) {
+                    throw new Error(
+                        "async migration requires a file-backed database; use the explicit synchronous opener for in-memory or URI test databases",
+                    );
+                }
                 await runMigrationsOffThread({
                     dbPath,
                     busyTimeoutMs,
                     sqlitePragmaConfig: { ...sqlitePragmaConfig },
                 });
             }
-            // Already-current after the worker, so this reaches runMigrations' read-only
-            // fast path. If no worker could start, this applies the migrations here.
+            // A worker must finish the upgrade before the main connection initializes.
+            // Never substitute the synchronous runner for a failed or incomplete worker.
+            if (hasPendingMigrations(db)) {
+                throw new Error(
+                    "the migration worker did not complete the pending migration; reinstall or rebuild the plugin",
+                );
+            }
             initializeDatabase(db, busyTimeoutMs);
-            await runMigrationsWithRetry(db);
+            if (hasPendingMigrations(db)) {
+                throw new Error(
+                    "storage initialization left a pending migration; reinstall or rebuild the plugin",
+                );
+            }
             ensureContextStoreUuid(db);
             const opened = finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
             migrateMs = performance.now() - migrateStartedAt;
@@ -2801,6 +2830,9 @@ export async function openDatabaseAsync(
                 `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
             );
         } finally {
+            log(
+                `[migrations] async open main-thread migration-body count: ${getMainThreadMigrationBodyCount() - mainThreadBodiesBefore} (total=${getMainThreadMigrationBodyCount()}) path=${dbPath}`,
+            );
             if (openMs === 0) openMs = performance.now() - openStartedAt;
             if (guardStartedAt !== null && guardMs === 0) {
                 guardMs = performance.now() - guardStartedAt;
