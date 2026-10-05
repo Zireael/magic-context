@@ -376,10 +376,10 @@ fn measure_value_costs(session: &str, store: &McStore, request: &Value) {
             profile_start!(perf_decode, "rt14_cloned_decode");
             match shape {
                 "state_import" => {
-                    std::hint::black_box(serde_json::from_value::<StateImportWire>(value.clone()).unwrap());
+                    std::hint::black_box(decode_state_import_wire(value).unwrap());
                 }
                 "state_sync" => {
-                    std::hint::black_box(serde_json::from_value::<ModuleStateSyncWire>(value.clone()).unwrap());
+                    std::hint::black_box(decode_state_sync_wire(value).unwrap());
                 }
                 _ => {
                     std::hint::black_box(
