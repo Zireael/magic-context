@@ -35,7 +35,7 @@ mutated array did not protect fresh host arrays.
   eager walker also introduced new markers on deferred passes. Source-content
   replay can incidentally preserve a seam marker in some cases, but is not a
   durable temporal decision. The regressions exercise both host dependency
-  configurations, a changed array head, a recreated transform/LKG reset, and
+  configurations, a changed array head, a reopened database/recreated transform/LKG reset, and
   delayed first appearance until an explicit rebuild.
 - **Rust module:** existing `mc_temporal_marks` rows already froze many
   observations, but the temporal-parity transition could compare them with
@@ -82,7 +82,57 @@ OPENCODE_DB, MAGIC_CONTEXT_STORAGE_DIR and PI_CODING_AGENT_DIR under its
 throwaway root. The raw requests, RPC events, journal and lsof output are
 retained there. No live database/config store was opened or modified.
 
+After restoring all mutations, the same host probe passed again at
+`$TMPDIR/magic-context/pi-temporal-drain/host-tCMltu/` (host PID 46,335),
+again comparing 19 objects and 13,492 bytes. Its within-run prefix hash was
+`6987e23a81d1a5dde52bd66bbf16b4fe96b53af84c94032ba7b6b5b16157a8c7`.
+The journal's new-turn timestamps can differ between independent probe runs;
+the oracle compares the drain and replay inside each run, not two sessions.
+
 The first probe used Anthropic transport and correctly rejected a raw-byte
 comparison because the host moved `cache_control` from the former tail to the
 new tail; the retained idle-gap content itself matched. That unsuccessful run
 was also isolated and is not used as the passing proof.
+
+## Mutation controls
+
+Each mutation was staged against the live implementation before changing it,
+marked as temporary non-vacuity breaks, observed with a non-empty working diff, then
+restored from the index and touched. The working diff was empty after each
+restore. No mutant is committed.
+
+| Neutralized control | Exact red test/check | Controls that stayed green |
+| --- | --- | --- |
+| Shared TypeScript message-id replay | `OpenCode 1 freezes user gap bytes across a cut and a restart` | all ten `formatGap` tests |
+| Shared TypeScript message-id replay, v2 host seams | `OpenCode 2 freezes user gap bytes across a cut and a restart` | all ten `formatGap` tests |
+| First-writer persisted/returned snapshot | `temporal choices freeze absence as well as marker bytes and preserve other replay entries` | all ten `formatGap` tests |
+| Pi message-id replay | `Pi marker-drain wire stability > lands the marker projection in the same pass as deferred publication` | all ten Pi temporal formatting/normalization tests |
+| Pi message-id replay, actual host | `Drain/defer wire prefix changed` | the marker-presence and physical-drain checks were reached and passed |
+| Rust transition comparison of already decided marks | `transform::tests::temporal_gap_cut_keeps_the_persisted_message_decision` | `temporal_gap_format_matches_typescript_goldens` |
+| Rust defer adoption fence | `transform::tests::temporal_gap_first_appears_on_rebuild_then_replays_after_predecessor_change` | `temporal_gap_cut_keeps_the_persisted_message_decision` |
+| Rust stored-row overwrite during backfill | `transform::tests::temporal_gap_cut_keeps_the_persisted_message_decision` | `temporal_gap_format_matches_typescript_goldens` |
+
+The Pi unit mutant lost exactly 15 bytes from the existing prefix (the
+`<!-- +10m -->` line), while its unmutated run matched the full array.
+The shared TypeScript mutants specifically exposed eager first appearance
+on the deferred tail; incidental source-body seam replay did not hide that
+failure. The Rust row-overwrite mutant replaced the retained `+5m` with an
+empty marker. Each named red run had exactly one failed test/check.
+
+## Final gates
+
+- Bun 1.4.2: root distribution build passed, including all four v2 loader tests.
+- TypeScript 5.9.3: both plugin package typecheck scripts and the focused host
+  probe tsconfig passed.
+- OpenCode/shared transform regression selection: 355 tests passed in six files.
+- Pi context/LKG/degraded-pass/replay regression selection: 187 tests passed in
+  seven files.
+- Cargo 1.99.0: `cargo test -j 2 -p mc-module --lib` passed 1,595 tests, with
+  21 pre-existing ignored tests. The post-mutation temporal selection passed
+  all 15 tests; package formatting passed with rustfmt 1.10.0.
+
+Native commands were serialized and limited to two jobs under outer timeouts.
+The initial 600-second Rust attempt timed out while waiting for shared compile
+slots; later package checks completed. Cargo resolved newer versions of the
+prepared worktree's sibling path dependencies during these checks; the generated
+lockfile drift was reverted, and no manifest or lockfile changes are delivered.

@@ -19,12 +19,19 @@ it("temporal choices freeze absence as well as marker bytes and preserve other r
                 ["gap", "<!-- +5m -->\n"],
             ]),
         );
-        freezeTemporalDecisions(
+        const replay = freezeTemporalDecisions(
             db,
             "session",
             new Map([
                 ["none", "<!-- +2h -->\n"],
                 ["gap", ""],
+            ]),
+        );
+        // Callers render the returned snapshot, not a second read of the ledger.
+        expect(replay).toEqual(
+            new Map([
+                ["none", ""],
+                ["gap", "<!-- +5m -->\n"],
             ]),
         );
         expect(getTemporalDecisions(db, "session")).toEqual(

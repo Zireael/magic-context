@@ -17,7 +17,7 @@ it.each([
     "OpenCode 2",
 ])("%s freezes user gap bytes across a cut and a restart", async (runtime) => {
     const root = createTestTempDir("temporal-replay-");
-    const db = openDatabase(join(root.dir, "context.db"))!;
+    let db = openDatabase(join(root.dir, "context.db"))!;
     const sessionId = `temporal-${runtime}`;
     const pending = new Set([sessionId]);
     const models = new Map([
@@ -54,6 +54,8 @@ it.each([
         await makeTransform()({}, { messages: rebuilt });
         expect(rebuilt[1].parts[0].text).toContain("<!-- +5m -->");
         updateSessionMeta(db, sessionId, { lastResponseTime: Date.now(), cacheTtl: "59m" });
+        closeDatabase();
+        db = openDatabase(join(root.dir, "context.db"))!;
         resetLkgSlotsForTest();
         const cut = structuredClone([user]);
         await makeTransform()({}, { messages: cut });
