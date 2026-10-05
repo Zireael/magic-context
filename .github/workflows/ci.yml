@@ -591,6 +591,11 @@ jobs:
           echo "$summary"
           echo "$summary" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Check Cargo path dependency boundaries
+        run: |
+          timeout 180s python3 scripts/check-cargo-path-dependencies.py
+          timeout 180s python3 scripts/check-cargo-path-dependencies.py --self-test
+
       - name: Format check
         run: cargo fmt --check
 
