@@ -404,6 +404,15 @@ function canonicalSeedJson(value: unknown): string {
     return encoded === undefined ? "null" : encoded;
 }
 
+function sortCanonicalSeeds<T>(seeds: T[]): T[] {
+    // A seed's canonical bytes do not depend on its position. Compute them
+    // once, retaining the existing locale comparison and stable tie ordering.
+    return seeds
+        .map((seed) => ({ seed, key: canonicalSeedJson(seed) }))
+        .sort((left, right) => left.key.localeCompare(right.key))
+        .map(({ seed }) => seed);
+}
+
 function editMarkerSeedPayload(input: unknown): string | undefined {
     if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
     const copy = JSON.parse(JSON.stringify(input)) as Record<string, unknown>;
@@ -572,9 +581,7 @@ function buildPendingDropSeeds(args: {
             byBlock.set(seed.block_id, seed);
     }
     return {
-        seeds: [...byBlock.values()].sort((left, right) =>
-            canonicalSeedJson(left).localeCompare(canonicalSeedJson(right)),
-        ),
+        seeds: sortCanonicalSeeds([...byBlock.values()]),
         skipped,
     };
 }
@@ -611,9 +618,7 @@ function buildAutoSearchHintSeeds(args: {
         });
     }
     return {
-        seeds: [...byBlock.values()].sort((left, right) =>
-            canonicalSeedJson(left).localeCompare(canonicalSeedJson(right)),
-        ),
+        seeds: sortCanonicalSeeds([...byBlock.values()]),
         skipped,
     };
 }
@@ -636,9 +641,7 @@ function buildStripSeeds(args: { db: ContextDatabase; sessionId: string }): Modu
     for (const messageId of getProcessedImageStrippedIds(args.db, args.sessionId)) {
         add(messageId, "processed_image");
     }
-    return [...byKey.values()].sort((left, right) =>
-        canonicalSeedJson(left).localeCompare(canonicalSeedJson(right)),
-    );
+    return sortCanonicalSeeds([...byKey.values()]);
 }
 
 type SeedItem =
@@ -1553,6 +1556,7 @@ export async function syncModuleState(args: {
 }
 
 export const __moduleStateSyncTest = {
+    sortCanonicalSeeds,
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
     canonicalOrdinalForMessageId,
