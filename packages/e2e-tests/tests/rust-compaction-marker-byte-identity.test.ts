@@ -436,4 +436,71 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
         expect(JSON.parse(row.pending_compaction_marker_state)).toEqual(pending);
         console.log(`real metadata-only execute: ${pass.raw}`);
     }, 180_000);
+
+    it("a durable admission fence clears on the next real rebuilding pass before and after restart", async () => {
+        // Keep TTL alive so recovery depends on the dispatched flush, not an
+        // unrelated idle-expiry HARD opportunity.
+        const config = { ...FOLD_CONFIG, cache_ttl: "5m" };
+        h.subc.writeModuleConfig(config);
+        await h.restart({ rust: false, magicContextConfig: config });
+        const sessionId = await h.createSession();
+        h.mock.setDefault({ text: "fence recovery reply", usage: { input_tokens: 500, output_tokens: 20 } });
+        await h.sendPrompt(sessionId, "seed the summarized fence recovery history");
+        const firstUser = (await h.listMessages(sessionId)).find(message => message.info?.role === "user")!.info!.id!;
+        const contextPath = join(h.env.dataDir, "cortexkit", "magic-context", "context.db");
+        const seedContext = new Database(contextPath);
+        try {
+            seedContext.exec("PRAGMA busy_timeout=30000");
+            seedContext.query(`INSERT INTO compartments(session_id,sequence,start_message,end_message,
+                start_message_id,end_message_id,start_block_index,end_block_index,title,content,p1,importance,episode_type,created_at)
+                VALUES (?,0,1,1,?,?,0,0,'fixture','covered seed history','covered seed history',50,'feature',1)`)
+                .run(sessionId, firstUser, firstUser);
+        } finally { seedContext.close(); }
+        const seed = await h.subc.moduleRequest(sessionId, h.env.workdir, {
+            method: "state_sync", shadow_generation: 0, expected_shadow_seq: 0, seed_boundary_id: `${firstUser}#0`,
+        });
+        expect(seed.ok).toBe(true);
+        await h.restart({ rust: true, magicContextConfig: config });
+        const warmBefore = h.readRustPasses().length;
+        await h.sendPrompt(sessionId, "warm the real fence recovery fixture");
+        await h.waitForRustPasses(warmBefore + 1);
+        assertHermeticStores(h);
+        for (const restart of [false, true]) {
+            // Recreate the durable state left by an unadmitted cut, not a mock
+            // flush acknowledgement. The live module must dispatch and rebuild it.
+            const context = new Database(contextPath);
+            try {
+                context.exec("PRAGMA busy_timeout=30000");
+                context.transaction(() => {
+                    // End the harness's frozen zero-TTL setup explicitly; changing
+                    // config alone does not replace an already adopted TTL policy.
+                    context.query(`UPDATE session_meta SET cache_ttl='5m', trailing_blank_decisions=json_set(
+                        COALESCE(NULLIF(trailing_blank_decisions,''),'{"version":2,"trailingBlank":{}}'),
+                        '$.version',2,'$.trailingBlank',json('{}'),'$.rustMarkerAdmissionFence',json('true'),
+                        '$.cacheTtlPolicy.value','5m','$.cacheTtlPolicy.config','5m')
+                        WHERE session_id=?`).run(sessionId);
+                    context.query("DELETE FROM lkg_slot_chunks WHERE session_id=?").run(sessionId);
+                    context.query("DELETE FROM lkg_slots WHERE session_id=?").run(sessionId);
+                }).immediate();
+            } finally { context.close(); }
+            if (restart) await h.restart({ rust: true, magicContextConfig: config });
+            assertHermeticStores(h);
+            const before = h.readRustPasses().length;
+            const providerRequestsBefore = h.mainRequests().length;
+            await h.sendPrompt(sessionId, `recover the armed fence restart=${restart}`);
+            const pass = (await h.waitForRustPasses(before + 1)).at(-1)!;
+            console.log(`real fence recovery restart=${restart}: ${pass.raw}`);
+            if (!pass.applied) throw new Error(`real fence recovery refused:\n${h.diagnosticLog().slice(-6000)}`);
+            expect(pass.applied).toBe(true);
+            expect(pass.servedFrom).toBe("transform");
+            expect(pass.decision).toBe("SOFT");
+            expect(pass.wireMessages).toBe(pass.inputCount);
+            expect(h.mainRequests().length).toBeGreaterThan(providerRequestsBefore);
+            const state = h.contextDb().query(`SELECT
+                COALESCE(json_extract(trailing_blank_decisions,'$.rustMarkerAdmissionFence'),0) AS fence,
+                (SELECT count(*) FROM lkg_slots WHERE session_id=?) AS slots
+                FROM session_meta WHERE session_id=?`).get(sessionId, sessionId) as { fence: number; slots: number };
+            expect(state).toEqual({ fence: 0, slots: 1 });
+        }
+    }, 180_000);
 });

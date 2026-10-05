@@ -1666,11 +1666,8 @@ export function createRustModeTransform(
                         method: args.method,
                         sessionId: args.sessionId,
                         projectRoot: options.projectRoot ?? deps.directory ?? process.cwd(),
-                        // The transport sends `body` as the whole request; `method`
-                        // above only selects its lane and timeout. The module
-                        // dispatches on the body's own `method`, so it has to be in
-                        // the body too, or every claim-lane op is refused as an
-                        // unknown request.
+                        // Keep the dispatch field explicit for alternate clients;
+                        // the subc transport also derives it from the call method.
                         body: { ...args.body, method: args.method },
                     }),
                 db: deps.db,
@@ -3621,7 +3618,7 @@ export function createRustModeTransform(
                     sessionId,
                     projectRoot,
                     method: "session.flush",
-                    body: { v: 1, session_id: sessionId },
+                    body: { method: "session.flush", v: 1, session_id: sessionId },
                     timeoutMs: options.moduleTimeoutMs,
                 });
                 if (!isRecord(flushed) || flushed.ok !== true)
