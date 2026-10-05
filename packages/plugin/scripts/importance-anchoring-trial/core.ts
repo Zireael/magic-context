@@ -6,7 +6,7 @@ import { isNoContentCompartment } from "../../src/features/magic-context/no-cont
 export const BANDS = [[85, 100], [60, 84], [30, 59], [10, 29], [1, 9]] as const;
 export type HistoricalReference = ReferenceCompartment & { id: number; sequence: number };
 export type Score = { start: number; end: number; importance: number; title: string; p1: string };
-export type Variant = "A" | "B" | "C" | "D";
+export type Variant = "A" | "B" | "C" | "D" | "E" | "A2";
 export function hash(text: string): string { return createHash("sha256").update(text).digest("hex"); }
 export function band(score: number): number { return BANDS.findIndex(([lo, hi]) => score >= lo && score <= hi); }
 
@@ -65,6 +65,15 @@ export function variantD(prompt: string, history: HistoricalReference[], session
     const seeds = `<compartment_examples_from_other_projects>\n${selected.seeds.map(s => s.block).join("\n\n")}\n</compartment_examples_from_other_projects>`;
     // Callback replacement preserves literal $& / $` strings in historical code.
     return { prompt: prompt.replace(/<compartment_examples_from_other_projects>[\s\S]*?<\/compartment_examples_from_other_projects>/, () => seeds).replace(/<session_references>[\s\S]*?<\/session_references>/, () => `<session_references>\n${body}\n</session_references>`), selected };
+}
+/** D orders three diverse references before four recent ones. Hide only the recent labels. */
+export function variantE(dPrompt: string): string {
+    const block = dPrompt.match(/<session_references>[\s\S]*?<\/session_references>/)?.[0];
+    if (!block || [...block.matchAll(/<compartment\b[^>]*>/g)].length !== 7) throw new Error("E requires D's seven references");
+    let index = 0;
+    const altered = block.replace(/<compartment\b[^>]*>/g, tag => index++ < 3 ? tag : tag.replace(/\s+importance="\d+"/, ""));
+    if ([...altered.matchAll(/<compartment\b[^>]*\simportance="\d+"/g)].length !== 3) throw new Error("E must retain exactly three scored diverse references");
+    return dPrompt.replace(block, () => altered);
 }
 export function scores(xml: string): Score[] {
     const output: Score[] = [];

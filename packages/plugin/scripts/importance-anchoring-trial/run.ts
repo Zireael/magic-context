@@ -8,12 +8,15 @@ import { scores, type Variant } from "./core";
 const root = resolve(process.argv[2] ?? join(tmpdir(), "magic-context/importance-trial"));
 if (root !== resolve(tmpdir(), "magic-context/importance-trial")) throw new Error("Root outside trial fence");
 const limit = Number(process.argv[3] ?? 30);
-if (limit < 1 || limit > 30) throw new Error("Trial is capped at 30 cases / 120 calls");
+if (limit < 1 || limit > 30) throw new Error("Trial is capped at 30 cases per invocation");
+const variants = (process.argv[4] ?? "A,B,C,D").split(",") as Variant[];
+if (!variants.length || new Set(variants).size !== variants.length || variants.some(v => !["A","B","C","D","E","A2"].includes(v))) throw new Error("Invalid or duplicate trial arms");
 const config = parse(await Bun.file(join(root, "magic-context.jsonc")).text());
 const configured = config.historian.opencode.model;
 const model = typeof configured === "string" ? configured : configured.model;
 const slash = model.indexOf("/");
 const generation = { max_output_tokens: 32000, temperature: config.historian.temperature };
+if (variants.some(v => v === "E" || v === "A2") && (model !== "google/antigravity-gemini-3.8-flash" || generation.temperature !== 0.1)) throw new Error("Follow-up model/temperature differs from the original trial");
 const manifest = await Bun.file(join(root, "manifest.json")).json();
 mkdirSync(join(root, "results"), { recursive: true });
 const client = await SubcClient.connect({connectionFile:join(root,"subc-connection.json")});
@@ -82,10 +85,9 @@ try {
     await Promise.all(Array.from({length:Math.min(3,limit)},async()=>{
         while(next<Math.min(limit,manifest.length)) {
             const index=next++;
-            const variants:Variant[]=["A","B","C","D"];
-            const order=[...variants.slice(index%4),...variants.slice(0,index%4)];
+            const order=[...variants.slice(index%variants.length),...variants.slice(0,index%variants.length)];
             for(const variant of order) await call(index,variant);
         }
     }));
 } finally {client.close();}
-console.log(`Completed/resumed ${Math.min(limit,manifest.length)} cases (four cells each); no automatic retries or fallback models.`);
+console.log(`Completed/resumed ${Math.min(limit,manifest.length)} cases (${variants.join("/")} cells); no automatic retries or fallback models.`);

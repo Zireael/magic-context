@@ -34,6 +34,20 @@ The root is deliberately fixed to reject accidentally passing a live path. A/B/C
 
 The code intentionally does not add a scoring-only instruction, deterministic answer template or temperature override. Such controls could conceal the production model's real response to changed reference scores. Consequently full summaries, not just scores, can vary.
 
+## Fixed-cohort E/A2 follow-up
+
+Do **not** use `prepare.ts` to select a newer cohort for the follow-up. After making and scrubbing fresh snapshots as above, run:
+
+```sh
+bun scripts/importance-anchoring-trial/restore-inputs.ts "$TMPDIR/magic-context/importance-trial"
+bun scripts/importance-anchoring-trial/run.ts "$TMPDIR/magic-context/importance-trial" 30 E,A2
+bun scripts/importance-anchoring-trial/analyze.ts "$TMPDIR/magic-context/importance-trial"
+```
+
+`restore-inputs.ts` locates the thirty original child IDs in committed `evidence.json`, verifies all 120 A–D prompt hashes and thirty system hashes, and verifies the recorded output P1 hashes. A2 is exactly A in a fresh lineage. E changes only D's last four reference opening tags, removing their importance attributes while keeping the first three diverse references scored. The copied config must still select the original model and temperature. Broca's version should be checked before dispatch; both phases here used 0.3.176.
+
+The follow-up alternates arm order by case, adds only sixty provider calls, and does not regenerate A–D observations. The analyzer carries those response records and superseded-run spend forward from `prior-evidence.json`, adds E/A2, reports distances from the recorded original and both A generations, and compares title/P1 arrays against both A and A2. No P1 bodies are needed to compare hashes. Retain only the newly sanitized `evidence.json`, then delete the temporary root again. A repeat of a previously used arm requires a new lineage namespace; do not append to an existing provider session or interpret its replay as another independent generation.
+
 ## Checks
 
 ```sh
@@ -41,4 +55,4 @@ bun run typecheck
 bun test scripts/importance-anchoring-trial/core.test.ts
 ```
 
-`typecheck` includes `tsconfig.scripts.json`. No product packaging or generated prompt file changes are required. The tests cover literal B/C scope, production band edges, deterministic planting, D counts/order/availability, empty boundary markers, literal `$&` in history, score parsing and population standard deviation. Live dispatch is never part of a unit test.
+`typecheck` includes `tsconfig.scripts.json`. No product packaging or generated prompt file changes are required. The tests cover literal B/C scope, production band edges, deterministic planting, D counts/order/availability, empty boundary markers, literal `$&` in history, E's selective score removal, score parsing and population standard deviation. Live dispatch is never part of a unit test.

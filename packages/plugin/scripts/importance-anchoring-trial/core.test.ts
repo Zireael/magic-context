@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { alterSessionScores, band, distribution, plantedScores, scores, selectD, variantD, type HistoricalReference } from "./core";
+import { alterSessionScores, band, distribution, plantedScores, scores, selectD, variantD, variantE, type HistoricalReference } from "./core";
 const ref=(importance:number,sequence:number):HistoricalReference=>({id:sequence,sequence,startMessage:sequence*10,endMessage:sequence*10+9,title:`ref ${sequence}`,importance,content:"content",p1:"one",p2:"two",p3:"three",p4:"four"});
 const prompt='<compartment_examples_from_other_projects><compartment importance="96">seed</compartment></compartment_examples_from_other_projects>\n<session_references><compartment title="reference" importance="74"><p1>importance="77" in prose</p1></compartment></session_references>\n<new_messages>importance="88" transcript</new_messages>';
 describe("paired reference manipulations",()=>{
@@ -61,6 +61,19 @@ describe("paired reference manipulations",()=>{
         expect(block.match(/<compartment /g)).toHaveLength(7);
         expect(block.match(/literal \$&amp; and \$` and \$'/g)).toHaveLength(7);
     });
+});
+test("E hides only the recent four scores and keeps D's three diverse scores, seeds and text",()=>{
+    const history=Array.from({length:10},(_,i)=>ref(74,i));
+    const d=variantD(prompt,history,"session",100).prompt;
+    const e=variantE(d);
+    const refBlock=e.match(/<session_references>[\s\S]*?<\/session_references>/)![0];
+    const tags=[...refBlock.matchAll(/<compartment\b[^>]*>/g)].map(m=>m[0]);
+    expect(tags).toHaveLength(7);
+    expect(tags.slice(0,3).every(t=>t.includes('importance="74"'))).toBe(true);
+    expect(tags.slice(3).every(t=>!t.includes("importance="))).toBe(true);
+    expect(e.match(/<compartment_examples_from_other_projects>[\s\S]*?<\/compartment_examples_from_other_projects>/)![0]).toBe(d.match(/<compartment_examples_from_other_projects>[\s\S]*?<\/compartment_examples_from_other_projects>/)![0]);
+    expect(e.replace(/\s+importance="\d+"/g, "")).toBe(d.replace(/\s+importance="\d+"/g, ""));
+    expect(()=>variantE(prompt)).toThrow("E requires D's seven references");
 });
 test("literal scoring distribution uses population sd",()=>{
     expect(distribution([10,20])).toEqual({n:2,min:10,max:20,mean:15,sd:5});
