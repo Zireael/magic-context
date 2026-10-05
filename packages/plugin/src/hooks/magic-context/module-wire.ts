@@ -526,6 +526,7 @@ export function buildPagedModuleTransformPayloads(
             value,
         })),
     );
+    const finishPages = new WeakMap<ModuleTransformWirePage, () => void>();
     const emptyArrays = (): Record<string, unknown[]> =>
         Object.fromEntries(arrayFields.map((field) => [field, []]));
     const emptyMaps = (): Record<string, Record<string, unknown>> =>
@@ -558,13 +559,20 @@ export function buildPagedModuleTransformPayloads(
             transform_page_index: args.index,
             transform_page_total: args.total,
             transform_page_complete: args.complete,
-            transform_page_digest: transformPageDigest(pageContent),
+            transform_page_digest: "0".repeat(64),
             ...pageContent,
         };
         if (args.complete) Object.assign(page, scalarFields);
         // Admission already counted candidate sizes incrementally. Stringify once
         // here so transport telemetry can reuse the exact UTF-8 length.
-        return { page, bytes: Buffer.byteLength(JSON.stringify(page)) };
+        const result = { page, bytes: Buffer.byteLength(JSON.stringify(page)) };
+        // Digests always occupy 64 ASCII bytes. Admission can use a placeholder
+        // while the page count converges; hash only the pages we actually send.
+        finishPages.set(result, () => {
+            page.transform_page_digest = transformPageDigest(pageContent);
+            if (args.complete) Object.assign(page, scalarFields);
+        });
+        return result;
     };
     const hasUnits = (
         arrays: Record<string, unknown[]>,
@@ -757,7 +765,10 @@ export function buildPagedModuleTransformPayloads(
             if (finalPage.bytes > pageMaxBytes) throw scalarTailError();
         }
         pages.push(finalPage);
-        if (pages.length === assumedTotal) return pages;
+        if (pages.length === assumedTotal) {
+            for (const page of pages) finishPages.get(page)?.();
+            return pages;
+        }
         assumedTotal = pages.length;
     }
     throw new Error("module transform page count did not stabilize");
