@@ -365,6 +365,12 @@ function trackSqliteConnection(
         ...metadata,
         reference: new WeakRef(db),
     });
+    const prepare = db.prepare.bind(db);
+    Object.defineProperty(db, "prepare", {
+        configurable: true,
+        writable: true,
+        value: (sql: string) => ownPreparedStatement(db, prepare(sql)),
+    });
     return db;
 }
 
@@ -539,6 +545,71 @@ export type Database = BetterSqlite3.Database;
  * historical behavior in this codebase).
  */
 export type Statement = BetterSqlite3.Statement<unknown[], unknown>;
+
+type FinalizableStatement = Statement & { finalize(): void };
+interface StatementOwner {
+    references: Set<WeakRef<FinalizableStatement>>;
+    registered: WeakSet<FinalizableStatement>;
+    collected: FinalizationRegistry<WeakRef<FinalizableStatement>>;
+}
+const statementOwners = new WeakMap<Database, StatementOwner>();
+
+function ownPreparedStatement(db: Database, statement: Statement): Statement {
+    const finalizable = statement as FinalizableStatement;
+    // Node finalizes its statements on close and exposes no finalize() method.
+    if (typeof finalizable.finalize !== "function") return statement;
+    let owner = statementOwners.get(db);
+    if (!owner) {
+        const references = new Set<WeakRef<FinalizableStatement>>();
+        owner = {
+            references,
+            registered: new WeakSet(),
+            collected: new FinalizationRegistry((reference) => references.delete(reference)),
+        };
+        statementOwners.set(db, owner);
+        const close = db.close.bind(db) as (...args: unknown[]) => unknown;
+        const { collected } = owner;
+        Object.defineProperty(db, "close", {
+            configurable: true,
+            writable: true,
+            value: (...args: unknown[]) => {
+                let failure: unknown;
+                for (const reference of references) {
+                    try {
+                        reference.deref()?.finalize();
+                    } catch (error) {
+                        failure ??= error;
+                    }
+                    collected.unregister(reference);
+                }
+                references.clear();
+                const result = close(...args);
+                if (failure) throw failure;
+                return result;
+            },
+        });
+    }
+    if (!owner.registered.has(finalizable)) {
+        const reference = new WeakRef(finalizable);
+        owner.references.add(reference);
+        owner.registered.add(finalizable);
+        owner.collected.register(finalizable, reference, reference);
+    }
+    return statement;
+}
+
+/**
+ * Cached statements must be finalized before closing their connection. Bun's
+ * prepare() leaves SQLite's native close deferred until all statements finish,
+ * even after the JS Database reports closed. Delayed WAL checkpoints can then
+ * overwrite a restored database if a caller reuses the file in the meantime.
+ * The shared Database owns every preparation; use this for caches that also
+ * accept direct bun:sqlite handles. Weak references avoid retaining one-shot
+ * statements for the lifetime of a long-running host.
+ */
+export function prepareCachedStatement(db: Database, sql: string): Statement {
+    return ownPreparedStatement(db, db.prepare(sql));
+}
 
 const privilegeDepth = new WeakMap<Database, number>();
 const transformPassScope = new AsyncLocalStorage<

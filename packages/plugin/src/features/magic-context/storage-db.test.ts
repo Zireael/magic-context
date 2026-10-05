@@ -275,13 +275,13 @@ describe("explicit shared storage resolution", () => {
         holder.exec("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE");
         const startedAt = performance.now();
         try {
-            const opened = await openDatabaseAsync({ dbPath, busyTimeoutMs: 35 });
+            // A genuinely held exclusive lock prevents the schema read. Bound
+            // the fail-closed rejection, not a successful read through a lost lock.
+            await expect(openDatabaseAsync({ dbPath, busyTimeoutMs: 35 })).rejects.toThrow(
+                "storage unavailable: database is locked",
+            );
             const elapsedMs = performance.now() - startedAt;
             expect(elapsedMs).toBeLessThan(1_000);
-            if (opened) {
-                const timeout = opened.prepare("PRAGMA busy_timeout").get() as { timeout: number };
-                expect(timeout.timeout).toBe(35);
-            }
         } finally {
             holder.exec("ROLLBACK");
             closeQuietly(holder);

@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { getHarness } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
-import type { Database, Statement } from "../../shared/sqlite";
+import { type Database, prepareCachedStatement, type Statement } from "../../shared/sqlite";
 import type { SessionMeta } from "./types";
 
 export interface SessionMetaRow {
@@ -372,7 +372,7 @@ export function ensureSessionMetaRow(
 ): void {
     let exists = sessionMetaExistsStatements.get(db);
     if (!exists) {
-        exists = db.prepare("SELECT 1 FROM session_meta WHERE session_id = ?");
+        exists = prepareCachedStatement(db, "SELECT 1 FROM session_meta WHERE session_id = ?");
         sessionMetaExistsStatements.set(db, exists);
     }
     // Most callers already have a row. Even INSERT OR IGNORE takes the writer
