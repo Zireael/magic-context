@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parse } from "comment-json";
 import { parseJsonc } from "../../lib/jsonc";
 import { structuredConfigSaveContent } from "./structured-save";
@@ -19,6 +22,31 @@ const commentedConfig = `{
 `;
 
 describe("structured config form save", () => {
+  it("round-trips a JSONC temp file byte-for-byte except changed value tokens", () => {
+    const directory = mkdtempSync(join(tmpdir(), "dashboard-config-"));
+    const path = join(directory, "magic-context.jsonc");
+    const original =
+      '{\r\n\t// dotfiles formatting stays\r\n\t"enabled" : true,\r\n\t"cache_ttl": { "default" : "5m", /* model note */ "provider/model": "1h" },\r\n\t"dreamer": {"tasks": { "verify": {"schedule" : "0 3 * * *"} }},\r\n\t"unknown" : [1, /* keep */ 2],\r\n}\r\n';
+    try {
+      writeFileSync(path, original);
+      const source = readFileSync(path, "utf8");
+      const form = structuredClone(parseJsonc(source));
+      (form.cache_ttl as Record<string, unknown>)["provider/model"] = "never";
+      const dreamer = form.dreamer as { tasks: { verify: { schedule: string } } };
+      dreamer.tasks.verify.schedule = "";
+      writeFileSync(path, structuredConfigSaveContent(source, form));
+      expect(readFileSync(path, "utf8")).toBe(
+        original.replace('"1h"', '"never"').replace('"0 3 * * *"', '""'),
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves an unchanged file completely untouched, including trailing whitespace", () => {
+    const source = '\n{ "enabled":true, /* keep */ "future": 1, }\t\n\n';
+    expect(structuredConfigSaveContent(source, structuredClone(parseJsonc(source)))).toBe(source);
+  });
   it("#given a commented config #when one form field changes #then every comment survives", () => {
     const form = structuredClone(parseJsonc(commentedConfig));
     form.protected_tokens = 30000;
