@@ -1067,15 +1067,20 @@ export function runRustModePostprocess(args: {
             getDeferredClearedCompactionMarkerState(args.db, args.sessionId),
         ]);
     const servedMarkerBefore = servedMarkerRecord();
-    applyRustModeDeferredCompactionMarker({
-        ...(args.compactionMarkerStrategy
-            ? { applyDeferred: args.compactionMarkerStrategy.applyDeferred }
-            : {}),
-        db: args.db,
-        sessionId: args.sessionId,
-        boundary: args.materializedBoundary,
-        sessionDirectory: args.sessionDirectory,
-    });
+    // A retained retry can survive an upgrade or a host-store lock. It still
+    // needs the same bust permission as a new marker: draining on SOFT+ would
+    // change the host's next input cut while its cached history stays frozen.
+    if (args.cacheBustingPass || args.materializedBoundary) {
+        applyRustModeDeferredCompactionMarker({
+            ...(args.compactionMarkerStrategy
+                ? { applyDeferred: args.compactionMarkerStrategy.applyDeferred }
+                : {}),
+            db: args.db,
+            sessionId: args.sessionId,
+            boundary: args.materializedBoundary,
+            sessionDirectory: args.sessionDirectory,
+        });
+    }
     (args.compactionMarkerStrategy?.reconcile ?? reconcileMarkerRepresentation)(
         args.messages,
         getPersistedCompactionMarkerState(args.db, args.sessionId),

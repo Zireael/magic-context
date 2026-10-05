@@ -206,7 +206,7 @@ afterEach(() => {
 });
 
 describe("applyDeferredCompactionMarker — outcomes", () => {
-    it("a native marker after a partial end cannot erase its uncovered suffix", () => {
+    it("advances past an indexed end covered by the next ordinal", () => {
         const dataHome = useTempDataHome("partial-adjacent-marker-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-partial-adjacent", 1_000);
@@ -235,14 +235,17 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
             makePending({ ordinal: 11, endMessageId: "msg-next" }),
             dataHome,
         );
-        expect(outcome).toEqual({ kind: "stale-skip", reason: "partial-message-boundary" });
-        expect(getPersistedCompactionMarkerState(db, "ses-partial-adjacent")).toBeNull();
+        expect(outcome).toEqual({ kind: "applied", markerOrdinal: 11 });
+        expect(
+            getPersistedCompactionMarkerState(db, "ses-partial-adjacent")?.boundaryMessageId,
+        ).toBe("msg-next");
     });
 
-    it("never places a whole-message native marker over a partial block boundary", () => {
+    it("keeps a partial published end and its tool turn raw with and without a Rust fence", () => {
         const dataHome = useTempDataHome("partial-block-marker-");
         const opencodeDb = createOpenCodeDb(dataHome);
-        insertUserMessage(opencodeDb, "msg-boundary", "ses-partial", 1_000);
+        insertUserMessage(opencodeDb, "msg-user", "ses-partial", 1_000);
+        insertMessage(opencodeDb, "msg-boundary", "ses-partial", 1_001, "assistant");
         closeQuietly(opencodeDb);
         const db = openDatabase();
         insertCompartment(db, "ses-partial", 10, "msg-boundary");
@@ -254,11 +257,51 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
             undefined,
             { ordinal: 10, endMessageId: "msg-boundary", rowVersion: 1 },
         ]) {
-            expect(
-                applyDeferredCompactionMarker(db, "ses-partial", makePending(), dataHome, trusted),
-            ).toEqual({ kind: "stale-skip", reason: "partial-message-boundary" });
-            expect(getPersistedCompactionMarkerState(db, "ses-partial")).toBeNull();
+            const outcome = applyDeferredCompactionMarker(
+                db,
+                "ses-partial",
+                makePending(),
+                dataHome,
+                trusted,
+            );
+            expect(["applied", "already-current"]).toContain(outcome.kind);
+            expect(getPersistedCompactionMarkerState(db, "ses-partial")?.boundaryMessageId).toBe(
+                "msg-user",
+            );
         }
+    });
+
+    it("still blocks an older indexed end with an uncovered remainder before the user cut", () => {
+        const dataHome = useTempDataHome("partial-gap-marker-");
+        const opencodeDb = createOpenCodeDb(dataHome);
+        insertUserMessage(opencodeDb, "msg-user", "ses-gap", 1_000);
+        insertMessage(opencodeDb, "msg-partial", "ses-gap", 1_001, "assistant");
+        insertUserMessage(opencodeDb, "msg-boundary", "ses-gap", 2_000);
+        closeQuietly(opencodeDb);
+        const db = openDatabase();
+        insertCompartment(db, "ses-gap", 8, "msg-partial");
+        db.prepare("UPDATE compartments SET end_block_index=0 WHERE session_id='ses-gap'").run();
+        appendCompartments(db, "ses-gap", [
+            {
+                sequence: 1,
+                startMessage: 10,
+                endMessage: 10,
+                startMessageId: "msg-boundary",
+                endMessageId: "msg-boundary",
+                title: "gap",
+                content: "gap",
+            },
+        ]);
+        db.prepare("INSERT INTO session_meta(session_id) VALUES ('ses-gap')").run();
+        expect(
+            applyDeferredCompactionMarker(db, "ses-gap", makePending(), dataHome, {
+                ordinal: 10,
+                endMessageId: "msg-boundary",
+                rowVersion: 1,
+            }),
+        ).toEqual({ kind: "stale-skip", reason: "partial-message-boundary" });
+        expect(updateCompactionMarkerAfterPublication(db, "ses-gap", 10, dataHome)).toBe(false);
+        expect(getPersistedCompactionMarkerState(db, "ses-gap")).toBeNull();
     });
     it("returns `applied` on the happy path (no existing marker)", () => {
         const dataHome = useTempDataHome("apply-deferred-applied-");

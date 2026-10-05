@@ -1561,7 +1561,96 @@ describe("deferred compaction marker representation", () => {
         expect(JSON.stringify(replay)).toBe(firstBytes);
     });
 
-    it("retries a retained marker on every defer and serves byte-identical output", () => {
+    it("an upgraded indexed pending waits through byte-identical defers and moves on the next bust", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-upgraded-indexed-pending";
+        createOpenCodeDbWithoutMessages("postprocess-indexed-upgrade-");
+        const opencodeDb = new Database(
+            join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"),
+        );
+        for (const [id, role, time] of [
+            ["msg-user", "user", 1_000],
+            ["msg-partial", "assistant", 1_001],
+        ] as const) {
+            opencodeDb
+                .prepare(
+                    "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+                )
+                .run(id, sessionId, time, time, JSON.stringify({ role }));
+        }
+        opencodeDb.close();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 10,
+                startMessageId: "msg-user",
+                endMessageId: "msg-partial",
+                endBlockIndex: 0,
+                title: "indexed",
+                content: "stable",
+            },
+        ]);
+        const pending = {
+            ordinal: 10,
+            endMessageId: "msg-partial",
+            publishedAt: 1,
+            injectAttempts: 3,
+            firstInjectFailedAt: 1,
+            lastInjectError: "host store was locked",
+        };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        const source = [
+            {
+                info: { role: "user", sessionID: sessionId, syntheticHead: true },
+                parts: [{ type: "text", text: "<session-history>stable</session-history>" }],
+            },
+            {
+                info: { id: "msg-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "kept tool turn" }],
+            },
+            {
+                info: { id: "msg-partial", role: "assistant", sessionID: sessionId },
+                parts: [
+                    { type: "text", text: "covered block" },
+                    { type: "text", text: "uncovered block" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const serve = (cacheBustingPass = false): MessageLike[] => {
+            const messages = structuredClone(source);
+            runRustModePostprocess({
+                db: db!,
+                sessionId,
+                messages,
+                cacheBustingPass,
+                fullFeatureMode: true,
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: false, frozen: true },
+            });
+            return messages;
+        };
+        const before = JSON.stringify(serve());
+        for (let pass = 0; pass < 3; pass++) {
+            expect(JSON.stringify(serve())).toBe(before);
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+            expect(getCompactionMarkerHealth(db, sessionId).attempts).toBe(3);
+        }
+        const bust = serve(true);
+        expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
+        expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryMessageId).toBe(
+            "msg-user",
+        );
+        expect(bust.find((message) => message.info.id === "msg-partial")?.parts).toEqual(
+            source.at(-1)!.parts,
+        );
+        for (let pass = 0; pass < 3; pass++)
+            expect(JSON.stringify(serve())).toBe(JSON.stringify(bust));
+    });
+
+    it("retries a retained marker only on busts and retains retry health on defers", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-rust-marker-retry-every-defer";
@@ -1604,6 +1693,7 @@ describe("deferred compaction marker representation", () => {
                 sessionId,
                 messages,
                 sessionDirectory: dataHome,
+                cacheBustingPass: true,
                 fullFeatureMode: true,
                 tagger: createTagger(),
                 ctxReduceAvailability: { callable: false, frozen: true },
@@ -1620,9 +1710,22 @@ describe("deferred compaction marker representation", () => {
             }
         }
         expect(new Set(served).size).toBe(1);
+        const pendingBeforeDefer = getPendingCompactionMarkerState(db, sessionId);
+        const messages = structuredClone(source);
+        runRustModePostprocess({
+            db,
+            sessionId,
+            messages,
+            sessionDirectory: dataHome,
+            fullFeatureMode: true,
+            tagger: createTagger(),
+            ctxReduceAvailability: { callable: false, frozen: true },
+        });
+        expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pendingBeforeDefer);
+        expect(JSON.stringify(messages)).toBe(served[0]);
     });
 
-    it("clears retry health when the second injection attempt succeeds", () => {
+    it("clears retry health when the next bust retries successfully, not on the intervening defer", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-rust-marker-retry-heals";
@@ -1659,13 +1762,14 @@ describe("deferred compaction marker representation", () => {
                 parts: [{ type: "text", text: "new turn" }],
             },
         ] as unknown as MessageLike[];
-        const drain = (): string => {
+        const drain = (cacheBustingPass = false): string => {
             const served = structuredClone(messages);
             runRustModePostprocess({
                 db,
                 sessionId,
                 messages: served,
                 sessionDirectory: dataHome,
+                cacheBustingPass,
                 fullFeatureMode: true,
                 tagger: createTagger(),
                 ctxReduceAvailability: { callable: false, frozen: true },
@@ -1673,7 +1777,7 @@ describe("deferred compaction marker representation", () => {
             return serializeAnthropicWireWithAdjacentAssistantMerge(served);
         };
 
-        const failedAttemptBytes = drain();
+        const failedAttemptBytes = drain(true);
         expect(getPendingCompactionMarkerState(db, sessionId)?.injectAttempts).toBe(1);
 
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
@@ -1691,7 +1795,9 @@ describe("deferred compaction marker representation", () => {
             .run("msg-boundary", sessionId, 1_000, 1_000, JSON.stringify({ role: "user" }));
         opencodeDb.close();
 
-        const healedAttemptBytes = drain();
+        expect(drain()).toBe(failedAttemptBytes);
+        expect(getPendingCompactionMarkerState(db, sessionId)?.injectAttempts).toBe(1);
+        const healedAttemptBytes = drain(true);
         expect(healedAttemptBytes).toBe(failedAttemptBytes);
         expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
         expect(getCompactionMarkerHealth(db, sessionId)).toEqual({

@@ -1,3 +1,4 @@
+import { getUncoveredCompartmentEndThrough } from "../../features/magic-context/compartment-storage";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getPersistedCompactionMarkerState,
@@ -162,19 +163,9 @@ export function trimToRecordedBoundary(
     // cannot be required to equal end+1 or 0; the ordinal continuation is what
     // proves nothing was skipped. The latest compartment has no successor, so its
     // indexed end always stays protected, and so does any end followed by a gap.
-    const partial = db
-        .prepare(
-            `SELECT k.end_message_id FROM compartments k
-             LEFT JOIN compartments n ON n.session_id = k.session_id AND n.sequence = k.sequence + 1
-             WHERE k.session_id = ?1 AND k.end_block_index IS NOT NULL
-               AND NOT (n.sequence IS NOT NULL AND (
-                   (n.start_message_id = k.end_message_id AND n.start_block_index > k.end_block_index)
-                   OR n.start_message = k.end_message + 1))
-             ORDER BY k.sequence LIMIT 1`,
-        )
-        .get(sessionId) as { end_message_id: string } | undefined;
+    const partial = getUncoveredCompartmentEndThrough(db, sessionId);
     const partialIndex = partial
-        ? messages.findIndex((message) => message.id === partial.end_message_id)
+        ? messages.findIndex((message) => message.id === partial.endMessageId)
         : -1;
     // The recorded cut can predate this guard; never remove a visible
     // partially covered message even when that old cut lies after it.
