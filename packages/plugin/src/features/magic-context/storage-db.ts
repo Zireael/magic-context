@@ -2744,6 +2744,14 @@ export async function openDatabaseAsync(
     const pending = pendingAsyncOpens.get(dbPath);
     if (pending) return pending;
 
+    // A worker cannot share an in-memory connection. Reject before file creation
+    // or permission hardening can mistake a SQLite pseudo-path for a real file.
+    if (!isFileBackedPath(dbPath)) {
+        throw new Error(
+            "async migration requires a file-backed database; use the explicit synchronous opener for in-memory or URI test databases",
+        );
+    }
+
     const opening = (async (): Promise<Database | null> => {
         let db: Database | undefined;
         const mainThreadBodiesBefore = getMainThreadMigrationBodyCount();
@@ -2794,11 +2802,6 @@ export async function openDatabaseAsync(
             // With nothing pending, nothing is started and the open costs what it
             // did before.
             if (hasPendingMigrations(db)) {
-                if (!isFileBackedPath(dbPath)) {
-                    throw new Error(
-                        "async migration requires a file-backed database; use the explicit synchronous opener for in-memory or URI test databases",
-                    );
-                }
                 await runMigrationsOffThread({
                     dbPath,
                     busyTimeoutMs,

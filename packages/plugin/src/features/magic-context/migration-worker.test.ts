@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -132,6 +132,20 @@ describe("startup migrations run on a worker thread", () => {
         expect(__getMainThreadMigrationBodyCountForTests()).toBe(before);
     });
 
+    test("a worker reporting completion before ready cannot authorize storage initialization", async () => {
+        const entry = join(root, "premature-done.mjs");
+        writeFileSync(
+            entry,
+            `import {parentPort} from "node:worker_threads"; parentPort.postMessage({type:"done"});`,
+        );
+        __setMigrationWorkerEntryForTests(pathToFileURL(entry));
+        const before = __getMainThreadMigrationBodyCountForTests();
+        await expect(openDatabaseAsync({ dbPath: join(root, "premature.db") })).rejects.toThrow(
+            "reported completion before ready",
+        );
+        expect(__getMainThreadMigrationBodyCountForTests()).toBe(before);
+    });
+
     test("an incomplete worker cannot cause the async opener to run pending bodies", async () => {
         const entry = join(root, "incomplete.mjs");
         writeFileSync(
@@ -147,11 +161,14 @@ describe("startup migrations run on a worker thread", () => {
     });
 
     test("the async opener refuses in-memory migrations; only the explicit sync path owns them", async () => {
+        const literalFile = join(process.cwd(), ":memory:");
+        expect(existsSync(literalFile)).toBe(false);
         const before = __getMainThreadMigrationBodyCountForTests();
         await expect(openDatabaseAsync(":memory:")).rejects.toThrow(
             "use the explicit synchronous opener",
         );
         expect(__getMainThreadMigrationBodyCountForTests()).toBe(before);
+        expect(existsSync(literalFile)).toBe(false);
     });
 
     test("a synchronous open of a database still being migrated is refused instead of migrating it", async () => {
