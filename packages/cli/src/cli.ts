@@ -168,6 +168,10 @@ async function runCommand(command: string | undefined, rest: string[]): Promise<
             const { runRepairDbCli } = await import("./commands/doctor-repair-db");
             return runRepairDbCli(rest.slice(1));
         }
+        if (rest[0] === "git-fts-map") {
+            const { runDoctorGitFtsMapCli } = await import("./commands/doctor-git-fts-map");
+            return runDoctorGitFtsMapCli(rest.slice(1));
+        }
         if (rest[0] === "list-hidden-sessions") {
             const { runListHiddenSessions } = await import("./commands/doctor-hidden-sessions");
             return runListHiddenSessions();
