@@ -241,6 +241,7 @@ impl ProjectedWireBlock {
     fn text(&self) -> Option<Cow<'_, str>> {
         let payload = self.payload.as_ref()?;
         if payload.escaped {
+            profile_start!(_perf_parse, "rt05_escaped_text");
             Some(Cow::Owned(
                 serde_json::from_str(
                     &payload.bytes[payload.range.start - 1..payload.range.end + 1],
@@ -361,6 +362,7 @@ impl FlatProjection {
         &self,
         prefix_messages: usize,
     ) -> Option<Vec<CkIngressMessage>> {
+        profile_start!(_perf_reattach, "rt02_reattach_prefix");
         if prefix_messages > self.message_count() || self.message_meta.len() != self.message_count()
         {
             return None;
@@ -601,6 +603,7 @@ pub(crate) fn project_messages_incremental(
     cached: &FlatProjection,
     prefix_messages: usize,
 ) -> Result<FlatProjection, CkWireError> {
+    profile_start!(_perf_project_incremental, "rt02_incremental_projection");
     if prefix_messages == 0
         || prefix_messages > messages.len()
         || prefix_messages > cached.message_count()
@@ -851,7 +854,10 @@ fn flatten_block(
             } => (
                 Some(name.clone()),
                 extract_file_path(input),
-                Some(Arc::new(input.clone())),
+                Some({
+                    profile_start!(_perf_input_copy, "rt20_project_input_copy");
+                    Arc::new(input.clone())
+                }),
                 *provider_executed,
                 Some(id.clone()),
                 None,

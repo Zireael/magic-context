@@ -81,6 +81,13 @@ use crate::ck_wire::{
     CkIngressMessage, CkWireBlock, CkWireError, CkWireMessage, FlatBlock, FlatProjection,
 };
 
+#[cfg(test)]
+#[path = "tests/perf_audit_identity.rs"]
+mod perf_audit_identity;
+#[cfg(test)]
+#[path = "tests/perf_audit_metadata.rs"]
+pub(crate) mod perf_audit_metadata;
+
 /// Max CAS retries before surfacing the conflict (the module is the single writer in
 /// the daemon case, so this rarely loops; the shared-store case re-loads and re-steps).
 const MAX_CAS_RETRIES: u32 = 8;
@@ -189,6 +196,7 @@ impl ServedMessage {
         message: CkWireMessage,
         projected_blocks: Option<&[&FlatBlock]>,
     ) -> Self {
+        profile_start!(_perf_fingerprints, "rt11_served_message_encode");
         let canonical_bytes = canonical_message_bytes(&message);
         let block_fingerprints = message
             .content
@@ -426,6 +434,7 @@ impl SerializedOutputCache {
     }
 
     fn snapshot(&mut self, session_id: &str, revert_epoch: u64) -> SerializedOutputCacheSnapshot {
+        profile_start!(_perf_snapshot, "rt08_output_snapshot");
         if self
             .sessions
             .get(session_id)
@@ -2634,6 +2643,7 @@ fn served_output_fingerprints(
 }
 
 fn normalize_synthetic_todo_ingress(req: &TransformRequest) -> Option<TransformRequest> {
+    profile_start!(_perf_normalize, "rt13_todo_normalize");
     let mut normalized = None;
     for (index, message) in req.messages.iter().enumerate() {
         if message.ck.meta.synthetic
@@ -4745,10 +4755,12 @@ fn apply_once(
                 .map(|tokens| (row.block_id.as_str(), tokens))
         })
         .collect();
+    profile_start!(perf_selection_inputs, "rt04_selection_inputs");
     let mut tail_for_selection =
         tail_sel_items(&live, loaded.meta.coverage_ordinal, &tag_tokens_by_block);
     attach_edit_input_key_orders(&mut tail_for_selection, &req.tool_input_key_orders);
     attach_user_answer_markers(&mut tail_for_selection, &req.messages);
+    profile_end!(perf_selection_inputs);
     // Todo state is deferred work just like an m1 or reduction delta: it may ride an
     // independently scheduled bust, but it never authorizes provider-visible bytes by itself.
     // Compute only the call-id transition here; the complete pair is built after classification.
@@ -5343,7 +5355,9 @@ fn apply_once(
         }
     }
     let mut todo_ms = 0.0;
+    profile_start!(perf_capture_clone, "rt04_capture_clone");
     let tail_for_capture = tail_for_selection.clone();
+    profile_end!(perf_capture_clone);
     if is_bust_pass && tail_reclaim_enabled {
         let todo_started_at = Instant::now();
         capture_todo_state_on_bust(
@@ -6601,7 +6615,8 @@ fn apply_once(
         )?;
     }
     #[cfg(test)]
-    if output_cache.is_some() {
+    if output_cache.is_some() && !crate::tests::per_pass_differentials_disabled() {
+        profile_start!(_perf_output_differential, "output_differential");
         let fresh = build_output_with_tags(
             &core,
             output_meta,
@@ -7117,6 +7132,7 @@ fn identity_drift_requires_reject(
 }
 
 fn frozen_unit_targets_mid(core: &CoreState, mid: &str) -> bool {
+    profile_start!(_perf_scan, "rt15_frozen_mid_scan");
     let strip_suffix = format!(":{mid}");
     core.frozen_units.iter().any(|unit| {
         let target = unit
@@ -8153,6 +8169,7 @@ fn protected_tail_floor_ordinal(
     execute_threshold_percentage: f64,
     estimate_tokens: impl Fn(&str) -> usize,
 ) -> u64 {
+    profile_start!(_perf_floor, "rt16_protected_floor");
     let newest_live = live.iter().map(|block| block.ordinal).max().unwrap_or(0);
     let target =
         crate::boundary::derive_protected_tail_token_target(&crate::boundary::BoundaryContext {
@@ -8352,6 +8369,7 @@ fn frozen_red_payload<'a>(core: &'a CoreState, target: &str) -> Option<&'a str> 
 
 /// Target ids that already carry a frozen `red:*` unit.
 fn frozen_red_targets(core: &CoreState) -> std::collections::HashSet<String> {
+    profile_start!(_perf_red_targets, "rt12_red_targets");
     core.frozen_units
         .iter()
         .filter_map(|u| u.key.strip_prefix(RED_KEY_PREFIX).map(str::to_string))
@@ -8383,6 +8401,10 @@ fn pending_agent_drops_applied_this_pass(
     loaded_core: &CoreState,
     final_core: &CoreState,
 ) -> bool {
+    profile_start!(_perf_pending, "rt12_pending_applied");
+    if pending.is_empty() {
+        return false;
+    }
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
     pending.iter().any(|drop| {
@@ -8396,6 +8418,10 @@ fn first_applied_pending_command_ids(
     loaded_core: &CoreState,
     final_core: &CoreState,
 ) -> Vec<String> {
+    profile_start!(_perf_pending, "rt12_first_commands");
+    if pending.is_empty() {
+        return Vec::new();
+    }
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
     pending
@@ -8421,6 +8447,10 @@ fn consumed_pending_drop_ids(
     projection: &FlatProjection,
     final_coverage: Option<u64>,
 ) -> Vec<i64> {
+    profile_start!(_perf_pending, "rt12_pending_consumed");
+    if pending.is_empty() {
+        return Vec::new();
+    }
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
     // Retirement must be PROVEN, not inferred from absence: the request array can be
@@ -9977,6 +10007,7 @@ fn tag_overlay_state(
     pending_tag_block_ids: &BTreeSet<String>,
     pending_user_hint_block_ids: &BTreeSet<String>,
 ) -> TagOverlayState {
+    profile_start!(_perf_tag_maps, "rt18_tag_maps");
     TagOverlayState {
         tag_by_block_id: tag_rows
             .iter()
@@ -11251,6 +11282,7 @@ pub(crate) fn js_utf16_units_from_internal(text: &str) -> Vec<u16> {
 }
 
 pub(crate) fn encode_js_surrogate_markers(encoded: Vec<u8>) -> Vec<u8> {
+    profile_start!(_perf_surrogates, "rt17_surrogates");
     let Ok(text) = String::from_utf8(encoded) else {
         unreachable!("serde_json always emits UTF-8")
     };
@@ -11572,6 +11604,7 @@ fn active_tags_for_nudge(
     tag_rows: &[McTagRow],
     mutation_exempt_mid: Option<&str>,
 ) -> Vec<ActiveTagForNudge> {
+    profile_start!(_perf_active_tags, "rt05_active_tags");
     let tag_by_block = tag_rows
         .iter()
         .map(|row| (row.block_id.as_str(), row))
@@ -12640,6 +12673,7 @@ fn legacy_system_strip_candidates(
     rendered: &[ServedMessage],
     frame_block_stems: &[Option<&'static str>],
 ) -> HashSet<String> {
+    profile_start!(_perf_legacy_candidates, "rt10_legacy_candidates");
     if !core
         .frozen_units
         .iter()
@@ -14065,6 +14099,7 @@ fn message_output_identity(
     first_assistant_in_run: bool,
     frozen_unit_scan_ms: &mut f64,
 ) -> String {
+    profile_start!(_perf_identity, "rt09_message_identity");
     let mut hasher = Sha256::new();
     digest_field(&mut hasher, message.mid.as_bytes());
     digest_field(&mut hasher, message.ck.role.as_bytes());
@@ -14112,16 +14147,7 @@ fn message_output_identity(
 
     for block in blocks {
         digest_field(&mut hasher, block.id.as_bytes());
-        for value in [
-            tag_overlay
-                .and_then(|overlay| overlay.tag_by_block_id.get(&block.id))
-                .map(ToString::to_string),
-            tag_overlay.and_then(|overlay| overlay.temporal_by_block_id.get(&block.id).cloned()),
-            tag_overlay.and_then(|overlay| overlay.user_hint_by_block_id.get(&block.id).cloned()),
-            tag_overlay.and_then(|overlay| overlay.channel1_by_block_id.get(&block.id).cloned()),
-        ] {
-            digest_field(&mut hasher, value.as_deref().unwrap_or_default().as_bytes());
-        }
+        digest_overlay_identity_fields(&mut hasher, tag_overlay, &block.id);
         let full_drop = match &block.wire_shape().kind {
             ck_wire::CkKind::ToolCall { id, .. } | ck_wire::CkKind::ToolResult { id, .. } => {
                 full_drop_ids.contains(id)
@@ -14130,7 +14156,25 @@ fn message_output_identity(
         };
         digest_field(&mut hasher, &[full_drop as u8]);
     }
-    format!("{:x}", hasher.finalize())
+    crate::digest::hex(&hasher.finalize())
+}
+
+fn digest_overlay_identity_fields(
+    hasher: &mut Sha256,
+    overlay: Option<&TagOverlayState>,
+    block_id: &str,
+) {
+    let tag = overlay
+        .and_then(|overlay| overlay.tag_by_block_id.get(block_id))
+        .map(ToString::to_string);
+    digest_field(hasher, tag.as_deref().unwrap_or_default().as_bytes());
+    for value in [
+        overlay.and_then(|overlay| overlay.temporal_by_block_id.get(block_id)),
+        overlay.and_then(|overlay| overlay.user_hint_by_block_id.get(block_id)),
+        overlay.and_then(|overlay| overlay.channel1_by_block_id.get(block_id)),
+    ] {
+        digest_field(hasher, value.map_or("", String::as_str).as_bytes());
+    }
 }
 
 fn cached_output_item(
@@ -15048,6 +15092,7 @@ fn build_output_with_tags_inner(
     prefix_dirty: bool,
     use_frozen_unit_index: bool,
 ) -> Result<BuiltOutput, TransformError> {
+    profile_start!(_perf_render, "rt10_output_build");
     let build_output_started_at = Instant::now();
     let mut build_timings = BuildOutputTimings::default();
     let mut out = Vec::with_capacity(4 + req.messages.len());

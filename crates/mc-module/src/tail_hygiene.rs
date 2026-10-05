@@ -146,7 +146,64 @@ pub(crate) fn real_user_turn_count(projection: &FlatProjection) -> u64 {
 }
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    format!("{:x}", Sha256::digest(bytes.as_ref()))
+    crate::digest::hex(&Sha256::digest(bytes.as_ref()))
+}
+
+#[cfg(test)]
+pub(crate) fn profile_part_hash_variants(session: &str, projection: &FlatProjection) {
+    let mut samples = std::collections::BTreeMap::<&str, Vec<f64>>::new();
+    for sample in 0..23 {
+        let variants = if sample % 2 == 0 {
+            ["concat_formatter", "stream_formatter", "stream_table"]
+        } else {
+            ["stream_table", "stream_formatter", "concat_formatter"]
+        };
+        for variant in variants {
+            crate::per_pass_profile::begin_pass();
+            profile_start!(perf_operation, "hash_variant");
+            for block in &projection.blocks {
+                // Mirror the production child-clock overhead in every variant.
+                profile_start!(perf_hash, "variant_part");
+                let hash = if variant == "concat_formatter" {
+                    let mut input = String::with_capacity(9 + block.bytes.len());
+                    input.push_str("excluded");
+                    input.push('\0');
+                    input.push_str(&block.bytes);
+                    format!("{:x}", Sha256::digest(input.as_bytes()))
+                } else {
+                    let mut hash = Sha256::new();
+                    hash.update(b"excluded");
+                    hash.update([0]);
+                    hash.update(block.bytes.as_bytes());
+                    let digest = hash.finalize();
+                    if variant == "stream_formatter" {
+                        format!("{digest:x}")
+                    } else {
+                        crate::digest::hex(&digest)
+                    }
+                };
+                std::hint::black_box(hash);
+                profile_end!(perf_hash);
+            }
+            profile_end!(perf_operation);
+            let costs = crate::per_pass_profile::end_pass();
+            if sample >= 3 {
+                samples
+                    .entry(variant)
+                    .or_default()
+                    .push(costs["hash_variant"].thread_cpu_ms);
+            }
+        }
+    }
+    for (variant, mut samples) in samples {
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "COST_MICRO {}",
+            serde_json::json!({"session":session,"finding":"RT-3",
+            "shape":variant,"n":samples.len(),"parts":projection.blocks.len(),
+            "thread_cpu_p50_ms":(samples[9]+samples[10])/2.0})
+        );
+    }
 }
 
 fn strip_channel1_reminder_spans(output: &str) -> &str {
@@ -229,14 +286,17 @@ fn part_measurement(
         TailHygienePartKind::File => "file",
         TailHygienePartKind::Excluded => "excluded",
     };
-    let mut hash_input = String::with_capacity(kind_name.len() + content.len() + 1);
-    hash_input.push_str(kind_name);
-    hash_input.push('\0');
-    hash_input.push_str(content);
+    profile_start!(perf_hash, "rt03_part_hash");
+    let mut hash = Sha256::new();
+    hash.update(kind_name.as_bytes());
+    hash.update([0]);
+    hash.update(content.as_bytes());
+    let content_hash = crate::digest::hex(&hash.finalize());
+    profile_end!(perf_hash);
     let active = tag_number.is_some() && !queued_for_drop;
     TailHygienePartMeasurement {
         key,
-        content_hash: hex_digest(hash_input),
+        content_hash,
         kind,
         tokens,
         u_tokens: if active && !protected { tokens } else { 0 },
@@ -1030,6 +1090,27 @@ mod tests {
     };
     use serde::{Deserialize, Serialize};
     use serde_json::{json, Value};
+
+    #[test]
+    fn streamed_part_hash_matches_concatenated_reference_for_every_kind() {
+        for (kind, name) in [
+            (TailHygienePartKind::Text, "text"),
+            (TailHygienePartKind::ToolInput, "toolInput"),
+            (TailHygienePartKind::ToolOutput, "toolOutput"),
+            (TailHygienePartKind::File, "file"),
+            (TailHygienePartKind::Excluded, "excluded"),
+        ] {
+            for content in ["", "\0", "\"\\\n\r", "é漢字🙂§17§", "[dropped §1§]"] {
+                let reference = format!("{name}\0{content}");
+                let expected = format!("{:x}", Sha256::digest(reference.as_bytes()));
+                let actual =
+                    part_measurement("key".into(), kind, content, 3, Some(1), false, false);
+                assert_eq!(actual.content_hash, expected);
+                assert_eq!(actual.tokens, 3);
+                assert_eq!(actual.u_tokens, 3);
+            }
+        }
+    }
 
     #[test]
     #[ignore = "release-only signature checkpoint prototype; no production cache"]

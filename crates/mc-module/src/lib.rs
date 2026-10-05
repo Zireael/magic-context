@@ -43,6 +43,7 @@ pub mod config;
 mod content_language;
 pub mod decay_render;
 pub mod decision_calibration;
+mod digest;
 pub mod divergence;
 pub mod healing;
 pub mod historian;
@@ -1615,6 +1616,14 @@ struct StateImportWire {
     batch_seq: usize,
     batch_count: usize,
     compartments: Vec<StateImportCompartmentWire>,
+}
+
+fn decode_state_import_wire(request: &Value) -> Result<StateImportWire, serde_json::Error> {
+    StateImportWire::deserialize(request)
+}
+
+fn decode_state_sync_wire(request: &Value) -> Result<ModuleStateSyncWire, serde_json::Error> {
+    ModuleStateSyncWire::deserialize(request)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -6295,13 +6304,16 @@ impl McHandler {
                 .lock()
                 .expect("boundary token cache mutex")
                 .prime_from_persisted_tags(&parsed.session_id, tags.as_slice());
-        } else if let Ok(tags) = store.load_tags_for_session(&parsed.session_id) {
-            // Malformed-lineage and compaction-off paths return before normal tag hydration.
-            // Preserve their fail-open tokenization behavior rather than treating absence as empty.
-            self.boundary_tokens
-                .lock()
-                .expect("boundary token cache mutex")
-                .prime_from_persisted_tags(&parsed.session_id, &tags);
+        } else {
+            profile_start!(_perf_fallback, "rt19_fallback_tag_load");
+            if let Ok(tags) = store.load_tags_for_session(&parsed.session_id) {
+                // Malformed-lineage and compaction-off paths return before normal tag hydration.
+                // Preserve their fail-open tokenization behavior rather than treating absence as empty.
+                self.boundary_tokens
+                    .lock()
+                    .expect("boundary token cache mutex")
+                    .prime_from_persisted_tags(&parsed.session_id, &tags);
+            }
         }
         let CachedBoundaryMessages {
             messages: boundary_messages,
@@ -7429,7 +7441,7 @@ impl McHandler {
             }
             Err(error) => return invalid_params_error(error.to_string()),
         };
-        let parsed: StateImportWire = match serde_json::from_value(request.clone()) {
+        let parsed: StateImportWire = match decode_state_import_wire(&request) {
             Ok(parsed) => parsed,
             Err(error) => {
                 if let Some(session_id) = raw_session_id.as_deref() {
@@ -10828,7 +10840,7 @@ impl McHandler {
             .iter()
             .filter(|field| request.get(**field).is_some())
             .count();
-        let parsed: ModuleStateSyncWire = match serde_json::from_value(request.clone()) {
+        let parsed: ModuleStateSyncWire = match decode_state_sync_wire(&request) {
             Ok(req) => req,
             Err(error) => {
                 if envelope_fields_present > 0 {
@@ -14351,6 +14363,10 @@ fn json_type_name(value: &Value) -> &'static str {
 /// first materialization freezes it into meta); every later pass reads the frozen value,
 /// never this, so expiry never drifts the rendered bytes between passes.
 fn now_ms() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = tests::per_pass_fixed_now_ms() {
+        return now;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -17960,34 +17976,40 @@ fn facade_command_outcome(result: Result<FacadeMutationOutcome, McStoreError>) -
 }
 
 fn canonical_value(value: &Value) -> String {
+    let mut output = Vec::new();
+    write_canonical_value(value, &mut output);
+    String::from_utf8(output).expect("canonical JSON is UTF-8")
+}
+
+fn write_canonical_value(value: &Value, output: &mut Vec<u8>) {
     match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(v) => v.to_string(),
-        Value::Number(n) => canonical_number(n),
-        Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()),
+        Value::Null => output.extend_from_slice(b"null"),
+        Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
+        Value::Number(number) => output.extend_from_slice(canonical_number(number).as_bytes()),
+        Value::String(text) => serde_json::to_writer(output, text).expect("JSON strings serialize"),
         Value::Array(values) => {
-            let inner = values
-                .iter()
-                .map(canonical_value)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("[{inner}]")
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                write_canonical_value(value, output);
+            }
+            output.push(b']');
         }
         Value::Object(map) => {
+            output.push(b'{');
             let mut entries = map.iter().collect::<Vec<_>>();
             entries.sort_by_key(|(key, _)| *key);
-            let inner = entries
-                .into_iter()
-                .map(|(key, value)| {
-                    format!(
-                        "{}:{}",
-                        serde_json::to_string(key).unwrap_or_default(),
-                        canonical_value(value)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{inner}}}")
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key).expect("JSON keys serialize");
+                output.push(b':');
+                write_canonical_value(value, output);
+            }
+            output.push(b'}');
         }
     }
 }
@@ -18820,10 +18842,15 @@ mod tests {
     mod gate_a2;
     mod guidance_get_golden;
     mod per_pass_cost;
+    mod perf_audit_canonical;
+    mod perf_audit_wire;
     // Only the profiling harness can construct the scoped override. Differential
     // predicates can read it without exposing a switch to other test suites.
     pub(crate) fn per_pass_differentials_disabled() -> bool {
         per_pass_cost::differentials_disabled()
+    }
+    pub(crate) fn per_pass_fixed_now_ms() -> Option<i64> {
+        per_pass_cost::fixed_now_ms()
     }
     mod single_store_drill;
     mod tool_catalog;
