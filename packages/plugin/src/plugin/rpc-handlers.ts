@@ -129,7 +129,7 @@ import {
     createStorageWriteStream,
     ensureStorageDirectorySync,
     shouldEnforcePrivateStoragePermissions,
-    writeStorageFileWithBun,
+    writeStorageFileAsync,
 } from "../shared/storage-permissions";
 import {
     resolveTailHygieneStatus,
@@ -1388,7 +1388,7 @@ async function generateDebugHeapSnapshot(
     }
 
     if (typeof snapshot === "string") {
-        await writeStorageFileWithBun(path, snapshot, enforcePrivatePermissions);
+        await writeStorageFileAsync(path, snapshot, enforcePrivatePermissions);
     } else {
         await writeSnapshotJson(
             path,
