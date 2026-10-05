@@ -12083,7 +12083,9 @@ impl McHandler {
                     // envelope remains; the host parser rejects malformed contents.
                     record_attempt("manifest", String::new());
                     output = Some((model.clone(), result, child_session.clone()));
-                    producer.purge_session(&child_session).await;
+                    // Cleanup reports unsupported runner deletion and closes routes.
+                    // The classify result is independent of snapshot retention.
+                    let _ = producer.purge_session(&child_session).await;
                     break;
                 }
                 Ok(_) => record_attempt(
@@ -12092,7 +12094,7 @@ impl McHandler {
                 ),
                 Err(error) => record_attempt("failed", error.to_string()),
             }
-            producer.purge_session(&child_session).await;
+            let _ = producer.purge_session(&child_session).await;
         }
         if output.is_none() {
             let failure = if attempt_errors.is_empty() {
