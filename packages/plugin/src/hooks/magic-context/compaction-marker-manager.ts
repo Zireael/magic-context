@@ -17,6 +17,7 @@ import {
     compareOpenCodeMessagesByCanonicalOrder,
     findBoundaryUserMessage,
     getOpenCodeMessageById,
+    isOpenCodeGapHistorianAbsent,
     listSessionCompactionMarkers,
     removeCompactionMarker,
     removeForeignCompactionMarker,
@@ -24,7 +25,7 @@ import {
 } from "../../features/magic-context/compaction-marker";
 import {
     getCompartmentsByEndMessageId,
-    getUncoveredCompartmentEndThrough,
+    getUncoveredCompartmentEndsThrough,
 } from "../../features/magic-context/compartment-storage";
 import {
     getPersistedCompactionMarkerState,
@@ -223,16 +224,34 @@ function boundaryWouldDiscardUncoveredMessage(
     ordinal: number,
     boundaryMessageId: string,
 ): boolean {
-    const partial = getUncoveredCompartmentEndThrough(db, sessionId, ordinal);
-    if (!partial) return false;
-    const ordering = compareOpenCodeMessagesByCanonicalOrder(
-        sessionId,
-        boundaryMessageId,
-        partial.endMessageId,
-    );
+    const current = getPersistedCompactionMarkerState(db, sessionId)?.boundaryOrdinal ?? -1;
+    const partials = getUncoveredCompartmentEndsThrough(db, sessionId, ordinal, current);
     // Unknown raw ordering is not proof of coverage. The boundary is kept by
     // filterCompacted, so an indexed end at/after it is safe, not a blanket veto.
-    return ordering === null || ordering > 0;
+    for (const partial of partials) {
+        const ordering = compareOpenCodeMessagesByCanonicalOrder(
+            sessionId,
+            boundaryMessageId,
+            partial.endMessageId,
+        );
+        if (ordering !== null && ordering <= 0) continue;
+        // Successors advance to the next PRESENT ordinal, not necessarily end+1.
+        // Missing successors/anchors never prove coverage. Background notices are
+        // absent only by the same synthetic policy the real historian uses.
+        if (
+            partial.successorStartMessageId &&
+            partial.successorStartMessage !== null &&
+            partial.successorStartMessage > partial.endMessage + 1 &&
+            isOpenCodeGapHistorianAbsent(
+                sessionId,
+                partial.endMessageId,
+                partial.successorStartMessageId,
+            )
+        )
+            continue;
+        return true;
+    }
+    return false;
 }
 
 /**

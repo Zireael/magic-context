@@ -1534,6 +1534,7 @@ describe("deferred compaction marker representation", () => {
                 ordinal: 10,
                 endMessageId: "msg-boundary",
             },
+            cacheBustingPass: true,
             fullFeatureMode: true,
             tagger: createTagger(),
             ctxReduceAvailability: { callable: false, frozen: true },
@@ -1559,6 +1560,39 @@ describe("deferred compaction marker representation", () => {
             ctxReduceAvailability: { callable: false, frozen: true },
         });
         expect(JSON.stringify(replay)).toBe(firstBytes);
+    });
+
+    it("committed scheduler-execute boundary metadata cannot drain a marker without served bust permission", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-metadata-only-marker";
+        const pending = {
+            ordinal: 10,
+            endMessageId: "msg-boundary",
+            publishedAt: 1,
+            injectAttempts: 3,
+        };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        const messages = [] as MessageLike[];
+        let writes = 0;
+        runRustModePostprocess({
+            db,
+            sessionId,
+            messages,
+            fullFeatureMode: true,
+            tagger: createTagger(),
+            materializedBoundary: { rowVersion: 7, ordinal: 10, endMessageId: "msg-boundary" },
+            compactionMarkerStrategy: {
+                applyDeferred: () => {
+                    writes++;
+                    return { kind: "applied", markerOrdinal: 10 };
+                },
+                reconcile: () => {},
+            },
+        });
+        expect(writes).toBe(0);
+        expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+        expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
     });
 
     it("an upgraded indexed pending waits through byte-identical defers and moves on the next bust", () => {

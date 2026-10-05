@@ -899,18 +899,45 @@ export function getUncoveredCompartmentEndThrough(
     sessionId: string,
     endOrdinal = Number.MAX_SAFE_INTEGER,
 ): { endMessageId: string; endMessage: number } | null {
-    const row = db
+    const end = getUncoveredCompartmentEndsThrough(db, sessionId, endOrdinal)[0];
+    return end ? { endMessageId: end.endMessageId, endMessage: end.endMessage } : null;
+}
+
+/** Enumerate candidates: callers may prove sparse gaps absent, or select a visible end. */
+export function getUncoveredCompartmentEndsThrough(
+    db: Database,
+    sessionId: string,
+    endOrdinal = Number.MAX_SAFE_INTEGER,
+    afterOrdinal = -1,
+): Array<{
+    endMessageId: string;
+    endMessage: number;
+    successorStartMessageId: string | null;
+    successorStartMessage: number | null;
+}> {
+    const rows = db
         .prepare(
-            `SELECT k.end_message_id, k.end_message FROM compartments k
+            `SELECT k.end_message_id, k.end_message,
+                n.start_message_id AS successor_id, n.start_message AS successor_start FROM compartments k
          LEFT JOIN compartments n ON n.session_id = k.session_id AND n.sequence = k.sequence + 1
-         WHERE k.session_id = ?1 AND k.end_message <= ?2 AND k.end_block_index IS NOT NULL
+         WHERE k.session_id = ?1 AND k.end_message <= ?2 AND k.end_message > ?3 AND k.end_block_index IS NOT NULL
            AND NOT COALESCE(n.sequence IS NOT NULL AND (
                (n.start_message_id = k.end_message_id AND n.start_block_index > k.end_block_index)
                OR n.start_message = k.end_message + 1), 0)
-         ORDER BY k.sequence LIMIT 1`,
+         ORDER BY k.sequence`,
         )
-        .get(sessionId, endOrdinal) as { end_message_id: string; end_message: number } | undefined;
-    return row ? { endMessageId: row.end_message_id, endMessage: row.end_message } : null;
+        .all(sessionId, endOrdinal, afterOrdinal) as Array<{
+        end_message_id: string;
+        end_message: number;
+        successor_id: string | null;
+        successor_start: number | null;
+    }>;
+    return rows.map((row) => ({
+        endMessageId: row.end_message_id,
+        endMessage: row.end_message,
+        successorStartMessageId: row.successor_id,
+        successorStartMessage: row.successor_start,
+    }));
 }
 
 export function isPartialCompartmentEnd(

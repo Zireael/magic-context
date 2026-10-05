@@ -49,7 +49,10 @@ import {
     selectHiddenMessagesAtCompactionSeam,
 } from "./inject-compartments";
 import type { MessageLike } from "./tag-messages";
-import { reconcileMarkerRepresentation } from "./transform-postprocess-phase";
+import {
+    RUST_MARKER_LOCK_SKIP_LOG,
+    reconcileMarkerRepresentation,
+} from "./transform-postprocess-phase";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
@@ -206,6 +209,170 @@ afterEach(() => {
 });
 
 describe("applyDeferredCompactionMarker — outcomes", () => {
+    it("lock-contention diagnostics promise the next cache-busting pass, not the next ordinary pass", () => {
+        expect(RUST_MARKER_LOCK_SKIP_LOG).toContain("next cache-busting pass retries");
+        expect(RUST_MARKER_LOCK_SKIP_LOG).not.toContain("next pass retries");
+    });
+    it("does not let already-cut indexed ends behind the current marker veto an advance", () => {
+        const dataHome = useTempDataHome("marker-old-gap-");
+        const oc = createOpenCodeDb(dataHome);
+        insertUserMessage(oc, "current", "ses-old-gap", 10);
+        insertUserMessage(oc, "target", "ses-old-gap", 20);
+        const db = openDatabase();
+        appendCompartments(db, "ses-old-gap", [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 8,
+                startMessageId: "gone",
+                endMessageId: "gone-end",
+                endBlockIndex: 0,
+                title: "old",
+                content: "old",
+            },
+            {
+                sequence: 1,
+                startMessage: 11,
+                endMessage: 20,
+                startMessageId: "next",
+                endMessageId: "target",
+                endBlockIndex: 0,
+                title: "new",
+                content: "new",
+            },
+        ]);
+        const marker = {
+            boundaryOrdinal: 10,
+            boundaryMessageId: "current",
+            targetEndMessageId: "current",
+            summaryMessageId: "old-summary",
+            summaryPartId: "old-summary-part",
+            compactionPartId: "old-compaction",
+        };
+        insertMarkerRows(oc, "ses-old-gap", marker);
+        setPersistedCompactionMarkerState(db, "ses-old-gap", marker);
+        oc.close();
+        expect(
+            applyDeferredCompactionMarker(
+                db,
+                "ses-old-gap",
+                makePending({ ordinal: 20, endMessageId: "target" }),
+                dataHome,
+            ),
+        ).toEqual({ kind: "applied", markerOrdinal: 20 });
+    });
+
+    it("advances ALF's seven sparse successor gaps only when the remaining raw coordinates are historian-synthetic", () => {
+        // Read-only context.db coordinates, 2026-10-05: three gaps are already
+        // behind marker 121728. No raw OpenCode store or live content is copied.
+        const gaps = [
+            [1589, 111638, 111640],
+            [1640, 114784, 114786],
+            [1746, 121167, 121169],
+            [1786, 122829, 122831],
+            [1795, 123463, 123465],
+            [1799, 123686, 123689],
+            [1843, 126147, 126150],
+        ] as const;
+        for (const realMessage of [false, true]) {
+            closeDatabase();
+            closeCompactionMarkerConnection();
+            const dataHome = useTempDataHome("marker-alf-sparse-");
+            const oc = createOpenCodeDb(dataHome);
+            const db = openDatabase();
+            const sessionId = "ses-alf-shape";
+            insertUserMessage(oc, "current", sessionId, 121728);
+            insertUserMessage(oc, "target", sessionId, 134815);
+            const marker = {
+                boundaryOrdinal: 121728,
+                boundaryMessageId: "current",
+                targetEndMessageId: "current",
+                summaryMessageId: "old-summary",
+                summaryPartId: "old-summary-part",
+                compactionPartId: "old-compaction",
+            };
+            insertMarkerRows(oc, sessionId, marker);
+            setPersistedCompactionMarkerState(db, sessionId, marker);
+            for (const [sequence, end, next] of gaps) {
+                appendCompartments(db, sessionId, [
+                    {
+                        sequence,
+                        startMessage: end - 1,
+                        endMessage: end,
+                        startMessageId: `start-${end}`,
+                        endMessageId: `end-${end}`,
+                        endBlockIndex: 0,
+                        title: "left",
+                        content: "left",
+                    },
+                    {
+                        sequence: sequence + 1,
+                        startMessage: next,
+                        endMessage: next,
+                        startMessageId: `next-${next}`,
+                        endMessageId: `next-${next}`,
+                        title: "right",
+                        content: "right",
+                    },
+                ]);
+                if (end <= marker.boundaryOrdinal) continue; // The host already cut these ids away.
+                insertMessage(oc, `end-${end}`, sessionId, end, "assistant");
+                oc.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)").run(
+                    `covered-${end}`,
+                    `end-${end}`,
+                    sessionId,
+                    end,
+                    end,
+                    '{"type":"text","text":"covered whole message"}',
+                );
+                insertUserMessage(oc, `next-${next}`, sessionId, next);
+                for (let ordinal = end + 1; ordinal < next; ordinal++) {
+                    const id = `notice-${ordinal}`;
+                    insertUserMessage(oc, id, sessionId, ordinal);
+                    oc.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)").run(
+                        `part-${ordinal}`,
+                        id,
+                        sessionId,
+                        ordinal,
+                        ordinal,
+                        JSON.stringify({
+                            type: "text",
+                            text: "background task notice",
+                            synthetic: !(realMessage && ordinal === 123687),
+                        }),
+                    );
+                }
+            }
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: 2029,
+                    startMessage: 134800,
+                    endMessage: 134815,
+                    startMessageId: "latest-start",
+                    endMessageId: "target",
+                    endBlockIndex: 0,
+                    title: "latest",
+                    content: "latest",
+                },
+            ]);
+            oc.close();
+            const outcome = applyDeferredCompactionMarker(
+                db,
+                sessionId,
+                makePending({ ordinal: 134815, endMessageId: "target" }),
+                dataHome,
+                { rowVersion: 1, ordinal: 134815, endMessageId: "target" },
+            );
+            expect(outcome).toEqual(
+                realMessage
+                    ? { kind: "stale-skip", reason: "partial-message-boundary" }
+                    : { kind: "applied", markerOrdinal: 134815 },
+            );
+            expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryOrdinal).toBe(
+                realMessage ? 121728 : 134815,
+            );
+        }
+    });
     it("advances past an indexed end covered by the next ordinal", () => {
         const dataHome = useTempDataHome("partial-adjacent-marker-");
         const opencodeDb = createOpenCodeDb(dataHome);
@@ -276,6 +443,9 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-user", "ses-gap", 1_000);
         insertMessage(opencodeDb, "msg-partial", "ses-gap", 1_001, "assistant");
+        // A real present message at the skipped coordinate, not merely a hole
+        // in the ordinal integers. Empty/retired holes are legitimate for Rust.
+        insertUserMessage(opencodeDb, "msg-real-gap", "ses-gap", 1_500);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-gap", 2_000);
         closeQuietly(opencodeDb);
         const db = openDatabase();

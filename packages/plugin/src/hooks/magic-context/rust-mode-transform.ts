@@ -162,7 +162,6 @@ import { loadContextUsage } from "./transform-context-state";
 import type { MessageLike } from "./transform-operations";
 import type { FrozenReleaseLastServed } from "./transform-postprocess-phase";
 import {
-    applyRustModeDeferredCompactionMarker,
     replayRustModeBindingMismatchStrips,
     runRustModePostprocess,
     rustModeServedKeyAfterPersistedStrips,
@@ -736,7 +735,9 @@ export function formatRustInputCoverageLog(args: {
 
 function materializedCompactionBoundary(
     response: Record<string, unknown>,
+    cacheBustingPass: boolean,
 ): import("./transform-postprocess-phase").RustMaterializedCompactionBoundary | undefined {
+    if (!cacheBustingPass) return undefined;
     if (response.committed !== true) return undefined;
     if (
         typeof response.scheduler_decision !== "string" ||
@@ -807,6 +808,7 @@ function armNoteNudgeOnRustPublish(args: {
 
 function formatRustPassLog(args: {
     decision: string;
+    committed?: boolean;
     reason: string;
     schedulerDecision?: string;
     schedulerDeferReason?: string;
@@ -851,9 +853,9 @@ function formatRustPassLog(args: {
     const historianFields = args.historianCanonicalCause
         ? ` historian_no_fire=${args.historianNoFire ?? "unknown"} canonical_cause=${args.historianCanonicalCause}`
         : "";
-    const identityFields = args.identityDelta?.length
-        ? ` identity_delta=${args.identityDelta.join(",")}`
-        : "";
+    const identityFields =
+        (args.committed === undefined ? "" : ` committed=${args.committed}`) +
+        (args.identityDelta?.length ? ` identity_delta=${args.identityDelta.join(",")}` : "");
     return `rust pass: decision=${args.decision} reason=${args.reason}${schedulerFields}${historianFields}${identityFields} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=identity_resolve:${timings.identityResolve.toFixed(1)} prompt_surface:${timings.promptSurface.toFixed(1)} mural_resolve:${timings.muralResolve.toFixed(1)} prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} ordinal_rebuild:${timings.ordinalRebuild.toFixed(1)} ordinal_rows:${timings.ordinalRows} ordinal_mode:${timings.ordinalMode} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)} transport_lane:${timings.transportDetail.lane.toFixed(1)} transport_route:${timings.transportDetail.route.toFixed(1)} transport_encode:${timings.transportDetail.encode.toFixed(1)} transport_issue:${timings.transportDetail.issue.toFixed(1)} transport_response_wait_decode:${timings.transportDetail.responseWait.toFixed(1)} transport_settle:${timings.transportDetail.settle.toFixed(1)} transport_wrapper:${Math.max(0, timings.transport - Object.values(timings.transportDetail).reduce((sum, ms) => sum + ms, 0)).toFixed(1)} preflight:${timings.preflight.toFixed(1)} todo_verdict:${timings.todoVerdict.toFixed(1)} todo_probe:${timings.todoProbe.toFixed(1)} todo_persist:${timings.todoPersist.toFixed(1)} todo_probe_required:${timings.todoProbeRequired} todo_probe_reason:${timings.todoProbeReason} todo_unprobed_bust:${timings.todoUnprobedBust} session_directory:${timings.sessionDirectory.toFixed(1)} paging:${timings.paging.toFixed(1)} output_clone:${timings.outputClone.toFixed(1)} delivery:${timings.delivery.toFixed(1)} bookkeeping:${timings.bookkeeping.toFixed(1)}`;
 }
 
@@ -2318,6 +2320,7 @@ export function createRustModeTransform(
         let decision = "error";
         let materializeReason = "none";
         let schedulerDecision: string | undefined;
+        let responseCommitted: boolean | undefined;
         let schedulerDeferReason: string | undefined;
         let historianNoFire: string | undefined;
         let historianCanonicalCause: string | undefined;
@@ -2576,6 +2579,7 @@ export function createRustModeTransform(
                 sessionId,
                 formatRustPassLog({
                     decision,
+                    committed: responseCommitted,
                     reason: materializeReason,
                     schedulerDecision,
                     schedulerDeferReason,
@@ -2603,6 +2607,8 @@ export function createRustModeTransform(
             }
         };
         const captureResponseTelemetry = (response: Record<string, unknown>): void => {
+            responseCommitted =
+                typeof response.committed === "boolean" ? response.committed : undefined;
             decision =
                 typeof response.decision === "string"
                     ? response.decision
@@ -3756,7 +3762,10 @@ export function createRustModeTransform(
                 state.forceFullWire = true;
                 sessionLog(sessionId, "deferred frozen-prefix divergence; replaying LKG");
             }
-            const materializedBoundary = materializedCompactionBoundary(response);
+            const materializedBoundary = materializedCompactionBoundary(
+                response,
+                moduleDecisionBusts,
+            );
             let thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null = null;
             let frozenHealthyPassesAfterApply: number | null = null;
             let frozenReleaseReason: string | null = null;
@@ -3955,15 +3964,6 @@ export function createRustModeTransform(
                     });
                     thinkingBindingRecovery = postprocess.thinkingBindingRecovery;
                     markerAt = postprocess.markerAt;
-                } else {
-                    // Frozen replay bypasses postprocess to preserve exact bytes, but
-                    // host-store repair is out-of-band and must still retry each pass.
-                    applyRustModeDeferredCompactionMarker({
-                        db: deps.db,
-                        sessionId,
-                        boundary: materializedBoundary,
-                        sessionDirectory: directory,
-                    });
                 }
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {

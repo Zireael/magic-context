@@ -1,4 +1,4 @@
-import { getUncoveredCompartmentEndThrough } from "../../features/magic-context/compartment-storage";
+import { getUncoveredCompartmentEndsThrough } from "../../features/magic-context/compartment-storage";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getPersistedCompactionMarkerState,
@@ -146,7 +146,7 @@ export function createV2RustCompactionMarkerStrategy(
 export function trimToRecordedBoundary(
     db: ContextDatabase,
     sessionId: string,
-    messages: Array<{ id?: string }>,
+    messages: Array<{ id?: string; role?: string }>,
 ): number {
     const marker = getPersistedCompactionMarkerState(db, sessionId);
     const boundaryId = marker?.boundaryMessageId;
@@ -163,13 +163,21 @@ export function trimToRecordedBoundary(
     // cannot be required to equal end+1 or 0; the ordinal continuation is what
     // proves nothing was skipped. The latest compartment has no successor, so its
     // indexed end always stays protected, and so does any end followed by a gap.
-    const partial = getUncoveredCompartmentEndThrough(db, sessionId);
-    const partialIndex = partial
-        ? messages.findIndex((message) => message.id === partial.endMessageId)
-        : -1;
+    const uncovered = new Set(
+        getUncoveredCompartmentEndsThrough(db, sessionId).map((end) => end.endMessageId),
+    );
+    const partialIndex = messages.findIndex(
+        (message) => message.id !== undefined && uncovered.has(message.id),
+    );
     // The recorded cut can predate this guard; never remove a visible
     // partially covered message even when that old cut lies after it.
-    const safeStart = partialIndex >= 0 ? Math.min(start, partialIndex) : start;
+    let safeStart = partialIndex >= 0 ? Math.min(start, partialIndex) : start;
+    if (partialIndex >= 0 && partialIndex < start) {
+        // A partial assistant/tool endpoint is not a valid turn boundary. Roll
+        // back to its user; if roles or that user are absent, do not guess a cut.
+        while (safeStart > 0 && messages[safeStart]?.role !== "user") safeStart--;
+        if (messages[safeStart]?.role !== "user") return 0;
+    }
     if (safeStart <= 0) return 0;
     messages.splice(0, safeStart);
     return safeStart;

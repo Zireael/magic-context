@@ -731,7 +731,7 @@ export interface RustMaterializedCompactionBoundary {
 
 /** Logged when another process holds the write lock past busy_timeout. */
 export const RUST_MARKER_LOCK_SKIP_LOG =
-    "rust compaction-marker: pending target write skipped on lock contention; next pass retries";
+    "rust compaction-marker: pending target write skipped on lock contention; next cache-busting pass retries";
 
 /**
  * SQLITE_BUSY, SQLITE_LOCKED and their extended codes such as SQLITE_BUSY_SNAPSHOT.
@@ -755,8 +755,12 @@ function isSqliteLockContentionError(error: unknown): boolean {
  * do not replace it with a target read later from status. Store that target in the
  * local pending blob, advance it only forward in session metadata, and clear it only
  * when compare-and-swap confirms that the pending value has not changed.
+ * SOFT+ (including committed metadata-only executes and frozen replay) holds the
+ * blob and its health untouched; there is no independent marker retry timer.
  */
 export function applyRustModeDeferredCompactionMarker(args: {
+    /** The served HARD/SOFT permission, never scheduler-execute or commit alone. */
+    cacheBustingPass: boolean;
     db: ContextDatabase;
     sessionId: string;
     boundary?: RustMaterializedCompactionBoundary;
@@ -768,6 +772,7 @@ export function applyRustModeDeferredCompactionMarker(args: {
      */
     applyDeferred?: CompactionMarkerStrategy["applyDeferred"];
 }): void {
+    if (!args.cacheBustingPass) return;
     const { boundary } = args;
     if (boundary) {
         if (
@@ -821,7 +826,7 @@ export function applyRustModeDeferredCompactionMarker(args: {
                 .immediate();
         } catch (error) {
             // This marker bookkeeping runs after the module already produced a valid
-            // transform, and every Rust-mode pass records the boundary again. A lock
+            // transform, and the next cache-busting pass records the boundary again. A lock
             // held past busy_timeout therefore skips this pass's recording and drain
             // instead of failing the pass into LKG or raw fallback.
             if (!isSqliteLockContentionError(error)) throw error;
@@ -1070,8 +1075,9 @@ export function runRustModePostprocess(args: {
     // A retained retry can survive an upgrade or a host-store lock. It still
     // needs the same bust permission as a new marker: draining on SOFT+ would
     // change the host's next input cut while its cached history stays frozen.
-    if (args.cacheBustingPass || args.materializedBoundary) {
+    if (args.cacheBustingPass) {
         applyRustModeDeferredCompactionMarker({
+            cacheBustingPass: true,
             ...(args.compactionMarkerStrategy
                 ? { applyDeferred: args.compactionMarkerStrategy.applyDeferred }
                 : {}),

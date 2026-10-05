@@ -32,14 +32,18 @@ import {
     getEmergencyRecoveryArmedAt,
     getMergedReasoningStrippedIds,
     getOverflowState,
+    getPendingCompactionMarkerState,
+    getPersistedCompactionMarkerState,
     getPersistedNoteNudge,
     getThinkingBindingRecoveryTarget,
     recordDetectedContextLimit,
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
+    setPendingCompactionMarkerState,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
+import { createTagger } from "../../features/magic-context/tagger";
 import {
     __resetToolDefinitionMeasurements,
     recordToolDefinition,
@@ -330,6 +334,73 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 }
 
 describe("Rust mode authority adapter", () => {
+    it("retains pending indexed markers while a healthy SOFT+ serves the frozen representation", async () => {
+        const sessionId = `rust-frozen-marker-${Date.now()}`;
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        installAvailabilityDb(sessionId);
+        const oc = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        oc.exec(
+            "CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+        );
+        oc.prepare("INSERT INTO message VALUES ('m1', ?, 1, 1, ?)").run(
+            sessionId,
+            '{"role":"user"}',
+        );
+        oc.close();
+        const db = makeDb();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "m1",
+                endMessageId: "m1",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "indexed",
+                content: "indexed",
+            },
+        ]);
+        let step = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                step++;
+                if (step === 2) throw new Error("module temporarily unavailable");
+                return {
+                    decision: step === 1 || step === 5 ? "HARD" : "SOFT+",
+                    scheduler_decision: step === 1 || step === 5 ? "execute" : "defer",
+                    row_version: step,
+                    native_messages: makeMessages(sessionId),
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const serve = async () => {
+            const input = makeMessages(sessionId);
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+            return JSON.stringify(output.messages);
+        };
+        const first = await serve();
+        await serve();
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1 };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        for (let pass = 0; pass < 2; pass++) {
+            expect(await serve()).toBe(first);
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+        }
+        await serve();
+        expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
+        expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryOrdinal).toBe(1);
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+    });
     it("unprovable shared boundaries fail by name without replay or parking", async () => {
         const sessionId = "ses-unprovable-shared-boundaries";
         sessions.push(sessionId);

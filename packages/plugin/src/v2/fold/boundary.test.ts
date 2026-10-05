@@ -10,7 +10,10 @@ import {
     getOrCreateSessionMeta,
     openDatabase,
 } from "../../features/magic-context/storage";
-import { getPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
+import {
+    getPersistedCompactionMarkerState,
+    setPersistedCompactionMarkerState,
+} from "../../features/magic-context/storage-meta-persisted";
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
@@ -206,6 +209,46 @@ describe("createV2RustCompactionMarkerStrategy with a partial published end", ()
 });
 
 describe("trimToRecordedBoundary with indexed ends and their successors", () => {
+    it("an absent earliest partial cannot mask a visible uncovered tool turn before the recorded cut", () => {
+        const db = useTempDataHome();
+        const sessionId = "ses-absent-partial";
+        getOrCreateSessionMeta(db, sessionId);
+        db.exec(`INSERT INTO compartments(session_id,sequence,start_message,end_message,start_message_id,end_message_id,end_block_index,title,content,created_at) VALUES
+            ('${sessionId}',0,1,2,'absent-user','absent-old-partial',0,'t','c',1),
+            ('${sessionId}',1,4,5,'visible-user','visible-partial',0,'t','c',1),
+            ('${sessionId}',2,8,9,'boundary-user','tail',0,'t','c',1)`);
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryOrdinal: 8,
+            boundaryMessageId: "boundary-user",
+            targetEndMessageId: "tail",
+            summaryMessageId: "",
+            summaryPartId: "",
+            compactionPartId: "",
+        });
+        const messages = [
+            { id: "older", role: "user", parts: [] },
+            { id: "visible-user", role: "user", parts: [] },
+            {
+                id: "visible-partial",
+                role: "assistant",
+                parts: [
+                    { type: "tool_use", id: "call" },
+                    { type: "text", text: "UNCOVERED_SUFFIX" },
+                ],
+            },
+            {
+                id: "other-unsummarized",
+                role: "tool",
+                parts: [{ type: "tool_result", tool_use_id: "call" }],
+            },
+            { id: "boundary-user", role: "user", parts: [] },
+            { id: "tail", role: "assistant", parts: [] },
+        ];
+        expect(trimToRecordedBoundary(db, sessionId, messages)).toBe(1);
+        expect(messages[0]?.id).toBe("visible-user");
+        expect(JSON.stringify(messages)).toContain("UNCOVERED_SUFFIX");
+        expect(messages.some((message) => message.id === "other-unsummarized")).toBe(true);
+    });
     type Row = [
         sequence: number,
         startMessage: number,
@@ -230,6 +273,7 @@ describe("trimToRecordedBoundary with indexed ends and their successors", () => 
         ).applyDeferred(db, sessionId, { ordinal: 7, endMessageId: "a4", publishedAt: 1 });
         const messages = history.map((message) => ({
             id: message.id,
+            role: message.role,
             parts:
                 message.id === "a2"
                     ? [
@@ -271,9 +315,9 @@ describe("trimToRecordedBoundary with indexed ends and their successors", () => 
             [1, 6, 7, "u3", "a4", 0, 0],
         ]);
         // a3 (ordinal 5) is in neither row, so a2's remainder may be uncovered: the
-        // cut stops at a2 instead of the recorded u3.
-        expect(result.dropped).toBe(3);
-        expect(result.ids).toEqual(["a2", "a3", "u3", "a4"]);
+        // cut rolls back to a2's user turn instead of the recorded u3.
+        expect(result.dropped).toBe(2);
+        expect(result.ids).toEqual(["u2", "a2", "a3", "u3", "a4"]);
         expect(result.text).toContain("UNCOVERED_FILE");
     });
 });
