@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { createReadStream, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import {
@@ -72,7 +73,7 @@ export function oc1Content(parts: unknown[], assistant: boolean): Content {
         const p = object(raw), type = text(p.type);
         if (type === "reasoning") {
             c.reasoning.push(text(p.text));
-            c.replayChars += JSON.stringify(p.metadata ?? {}).length;
+            c.replayChars += number(p.metadataChars);
         } else if (type === "text" && p.ignored !== true) {
             (assistant ? c.visible : c.bodies).push(text(p.text));
         } else if (type === "tool") {
@@ -164,10 +165,26 @@ function recordStep(harness: string, s: Step) {
     if ((s.usage.reasoning ?? 0) > 0) g.reportedReasoningSteps++;
 }
 function oc1(db: Database) {
-    const rows = db.query(`SELECT id,session_id,time_created,data FROM message
+    const rows = db.query(`SELECT id,session_id,time_created,
+        json_object('role',json_extract(data,'$.role'),
+            'providerID',json_extract(data,'$.providerID'),'modelID',json_extract(data,'$.modelID'),
+            'tokens',json_extract(data,'$.tokens'),'finish',json_extract(data,'$.finish'),
+            'error',json_extract(data,'$.error') IS NOT NULL,'summary',json_extract(data,'$.summary')) AS data
+        FROM message
         WHERE time_created >= ? AND time_created <= ? ORDER BY session_id,time_created,id`)
         .all(since, until) as Array<{ id: string; session_id: string; time_created: number; data: string }>;
-    const partsQuery = db.query("SELECT data FROM part WHERE message_id = ? ORDER BY id");
+    // Read only fields required for tokenization, on eligible pairs. Never select
+    // replay payloads, auth tables, or full message/part JSON. Private text stays in
+    // memory; only its calibrated token counts leave this process.
+    const partsQuery = db.query(`SELECT json_object(
+        'type',json_extract(data,'$.type'),'text',json_extract(data,'$.text'),
+        'ignored',json(CASE WHEN json_extract(data,'$.ignored') THEN 'true' ELSE 'false' END),'tool',json_extract(data,'$.tool'),
+        'metadataChars',length(json_extract(data,'$.metadata')),
+        'state',json_object('status',json_extract(data,'$.state.status'),
+            'input',json_extract(data,'$.state.input'),'output',json_extract(data,'$.state.output'),
+            'error',json_extract(data,'$.state.error'),
+            'attachments',json(CASE WHEN json_array_length(data,'$.state.attachments') > 0 THEN '[1]' ELSE '[]' END))
+        ) AS data FROM part WHERE message_id = ? ORDER BY id`);
     const parts = (id: string) => (partsQuery.all(id) as Array<{ data: string }>).map((p) => JSON.parse(p.data));
     let previous: Step | undefined, pending: string[] = [], blocked = false;
     let prior: number | null = null, session = "";
@@ -259,12 +276,15 @@ function oc2(db: Database) {
     const counts = db.query(`SELECT type, count(*) AS n FROM session_message GROUP BY type`).all();
     const recent = db.query(`SELECT count(*) AS n FROM session_message
         WHERE type='assistant' AND time_created >= ? AND time_created <= ?`).get(since, until);
-    const shapes = db.query(`SELECT data FROM session_message WHERE type='assistant' LIMIT 3`).all() as Array<{ data: string }>;
+    const shapes = db.query(`SELECT json_object('model',json_extract(data,'$.model'),
+        'tokens',json_extract(data,'$.tokens'),'usage',json_extract(data,'$.usage'),
+        'contentTypes',(SELECT json_group_array(json_extract(value,'$.type')) FROM json_each(data,'$.content'))
+        ) AS data FROM session_message WHERE type='assistant' LIMIT 3`).all() as Array<{ data: string }>;
     inventory.push({ harness: "oc2", allTimeTypeCounts: counts, recentAssistantCount: recent,
         assistantShapes: shapes.map((r) => {
             const d = object(JSON.parse(r.data));
             return { keys: Object.keys(d), usage: d.usage ?? d.tokens, model: d.model,
-                contentTypes: array(d.content).map((p) => object(p).type) };
+                contentTypes: d.contentTypes };
         }),
     });
     if (number(object(recent).n) > 0) throw new Error("OC2 has recent assistants; inspect its shapes and implement its real store format before measuring");
@@ -308,24 +328,27 @@ async function main() {
     const rootArg = args[0];
     if (!rootArg) throw new Error("Usage: timeout 1800s bun analyze.ts SNAPSHOT_ROOT [SINCE_ISO UNTIL_ISO]");
     const root = realpathSync(resolve(rootArg));
-    // Refuse implicit home-store reads: snapshots must live beneath the prescribed
-    // temporary directory, with no symlink escaping it. Output never contains text.
+    // Keep all scratch output within the prescribed root. Source OpenCode stores
+    // are opened read-only and SELECTed narrowly, never copied in their entirety.
     const allowed = realpathSync(resolve(process.env.TMPDIR ?? "/tmp", "magic-context/reasoning-diff"));
-    if (root !== allowed) throw new Error("Only the sanitized reasoning-diff snapshot root is accepted");
+    if (root !== allowed) throw new Error("Only the reasoning-diff scratch root is accepted");
     if (args[1]) since = Date.parse(args[1]);
     if (args[2]) until = Date.parse(args[2]);
     if (!Number.isFinite(since) || !Number.isFinite(until) || since > until) throw new Error("Invalid date window");
     if (!await preloadTokenizer()) throw new Error("MC tokenizer unavailable; refusing heuristic measurements");
-    for (const filename of ["opencode.db", "opencode2.db"]) {
-        const path = realpathSync(join(root, filename));
-        if (!path.startsWith(`${root}${sep}`)) throw new Error("Snapshot symlink escapes temporary root");
+    const source = join(homedir(), ".local/share/opencode");
+    const filenames = readdirSync(source).filter((name) => /^opencode.*\.db$/.test(name));
+    if (!filenames.length) throw new Error("No named OpenCode stores found");
+    for (const filename of filenames) {
+        const path = join(source, filename);
         const db = new Database(path, { readonly: true });
         try {
+            db.exec("BEGIN");
             const tables = db.query("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
-            if (tables.some((t) => ["credential", "account", "account_state", "control_account"].includes(t.name)))
-                throw new Error("Unsanitized snapshot");
-            if (filename === "opencode.db") oc1(db); else oc2(db);
-        } finally { db.close(); }
+            if (tables.some((t) => t.name === "message") && tables.some((t) => t.name === "part")) oc1(db);
+            else if (tables.some((t) => t.name === "session_message")) oc2(db);
+            else throw new Error(`Unsupported store schema: ${filename}`);
+        } finally { db.exec("ROLLBACK"); db.close(); }
         console.log(`Read ${filename}: ${groups.size} route groups`);
     }
     for (const directory of readdirSync(join(root, "pi"))) {

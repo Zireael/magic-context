@@ -6,7 +6,8 @@ installed Bun/SQLite/Python tools. The requested calibration file lives at
 revision; no compatibility file is needed.
 
 ```sh
-timeout 7200s python3 packages/plugin/scripts/reasoning-resend-cost/snapshot.py
+timeout 20s df -h /System/Volumes/Data
+timeout 120s python3 packages/plugin/scripts/reasoning-resend-cost/copy-pi.py
 timeout 1800s bun packages/plugin/scripts/reasoning-resend-cost/analyze.ts \
   "${TMPDIR%/}/magic-context/reasoning-diff" \
   2026-09-27T00:00:00Z 2026-10-04T23:59:59.999Z
@@ -14,15 +15,23 @@ timeout 120s bun test packages/plugin/scripts/reasoning-resend-cost/analysis.tes
 timeout 300s bun run --cwd packages/plugin typecheck
 ```
 
-Use a background execution facility with a long timeout for acquisition/analysis,
-not a foreground polling loop. Acquisition refuses an existing root. It executes
-only `VACUUM INTO` against live OpenCode stores, then drops `credential`, `account`,
-`account_state`, and `control_account` **from the copies**. To avoid a second
-full-size disk rebuild, v1 copies are reduced to every message in the analysis
-window and all their parts, then vacuumed. Nothing is sampled within that window.
-Pi files are copied before reading; file metadata selects recently modified
-sessions. Analysis refuses symlinks escaping the temporary root and copies still
-containing any of the four auth tables.
+Use a background execution facility with a long timeout for analysis, not a
+foreground polling loop. **Do not copy/vacuum the whole OpenCode store**: it can
+fill the shared disk. The task's corrected acquisition method permits narrow
+read-only SQL on live `message`/`part` (v2: `session_message`). The script opens
+named OpenCode stores with Bun SQLite's `readonly: true` and a read transaction;
+selects only windowed message IDs, session IDs, timestamps, route IDs and usage;
+then selects tokenization fields of parts **only for candidate pairs**. It never
+queries `credential`, `account`, `account_state` or `control_account`. Replay
+payloads are measured by length, not retrieved. Text needed by MC's tokenizer
+stays in memory and is never written to scratch. SQLite schema names only identify
+the store generation. This is a single-read-transaction view per OpenCode store,
+not a simultaneous cross-harness snapshot.
+
+Pi acquisition refuses an existing root and more than 2 GB of selected files.
+Files are copied before reading; file metadata selects recently modified sessions.
+Analysis refuses Pi symlinks escaping the temporary root. Check disk free space
+before acquisition; numeric output is small and no OpenCode DB copy is created.
 
 `summary.json` and `pairs.jsonl` under the temporary root contain numeric counts
 and step/session identifiers, **not** text, tool arguments, signatures or opaque
