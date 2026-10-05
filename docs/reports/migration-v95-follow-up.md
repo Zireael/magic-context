@@ -107,3 +107,38 @@ Fresh verification:
   reads find ledger **94**, numeric FTS row **7 / 123**, integer map SHA, unchanged
   companion store and an empty pre-repair backup map. Driver lsof proves only
   throwaway context/store/backup files and sidecars were opened.
+
+## S2 — unshipped v95 DDL preserves SHA storage classes
+
+The map declares `sha BLOB`, SQLite's no-coercion affinity. v95 is corrected in
+place: no conversion migration, v96 or store.db lane change. The numeric probe
+`(rowid=7, sha=123, project_path='project', message='numeric legacy')` keeps
+integer storage in FTS and map through first migration and lost-ledger replay.
+Public text SHA `'123'` insertion/deletion leaves that numeric orphan alone,
+matching the pre-v95 behavior. Repair verification also rejects equal-valued
+integer/real pairs whose storage classes differ.
+
+Fresh verification:
+
+- Changing only the map DDL back to TEXT reddens **“numeric legacy FTS SHA
+  survives migration and replay without matching a text SHA”**, with map type
+  `text` instead of `integer`; **9 peers pass**. Staged-state/diff-stat/restore
+  proof is in the delivery declaration.
+- Restored migration/armed replay/v38/fence/tag-trim/public git API tests:
+  **29 passed**, 652 assertions across seven files (Bun 1.4.2).
+- `bun scripts/dump-context-db-schema.ts` regenerated the runtime schema into a
+  disposable file. Independent comparison matches the committed **v95** fixture
+  exactly (**1 comparison**). The continuation merge already carries that fixture
+  and the original v95 index-sensitive Rust domain hash updates.
+- **cargo 1.99.0** fingerprint test:
+  `cargo test --offline -j 2 -p mc-module --lib domain_fingerprints_match_the_committed_schema_snapshot -- --nocapture`
+  ran **1 test, passed**. It recomputes Rust domain hashes from the actual schema
+  fixture. The project-owned git map is not a Rust domain table, so BLOB versus
+  TEXT needs no additional domain hash change.
+- `cargo fmt --all --check`: passed (rustfmt **1.10.0**).
+
+The first `--locked` native check refused because isolated sibling path packages
+advanced independently of the committed lock (subc-core 0.20.55→0.20.56,
+subc-daemon 0.31.1→0.32.0, subc-os 0.1.5→0.1.6). The scoped check used temporary
+offline resolution, then restored the staged original Cargo.lock. No dependency
+or lockfile upgrade is part of this delivery; no network install was attempted.
