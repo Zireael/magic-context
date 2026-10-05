@@ -468,6 +468,49 @@ describe("shouldHoldIgnoredNotificationFromOpenCodeDb", () => {
 });
 
 describe("tracked out-of-pass turn state", () => {
+    it("retains only turn flags for both pending and known parts", () => {
+        useTempDataHome("turn-flag-retention-");
+        const body = "large tool output and image data ".repeat(10_000);
+        for (const messageID of ["known", "pending"]) {
+            if (messageID === "known")
+                observeOpenCodeTurnEvent("message.updated", {
+                    info: {
+                        id: messageID,
+                        sessionID: "flags",
+                        role: "assistant",
+                        finish: "stop",
+                        time: { created: 1 },
+                    },
+                });
+            observeOpenCodeTurnEvent("message.part.updated", {
+                part: {
+                    id: "part",
+                    messageID,
+                    sessionID: "flags",
+                    type: "tool",
+                    state: { output: body },
+                    url: body,
+                    metadata: { diagnostics: body },
+                },
+            });
+        }
+        expect(__openCodeTurnStateTest.retainedPartBytes()).toBeLessThan(1024);
+        expect(assistantAwaitingTools(undefined, "flags")).toBe(true);
+    });
+
+    it("reveals prior turn flags after removal and keeps equal-time insertion order", () => {
+        useTempDataHome("turn-flag-removal-");
+        for (const [id, finish] of [
+            ["old", "tool-calls"],
+            ["new", "stop"],
+        ])
+            observeOpenCodeTurnEvent("message.updated", {
+                info: { id, finish, role: "assistant", sessionID: "flags", time: { created: 5 } },
+            });
+        expect(assistantAwaitingTools(undefined, "flags")).toBe(false);
+        observeOpenCodeTurnEvent("message.removed", { sessionID: "flags", messageID: "new" });
+        expect(assistantAwaitingTools(undefined, "flags")).toBe(true);
+    });
     it("keeps answering after the selected DB disappears and logs the missing path once", () => {
         useTempDataHome("read-session-db-tracked-disappears-");
         const dbPath = join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db");

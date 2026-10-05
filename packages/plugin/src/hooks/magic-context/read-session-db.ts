@@ -228,8 +228,25 @@ export function shouldHoldIgnoredNotificationFromMessages(
 }
 
 function trackedMessages(session: TrackedSession): TurnStateMessage[] {
-    return [...session.messages.values()]
-        .sort((left, right) => left.timeCreated - right.timeCreated)
+    let assistant: TrackedMessage | undefined;
+    let user: TrackedMessage | undefined;
+    for (const message of session.messages.values()) {
+        if (
+            message.role === "assistant" &&
+            (!assistant || message.timeCreated >= assistant.timeCreated)
+        )
+            assistant = message;
+        if (
+            message.role === "user" &&
+            (!user || message.timeCreated >= user.timeCreated) &&
+            (message.parts.size === 0 || ![...message.parts.values()].every(isMachineGeneratedPart))
+        )
+            user = message;
+    }
+    // Retain historical flags so removal of the newest row reveals the same
+    // predecessor, but construct only the two rows the turn predicates inspect.
+    return [user, assistant]
+        .filter((message): message is TrackedMessage => !!message)
         .map((message) => ({
             info: {
                 id: message.id,
@@ -239,6 +256,19 @@ function trackedMessages(session: TrackedSession): TurnStateMessage[] {
             },
             parts: [...message.parts.values()],
         }));
+}
+
+function turnStatePart(part: Record<string, unknown>): unknown {
+    const marker = asRecord(asRecord(part.metadata)?.marker);
+    return {
+        type: part.type === "tool" ? "tool" : undefined,
+        providerExecuted: part.providerExecuted === true,
+        synthetic: truthyStoredFlag(part.synthetic),
+        ignored: truthyStoredFlag(part.ignored),
+        ...(marker?.kind !== null && marker?.kind !== undefined
+            ? { metadata: { marker: { kind: true } } }
+            : {}),
+    };
 }
 
 function pendingMessageParts(sessionId: string, messageId: string): Map<string, unknown> {
@@ -262,7 +292,7 @@ export function observeOpenCodeTurnEvent(type: string, properties: unknown): voi
         }
         const tracked = trackedSessions.get(part.sessionID)?.messages.get(part.messageID);
         if (tracked) {
-            tracked.parts.set(part.id, part);
+            tracked.parts.set(part.id, turnStatePart(part));
             return;
         }
         let byMessage = pendingParts.get(part.sessionID);
@@ -275,7 +305,7 @@ export function observeOpenCodeTurnEvent(type: string, properties: unknown): voi
             parts = new Map();
             byMessage.set(part.messageID, parts);
         }
-        parts.set(part.id, part);
+        parts.set(part.id, turnStatePart(part));
         return;
     }
 
@@ -363,6 +393,16 @@ export function assistantAwaitingTools(_deps: unknown, sessionId: string): boole
 }
 
 export const __openCodeTurnStateTest = {
+    retainedPartBytes(): number {
+        let bytes = 0;
+        for (const session of trackedSessions.values())
+            for (const message of session.messages.values())
+                for (const part of message.parts.values()) bytes += JSON.stringify(part).length;
+        for (const session of pendingParts.values())
+            for (const message of session.values())
+                for (const part of message.values()) bytes += JSON.stringify(part).length;
+        return bytes;
+    },
     reset(): void {
         trackedSessions.clear();
         pendingParts.clear();
