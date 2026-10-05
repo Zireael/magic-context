@@ -10,6 +10,7 @@ import {
     lkgContentDigest,
     lkgContentDigestFromFields,
     lkgContentFields,
+    memoizedLkgContentDigestFromFields,
     noteEntry,
 } from "./lkg-slot";
 import { assertOpenAiCompatAdjacency } from "./openai-compat-adjacency";
@@ -101,7 +102,12 @@ export function createLkgEntryProjector(
                 reused += 1;
                 return cached.digest;
             }
-            return snapshot.fields ? lkgContentDigestFromFields(snapshot.fields) : null;
+            if (!snapshot.fields) return null;
+            // An explicit projector budget must not retain entries in the
+            // separate shared memo beyond that caller's requested bound.
+            return options.maxBytes === undefined
+                ? memoizedLkgContentDigestFromFields(snapshot.id, snapshot.fields)
+                : lkgContentDigestFromFields(snapshot.fields);
         });
         if (prior) {
             bytes -= prior.bytes;
