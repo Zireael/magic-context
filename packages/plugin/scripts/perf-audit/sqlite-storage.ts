@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     Database,
+    getSqliteMemoryStats,
     withAsyncPrivilegedWriter,
     withPrivilegedWriter,
     withSqliteTransformPass,
@@ -39,6 +40,10 @@ import { createTagger } from "../../src/features/magic-context/tagger";
 const root = mkdtempSync(join(tmpdir(), "magic-context-perf-db-"));
 process.env.MAGIC_CONTEXT_TEST_DATA_DIR = root;
 process.env.MAGIC_CONTEXT_STORAGE_DIR = root;
+process.env.XDG_DATA_HOME = join(root, "data");
+process.env.XDG_CONFIG_HOME = join(root, "config");
+process.env.OPENCODE_DB = join(root, "absent-opencode.db");
+process.env.MAGIC_CONTEXT_LOG_PATH = join(root, "perf.log");
 process.env.NODE_ENV = "test";
 const sizes = [1_000, 10_000, 60_000];
 const records: Record<string, unknown>[] = [];
@@ -311,6 +316,11 @@ try {
                 });
             }
         } finally { cleanup.close(); }
+        for (const connection of getSqliteMemoryStats().connections) {
+            if (connection.filename !== ":memory:" && !connection.filename.startsWith(`${root}/`)) {
+                throw new Error(`non-fixture SQLite connection: ${connection.filename}`);
+            }
+        }
         closeDatabase();
     }
     console.log(JSON.stringify({ completed: sizes.length, records: records.length, root, removed: true }));
