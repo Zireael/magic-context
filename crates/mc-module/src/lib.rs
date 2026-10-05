@@ -10399,6 +10399,11 @@ impl McHandler {
         let reject_transform = |e: crate::transform::TransformError| {
             let code = if matches!(e, crate::transform::TransformError::AssistantTerminalRetry) {
                 "assistant_terminal_retry"
+            } else if matches!(
+                e,
+                crate::transform::TransformError::ProtectedToolResultsOverLimit
+            ) {
+                crate::transform::PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE
             } else {
                 "transform_failed"
             };
@@ -27458,6 +27463,44 @@ mod tests {
         assert_eq!(trace.last_completed_at_ms, 0);
         assert!(trace.last_received_at_ms > 0);
         assert!(trace.last_reject_at_ms.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_protected_results_over_limit_is_a_typed_refusal_not_passthrough() {
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.protected_tools.insert("bash".into(), 8);
+        let (handler, store, _dir, project) = handler_with_store(producer, config.clone());
+        let mut route = binding_with_harness(project.to_str().unwrap(), "claude-code", "ses");
+        route.config = config;
+        handler.bind_route(7, route);
+        let mut messages = vec![];
+        for n in 0..8 {
+            messages.push(assistant_tool_call(&format!("call-{n}"), n * 2 + 1));
+            messages.push(tool_result(
+                &format!("result-{n}"),
+                n * 2 + 2,
+                &"word ".repeat(20000),
+            ));
+        }
+        let mut request = request_with_usage(messages, 200000, 50000);
+        request["serializer_profile"] = json!("claude-code-anthropic");
+        request["usage"]["final_wire_trusted"] = json!(true);
+        request["usage"]["final_wire_input_tokens"] = json!(200000);
+        let before = store.load("ses").unwrap().row_version;
+        let (code, message) = error_frame(call_transform_outcome(&handler, request.clone()).await);
+        let golden: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/protected-tool-refusal.json"
+        ))
+        .unwrap();
+        assert_eq!(code, golden["code"].as_str().unwrap());
+        assert_eq!(message, golden["message"].as_str().unwrap());
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+        request["usage"]["final_wire_trusted"] = json!(false);
+        assert!(matches!(
+            call_transform_outcome(&handler, request).await,
+            HandlerOutcome::Response(_)
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

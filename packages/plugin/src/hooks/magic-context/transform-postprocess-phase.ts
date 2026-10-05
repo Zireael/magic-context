@@ -107,7 +107,7 @@ import {
     type DroppedTokenReduction,
     estimateDroppedTokensFromTagReductions,
 } from "./dropped-token-estimate";
-import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { EmergencyFailClosedError, outgoingContextRefusal } from "./emergency-fail-closed";
 import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
@@ -1640,9 +1640,11 @@ export interface EmergencyFailClosedDecision {
         | "below-emergency-band"
         | "provider-overflow-abort"
         | "proceed"
+        | "trusted-final-wire-over-limit"
         | "trusted-final-wire-disarm";
     /** Trusted current-pass wire evidence that lets the caller clear its durable latch. */
     disarm?: { finalWireTokens: number; provenLimitTokens: number };
+    refusalMessage?: string;
 }
 
 export function evaluateEmergencyFailClosed(input: {
@@ -1653,9 +1655,19 @@ export function evaluateEmergencyFailClosed(input: {
     finalWireEstimate?: { tokens: number; trusted: boolean };
     /** A current-model limit parsed from a provider overflow response, never a catalog fallback. */
     providerProvenLimitTokens?: number;
+    contextLimitTokens?: number;
+    protectedToolTokens?: number;
 }): EmergencyFailClosedDecision {
     const estimate = input.finalWireEstimate;
     const limit = input.providerProvenLimitTokens;
+    const refusalMessage = outgoingContextRefusal(
+        estimate,
+        input.contextLimitTokens ?? limit,
+        input.protectedToolTokens,
+    );
+    if (refusalMessage) {
+        return { shouldAbort: true, reason: "trusted-final-wire-over-limit", refusalMessage };
+    }
     if (
         input.emergencyRecoveryArmed &&
         estimate?.trusted === true &&
@@ -1675,9 +1687,8 @@ export function evaluateEmergencyFailClosed(input: {
     if (input.usagePercentage < 95) {
         return { shouldAbort: false, reason: "below-emergency-band" };
     }
-    // Inside messages.transform, only the provider's own rejection proves that
-    // this turn shape overflows. Local numeric estimates remain telemetry until
-    // module-side accounting can reproduce provider-accurate framing.
+    // Without complete final-wire evidence, retain the provider-proven recovery
+    // rule. Partial local estimates must not originate a refusal.
     const shouldAbort =
         input.emergencyRecoveryArmed &&
         input.emergencyRecoveryOrigin === "provider_overflow" &&

@@ -2054,6 +2054,7 @@ struct Channel1Target {
 /// handler maps these to a clean Error frame rather than a partial/raw array.
 #[derive(Debug)]
 pub enum TransformError {
+    ProtectedToolResultsOverLimit,
     Store(McStoreError),
     /// Anthropic cannot accept an assistant-terminal retry, and moving completed output
     /// below its own prompt would rewrite conversational causality.
@@ -2100,9 +2101,14 @@ pub enum TransformError {
     LineageProtocol(String),
 }
 
+pub const PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE: &str = "protected_tool_results_over_limit";
+pub const PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE: &str = "The tool results kept by protected_tools are larger than this model's context window, so this turn was not sent. Lower the protected_tools counts.";
+
 impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TransformError::ProtectedToolResultsOverLimit => write!(f,
+                "{PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE}"),
             TransformError::Store(e) => write!(f, "store: {e}"),
             TransformError::AssistantTerminalRetry => write!(
                 f,
@@ -6781,6 +6787,36 @@ fn apply_once(
         &projection,
         meta.coverage_ordinal,
     );
+    // Only current trusted ingress evidence can authorize a native refusal. This
+    // counts the protected results still live after this plan's actual fold;
+    // protected results cannot be reduced by reclaim, so they are a lower bound
+    // on the final request even when other content was successfully reclaimed.
+    if req
+        .usage
+        .as_ref()
+        .is_some_and(|usage| usage.final_wire_trusted)
+        && hard_context_limit_tokens > 0.0
+    {
+        let frozen_units = FrozenUnitLookup::Scan(&core.frozen_units);
+        let protected_result_tokens = tail_for_selection
+            .iter()
+            .filter(|item| {
+                matches!(item.kind, crate::selection::SelKind::ToolResult { .. })
+                    && selection_outcome
+                        .protected_tool_block_ids
+                        .contains(&item.id)
+                    && is_tail(item.ordinal, meta.coverage_ordinal)
+                    && item.id.rsplit_once('#').is_some_and(|(mid, _)| {
+                        output_message_strip_unit(&frozen_units, "stale_reduce", mid).is_none()
+                    })
+            })
+            .map(|item| item.served_token_count.or(item.token_count).unwrap_or(0) as f64)
+            .sum::<f64>()
+            * active_calibration.tools_ratio;
+        if protected_result_tokens > hard_context_limit_tokens {
+            return Err(TransformError::ProtectedToolResultsOverLimit);
+        }
+    }
     let first_applied_command_ids =
         first_applied_pending_command_ids(&pending_agent_drops, &loaded.core, &core);
     let frozen_reductions_before = frozen_red_targets(&loaded.core);

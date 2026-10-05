@@ -96,7 +96,7 @@ import {
 } from "./ctx-reduce-nudge";
 import { DegradedPassRefusalError, degradedPassError } from "./degraded-pass-refusal";
 import { deriveTriggerBudget } from "./derive-budgets";
-import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { contextRefusalError, EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
     historyBudgetPolicyIdentity,
@@ -2739,7 +2739,7 @@ export function createTransform(deps: TransformDeps) {
                   : contextUsage.percentage;
             finalWireEstimate =
                 finalWireEstimate ??
-                (emergencyUsagePercentage >= 95
+                (emergencyUsagePercentage >= 95 || schedulerDecision === "execute"
                     ? estimateFinalWireInputTokens({
                           messages,
                           systemPromptTokens: sessionMeta.systemPromptTokens,
@@ -2869,6 +2869,12 @@ export function createTransform(deps: TransformDeps) {
                 foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
                 finalWireEstimate,
                 providerProvenLimitTokens,
+                contextLimitTokens: boundaryContextLimit,
+                protectedToolTokens: protectedToolTokenCount(
+                    getActiveTagsBySession(db, sessionId),
+                    deps.protectedTools,
+                    resolveDecisionCalibration(modelForBudget?.providerID, modelForBudget?.modelID),
+                ),
             });
             if (emergencyFailClosed.disarm) {
                 clearEmergencyRecovery(db, sessionId);
@@ -2878,6 +2884,9 @@ export function createTransform(deps: TransformDeps) {
                 );
             }
             if (emergencyFailClosed.shouldAbort) {
+                if (emergencyFailClosed.refusalMessage) {
+                    throw contextRefusalError(emergencyFailClosed.refusalMessage);
+                }
                 // The notice must finish before host refusal so recovery instructions survive interruption.
                 try {
                     await host.hostRefusalNotice(
@@ -3291,3 +3300,6 @@ export function resolveHistoryBudgetTokens(
             historyBudgetPercentage,
     );
 }
+
+import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
+import { resolveDecisionCalibration } from "./decision-calibration";

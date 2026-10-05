@@ -1,8 +1,13 @@
 import {
+    type DecisionCalibration,
+    providerMass,
+} from "../../hooks/magic-context/decision-calibration";
+import {
     DEFAULT_PROTECTED_TOOLS,
     mergeProtectedTools,
     normalizeProtectedToolName,
 } from "../../shared/protected-tools-policy";
+import type { TagEntry } from "./types";
 
 export {
     DEFAULT_PROTECTED_TOOLS,
@@ -29,4 +34,16 @@ export function protectedToolTagNumbers(
         counts[name] -= 1;
     }
     return protectedTags;
+}
+export function protectedToolTokenCount(
+    tags: readonly TagEntry[],
+    counts?: Readonly<Record<string, number>>,
+    calibration?: DecisionCalibration,
+): number {
+    const protectedTags = protectedToolTagNumbers(tags, counts);
+    const tokens = tags.reduce(
+        (sum, tag) => sum + (protectedTags.has(tag.tagNumber) ? (tag.tokenCount ?? 0) : 0),
+        0,
+    );
+    return calibration ? providerMass({ tools: tokens }, calibration, true) : tokens;
 }

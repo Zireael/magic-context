@@ -10901,3 +10901,71 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
         for (const m of stripped.slice(1)) expect(reasoningCount(m)).toBe(0);
     });
 });
+function seedProtectedReviewSession(id: string, tool = "probe", repeats = 3000) {
+    db = new Database(":memory:");
+    initializeDatabase(db);
+    const add = (number: number): MessageLike => {
+        insertTag(
+            db,
+            id,
+            `call-${number}`,
+            "tool",
+            repeats * 5,
+            number,
+            0,
+            tool,
+            0,
+            `owner-${number}`,
+            null,
+            { tokenCount: repeats, inputTokenCount: 0, reasoningTokenCount: 0 },
+        );
+        return {
+            info: { id: `owner-${number}`, role: "assistant" },
+            parts: [
+                {
+                    type: "tool",
+                    tool,
+                    callID: `call-${number}`,
+                    state: { status: "completed", input: {}, output: "word ".repeat(repeats) },
+                },
+            ],
+        } as MessageLike;
+    };
+    return { add };
+}
+
+it("impossible protected reclaim refuses an over-limit wire before provider rejection", async () => {
+    const id = "protected-impossible-reclaim";
+    const { add } = seedProtectedReviewSession(id, "probe", 12000);
+    const messages = Array.from({ length: 8 }, (_, index) => add(index + 1));
+    const total = estimateMessageTokens(messages[0]).toolCall * messages.length;
+    expect(total).toBeGreaterThan(16000);
+    const result = await runPostTransformPhase(
+        basePostTransformArgs(db, id, messages, {
+            tags: getActiveTagsBySession(db, id),
+            protectedTools: { probe: 8 },
+            targets: new Map(
+                messages.map((message, index) => [index + 1, makeDropTarget(message)]),
+            ),
+            schedulerDecision: "execute",
+            contextUsage: { percentage: 100, inputTokens: total },
+            usableWindow: 16000,
+            emergencyCeilingTokens: 16000,
+        }),
+    );
+    expect(result.emergencyReclaimedTokens).toBe(0);
+    expect(getTagsBySession(db, id).every((tag) => tag.status === "active")).toBe(true);
+    expect(
+        messages.reduce((sum, message) => sum + estimateMessageTokens(message).toolCall, 0),
+    ).toBeGreaterThan(16000);
+    expect(
+        evaluateEmergencyFailClosed({
+            usagePercentage: 100,
+            emergencyRecoveryArmed: false,
+            emergencyRecoveryOrigin: null,
+            foldMaterializedThisPass: false,
+            finalWireEstimate: { tokens: total, trusted: true },
+            providerProvenLimitTokens: 16000,
+        }).shouldAbort,
+    ).toBe(true);
+});

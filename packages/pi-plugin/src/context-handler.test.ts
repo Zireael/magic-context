@@ -7926,3 +7926,49 @@ describe("Pi proactive strip of invalidated thinking", () => {
 		}
 	});
 });
+it("Pi protected results refuse a successful no-op reclaim before transport", async () => {
+	const db = createTestDb();
+	const sessionId = "pi-protected-pre-send-refusal";
+	const fake = createFakePi();
+	Object.assign(fake.pi, { getAllTools: () => [] });
+	registerPiContextHandler(fake.pi as never, {
+		db,
+		protectedTools: { custom: 8 },
+		protectedTags: 0,
+		heuristics: {},
+		injection: { injectionBudgetTokens: 10000 },
+	});
+	const handler = fake.handlers.get("context") as Parameters<typeof runPass>[0];
+	const messages = [userMessage("start", 1)];
+	for (let n = 1; n <= 8; n++)
+		messages.push(assistantToolCall(`custom-${n}`, "custom", {}, n * 2), {
+			...toolResultMessage(`custom-${n}`, "word ".repeat(20000), n * 2 + 1),
+			toolName: "custom",
+		});
+	const ctx = {
+		...fakeContext(sessionId),
+		getSystemPrompt: () => "You are helpful.",
+		model: {
+			provider: "anthropic",
+			id: "claude-fable-5-1",
+			contextWindow: 50000,
+		},
+		getContextUsage: () => ({
+			tokens: 100000,
+			percent: 200,
+			contextWindow: 50000,
+		}),
+	};
+	try {
+		await expect(
+			handler({ messages: messages as never[] }, ctx as never),
+		).rejects.toMatchObject({
+			code: "protected_tool_results_over_limit",
+			message:
+				"The tool results kept by protected_tools are larger than this model's context window, so this turn was not sent. Lower the protected_tools counts.",
+		});
+	} finally {
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
+});

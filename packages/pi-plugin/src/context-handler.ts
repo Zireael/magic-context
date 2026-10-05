@@ -4005,6 +4005,33 @@ export function registerPiContextHandler(
 				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
 			);
 			runPiDebugAssertion(assertTailHygieneLastWriter);
+			if (
+				!options.compactionOff &&
+				(result.executedWorkThisPass ||
+					isCacheBusting ||
+					schedulerDecision === "execute")
+			) {
+				const envelope = readPiLkgFitEnvelope(
+					ctx,
+					pi,
+					resolvePiContextModelKey(ctx),
+					sessionDecisionCalibration(options.db, sessionId),
+				);
+				const estimate = estimatePiOutgoingInputTokens(
+					outputMessages,
+					envelope,
+				);
+				const refusal = outgoingContextRefusal(
+					estimate,
+					rawFallbackLimit,
+					protectedToolTokenCount(
+						getActiveTagsBySession(options.db, sessionId),
+						options.protectedTools,
+						envelope?.calibration,
+					),
+				);
+				if (refusal) throw contextRefusalError(refusal);
+			}
 			let serializedOutput: PiLkgSerializedOutput | undefined;
 			if (!lkgCompactionOff && lkgPassSnapshot) {
 				let hostEnvelopeSignature: string | undefined;
@@ -8008,3 +8035,10 @@ function runPersistedReplayStage<T>(
 		throw new PiDegradedPassError(site, { cause: error });
 	}
 }
+
+import { protectedToolTokenCount } from "@magic-context/core/features/magic-context/reclaim-protection";
+import {
+	contextRefusalError,
+	outgoingContextRefusal,
+} from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
+import { estimatePiOutgoingInputTokens } from "./pi-raw-fallback";
