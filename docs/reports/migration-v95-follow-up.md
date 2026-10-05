@@ -71,3 +71,39 @@ then an empty working diff:
 
 Restored worker/host tests pass. Detailed mutation output and diff-stat evidence
 are included in the delivery declaration, not inferred from the green suite.
+
+## S1 — offline map diagnosis and paired-backup repair
+
+```sh
+magic-context doctor git-fts-map
+magic-context doctor git-fts-map --repair [--backup-root <directory>]
+```
+
+Diagnosis takes a read-only inventory snapshot and reports missing, mismatched
+and extra map rows. Repair refuses active/uncertain holders, acquires IMMEDIATE
+locks on **both** stores, rechecks holders, VACUUMs and quick-checks a backup
+pair, then rewrites **only** the map inside the context transaction. The store
+lock is rolled back without data changes. Backups explicitly require restoring
+both stores or neither. Repair preserves the FTS corpus/rowids, rendered
+metadata and migration ledger; both anti-joins and SHA storage classes are
+verified before commit. Migration replay refusal names this exact command.
+
+Three new tests introduce missing/extra/wrong-storage-class map entries during
+the rewrite using disposable map triggers. They exercise the **real** verifier,
+not its injected-failure seam, and assert rollback with the verified backup
+retained. Each corresponding verifier mutation reddens only its named test
+(**10 peers pass**). This demonstrates both anti-joins and the type check are
+live controls. The existing holder, backup-before-write and FTS/ledger
+preservation tests remain unchanged.
+
+Fresh verification:
+
+- Doctor/help run: **29 passed**, 129 assertions (Bun 1.4.2).
+- Restored doctor tests: **11 passed**, 46 assertions.
+- CLI lint: **135 files checked**, no errors; one unrelated warning/info.
+- CLI tsc passes using the documented baseline Bun-type workaround.
+- Actual emitted CLI under **Node v24.16.0 / SQLite 3.53.0**: **9 checks passed**.
+  Damaged diagnosis exits 1, repair exits 0, post-diagnosis exits 0. Independent
+  reads find ledger **94**, numeric FTS row **7 / 123**, integer map SHA, unchanged
+  companion store and an empty pre-repair backup map. Driver lsof proves only
+  throwaway context/store/backup files and sidecars were opened.

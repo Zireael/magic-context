@@ -205,6 +205,37 @@ test("failed verification rolls back repair while retaining the paired backup", 
     expect(readdirSync(join(data, "backups"))).toHaveLength(1);
 });
 
+// Interference after the INSERT must be caught by the real verifier, not just
+// an injected exception at its test seam. Each case isolates one inventory error.
+for (const [damage, interference] of [
+    ["a missing row", "DELETE FROM git_commit_fts_rowid_map WHERE fts_rowid=NEW.fts_rowid"],
+    ["an extra row", "INSERT INTO git_commit_fts_rowid_map VALUES(99,'extra')"],
+    [
+        "a wrong SHA storage class",
+        "UPDATE git_commit_fts_rowid_map SET sha=123.0 WHERE fts_rowid=NEW.fts_rowid",
+    ],
+] as const) {
+    test(`repair verification rejects ${damage} introduced during the map rewrite`, () => {
+        mutate(`DELETE FROM git_commit_fts_rowid_map;
+            CREATE TRIGGER interfere_with_map AFTER INSERT ON git_commit_fts_rowid_map
+            WHEN NEW.fts_rowid=7 BEGIN ${interference}; END`);
+        expect(runDoctorGitFtsMap({ repair: true }, deps())).toBe(2);
+        expect(lines.join("\n")).toContain("git FTS map verification failed; repair rolled back");
+        const db = read();
+        try {
+            expect(db.prepare("SELECT count(*) AS n FROM git_commit_fts_rowid_map").get()).toEqual({
+                n: 0,
+            });
+            expect(
+                db.prepare("SELECT sha,message FROM git_commits_fts WHERE rowid=7").get(),
+            ).toEqual({ sha: 123, message: "numeric legacy" });
+        } finally {
+            db.close();
+        }
+        expect(readdirSync(join(data, "backups"))).toHaveLength(1);
+    });
+}
+
 test("missing-map recovery is offline and does not touch FTS or its ledger", () => {
     mutate("DROP TABLE git_commit_fts_rowid_map");
     expect(runDoctorGitFtsMap({}, deps())).toBe(1);

@@ -267,7 +267,9 @@ describe("migration 95", () => {
             db.exec(
                 "DELETE FROM schema_migrations WHERE version=95; DELETE FROM git_commit_fts_rowid_map",
             );
-            expect(() => runMigrations(db)).toThrow("git FTS rowid inventory differs");
+            expect(() => runMigrations(db)).toThrow(
+                /git FTS rowid inventory differs.*magic-context doctor git-fts-map --repair/,
+            );
             expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
                 v: 94,
             });
