@@ -61,8 +61,8 @@ pub const ERROR_CLASS_WIRE_SET: [&str; 4] = [
     "context_overflow",
 ];
 
-/// Runner route-open contract. The received text remains authoritative; these literals only
-/// identify the stage that produced it.
+/// Runner route-open contract. Message literals identify the reporting stage;
+/// typed error classes, when supplied, decide retryability instead of that text.
 pub const RUNNER_REFUSAL_OPEN_CODES: [&str; 1] = ["open_failed"];
 pub const RUNNER_REFUSAL_OPEN_MESSAGE_LITERALS: [&str; 4] = [
     "run resolution failed",
@@ -109,9 +109,20 @@ pub struct RunnerRefusal {
     pub stage: RunnerRefusalStage,
     pub received_code: String,
     pub received_message: String,
+    classification: Option<ErrorClassification>,
+    class_field_present: bool,
 }
 
 impl RunnerRefusal {
+    /// Older runners supplied only text. Never let that text override a typed
+    /// class, or permanently cache a refusal with an unknown future class.
+    pub fn is_durable(&self) -> bool {
+        if let Some(classification) = self.classification {
+            return classification.class == ErrorClass::Permanent;
+        }
+        !self.class_field_present && self.stage.is_durable()
+    }
+
     fn from_open_body(body: &ProducerErrorBody) -> Option<Self> {
         if !RUNNER_REFUSAL_OPEN_CODES.contains(&body.code.as_str()) {
             return None;
@@ -132,6 +143,8 @@ impl RunnerRefusal {
             stage,
             received_code: body.code.clone(),
             received_message: body.message.clone(),
+            classification: body.classification(),
+            class_field_present: body.has_class_field(),
         })
     }
 }
@@ -230,7 +243,15 @@ impl ProducerErrorBody {
             .and_then(Value::as_str)
             .unwrap_or("producer error")
             .to_string();
-        let (classification, class_field_present) = classification_from_object(&value);
+        // Broca route-open failures carry their class in detail, not at the
+        // top level used by ordinary producer errors. Absent detail.class keeps
+        // the legacy message-based decision; unknown present classes do not.
+        let class_source = if code == "open_failed" {
+            value.get("detail").unwrap_or(&Value::Null)
+        } else {
+            &value
+        };
+        let (classification, class_field_present) = classification_from_object(class_source);
         Self {
             code,
             message,
@@ -395,6 +416,9 @@ pub enum HistorianProducerError {
         retracted: bool,
     },
     MissingSession,
+    RunnerSessionDeletionUnsupported {
+        session_id: String,
+    },
     HostRunnerRequiresHostTransport,
     UnexpectedStreamEnd,
     TimedOut,
@@ -629,6 +653,10 @@ impl fmt::Display for HistorianProducerError {
             HistorianProducerError::MissingSession => {
                 write!(f, "historian producer has no bound session")
             }
+            HistorianProducerError::RunnerSessionDeletionUnsupported { session_id } => write!(
+                f,
+                "runner cannot delete session {session_id}; Broca's append-only write-ahead log retains it until archival after 7 days"
+            ),
             HistorianProducerError::HostRunnerRequiresHostTransport => {
                 write!(f, "host historian runner does not use a subc module route")
             }
@@ -673,6 +701,7 @@ impl Error for HistorianProducerError {
             | HistorianProducerError::MissingRunId
             | HistorianProducerError::SendQueued { .. }
             | HistorianProducerError::MissingSession
+            | HistorianProducerError::RunnerSessionDeletionUnsupported { .. }
             | HistorianProducerError::HostRunnerRequiresHostTransport
             | HistorianProducerError::UnexpectedStreamEnd
             | HistorianProducerError::TimedOut
@@ -831,6 +860,11 @@ impl HistorianProducer {
             ))
         })?;
         let mut params = serde_json::Map::new();
+        // Each historian firing (including model fallbacks) and dreamer attempt owns
+        // a distinct session id. Use that durable attempt identity, not a connection
+        // nonce or frame correlation id: resending after a lost reply must deduplicate,
+        // while a new attempt after a classified failure must start a new run.
+        params.insert("send_id".into(), json!(session_id));
         params.insert("prompt".into(), json!(prompt));
         params.insert(
             "model".into(),
@@ -942,16 +976,18 @@ impl HistorianProducer {
         Ok(())
     }
 
-    /// Delete the bound provider session before releasing its routes. Dreamer
-    /// sessions contain memory-pool snapshots, so retention settings never apply.
+    /// Release routes, but report that the runner cannot delete session data.
+    /// Dreamer sessions contain memory-pool snapshots; closing a route does not
+    /// remove those snapshots from Broca's append-only write-ahead log.
     pub async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
-        self.bind_session(session_id.to_string());
-        let route = self.ensure_command_route().await?;
-        let _ = self
-            .unary_json(route, json!({ "method": "session.delete", "params": {} }))
-            .await?;
         self.close().await;
-        Ok(())
+        static RETENTION_WARNING: std::sync::Once = std::sync::Once::new();
+        RETENTION_WARNING.call_once(|| {
+            tracing::warn!("[mc-module] runner cannot delete sessions: Broca has no session.delete operation; its write-ahead log is append-only and archives after 7 days. Dreamer memory-pool snapshots sent to the runner stay in Broca's store until archived; closing routes does not delete them.");
+        });
+        Err(HistorianProducerError::RunnerSessionDeletionUnsupported {
+            session_id: session_id.to_string(),
+        })
     }
 
     pub async fn close(&mut self) {
@@ -1777,6 +1813,70 @@ mod tests {
     }
 
     #[test]
+    fn open_failed_detail_class_overrides_message_and_unknown_classes_never_fall_back() {
+        for (class, message, durable, retryable) in [
+            ("permanent", "runner selection rejected", true, false),
+            (
+                "transient",
+                "run resolution failed: unknown model 'x'",
+                false,
+                true,
+            ),
+            (
+                "permanent",
+                "rate limit; no apikey credential for provider 'x'",
+                true,
+                false,
+            ),
+            (
+                "future_class",
+                "rate limit; unknown provider 'x'",
+                false,
+                false,
+            ),
+        ] {
+            let parsed = error_body(
+                &serde_json::to_vec(&json!({
+                    "code": "open_failed",
+                    "message": message,
+                    "detail": {"class": class, "retry_after_secs": 120}
+                }))
+                .unwrap(),
+            );
+            let error = HistorianProducerError::Subc(parsed);
+            assert!(error.has_class_field());
+            assert_eq!(error.is_retryable_model_failure(), retryable, "{class}");
+            assert_eq!(
+                error.runner_refusal().unwrap().is_durable(),
+                durable,
+                "{class}"
+            );
+            assert_eq!(
+                error.classification(),
+                ErrorClass::from_wire(class).map(|class| ErrorClassification {
+                    class,
+                    retry_after_secs: Some(120),
+                })
+            );
+        }
+        for detail in [Value::Null, json!({"cause": "catalog"})] {
+            let error = HistorianProducerError::Subc(error_body(
+                &serde_json::to_vec(&json!({
+                    "code": "open_failed",
+                    "message": "run resolution failed: unknown model 'x'",
+                    "detail": detail
+                }))
+                .unwrap(),
+            ));
+            assert!(!error.has_class_field());
+            assert!(
+                error.runner_refusal().unwrap().is_durable(),
+                "legacy stage fallback"
+            );
+        }
+    }
+
+    #[test]
     fn error_class_wire_strings_match_pinned_contract_set() {
         assert_eq!(
             ERROR_CLASS_WIRE_SET,
@@ -1887,6 +1987,14 @@ mod tests {
     }
 
     async fn fake_server(send_response: Value, stream_events: Vec<Value>) -> FakeServer {
+        fake_server_with_lost_send_reply(send_response, stream_events, false).await
+    }
+
+    async fn fake_server_with_lost_send_reply(
+        send_response: Value,
+        stream_events: Vec<Value>,
+        mut lose_first_reply: bool,
+    ) -> FakeServer {
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
@@ -1912,85 +2020,90 @@ mod tests {
         let log = Arc::new(Mutex::new(ServerLog::default()));
         let log_task = Arc::clone(&log);
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            authenticate_server(
-                &mut stream,
-                &key,
-                &daemon_id,
-                "fake",
-                Duration::from_secs(2),
-            )
-            .await
-            .unwrap();
-            let mut next_route = 10u16;
-            let mut route_sessions = std::collections::HashMap::<u16, String>::new();
             let mut stream_events: VecDeque<Value> = stream_events.into();
             loop {
-                let Some(frame) = read_frame(&mut stream).await.unwrap() else {
-                    break;
-                };
-                match frame.header.ty {
-                    FrameType::Goodbye => {
-                        log_task.lock().await.goodbyes.push(frame.header.channel);
-                    }
-                    FrameType::Request if frame.header.channel == 0 => {
-                        let req: ClientControlRequest =
-                            serde_json::from_slice(&frame.body).unwrap();
-                        if let ClientControlRequest::RouteOpen { identity, .. } = req {
-                            let route = next_route;
-                            next_route += 1;
-                            route_sessions.insert(route, identity.session.clone());
-                            log_task.lock().await.route_sessions.push(identity.session);
-                            send_response_frame(
-                                &mut stream,
-                                frame.header.channel,
-                                frame.header.epoch,
-                                frame.header.corr,
-                                serde_json::to_vec(&ClientControlResponse::RouteOpen {
-                                    route_channel: route,
-                                    route_epoch: 1,
-                                })
-                                .unwrap(),
-                            )
-                            .await;
+                let (mut stream, _) = listener.accept().await.unwrap();
+                authenticate_server(
+                    &mut stream,
+                    &key,
+                    &daemon_id,
+                    "fake",
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+                let mut next_route = 10u16;
+                let mut route_sessions = std::collections::HashMap::<u16, String>::new();
+                loop {
+                    let Some(frame) = read_frame(&mut stream).await.unwrap() else {
+                        break;
+                    };
+                    match frame.header.ty {
+                        FrameType::Goodbye => {
+                            log_task.lock().await.goodbyes.push(frame.header.channel);
                         }
-                    }
-                    FrameType::Request => {
-                        let req: Value = serde_json::from_slice(&frame.body).unwrap();
-                        match req.get("method").and_then(Value::as_str) {
-                            Some("session.send") => {
-                                log_task.lock().await.sends.push(req["params"].clone());
+                        FrameType::Request if frame.header.channel == 0 => {
+                            let req: ClientControlRequest =
+                                serde_json::from_slice(&frame.body).unwrap();
+                            if let ClientControlRequest::RouteOpen { identity, .. } = req {
+                                let route = next_route;
+                                next_route += 1;
+                                route_sessions.insert(route, identity.session.clone());
+                                log_task.lock().await.route_sessions.push(identity.session);
                                 send_response_frame(
                                     &mut stream,
                                     frame.header.channel,
                                     frame.header.epoch,
                                     frame.header.corr,
-                                    serde_json::to_vec(&send_response).unwrap(),
+                                    serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                                        route_channel: route,
+                                        route_epoch: 1,
+                                    })
+                                    .unwrap(),
                                 )
                                 .await;
                             }
-                            Some("session.subscribe") => {
-                                log_task.lock().await.subscribes.push(req["params"].clone());
-                                while let Some(event) = stream_events.pop_front() {
-                                    send_stream_data(
+                        }
+                        FrameType::Request => {
+                            let req: Value = serde_json::from_slice(&frame.body).unwrap();
+                            match req.get("method").and_then(Value::as_str) {
+                                Some("session.send") => {
+                                    log_task.lock().await.sends.push(req["params"].clone());
+                                    if lose_first_reply {
+                                        lose_first_reply = false;
+                                        continue;
+                                    }
+                                    send_response_frame(
                                         &mut stream,
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        event,
+                                        serde_json::to_vec(&send_response).unwrap(),
                                     )
                                     .await;
                                 }
-                                send_stream_end(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                )
-                                .await;
-                            }
-                            Some("run.status") => {
-                                send_response_frame(
+                                Some("session.subscribe") => {
+                                    log_task.lock().await.subscribes.push(req["params"].clone());
+                                    while let Some(event) = stream_events.pop_front() {
+                                        send_stream_data(
+                                            &mut stream,
+                                            frame.header.channel,
+                                            frame.header.epoch,
+                                            frame.header.corr,
+                                            event,
+                                        )
+                                        .await;
+                                    }
+                                    send_stream_end(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                    )
+                                    .await;
+                                }
+                                Some("run.status") => {
+                                    send_response_frame(
                                     &mut stream,
                                     frame.header.channel,
                                     frame.header.epoch,
@@ -2001,35 +2114,36 @@ mod tests {
                                     .unwrap(),
                                 )
                                 .await;
+                                }
+                                Some("run.cancel") => {
+                                    send_response_frame(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        serde_json::to_vec(&json!({"ack":true})).unwrap(),
+                                    )
+                                    .await;
+                                }
+                                Some("session.retract") => {
+                                    log_task.lock().await.retracts.push(req["params"].clone());
+                                    send_response_frame(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        serde_json::to_vec(&json!({"result":"retracted"})).unwrap(),
+                                    )
+                                    .await;
+                                }
+                                other => panic!(
+                                    "unexpected request {other:?} on route {:?}",
+                                    route_sessions.get(&frame.header.channel)
+                                ),
                             }
-                            Some("run.cancel") => {
-                                send_response_frame(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                    serde_json::to_vec(&json!({"ack":true})).unwrap(),
-                                )
-                                .await;
-                            }
-                            Some("session.retract") => {
-                                log_task.lock().await.retracts.push(req["params"].clone());
-                                send_response_frame(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                    serde_json::to_vec(&json!({"result":"retracted"})).unwrap(),
-                                )
-                                .await;
-                            }
-                            other => panic!(
-                                "unexpected request {other:?} on route {:?}",
-                                route_sessions.get(&frame.header.channel)
-                            ),
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         });
@@ -2103,6 +2217,141 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn lost_send_reply_retry_reuses_attempt_send_id_after_reconnect() {
+        let server = fake_server_with_lost_send_reply(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            true,
+        )
+        .await;
+        let mut first = client(&server).await;
+        first.config.request_timeout = Duration::from_millis(50);
+        let session = "mc-historian:proj:lineage:1";
+        let error = first
+            .start(session, "role", "prompt", "prov/model-a")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HistorianProducerError::TimedOut));
+        first.close().await;
+        drop(first);
+
+        // A retry of the same logical send survives a fresh connection and corr id.
+        let mut retry = client(&server).await;
+        let handle = retry
+            .start(session, "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        assert_eq!(handle.run_id, "run-1");
+        retry.close().await;
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 2);
+        assert_eq!(log.sends[0]["send_id"], json!(session));
+        assert_eq!(log.sends[1]["send_id"], json!(session));
+    }
+
+    #[tokio::test]
+    async fn new_historian_and_dreamer_attempts_get_distinct_send_ids() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        let sessions = [
+            crate::historian::historian_producer_session_id("proj", "lineage", 1),
+            crate::historian::historian_producer_session_id("proj", "lineage", 2),
+            crate::classify::child_session_id("proj", "command", 1),
+            crate::classify::child_session_id("proj", "command", 2),
+        ];
+        for session in &sessions {
+            client
+                .start(session, "role", "prompt", "prov/model-a")
+                .await
+                .unwrap();
+            client.close().await;
+        }
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), sessions.len());
+        let ids = log
+            .sends
+            .iter()
+            .map(|params| params["send_id"].as_str().expect("send_id on every send"))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            sessions.len(),
+            "even identical prompts need a new id for a new attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_session_reports_retention_and_closes_both_routes() {
+        const CHILD: &str = "MC_TEST_RUNNER_RETENTION_CHILD";
+        const TEST: &str =
+            "historian_producer::tests::purge_session_reports_retention_and_closes_both_routes";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate the process-wide once-only warning from parallel tests.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "retention child failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Arc::clone(&logs);
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || LogWriter(Arc::clone(&writer)))
+                .finish(),
+        )
+        .unwrap();
+        let server = fake_server(json!({}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client.bind_session("mc-dreamer:classify:snapshot");
+        client.ensure_command_route().await.unwrap();
+        client.ensure_subscribe_route().await.unwrap();
+        let error = crate::historian::HistorianProducerDriver::purge_session(
+            &mut client,
+            "mc-dreamer:classify:snapshot",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianProducerError::RunnerSessionDeletionUnsupported { .. }
+        ));
+        assert!(error.to_string().contains("until archival after 7 days"));
+        assert!(client.command_route.is_none());
+        assert!(client.subscribe_route.is_none());
+        client.purge_session("another-snapshot").await.unwrap_err();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let log = server.log.lock().await;
+        assert_eq!(log.route_sessions, vec!["mc-dreamer:classify:snapshot"; 2]);
+        assert_eq!(log.goodbyes, vec![11, 10]);
+        assert!(log.sends.is_empty());
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(logs.matches("runner cannot delete sessions").count(), 1);
+        assert!(logs.contains("memory-pool snapshots"));
+        assert!(logs.contains("archives after 7 days"));
     }
 
     #[tokio::test]

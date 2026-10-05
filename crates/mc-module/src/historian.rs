@@ -56,9 +56,9 @@ struct HistorianRunnerRefusalCacheState {
     transient: BTreeMap<String, TransientRunnerRefusal>,
 }
 
-/// Runner refusals are shared across sessions. Provider and model catalog failures remain cached
-/// until the model chain changes; credential and other resolution failures use an expiring retry
-/// for each model.
+/// Runner refusals are shared across sessions. Typed permanent failures remain
+/// cached until the model chain changes; other classes use an expiring retry.
+/// Older runners without a class use the provider/model stage as the durable fallback.
 #[derive(Debug, Default)]
 pub struct HistorianRunnerRefusalCache {
     state: Mutex<HistorianRunnerRefusalCacheState>,
@@ -134,7 +134,7 @@ impl HistorianRunnerRefusalCache {
         if state.generation != generation {
             return None;
         }
-        if refusal.stage.is_durable() {
+        if refusal.is_durable() {
             state.durable.insert(model.to_string(), refusal);
             state.transient.remove(model);
             return None;
@@ -1208,11 +1208,12 @@ pub trait HistorianProducerDriver: Send {
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError>;
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError>;
     async fn close(&mut self);
-    /// Delete the provider session on every terminal path. The default calls close()
-    /// for compatibility with older test producers, while production producers override
-    /// this method to explicitly delete session data before closing.
-    async fn purge_session(&mut self, _session_id: &str) {
+    /// Release the provider session on every terminal path. The default closes
+    /// test/host transports; module runners report unsupported deletion rather
+    /// than claiming that closing routes removed their retained snapshots.
+    async fn purge_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
         self.close().await;
+        Ok(())
     }
 }
 
@@ -1315,13 +1316,8 @@ impl HistorianProducerDriver for HistorianProducer {
         HistorianProducer::close(self).await;
     }
 
-    async fn purge_session(&mut self, session_id: &str) {
-        if HistorianProducer::purge_session(self, session_id)
-            .await
-            .is_err()
-        {
-            HistorianProducer::close(self).await;
-        }
+    async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
+        HistorianProducer::purge_session(self, session_id).await
     }
 }
 
@@ -2138,7 +2134,7 @@ where
                             )
                         })
                         .or_else(|| {
-                            (!refusal.stage.is_durable()).then_some(request.failure_backoff_at_ms)
+                            (!refusal.is_durable()).then_some(request.failure_backoff_at_ms)
                         });
                     if let Some(retry_at_ms) = retry_at_ms {
                         earliest_runner_retry_ms = Some(
@@ -4590,6 +4586,42 @@ mod tests {
         assert_eq!(recovered.observed_starts.len(), 1);
         assert_eq!(cache.activate_chain(&models), generation);
         assert!(cache.cached_refusal(generation, &models[0], 999).is_none());
+    }
+
+    #[test]
+    fn typed_runner_refusal_class_controls_durable_cache_not_reporting_stage() {
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+        let cache = HistorianRunnerRefusalCache::default();
+        let generation = cache.activate_chain(&models);
+        let permanent = HistorianProducerError::tagged_subc(
+            "open_failed",
+            "no apikey credential for provider 'prov'",
+            ErrorClass::Permanent,
+            None,
+        )
+        .runner_refusal()
+        .unwrap();
+        let transient = HistorianProducerError::tagged_subc(
+            "open_failed",
+            "unknown model 'model-b'",
+            ErrorClass::Transient,
+            None,
+        )
+        .runner_refusal()
+        .unwrap();
+        assert_eq!(permanent.stage, RunnerRefusalStage::Credential);
+        assert_eq!(transient.stage, RunnerRefusalStage::Model);
+        assert_eq!(
+            cache.record_refusal(generation, &models[0], permanent, 100, 500),
+            None
+        );
+        assert_eq!(
+            cache.record_refusal(generation, &models[1], transient, 100, 500),
+            Some(600)
+        );
+        assert_eq!(cache.cached_durable_refusals(generation, &models).len(), 1);
+        assert!(cache.cached_refusal(generation, &models[0], 601).is_some());
+        assert!(cache.cached_refusal(generation, &models[1], 601).is_none());
     }
 
     #[test]
