@@ -16,7 +16,10 @@ function fixturePath(): string {
 }
 
 function openFiles(path: string): string[] {
-    const inventory = spawnSync("lsof", ["-p", String(process.pid), "-Fn"], { encoding: "utf8" });
+    const inventory = spawnSync("lsof", ["-p", String(process.pid), "-Fn"], {
+        encoding: "utf8",
+        windowsHide: true,
+    });
     expect(inventory.status).toBe(0);
     return inventory.stdout.split("\n").filter((line) => line.startsWith(`n${path}`));
 }
