@@ -47,7 +47,7 @@ import { readSessionCacheTtl } from "../features/magic-context/session-cache-ttl
 import { getQuickJsNativeMemoryStats } from "../features/magic-context/smart-notes/sandbox-runner";
 import {
     type ContextDatabase as Database,
-    openDatabase,
+    openCurrentDatabase as openDatabase,
     setSessionWorkMetrics,
 } from "../features/magic-context/storage";
 import {

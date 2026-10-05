@@ -64,9 +64,9 @@ import { installV95PerfSchema } from "./migration-v95-perf-indexes";
 import { runMigrationsOffThread } from "./migration-worker-client";
 import {
     FORK_MIGRATION_VERSION_FLOOR,
+    getMainThreadMigrationBodyCount,
     hasPendingMigrations,
     runMigrations,
-    runMigrationsWithRetry,
 } from "./migrations";
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
@@ -234,6 +234,8 @@ export interface DatabaseBootTimings {
 }
 
 export interface OpenDatabaseOptions {
+    /** Host-side synchronous reads may reuse/open only an already-current schema. */
+    allowMigrations?: boolean;
     dbPath?: string;
     latestSupportedVersion?: number;
     /** Test/diagnostic override; production uses BOOT_SQLITE_BUSY_TIMEOUT_MS. */
@@ -2579,7 +2581,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // An upgrade changes indexes/triggers only inside the migration transaction.
     // Fresh/current schemas share the same installer, without rescanning FTS on open.
     const version = getPersistedSchemaVersion(db);
-    if (version === 0 || version >= 95) installV95PerfSchema(db);
+    if (version === 0 || version >= 95) installV95PerfSchema(db, false, version === 0);
 }
 
 const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
@@ -2706,12 +2708,24 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             closeQuietly(db);
             return null;
         }
+        if (options?.allowMigrations === false && hasPendingMigrations(db)) {
+            log(
+                `[magic-context] storage not ready: pending migrations at ${dbPath}; host callers must await the async opener`,
+            );
+            closeQuietly(db);
+            return null;
+        }
         if (!enforceMigrationOnOpenGuard(db, dbPath, dbDir, latestSupportedVersion)) {
             closeQuietly(db);
             return null;
         }
         initializeDatabase(db, busyTimeoutMs);
-        runMigrations(db);
+        if (options?.allowMigrations === false) {
+            if (hasPendingMigrations(db)) {
+                closeQuietly(db);
+                return null;
+            }
+        } else runMigrations(db);
         ensureContextStoreUuid(db);
         return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
     } catch (error) {
@@ -2726,6 +2740,11 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
         );
     }
+}
+
+/** Tool/RPC/timer access must not turn an earlier async boot failure into a synchronous upgrade. */
+export function openCurrentDatabase(options: OpenDatabaseOptions = {}): Database | null {
+    return openDatabase({ ...options, allowMigrations: false });
 }
 
 /**
@@ -2765,6 +2784,7 @@ export async function openDatabaseAsync(
 
     const opening = (async (): Promise<Database | null> => {
         let db: Database | undefined;
+        const mainThreadBodiesBefore = getMainThreadMigrationBodyCount();
         const openStartedAt = performance.now();
         let openMs = 0;
         let guardMs = 0;
@@ -2803,17 +2823,31 @@ export async function openDatabaseAsync(
             // worker has committed, so no caller can read a half-migrated schema.
             // With nothing pending, nothing is started and the open costs what it
             // did before.
-            if (isFileBackedPath(dbPath) && hasPendingMigrations(db)) {
+            if (hasPendingMigrations(db)) {
+                if (!isFileBackedPath(dbPath)) {
+                    throw new Error(
+                        "async migration requires a file-backed database; use the explicit synchronous opener for in-memory or URI test databases",
+                    );
+                }
                 await runMigrationsOffThread({
                     dbPath,
                     busyTimeoutMs,
                     sqlitePragmaConfig: { ...sqlitePragmaConfig },
                 });
             }
-            // Already-current after the worker, so this reaches runMigrations' read-only
-            // fast path. If no worker could start, this applies the migrations here.
+            // A worker must finish the upgrade before the main connection initializes.
+            // Never substitute the synchronous runner for a failed or incomplete worker.
+            if (hasPendingMigrations(db)) {
+                throw new Error(
+                    "the migration worker did not complete the pending migration; reinstall or rebuild the plugin",
+                );
+            }
             initializeDatabase(db, busyTimeoutMs);
-            await runMigrationsWithRetry(db);
+            if (hasPendingMigrations(db)) {
+                throw new Error(
+                    "storage initialization left a pending migration; reinstall or rebuild the plugin",
+                );
+            }
             ensureContextStoreUuid(db);
             const opened = finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
             migrateMs = performance.now() - migrateStartedAt;
@@ -2826,6 +2860,9 @@ export async function openDatabaseAsync(
                 `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
             );
         } finally {
+            log(
+                `[migrations] async open main-thread migration-body count: ${getMainThreadMigrationBodyCount() - mainThreadBodiesBefore} (total=${getMainThreadMigrationBodyCount()}) path=${dbPath}`,
+            );
             if (openMs === 0) openMs = performance.now() - openStartedAt;
             if (guardStartedAt !== null && guardMs === 0) {
                 guardMs = performance.now() - guardStartedAt;

@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { enforceProjectCap, upsertCommits } from "./git-commits/storage-git-commits";
 import {
+    GIT_FTS_MAP_DISAGREEMENT_SQL,
     installV95PerfSchema,
     tagOrderConstraintIndex,
     V95_REDUNDANT_INDEXES,
@@ -200,9 +201,20 @@ describe("migration 95", () => {
             runMigrations(db);
             const before = fts(db);
             const changes = db.prepare("SELECT total_changes() AS n").get();
+            const prepares = spyOn(db, "prepare");
             installV95PerfSchema(db);
             expect(db.prepare("SELECT total_changes() AS n").get()).toEqual(changes);
             initializeDatabase(db);
+            // Integrity scans belong to migration replay and explicit offline doctor,
+            // not the steady-state host open whose cost should stay metadata-only.
+            expect(
+                prepares.mock.calls.some(
+                    ([sql]) =>
+                        sql === GIT_FTS_MAP_DISAGREEMENT_SQL ||
+                        sql.includes("SELECT rowid, sha FROM git_commits_fts"),
+                ),
+            ).toBe(false);
+            prepares.mockRestore();
             expect(fts(db)).toEqual(before);
             expect(map(db)).toEqual(identities(db));
             for (const name of V95_REDUNDANT_INDEXES)
@@ -284,6 +296,54 @@ describe("migration 95", () => {
             ).toThrow("rollback");
             db.exec("ALTER TABLE tags ADD COLUMN extra TEXT; CREATE INDEX other ON tags(other)");
             expect(tagOrderConstraintIndex(db)).toBe(original);
+        } finally {
+            db.close();
+        }
+    });
+
+    test("numeric legacy FTS SHA survives migration and replay without matching a text SHA", () => {
+        const db = v94();
+        try {
+            db.prepare(
+                "INSERT INTO git_commits_fts(rowid,sha,project_path,message) VALUES (7,123,'project','numeric legacy')",
+            ).run();
+            runMigrations(db);
+            expect(
+                db
+                    .prepare(
+                        "SELECT typeof(f.sha) AS ft, typeof(m.sha) AS mt FROM git_commits_fts f JOIN git_commit_fts_rowid_map m ON m.fts_rowid=f.rowid WHERE f.rowid=7",
+                    )
+                    .get(),
+            ).toEqual({ ft: "integer", mt: "integer" });
+            db.exec("DELETE FROM schema_migrations WHERE version=95");
+            runMigrations(db);
+            upsertCommits(db, "project", [{ ...commit, sha: "123" }]);
+            expect(
+                db.prepare("SELECT rowid,sha,message FROM git_commits_fts WHERE rowid=7").get(),
+            ).toEqual({ rowid: 7, sha: 123, message: "numeric legacy" });
+            db.prepare("DELETE FROM git_commits WHERE sha=?").run("123");
+            expect(identities(db)).toEqual([{ rowid: 7, sha: 123 }]);
+            expect(map(db)).toEqual(identities(db));
+        } finally {
+            db.close();
+        }
+    });
+
+    test("a current initializer refuses a missing map without scanning or rebuilding FTS", () => {
+        const db = v94();
+        try {
+            upsertCommits(db, "project", [commit]);
+            runMigrations(db);
+            db.exec("DROP TABLE git_commit_fts_rowid_map");
+            expect(() => initializeDatabase(db)).toThrow(
+                "magic-context doctor git-fts-map --repair",
+            );
+            expect(
+                db
+                    .prepare("SELECT 1 FROM sqlite_master WHERE name='git_commit_fts_rowid_map'")
+                    .get(),
+            ).toBeNull();
+            expect(fts(db)).toHaveLength(1);
         } finally {
             db.close();
         }

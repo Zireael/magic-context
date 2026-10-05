@@ -3270,6 +3270,10 @@ export function hasPendingMigrations(db: Database): boolean {
 let mainThreadMigrationBodies = 0;
 
 export function __getMainThreadMigrationBodyCountForTests(): number {
+    return getMainThreadMigrationBodyCount();
+}
+
+export function getMainThreadMigrationBodyCount(): number {
     return mainThreadMigrationBodies;
 }
 

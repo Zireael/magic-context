@@ -430,7 +430,7 @@ the current relationship, including duplicate/orphan legacy FTS rows, instead:
 ```sql
 CREATE TABLE IF NOT EXISTS git_commit_fts_rowid_map (
     fts_rowid INTEGER PRIMARY KEY,
-    sha TEXT
+    sha BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_git_commit_fts_rowid_map_sha
     ON git_commit_fts_rowid_map(sha);
@@ -470,7 +470,8 @@ AFTER UPDATE OF message, project_path ON git_commits BEGIN
 END;
 ```
 
-sha stays nullable in the map to preserve legacy FTS storage classes/NULLs; it
+sha has BLOB affinity (no coercion) and stays nullable in the map to preserve
+legacy FTS storage classes/NULLs; it
 is not UNIQUE because the old trigger deletes **all** same-SHA rows. No FK to
 git_commits: a cascade would lose orphan rowids the old pre-delete could remove.
 Use `=` on sha, as before, not NULL-equal matching. Existing public upserts do
@@ -1075,3 +1076,228 @@ search hints are deterministic under all timing schedules.
   deleted after connections close. No binary placement or live migration is
   performed. ARCHITECTURE.md, STRUCTURE.md, compaction-marker-manager.ts,
   compartment-storage.ts and selection/config files remain unchanged.
+
+## Adversarial-review follow-up
+
+The review in `docs/reports/migration-v95-review.md` was imported by merging
+master before these changes. The parent clarified that **v95 is unshipped**:
+no live/user store has applied it. Accordingly its map DDL is corrected in place,
+with no conversion shim, v96, cache reset or store.db change. Every follow-up
+rehearsal starts from a fresh v94 backup clone and the final emitted bundles.
+
+### B1: unavailable workers fail closed
+
+Worker construction errors, pre-ready errors/exits, and completion before ready
+now reject with the underlying cause and **“the migration worker could not
+start; reinstall or rebuild the plugin”** guidance. The async opener contains
+no main-thread migration-runner call. It refuses incomplete workers while a
+migration remains pending, and refuses pending in-memory/URI async opens rather
+than quietly using a synchronous path. Explicit synchronous opens still migrate
+for CLI/tests; the existing counter control proves that path is observable.
+
+Synchronous host access after bootstrap is explicitly **current-schema-only**.
+Tool registration, startup maintenance, RPC and dream triggers cannot cold-migrate
+after an earlier async open failed: they reuse/open a current store or return
+unavailable and let the async recovery path own the upgrade. This closes the
+secondary registration path that could otherwise resurrect the forbidden fallback.
+The explicit sync opener remains unchanged by default for offline CLI/tests.
+The OpenCode 1 failure test also calls the real tool registry after failed boot
+and requires an empty registry and zero main-thread bodies. Healthy registry
+fixtures now explicitly establish storage first, as the real host does.
+
+The old fallback-success assertion was replaced deliberately: fallback is now
+forbidden because a supervised host can otherwise stall, be killed, roll back
+the transaction and repeat the same stalled migration on restart. This changes
+broken-install startup from apparent recovery to a clear storage refusal, not
+healthy transform behavior. OpenCode 1's actual async session-hook factory records
+the storage failure and its primary transform refuses; OpenCode 2's actual boot
+gate refuses before a request; Pi's actual extension factory installs its
+fail-closed surface and the installed Pi context runner aborts. Default blocking
+and compaction settings are used; existing explicit user opt-outs are unchanged.
+
+New logs expose worker ready, connection close, and async-open main-thread
+migration-body delta/total. Commit is the existing applied-v95 log after COMMIT.
+The real-host records below show **delta=0 and total=0**. A missing-worker mutation
+that actually runs the old synchronous migration made only
+**“a worker that cannot load refuses pending v95 without a main-thread fallback”**
+fail; **9 worker-test peers passed**. The mutation was restored before builds.
+
+### S1: explicit offline diagnosis and map-only repair
+
+Commands:
+
+```sh
+magic-context doctor git-fts-map
+magic-context doctor git-fts-map --repair [--backup-root <directory>]
+```
+
+The first command is a read-only, single-snapshot inventory check. It reports
+missing map rows, mismatched values/storage classes and extra rows. It does not
+create a database, migrate, fix the map, or rebuild FTS. These scans are **not**
+added to normal opens. A missing entire map on a current store now refuses online
+initialization with the offline command, rather than silently scanning/backfilling
+it on the host thread. Existing-map disagreement during migration replay names
+the same command.
+
+Repair requires both context.db and store.db, a supported context lane (94 for
+lost-ledger recovery or 95), and all OpenCode, Pi/OMP, dashboard and ck-mc holders
+stopped. Holder uncertainty also refuses. It locks **both files IMMEDIATE**,
+rechecks holders, takes read-only VACUUM snapshots of committed data in a unique
+backup directory, and quick-checks both snapshots **before changing any map row**.
+The locks prevent a new writer from splitting the backup consistency unit. The
+store transaction has no mutations and is rolled back. Backup manifests and
+messages explicitly require restoring both stores or neither.
+
+Within that same context IMMEDIATE transaction, the only data rewrite is:
+
+```sql
+DELETE FROM git_commit_fts_rowid_map;
+INSERT INTO git_commit_fts_rowid_map(fts_rowid, sha)
+SELECT rowid, sha FROM git_commits_fts;
+```
+
+If the map table itself is absent, only its final table/index are provisioned
+inside this offline transaction. Both anti-joins verify exact rowid/value/**type**
+inventory before COMMIT; failure rolls back. No schema-ledger row is inserted or
+forced, no UUID is minted, no FTS row is deleted/retokenized, and no rendered
+head/replay decision is invalidated. Existing stale/orphan FTS documents are
+intentionally preserved; corpus cleanup remains a separate policy decision.
+Normal v95 replay can proceed after a lost-ledger repair.
+
+**8 doctor tests** cover read-only damage diagnosis, backup-before-write ordering,
+paired-store presence, initial/late holders, verification rollback, entire-map
+absence, raw numeric SHA preservation and unchanged metadata/FTS/ledger. The
+emitted CLI was also exercised under **Node v24.16.0 / SQLite 3.53.0**: damaged
+diagnostic exits 1, repair verifies a backup pair, post-diagnostic exits 0. Four
+independent result assertions verify ledger **94**, integer SHA **123**, and
+actual FTS rowid **7**. A late-holder-recheck mutation reddened only its named
+doctor test (**7 peers passed**). A forced normal-open inventory scan reddened
+only the current-initializer test (**9 v95 peers passed**).
+
+### S2: preserve numeric SHA storage and old matching
+
+The map's `sha BLOB` column has **no affinity coercion**. It keeps text, integer,
+real, BLOB and NULL values from FTS; the replay/doctor anti-joins also compare
+`typeof`, not just SQLite value equality. The review's exact orphan probe is
+included: `(rowid=7, sha=123, project_path='project', message='numeric legacy')`.
+It survives the first migration and removal/replay of ledger 95 with integer
+storage in both FTS and map. Public insert/delete for text SHA `'123'` does **not**
+match or erase that numeric orphan, matching v94's actual trigger behavior.
+Changing the DDL back to TEXT reddened only this test (**9 peers passed**).
+
+The schema fixture was regenerated. Rust's domain fingerprints did **not** move
+because this project-owned map is not a Rust domain table; the exact committed
+snapshot/fingerprint test passed. No extra schema version is introduced.
+
+### S3: full-size host/holder/restart rehearsal
+
+Source: the permitted **read-only backup pair** at
+`$TMPDIR/magic-context/ckmc-perf/backups/`, never either live database. Disk
+preflight showed **26 GiB free**. APFS clones preserve the seed; only disposable
+working destinations become owner-writable. The source context is **5.7 GiB** at
+v94, with **2,070,685 tags, 344,457 message-map rows, 47,897 git FTS rows** and
+13,735 metadata rows. store.db is a **1.0 GiB** paired snapshot. The first 60-second
+quick_check limit was too short under shared I/O; the bounded 600-second check
+completed **ok**. No source permissions or backup contents were changed.
+
+The instrument now queries **each host's actual context.db** before and after
+startup/restart and records those three corpus counts, rather than inferring
+scale from a separate specimen. All hosts retained the full counts and moved
+94→95. Raw OpenCode stores remain synthetic, as required; they are not the large
+database being migrated. Dreamer/historian/inference/background hint features
+are disabled symmetrically. lsof audits the whole host process group and the
+independent holder; every database/WAL/SHM descriptor is under the resolved task
+root. No migration guard is bypassed.
+
+`/health` requests are scheduled independently every **250 ms**, with the same
+**1-second timeout**. The recorded interval runs from the worker's v95 batch
+start through **connection close**, so post-COMMIT checkpoint/close is included.
+Success gaps overlapping that interval and whole-startup failures are reported
+separately. All four full-size cases have **zero failures even across whole
+startup**, and all main-thread-body logs are **0 (total=0)**.
+
+| Host / case | Worker start → COMMIT → close (UTC) | Batch start→close ms | Probes / overlapping v95 | Longest v95 gap ms | Whole-startup max gap ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| OpenCode 1.18.30, alone | 18:00:43.239 → 44.310 → 44.321 | 647 | 109 / 3 | **374** | 766 |
+| OpenCode 1.18.30, second-process reader | 18:00:59.532 → 18:01:00.057 → 00.061 | 506 | 34 / 2 | **472** | 702 |
+| OpenCode 2.0.22, alone | 18:01:07.086 → 07.506 → 07.511 | 371 | 13 / 1 | **299** | 431 |
+| OpenCode 2.0.22, second-process reader | 18:01:14.757 → 15.568 → 15.571 | 795 | 17 / 4 | **273** | 894 |
+
+Dates are **2026-10-05**, wall timestamps generated by the actual emitted workers.
+For each reader case, a separate Bun process holds an old-schema read snapshot
+on that full copy throughout migration. Its handle is read-write so SQLite can
+create WAL/SHM bookkeeping, but its only statements are BEGIN and SELECT; it does
+not mutate rows or hold a writer lock. This tests an open/pinned reader, **not**
+writer-lock admission latency. Its lsof paths prove it is attached to the same
+working copy, not the seed or another fixture. An initial read-only-handle probe
+could not open WAL bookkeeping and was rejected before measurement, not counted
+as a passing holder case.
+
+Each real host was then shut down and restarted against its **same full v95
+copy**, with no worker or applied-v95 log and main-thread-body count still zero:
+
+| Restart | Health successes / failures | Longest gap ms |
+| --- | ---: | ---: |
+| 1.18.30 alone | 8 / 0 | 333 |
+| 1.18.30 after reader case | 8 / 0 | 294 |
+| 2.0.22 alone | 10 / 0 | 472 |
+| 2.0.22 after reader case | 12 / 0 | 912 |
+
+Pi was practical too: **real Pi 0.83.0 RPC CLI under Node v24.16.0**, final Pi
+dist, the same full context corpus and fully fenced HOME/XDG/agent/storage paths.
+Migration worker start **18:01:22.837**, COMMIT **18:01:23.632**, close
+**18:01:23.636**; its v95 batch begins at **18:01:22.897** (739 ms to close).
+The verified boot plus lsof/count capture took **3,127.560 ms**, no-op restart
+**2,088.394 ms**; both main-thread-body counts are zero and corpus counts unchanged.
+Pi's RPC get_state can respond **before** async extension storage completes, so
+the instrument waits for the real completion log instead of falsely declaring
+storage ready on that first RPC response. No inference, provider-body comparison
+or Pi `/health` SLA is claimed by this boot-only probe.
+
+The final backup-copy runner also independently verified streaming metadata,
+tag and FTS/rowid hashes unchanged, quick_check=ok, zero foreign-key violations,
+v95 duration **1,005.407 ms** and no-op duration **0.514 ms**. An earlier warm
+follow-up run measured 418.246/0.089 ms. These load-dependent figures
+do not replace the real-host intervals above or promise a fixed migration time.
+
+Reproduction: the updated `migration-batch-hosts.mjs` accepts `--health-only
+--full-size-health` and tests the four cases plus their restarts. The separate
+`migration-batch-pi-boot.mjs` uses the real Node Pi RPC CLI. Every native subprocess
+has an outer timeout, and the scripts record raw samples/worker timestamps,
+corpus counts and lsof inventories under the private root. Read-only seed files,
+working copies, captures and roots are removed after all connections close;
+the permitted backup source remains untouched.
+
+### Follow-up verification and baseline limits
+
+- Merged master manifests/lockfiles were installed with frozen Bun install:
+  **995 installs / 1,250 packages**, no additional lockfile edits.
+- Plugin, CLI and Pi package typechecks passed; TypeScript **5.9.3**. Focused
+  worker/host-boot/map/transaction-route run: **24 passed**; doctor plus CLI help:
+  **26 passed**; actual Pi fail-closed boot: **1 passed**.
+  After hardening the secondary synchronous host-access path, **86 affected
+  boot/tool/timer/transform/dream-trigger tests passed**, and both real-host
+  full-size/restart matrices plus Pi were repeated with the final emitted code.
+- Full plugin run: **6,886 passed / 4 skipped / 2 failed** initially. One failure
+  required making both repair BEGIN calls **standalone shared Database.exec**
+  acquisitions instead of combined PRAGMA/BEGIN SQL; the acquisition fence and
+  affected tests passed on rerun. The other is **pre-existing on merged master**:
+  dashboard `structured-save.test.ts` allocates raw temporary directories, which
+  the cross-package registered-temp-dir guard rejects. That unrelated dashboard
+  test and the guard were not weakened or edited.
+- Complete CLI suite: **608 + 9 + 8 + 10 + 8 passed**, **2 skipped**, zero failures.
+  Complete Pi serial suite: **1,525 passed / 3 skipped**, zero failures.
+- `bun run build:dists` passed with **4 loader tests / 3 load probes**; CLI build
+  passed (**401 modules**). All six emitted OpenCode/Pi entry/worker dependency
+  graphs are fenced at 95, contain the fail-closed worker error/final BLOB DDL,
+  and contain **no worker_unavailable fallback**. No mutant was built.
+- Regenerated Rust schema fingerprint assertion: **1 passed**, cargo 1.99.0
+  `--locked -j 2 -p mc-module --lib`; rustfmt 1.10.0 check passed. No Rust domain
+  hash or native-store migration changes were required.
+- Five independent follow-up controls reddened only their named assertion:
+  missing-worker main-thread fallback (9 peers green), late-holder acceptance
+  (7 peers), normal-open inventory scanning (9 peers), and numeric SHA coercion
+  (9 peers), plus enabling cold migration through host tool registration (its
+  OpenCode 1 boot test red, OpenCode 2 peer green). All used staged live state, nonempty mutant diff, checkout/touch
+  restore and empty working diff. The existing fallback-success assertion was
+  replaced because the accepted broken-install contract intentionally changed.

@@ -20,8 +20,22 @@ export const V95_REDUNDANT_INDEXES = [
 
 export const GIT_COMMIT_FTS_ROWID_MAP_DDL = `CREATE TABLE git_commit_fts_rowid_map (
     fts_rowid INTEGER PRIMARY KEY,
-    sha TEXT
+    sha BLOB
 )`;
+// BLOB affinity preserves the FTS value's storage class. FTS's unindexed SHA
+// column does not coerce a numeric legacy value into a canonical text key.
+export const GIT_FTS_MAP_REPAIR_COMMAND = "magic-context doctor git-fts-map --repair";
+export const GIT_FTS_MAP_DISAGREEMENT_SQL = `
+    SELECT 1 FROM git_commits_fts AS f
+    LEFT JOIN git_commit_fts_rowid_map AS m ON m.fts_rowid = f.rowid
+    WHERE m.fts_rowid IS NULL OR m.sha IS NOT f.sha OR typeof(m.sha) IS NOT typeof(f.sha)
+    UNION ALL
+    SELECT 1 FROM git_commit_fts_rowid_map AS m
+    WHERE NOT EXISTS (SELECT 1 FROM git_commits_fts AS f WHERE f.rowid = m.fts_rowid)
+    LIMIT 1`;
+export function gitFtsMapRepairMessage(detail: string): string {
+    return `${detail}; stop all hosts, then run \`${GIT_FTS_MAP_REPAIR_COMMAND}\` to back up both stores and rebuild only the map`;
+}
 const mapIndex = "CREATE INDEX idx_git_commit_fts_rowid_map_sha ON git_commit_fts_rowid_map(sha)";
 const remove = (row: "NEW" | "OLD") => `
     DELETE FROM git_commits_fts WHERE rowid IN (
@@ -52,7 +66,11 @@ END`,
 ] as const;
 
 /** Preserve FTS content and rowids; only its SHA-to-rowid lookup is materialized. */
-export function installV95PerfSchema(db: Database, verifyExistingMap = false): void {
+export function installV95PerfSchema(
+    db: Database,
+    verifyExistingMap = false,
+    allowCreateMap = true,
+): void {
     const schema = new Map(
         (
             db.prepare("SELECT name, sql FROM sqlite_master").all() as Array<{
@@ -72,30 +90,29 @@ export function installV95PerfSchema(db: Database, verifyExistingMap = false): v
     if (!schema.has("git_commits") || !schema.has("git_commits_fts")) return;
     const installed = schema.get("git_commit_fts_rowid_map");
     if (installed === undefined) {
+        if (!allowCreateMap)
+            throw new Error(gitFtsMapRepairMessage("git FTS rowid map is missing"));
         db.exec(GIT_COMMIT_FTS_ROWID_MAP_DDL);
         db.exec(
             "INSERT INTO git_commit_fts_rowid_map(fts_rowid, sha) SELECT rowid, sha FROM git_commits_fts",
         );
     } else if (installed !== GIT_COMMIT_FTS_ROWID_MAP_DDL) {
-        throw new Error("git_commit_fts_rowid_map schema differs; refusing to replace rowid data");
+        throw new Error(
+            gitFtsMapRepairMessage(
+                "git_commit_fts_rowid_map schema differs; refusing to replace rowid data",
+            ),
+        );
     }
     // A lost migration ledger may replay this body against an already-split store.
     // Validate that inventory once, without adding an FTS scan to current opens.
     if (
         verifyExistingMap &&
         installed !== undefined &&
-        db
-            .prepare(`
-        SELECT 1 FROM git_commits_fts AS f
-        LEFT JOIN git_commit_fts_rowid_map AS m ON m.fts_rowid = f.rowid
-        WHERE m.fts_rowid IS NULL OR m.sha IS NOT f.sha
-        UNION ALL
-        SELECT 1 FROM git_commit_fts_rowid_map AS m
-        WHERE NOT EXISTS (SELECT 1 FROM git_commits_fts AS f WHERE f.rowid = m.fts_rowid)
-        LIMIT 1`)
-            .get()
+        db.prepare(GIT_FTS_MAP_DISAGREEMENT_SQL).get()
     ) {
-        throw new Error("git FTS rowid inventory differs; refusing migration replay");
+        throw new Error(
+            gitFtsMapRepairMessage("git FTS rowid inventory differs; refusing migration replay"),
+        );
     }
     if (!schema.has("idx_git_commit_fts_rowid_map_sha")) db.exec(mapIndex);
     for (const [name, ddl] of triggers) {

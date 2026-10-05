@@ -52,6 +52,7 @@ export {
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     type OpenDatabaseOptions,
+    openCurrentDatabase,
     openDatabase,
     runSqliteOptimize,
     schemaVersionIsSupported,

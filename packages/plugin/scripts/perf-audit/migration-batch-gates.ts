@@ -39,8 +39,12 @@ const design = readFileSync(
     resolve(import.meta.dir, "../../../../docs/designs/perf-audit-migration-batch.md"),
     "utf8",
 );
-const sql = [...design.matchAll(/```sql\n([\s\S]*?)\n```/g)].map((match) => match[1]!);
+// Later repair/review examples are not part of the original approval-gate prototype.
+const sql = [...design.matchAll(/```sql\n([\s\S]*?)\n```/g)].slice(0, 11).map((match) => match[1]!);
 assert.equal(sql.length, 11, "review the extractor if the design SQL block layout changes");
+assert.ok(sql[0]!.includes("CREATE TABLE IF NOT EXISTS session_meta_payloads"));
+assert.ok(sql[9]!.includes("CREATE TABLE IF NOT EXISTS git_commit_fts_rowid_map"));
+assert.ok(sql[10]!.includes("CREATE TABLE mc_chunk_transcript_payloads"));
 let checks = 1;
 
 function open(path: string): ContextDatabase {

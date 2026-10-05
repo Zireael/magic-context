@@ -183,7 +183,7 @@ CREATE TABLE "git_commit_embeddings" (
                     );
 CREATE TABLE git_commit_fts_rowid_map (
     fts_rowid INTEGER PRIMARY KEY,
-    sha TEXT
+    sha BLOB
 );
 CREATE TABLE git_commits (
                     sha TEXT PRIMARY KEY,

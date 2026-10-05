@@ -6,6 +6,7 @@ import { strict as assert } from "node:assert";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+    chmodSync,
     existsSync,
     mkdirSync,
     readFileSync,
@@ -28,9 +29,13 @@ const repo = resolve(import.meta.dir, "../../../..");
 if (!existsSync(join(root, "node_modules")))
     symlinkSync(join(repo, "packages/plugin/node_modules"), join(root, "node_modules"));
 const copy = (from, to) => {
+    assert.ok(to.startsWith(`${root}/`), "only a throwaway destination may become writable");
     mkdirSync(resolve(to, ".."), { recursive: true });
     const child = spawnSync("timeout", ["60", "cp", "-c", from, to], { encoding: "utf8" });
     assert.equal(child.status, 0, child.stderr);
+    // Backup specimens may be owner-read-only. Preserve the seed; make only
+    // each disposable working clone writable for its host/migration.
+    chmodSync(to, 0o600);
 };
 const sha = (text) => createHash("sha256").update(text).digest("hex");
 function environment(lane, version) {
@@ -365,14 +370,84 @@ if (process.argv.includes("--skip-rehearsal")) {
     writeFileSync(join(root, "hosts.json"), JSON.stringify(report, null, 2));
 }
 
-for (const version of [1, 2]) {
+function contextCounts(path) {
+    const connection = new Database(path, { readonly: true });
+    try {
+        return {
+            schema: connection
+                .query("SELECT MAX(version) AS n FROM schema_migrations WHERE version<10000")
+                .get().n,
+            tags: connection.query("SELECT count(*) AS n FROM tags").get().n,
+            messageMap: connection.query("SELECT count(*) AS n FROM message_fts_rowid_map").get().n,
+            gitFts: connection.query("SELECT count(*) AS n FROM git_commits_fts").get().n,
+        };
+    } finally {
+        connection.close();
+    }
+}
+const expectedCounts = contextCounts(join(root, "context.db"));
+const healthCases = [1, 2].flatMap((version) =>
+    process.argv.includes("--full-size-health")
+        ? [
+              { version, holder: false },
+              { version, holder: true },
+          ]
+        : [{ version, holder: false }],
+);
+for (const { version, holder } of healthCases) {
     if (process.argv.includes("--wire-only")) continue;
     if (version === 1 && process.argv.includes("--skip-health-v1")) continue;
-    const fixture = environment(`health-v${version}`, version);
+    if (version === 1 && !holder && process.argv.includes("--skip-single-v1")) continue;
+    const label = `health-v${version}${holder ? "-reader-holder" : ""}`;
+    const fixture = environment(label, version);
     const logStart = existsSync(fixture.env.MAGIC_CONTEXT_LOG_PATH)
         ? readFileSync(fixture.env.MAGIC_CONTEXT_LOG_PATH, "utf8").length
         : 0;
-    copy(join(root, "context.db"), join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR, "context.db"));
+    const contextPath = join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR, "context.db");
+    for (const suffix of ["", "-wal", "-shm"]) rmSync(contextPath + suffix, { force: true });
+    copy(join(root, "context.db"), contextPath);
+    const startingCounts = contextCounts(contextPath);
+    assert.deepEqual(startingCounts, expectedCounts);
+    let holderProcess,
+        holderFiles = [];
+    if (holder) {
+        const connection = new Database(contextPath);
+        connection.exec("PRAGMA journal_mode=WAL");
+        connection.close();
+        holderProcess = spawn(
+            "timeout",
+            [
+                "180",
+                process.execPath,
+                "--eval",
+                `import {Database} from "bun:sqlite";const db=new Database(${JSON.stringify(contextPath)});db.exec("BEGIN");db.query("SELECT MAX(version) FROM schema_migrations").get();console.log("READER_READY");setInterval(()=>{},1000);`,
+            ],
+            {
+                env: fixture.env,
+                cwd: fixture.cwd,
+                detached: true,
+                stdio: ["ignore", "pipe", "pipe"],
+            },
+        );
+        let holderError = "";
+        holderProcess.stderr.on("data", (data) => {
+            holderError += data;
+        });
+        await new Promise((done, reject) => {
+            const t = setTimeout(() => reject(new Error("reader-holder deadline")), 10000);
+            holderProcess.stdout.on("data", (data) => {
+                if (String(data).includes("READER_READY")) {
+                    clearTimeout(t);
+                    done();
+                }
+            });
+            holderProcess.on("exit", (code) => {
+                clearTimeout(t);
+                reject(new Error(`reader-holder exit ${code}: ${holderError}`));
+            });
+        });
+        holderFiles = inventory(holderProcess.pid);
+    }
     let server;
     try {
         server = await host(
@@ -403,8 +478,15 @@ for (const version of [1, 2]) {
                     ?.match(/^\[([^\]]+)\]/)?.[1] ?? "",
             );
         const migrationStart = timestamp("current upstream migration lane: 94");
-        const migrationEnd = timestamp("applied v95");
-        assert.ok(Number.isFinite(migrationStart) && migrationEnd >= migrationStart);
+        const commitAt = timestamp("applied v95");
+        const workerStart = timestamp("applying pending migrations on a worker thread");
+        const migrationEnd = timestamp("migration worker connection closed");
+        assert.ok(
+            Number.isFinite(migrationStart) &&
+                migrationEnd >= commitAt &&
+                commitAt >= migrationStart,
+        );
+        assert.ok(/async open main-thread migration-body count: 0 \(total=0\)/.test(logs), logs);
         const live = server.samples.filter(
             (s) => s.wallStarted <= migrationEnd && s.wallEnded >= migrationStart,
         );
@@ -426,8 +508,12 @@ for (const version of [1, 2]) {
         assert.ok(overlapping.length > 0);
         const longestGapMs = Math.max(...overlapping.map((gap) => gap.gap));
         writeFileSync(
-            join(root, `health-v${version}-samples.json`),
-            JSON.stringify({ migrationStart, migrationEnd, samples: server.samples }, null, 2),
+            join(root, `${label}-samples.json`),
+            JSON.stringify(
+                { workerStart, migrationStart, commitAt, migrationEnd, samples: server.samples },
+                null,
+                2,
+            ),
         );
         assert.ok(
             live.every((s) => !s.error && s.status === 200),
@@ -437,6 +523,15 @@ for (const version of [1, 2]) {
         const files = inventory(server.child.pid);
         const result = {
             version,
+            label,
+            holder,
+            startingCounts,
+            hostCounts: contextCounts(contextPath),
+            holderFiles,
+            mainThreadMigrationBodies: 0,
+            workerStart,
+            commitAt,
+            workerClosedAt: migrationEnd,
             probes: server.samples.length,
             migrationProbes: live.length,
             migrationDurationMs: migrationEnd - migrationStart,
@@ -453,12 +548,73 @@ for (const version of [1, 2]) {
         report.health.push(result);
         console.log(JSON.stringify({ stage: "health", ...result }));
         writeFileSync(join(root, "hosts.json"), JSON.stringify(report, null, 2));
+        await server.stop();
+        server = undefined;
+        if (holderProcess) {
+            const ended = new Promise((done) => holderProcess.once("close", done));
+            process.kill(-holderProcess.pid, "SIGTERM");
+            await ended;
+            holderProcess = undefined;
+        }
+        const restartOffset = existsSync(fixture.env.MAGIC_CONTEXT_LOG_PATH)
+            ? readFileSync(fixture.env.MAGIC_CONTEXT_LOG_PATH, "utf8").length
+            : 0;
+        server = await host(
+            version,
+            fixture,
+            join(
+                repo,
+                version === 1
+                    ? "packages/plugin/dist/index.js"
+                    : "packages/plugin/dist/v2/server.js",
+            ),
+        );
+        await server.create();
+        await new Promise((done) => setTimeout(done, 1500));
+        await server.stopSampling();
+        const restartLogs = server.logs().slice(restartOffset);
+        assert.ok(
+            !restartLogs.includes("applying pending migrations on a worker thread") &&
+                !restartLogs.includes("applied v95"),
+            restartLogs,
+        );
+        assert.ok(
+            /async open main-thread migration-body count: 0 \(total=0\)/.test(restartLogs),
+            restartLogs,
+        );
+        const successful = server.samples
+            .filter((s) => !s.error && s.status === 200)
+            .map((s) => s.wallEnded)
+            .sort((a, b) => a - b);
+        const restart = {
+            label,
+            version,
+            probes: server.samples.length,
+            failures: server.samples.length - successful.length,
+            longestGapMs: Math.max(...successful.slice(1).map((t, i) => t - successful[i])),
+            mainThreadMigrationBodies: 0,
+            counts: contextCounts(contextPath),
+            files: inventory(server.child.pid),
+        };
+        assert.equal(restart.failures, 0, JSON.stringify(restart));
+        assert.ok(restart.longestGapMs <= 1000, JSON.stringify(restart));
+        result.restart = restart;
+        console.log(JSON.stringify({ stage: "restart", ...restart }));
+        writeFileSync(join(root, "hosts.json"), JSON.stringify(report, null, 2));
     } finally {
         await server?.stop();
+        if (holderProcess) {
+            const ended = new Promise((done) => holderProcess.once("close", done));
+            try {
+                process.kill(-holderProcess.pid, "SIGTERM");
+            } catch {}
+            await ended;
+        }
     }
 }
 
 for (const version of [1, 2]) {
+    if (process.argv.includes("--health-only")) continue;
     rmSync(join(root, `wire-v${version}`), { recursive: true, force: true });
     const fixture = environment(`wire-v${version}`, version);
     const base = join(
