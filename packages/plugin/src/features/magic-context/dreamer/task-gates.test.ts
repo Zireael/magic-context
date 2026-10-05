@@ -1,8 +1,12 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -13,7 +17,7 @@ import {
 import { runMigrations } from "../migrations";
 import { advanceSessionActivity } from "../session-activity";
 import { initializeDatabase } from "../storage-db";
-import { evaluateTaskGate, getDreamTaskBacklog } from "./task-gates";
+import { evaluateTaskGate, getDreamTaskBacklog, getDreamTaskBacklogs } from "./task-gates";
 import { formatDreamTaskBacklogs, processedDreamTaskItems } from "./task-registry";
 
 let db: Database | null = null;
@@ -31,6 +35,77 @@ function freshDb(): Database {
 }
 
 describe("dream task backlog probes", () => {
+    test("an empty task registry returns without requiring memory tables", () => {
+        db = new Database(":memory:");
+        expect(getDreamTaskBacklogs(db, "empty", [])).toEqual({});
+    });
+
+    test("backlog memo distinguishes non-finite watermarks from null", () => {
+        db = freshDb();
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+        ).run("watermark-session", "opencode", "watermark-project", 1);
+        for (const value of [Number.POSITIVE_INFINITY, Number.NaN, null]) {
+            const options = { retrospectiveWatermarkMs: value };
+            expect(
+                getDreamTaskBacklogs(db, "watermark-project", ["retrospective"], options)
+                    .retrospective,
+            ).toEqual(getDreamTaskBacklog(db, "watermark-project", "retrospective", options));
+        }
+    });
+    test("backlog memo observes own and external writes, isolates handles and does not retain caller mutations", () => {
+        const dir = createTestTempDirFromPath(join(tmpdir(), "backlog-cache-"));
+        const reader = new Database(join(dir, "copy.db"));
+        initializeDatabase(reader);
+        runMigrations(reader);
+        const writer = new Database(join(dir, "copy.db"));
+        const other = freshDb();
+        const project = "git:backlog-cache";
+        const read = (database: Database) =>
+            getDreamTaskBacklogs(database, project, ["map-memories"]);
+        const add = (database: Database, content: string) =>
+            insertMemory(database, { projectPath: project, category: "ARCHITECTURE", content });
+        try {
+            add(reader, "first");
+            const first = read(reader);
+            expect(first["map-memories"]).toEqual({ pending: 1, total: 1 });
+            if (first["map-memories"]) first["map-memories"].total = 999;
+            expect(read(reader)["map-memories"]).toEqual({ pending: 1, total: 1 });
+            add(reader, "second");
+            expect(read(reader)["map-memories"]).toEqual({ pending: 2, total: 2 });
+            add(writer, "third");
+            expect(read(reader)["map-memories"]).toEqual({ pending: 3, total: 3 });
+            expect(read(other)["map-memories"]).toEqual({ pending: 0, total: 0 });
+        } finally {
+            reader.close();
+            writer.close();
+            other.close();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("backlog memo bypasses expiring pools even when no database write occurs", () => {
+        db = freshDb();
+        const originalNow = Date.now;
+        try {
+            Date.now = () => 1000;
+            insertMemory(db, {
+                projectPath: "git:expiry-cache",
+                category: "ARCHITECTURE",
+                content: "expires",
+                expiresAt: 2000,
+            });
+            expect(
+                getDreamTaskBacklogs(db, "git:expiry-cache", ["map-memories"])["map-memories"],
+            ).toEqual({ pending: 1, total: 1 });
+            Date.now = () => 2000;
+            expect(
+                getDreamTaskBacklogs(db, "git:expiry-cache", ["map-memories"])["map-memories"],
+            ).toEqual({ pending: 0, total: 0 });
+        } finally {
+            Date.now = originalNow;
+        }
+    });
     test("map and classify probes match seeded candidate counts", () => {
         db = freshDb();
         const projectIdentity = "/repo/project";

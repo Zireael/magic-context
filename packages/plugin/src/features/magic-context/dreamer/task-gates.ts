@@ -1,5 +1,5 @@
 import { DREAM_TASK_PROMOTION_DEFAULTS } from "../../../config/schema/magic-context";
-import type { Database } from "../../../shared/sqlite";
+import type { Database, Statement } from "../../../shared/sqlite";
 import { hasMemoryClassifiedAtColumn } from "../memory/storage-memory";
 import { hasMuralCueColumns } from "../mural/storage-mural-cues";
 import {
@@ -469,6 +469,17 @@ export function getDreamTaskBacklog(
     }
 }
 
+const backlogCaches = new WeakMap<
+    Database,
+    {
+        revisionStatement: Statement;
+        expiryStatement: Statement;
+        revision: string;
+        entries: Map<string, DreamTaskBacklogMap>;
+        eligibleProjects: Map<string, boolean>;
+    }
+>();
+
 /** Read the complete backlog breakdown in the caller's requested registry order. */
 export function getDreamTaskBacklogs(
     db: Database,
@@ -476,8 +487,54 @@ export function getDreamTaskBacklogs(
     tasks: readonly DreamTaskName[] = CANONICAL_DREAM_TASKS,
     options: { lastRunAt?: number | null; retrospectiveWatermarkMs?: number | null } = {},
 ): DreamTaskBacklogMap {
+    if (tasks.length === 0) return {};
+    let cache = backlogCaches.get(db);
+    if (!cache) {
+        cache = {
+            revisionStatement: db.prepare(`SELECT total_changes() AS writes,
+                (SELECT data_version FROM pragma_data_version) AS dataVersion,
+                (SELECT schema_version FROM pragma_schema_version) AS schemaVersion`),
+            expiryStatement: db.prepare(`SELECT 1 FROM memories WHERE project_path = ?
+                AND status IN ('active','permanent') AND expires_at IS NOT NULL LIMIT 1`),
+            revision: "",
+            entries: new Map(),
+            eligibleProjects: new Map(),
+        };
+        backlogCaches.set(db, cache);
+    }
+    const revision = JSON.stringify(cache.revisionStatement.get());
+    if (revision !== cache.revision) {
+        cache.entries.clear();
+        cache.eligibleProjects.clear();
+        cache.revision = revision;
+    }
+    let eligible = cache.eligibleProjects.get(projectPath);
+    if (eligible === undefined) {
+        // An expiring pool can change without a write. Never memoize its counts;
+        // all other backlog predicates depend only on rows and caller options.
+        eligible = !cache.expiryStatement.get(projectPath);
+        if (cache.eligibleProjects.size >= 16) cache.eligibleProjects.clear();
+        cache.eligibleProjects.set(projectPath, eligible);
+    }
+    // JSON numbers collapse NaN/Infinity to null; null and omitted watermarks
+    // also have different meanings. Preserve those distinctions in the key.
+    const optionKey = (value: number | null | undefined) =>
+        value === undefined ? "omitted" : value === null ? "null" : `number:${value}`;
+    const key = JSON.stringify([
+        projectPath,
+        tasks,
+        optionKey(options.lastRunAt),
+        optionKey(options.retrospectiveWatermarkMs),
+    ]);
+    const cached = eligible ? cache.entries.get(key) : undefined;
+    if (cached) return structuredClone(cached);
     const result: DreamTaskBacklogMap = {};
     for (const task of tasks) result[task] = getDreamTaskBacklog(db, projectPath, task, options);
+    if (eligible) {
+        if (cache.entries.size >= 16)
+            cache.entries.delete(cache.entries.keys().next().value as string);
+        cache.entries.set(key, structuredClone(result));
+    }
     return result;
 }
 
