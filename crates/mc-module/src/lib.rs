@@ -40543,3 +40543,6 @@ fn render_tag_expand(tag: &mc_store::McTagRow, messages: &[ck_wire::CkIngressMes
         .collect::<Vec<_>>()
         .join("\n")
 }
+#[cfg(test)]
+#[path = "../tests/perf_audit.rs"]
+mod perf_audit;

@@ -14517,6 +14517,18 @@ impl McStore {
         project_path: &str,
         query: &str,
     ) -> Result<Vec<StoredMemorySearchRow>, McStoreError> {
+        self.search_visible_memory_contents_in_range(project_path, query, None, None)
+    }
+
+    /// Apply inclusive creation-date bounds before the candidate cap, so newer
+    /// out-of-range matches cannot hide an older matching memory.
+    pub fn search_visible_memory_contents_in_range(
+        &self,
+        project_path: &str,
+        query: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<Vec<StoredMemorySearchRow>, McStoreError> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -14527,6 +14539,8 @@ impl McStore {
         };
         let pattern = sql_like_pattern(query);
 
+        let (dates, date_binds) = search_date_filter(from_ms, to_ms);
+
         let rows = self.context_read(|conn| {
             let sql = format!(
                 "SELECT id, project_path, category, content, created_at, updated_at
@@ -14535,12 +14549,14 @@ impl McStore {
                     AND status IN ('active', 'permanent')
                     AND (expires_at IS NULL OR expires_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000)
                     AND LOWER(content) LIKE ? ESCAPE '\\'
+                    {dates}
                   ORDER BY updated_at DESC, id ASC
                   LIMIT 100"
             );
             let mut stmt = conn.prepare(&sql)?;
             let mut all_binds = binds.clone();
             all_binds.push(rusqlite::types::Value::from(pattern));
+            all_binds.extend(date_binds.iter().cloned());
             let mapped = stmt
                 .query_map(rusqlite::params_from_iter(all_binds.iter()), |r| {
                     Ok(StoredMemorySearchRow {
@@ -14566,12 +14582,24 @@ impl McStore {
         session_id: &str,
         query: &str,
     ) -> Result<Vec<StoredCompartmentSearchRow>, McStoreError> {
+        self.search_compartments_like_in_range(session_id, query, None, None)
+    }
+
+    /// Search compartment text with inclusive dates applied before LIMIT 100.
+    pub fn search_compartments_like_in_range(
+        &self,
+        session_id: &str,
+        query: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<Vec<StoredCompartmentSearchRow>, McStoreError> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
         let pattern = sql_like_pattern(query);
+        let (dates, date_binds) = search_date_filter(from_ms, to_ms);
         let rows = self.context_read(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT sequence, start_message, end_message, title, content, p1, p2, p3, p4, created_at
                    FROM compartments
                   WHERE session_id = ?1
@@ -14580,12 +14608,15 @@ impl McStore {
                       OR LOWER(COALESCE(p1, '')) LIKE ?2 ESCAPE '\\'
                       OR LOWER(COALESCE(p2, '')) LIKE ?2 ESCAPE '\\'
                       OR LOWER(COALESCE(p3, '')) LIKE ?2 ESCAPE '\\'
-                      OR LOWER(COALESCE(p4, '')) LIKE ?2 ESCAPE '\\')
+                       OR LOWER(COALESCE(p4, '')) LIKE ?2 ESCAPE '\\')
+                    {dates}
                   ORDER BY sequence DESC
                   LIMIT 100",
-            )?;
+            ))?;
+            let mut parameters = vec![SqlValue::Text(session_id.to_string()), SqlValue::Text(pattern.clone())];
+            parameters.extend(date_binds.iter().cloned());
             let mapped = stmt
-                .query_map(params![session_id, pattern], |r| {
+                .query_map(rusqlite::params_from_iter(parameters.iter()), |r| {
                     Ok(StoredCompartmentSearchRow {
                         sequence: r.get(0)?,
                         start_ordinal: r.get(1)?,
@@ -15408,6 +15439,18 @@ impl McStore {
         session_id: &str,
         query: &str,
     ) -> Result<Vec<StoredNoteSearchRow>, McStoreError> {
+        self.search_notes_like_in_range(project_path, session_id, query, None, None)
+    }
+
+    /// Search notes with inclusive dates applied before LIMIT 100.
+    pub fn search_notes_like_in_range(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        query: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<Vec<StoredNoteSearchRow>, McStoreError> {
         let terms = keyword_search_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -15424,6 +15467,7 @@ impl McStore {
             })
             .collect::<Vec<_>>()
             .join(" OR ");
+        let (dates, date_binds) = search_date_filter(from_ms, to_ms);
         let sql = format!(
             "SELECT id, content, status, surface_condition, COALESCE(session_id, ''), anchor_ordinal,
                         created_at, updated_at
@@ -15432,6 +15476,7 @@ impl McStore {
                     AND (type = 'smart' OR session_id = ?2)
                     AND status IN ('active', 'pending', 'ready')
                     AND ({predicates})
+                    {dates}
                   ORDER BY updated_at DESC, id DESC
                   LIMIT 100"
         );
@@ -15444,6 +15489,7 @@ impl McStore {
                 .iter()
                 .map(|term| SqlValue::Text(sql_like_pattern(term))),
         );
+        parameters.extend(date_binds);
         let rows = self.context_read(|conn| {
             let mut stmt = conn.prepare(&sql)?;
             let mapped = stmt
@@ -17343,6 +17389,22 @@ fn keyword_search_terms(query: &str) -> Vec<String> {
         }
     }
     terms
+}
+
+/// Bounds are appended after the query's other placeholders and bound in the same
+/// order. An undated search adds no predicate and retains its existing matching cap.
+fn search_date_filter(from_ms: Option<i64>, to_ms: Option<i64>) -> (String, Vec<SqlValue>) {
+    let mut sql = String::new();
+    let mut binds = Vec::new();
+    if let Some(from) = from_ms {
+        sql.push_str(" AND created_at >= ?");
+        binds.push(SqlValue::Integer(from));
+    }
+    if let Some(to) = to_ms {
+        sql.push_str(" AND created_at <= ?");
+        binds.push(SqlValue::Integer(to));
+    }
+    (sql, binds)
 }
 
 fn sql_like_pattern(query: &str) -> String {
