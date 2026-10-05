@@ -8402,6 +8402,9 @@ fn pending_agent_drops_applied_this_pass(
     final_core: &CoreState,
 ) -> bool {
     profile_start!(_perf_pending, "rt12_pending_applied");
+    if pending.is_empty() {
+        return false;
+    }
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
     pending.iter().any(|drop| {
@@ -8416,6 +8419,9 @@ fn first_applied_pending_command_ids(
     final_core: &CoreState,
 ) -> Vec<String> {
     profile_start!(_perf_pending, "rt12_first_commands");
+    if pending.is_empty() {
+        return Vec::new();
+    }
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
     pending
@@ -8442,6 +8448,9 @@ fn consumed_pending_drop_ids(
     final_coverage: Option<u64>,
 ) -> Vec<i64> {
     profile_start!(_perf_pending, "rt12_pending_consumed");
+    if pending.is_empty() {
+        return Vec::new();
+    }
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
     // Retirement must be PROVEN, not inferred from absence: the request array can be
