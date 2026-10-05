@@ -141,16 +141,6 @@ export function openStorageFileSync(filePath: string, flags: string, forcePrivat
     return openSync(filePath, flags, privateMode ? 0o600 : 0o666);
 }
 
-export async function writeStorageFileWithBun(
-    filePath: string,
-    content: string,
-    forcePrivate = false,
-): Promise<void> {
-    const descriptor = openStorageFileSync(filePath, "w", forcePrivate);
-    closeSync(descriptor);
-    await Bun.write(filePath, content);
-}
-
 export async function writeStorageFileAsync(
     filePath: string,
     content: string | Uint8Array,
