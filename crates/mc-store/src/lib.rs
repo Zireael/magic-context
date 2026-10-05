@@ -21,6 +21,7 @@ pub mod context_boundaries;
 pub use context_boundaries::ResolvedContextBoundary;
 pub mod context_writes;
 mod historian_claim;
+pub mod private_permissions;
 pub mod single_store_domain;
 pub mod single_store_schema;
 
@@ -7858,6 +7859,41 @@ impl McStore {
     }
 
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
+        Self::open_with_private_permissions(descriptor, true)
+    }
+
+    pub fn open_with_private_permissions(
+        descriptor: &StorageDescriptor,
+        enforce_private_permissions: bool,
+    ) -> Result<Self, McStoreError> {
+        let mut storage_root = None;
+        let mut before = private_permissions::TightenReport::default();
+        if let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend {
+            let path = Path::new(path);
+            let root = path.parent().unwrap_or_else(|| Path::new("."));
+            private_permissions::ensure_directory(root, true).map_err(|error| {
+                McStoreError::Serde(format!("storage directory unavailable: {error}"))
+            })?;
+            let root_tightening = private_permissions::tighten_directory(root, true);
+            let tree_tightening =
+                private_permissions::tighten_tree(root, enforce_private_permissions);
+            before = private_permissions::TightenReport {
+                tightened: root_tightening.tightened + tree_tightening.tightened,
+                failures: root_tightening.failures + tree_tightening.failures,
+            };
+            if !path.exists() {
+                match private_permissions::create_file(path, true) {
+                    Ok(file) => drop(file),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(McStoreError::Serde(format!(
+                            "storage file unavailable: {error}"
+                        )));
+                    }
+                }
+            }
+            storage_root = Some(root.to_path_buf());
+        }
         let inner = open_sqlite(descriptor)?;
         inner.with_conn(single_store_domain::set_synchronous_normal_if_wal)?;
         // Registered before migrating: the older migrations of a store below v53 install
@@ -7950,6 +7986,18 @@ impl McStore {
             route_identities_for_test: Mutex::new(HashMap::new()),
         };
         store.prune_transform_session_roots()?;
+        if let Some(root) = storage_root {
+            let after = if enforce_private_permissions {
+                private_permissions::tighten_tree(&root, true)
+            } else {
+                private_permissions::tighten_directory(&root, true)
+            };
+            tracing::info!(
+                tightened = before.tightened + after.tightened,
+                failures = before.failures + after.failures,
+                "mc-store: storage permission tightening"
+            );
+        }
         Ok(store)
     }
 

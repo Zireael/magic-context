@@ -439,6 +439,21 @@ fn user_config_path() -> PathBuf {
     user_config_path_from(std::env::var_os("XDG_CONFIG_HOME"), user_home_dir())
 }
 
+/// Read the user-only permission override shared with the plugin.
+/// Project config cannot loosen filesystem permissions for the user's store.
+pub fn private_storage_permissions_enabled() -> bool {
+    fs::read_to_string(user_config_path())
+        .ok()
+        .and_then(|raw| parse_config_text(&raw).ok())
+        .and_then(|config| config.get("storage").and_then(Value::as_object).cloned())
+        .and_then(|storage| {
+            storage
+                .get("enforce_private_permissions")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true)
+}
+
 /// The user config file, chosen the way the host chooses it (`configHome()` and
 /// `detectConfigFile` in the plugin): `XDG_CONFIG_HOME` counts only when it is an absolute
 /// path, otherwise `<home>/.config`; in that directory `magic-context.jsonc` wins and

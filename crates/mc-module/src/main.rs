@@ -28,6 +28,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{}", mc_module::supported_fences_line());
         return Ok(());
     }
+    let enforce_private_permissions = mc_module::config::private_storage_permissions_enabled();
+    #[cfg(unix)]
+    if enforce_private_permissions {
+        // ck-mc owns its process, so a restrictive mask also protects files the
+        // external logger and SQLite create without exposing a mode option.
+        nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+    }
     // The offline single-store migration runs without subc and without serving: the doctor
     // command calls it while nothing has either database open.
     if std::env::args().nth(1).as_deref() == Some("single-store-migrate") {
@@ -54,6 +61,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Err(error) => return Err(error.into()),
     };
     tracing::info!("mc-module: logger initialized");
+    let log_permissions =
+        mc_store::private_permissions::tighten_tree(logger.logs_dir(), enforce_private_permissions);
+    tracing::info!(
+        tightened = log_permissions.tightened,
+        failures = log_permissions.failures,
+        "mc-module: log permission tightening"
+    );
     let connection_file = parse_subc_arg(std::env::args_os().skip(1))?;
     // The runner settings are user-tier only, so one resolution covers every project
     // this process serves. The manifest's routes and self-signals follow it: when

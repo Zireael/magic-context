@@ -1,10 +1,6 @@
 import {
-    chmodSync,
-    copyFileSync,
-    cpSync,
     type Dirent,
     existsSync,
-    mkdirSync,
     readdirSync,
     readFileSync,
     rmdirSync,
@@ -45,7 +41,14 @@ import {
 import { configureContextDatabasePragmas } from "../../shared/sqlite-context-pragmas";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { importPluginModule } from "../../shared/stale-plugin-build";
-import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
+import {
+    copyStorageFileSync,
+    copyStorageTreeSync,
+    ensureStorageDirectorySync,
+    shouldEnforcePrivateStoragePermissions,
+    tightenStorageTreeSync,
+    writeStorageFileSync,
+} from "../../shared/storage-permissions";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 
 import { ensureContextStoreUuid } from "./context-store-uuid";
@@ -166,64 +169,13 @@ export const LATEST_SUPPORTED_VERSION = 94;
  */
 export const BOOT_SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
-// chmod is meaningless on Windows (POSIX modes are not honored), so all
-// permission tightening is skipped there. mkdir's `mode` is likewise ignored.
-const PERMISSIONS_ENFORCEABLE = process.platform !== "win32";
-
-const defaultStoragePermissionFs = { chmodSync, mkdirSync };
-let storagePermissionFs = defaultStoragePermissionFs;
-
-/** Test seam: captures permission-changing calls without changing real fixture modes. */
-export function __setStoragePermissionFsForTests(
-    overrides: Partial<typeof defaultStoragePermissionFs>,
-): void {
-    storagePermissionFs = { ...defaultStoragePermissionFs, ...overrides };
-}
-
-export function __resetStoragePermissionFsForTests(): void {
-    storagePermissionFs = defaultStoragePermissionFs;
-}
-
-/**
- * Create `dir` recursively. When private permissions are enabled, also create
- * and tighten it to owner-only 0o700. When an operator manages trusted-group
- * permissions, do not pass a mode or chmod an existing directory.
- */
 function ensureSecureStorageDir(dir: string): void {
-    if (!shouldEnforcePrivateStoragePermissions()) {
-        storagePermissionFs.mkdirSync(dir, { recursive: true });
-        return;
-    }
-
-    storagePermissionFs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    if (!PERMISSIONS_ENFORCEABLE) return;
-    try {
-        storagePermissionFs.chmodSync(dir, 0o700);
-    } catch (error) {
-        log(
-            `[magic-context] could not restrict storage dir permissions on ${dir}: ${getErrorMessage(error)}`,
-        );
-    }
+    ensureStorageDirectorySync(dir);
 }
 
-/**
- * Restrict the SQLite DB file and its WAL/SHM sidecars to owner-only (0o600)
- * only when Magic Context owns storage permission management. A trusted-group
- * deployment keeps the operator's modes unchanged, including sidecars.
- */
-function restrictDatabaseFilePermissions(dbPath: string): void {
-    if (!PERMISSIONS_ENFORCEABLE || !shouldEnforcePrivateStoragePermissions()) return;
-    for (const suffix of ["", "-wal", "-shm"]) {
-        const file = `${dbPath}${suffix}`;
-        if (!existsSync(file)) continue;
-        try {
-            storagePermissionFs.chmodSync(file, 0o600);
-        } catch (error) {
-            log(
-                `[magic-context] could not restrict DB file permissions on ${file}: ${getErrorMessage(error)}`,
-            );
-        }
-    }
+function tightenStorageTree(dir: string): void {
+    const { failures } = tightenStorageTreeSync(dir);
+    log(`[magic-context] storage permission tightening failures=${failures}`);
 }
 
 export interface DatabaseBootTimings {
@@ -349,7 +301,7 @@ function migrateLegacyStorageIfNeeded(targetDbPath: string, targetDbDir: string)
         const dst = join(targetDbDir, `context.db${suffix}`);
         if (existsSync(src)) {
             try {
-                copyFileSync(src, dst);
+                copyStorageFileSync(src, dst);
             } catch (error) {
                 log(`[magic-context] failed to copy ${src}:`, getErrorMessage(error));
             }
@@ -361,7 +313,7 @@ function migrateLegacyStorageIfNeeded(targetDbPath: string, targetDbDir: string)
     const targetModelsDir = join(targetDbDir, "models");
     if (existsSync(legacyModelsDir) && !existsSync(targetModelsDir)) {
         try {
-            cpSync(legacyModelsDir, targetModelsDir, { recursive: true });
+            copyStorageTreeSync(legacyModelsDir, targetModelsDir);
         } catch (error) {
             log("[magic-context] failed to copy embedding model cache:", getErrorMessage(error));
         }
@@ -1151,7 +1103,9 @@ function finishDatabaseOpen(
     loadToolDefinitionMeasurements(db);
     // When enabled, tighten the DB + WAL/SHM sidecars now that WAL mode has
     // created them. Externally managed trusted-group storage skips this entirely.
-    restrictDatabaseFilePermissions(dbPath);
+    // SQLite creates WAL sidecars itself; the startup tree pass also covers files
+    // materialized during this open. The helper logs failure counts only.
+    tightenStorageTree(dirname(dbPath));
     databases.set(dbPath, db);
     pathByDatabase.set(db, dbPath);
     persistenceByDatabase.set(db, true);
@@ -2704,6 +2658,14 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             migrateLegacyStorageIfNeeded(dbPath, dbDir);
         }
         ensureSecureStorageDir(dbDir);
+        tightenStorageTree(dbDir);
+        if (!existsSync(dbPath) && shouldEnforcePrivateStoragePermissions()) {
+            try {
+                writeStorageFileSync(dbPath, new Uint8Array(), { flag: "wx" });
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            }
+        }
 
         db = new Database(dbPath);
         installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
@@ -2779,6 +2741,14 @@ export async function openDatabaseAsync(
         try {
             if (!explicitDbPath) migrateLegacyStorageIfNeeded(dbPath, dbDir);
             ensureSecureStorageDir(dbDir);
+            tightenStorageTree(dbDir);
+            if (!existsSync(dbPath) && shouldEnforcePrivateStoragePermissions()) {
+                try {
+                    writeStorageFileSync(dbPath, new Uint8Array(), { flag: "wx" });
+                } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+                }
+            }
 
             db = new Database(dbPath);
             installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);

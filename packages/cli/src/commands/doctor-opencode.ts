@@ -1579,7 +1579,9 @@ export async function runDoctor(
             }
 
             if (mcChanged) {
-                writeFileAtomic(paths.magicContextConfig, `${stringify(mcConfig, null, 2)}\n`);
+                writeFileAtomic(paths.magicContextConfig, `${stringify(mcConfig, null, 2)}\n`, {
+                    ownerOnly: true,
+                });
             }
         } catch {
             log.warn("Could not migrate deprecated config keys in magic-context.jsonc");

@@ -32,6 +32,8 @@ macro_rules! profile_end {
 }
 #[cfg(test)]
 mod per_pass_profile;
+#[cfg(test)]
+mod private_permissions_source_test;
 
 pub mod boundary;
 pub mod caveman;
@@ -4718,14 +4720,20 @@ impl McHandler {
     /// fails with the refusal that names why, before any request is served.
     async fn open_store_once(descriptor: &StorageDescriptor) -> Result<McStore, McStoreError> {
         let descriptor = descriptor.clone();
+        let enforce_private_permissions = crate::config::private_storage_permissions_enabled();
         let open = move || {
-            let store = McStore::open(&descriptor)?;
+            let store =
+                McStore::open_with_private_permissions(&descriptor, enforce_private_permissions)?;
             let store_path = match &descriptor.backend {
                 StorageBackend::Sqlite { path } => Some(PathBuf::from(path)),
                 StorageBackend::Postgres { .. } => None,
             };
             let context_path = single_store_reads::context_db_path_for(store_path.as_deref());
-            single_store_reads::attach(&store, &context_path)?;
+            single_store_reads::attach_with_private_permissions(
+                &store,
+                &context_path,
+                enforce_private_permissions,
+            )?;
             Ok(store)
         };
         match tokio::task::spawn_blocking(open).await {

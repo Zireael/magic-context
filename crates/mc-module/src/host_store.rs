@@ -41,6 +41,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use mc_store::private_permissions::{
+    create_file, ensure_directory, tighten_directory, tighten_tree,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -849,7 +852,22 @@ pub struct HostStore {
 impl HostStore {
     /// Open `context.db` read/write against this binary's fence.
     pub fn open(path: &Path) -> Result<Self, HostStoreError> {
-        Self::open_with_fence(path, BUILT_CONTEXT_FENCE_VERSION)
+        Self::open_with_private_permissions(
+            path,
+            crate::config::private_storage_permissions_enabled(),
+        )
+    }
+
+    /// Open against the user-tier privacy policy; tests use `open_with_fence` below.
+    pub fn open_with_private_permissions(
+        path: &Path,
+        enforce_private_permissions: bool,
+    ) -> Result<Self, HostStoreError> {
+        Self::open_with_fence_and_private_permissions(
+            path,
+            BUILT_CONTEXT_FENCE_VERSION,
+            enforce_private_permissions,
+        )
     }
 
     /// Open against an explicit built fence.
@@ -857,6 +875,37 @@ impl HostStore {
     /// Tests use this to stand a database one lane ahead of the binary without shipping
     /// a migration; production always goes through [`HostStore::open`].
     pub fn open_with_fence(path: &Path, built_version: i64) -> Result<Self, HostStoreError> {
+        Self::open_with_fence_and_private_permissions(path, built_version, true)
+    }
+
+    fn open_with_fence_and_private_permissions(
+        path: &Path,
+        built_version: i64,
+        enforce_private_permissions: bool,
+    ) -> Result<Self, HostStoreError> {
+        let storage_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        ensure_directory(storage_dir, true).map_err(|error| HostStoreError::OpenFailed {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })?;
+        let root_before = tighten_directory(storage_dir, true);
+        let tree_before = tighten_tree(storage_dir, enforce_private_permissions);
+        let before = mc_store::private_permissions::TightenReport {
+            tightened: root_before.tightened + tree_before.tightened,
+            failures: root_before.failures + tree_before.failures,
+        };
+        if !path.exists() {
+            match create_file(path, true) {
+                Ok(file) => drop(file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(HostStoreError::OpenFailed {
+                        path: path.display().to_string(),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        }
         let conn = Connection::open(path).map_err(|error| HostStoreError::OpenFailed {
             path: path.display().to_string(),
             reason: error.to_string(),
@@ -891,6 +940,13 @@ impl HostStore {
             })?;
 
         let fence = FenceState::read(&conn, path, built_version)?;
+        let root_after = tighten_directory(storage_dir, true);
+        let tree_after = tighten_tree(storage_dir, enforce_private_permissions);
+        tracing::info!(
+            tightened = before.tightened + root_after.tightened + tree_after.tightened,
+            failures = before.failures + root_after.failures + tree_after.failures,
+            "mc-module: storage permission tightening"
+        );
         Ok(HostStore {
             conn,
             path: path.to_path_buf(),
