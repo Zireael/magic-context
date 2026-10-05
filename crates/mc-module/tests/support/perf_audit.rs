@@ -1,4 +1,4 @@
-//! Run under an outer timeout with --release --ignored --nocapture --test-threads=1.
+//! Library-only instrument: run under an outer timeout with --release --lib --ignored --nocapture --test-threads=1.
 //! All fixture paths are temporary. No host service or live store is opened.
 use crate::{
     config::ConfigCache,
@@ -6,6 +6,7 @@ use crate::{
     project_identity::ProjectIdentityResolver,
     reply_pages::accepts_reply_pages,
 };
+use mc_store::ContextDomain;
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::{hint::black_box, time::Instant};
@@ -131,10 +132,35 @@ fn measure_module_findings() {
             },
             20,
         );
+        let domain = crate::single_store_reads::ModuleContextDomain::open(&path).unwrap();
+        let scalar_reads_ms = timed(
+            || {
+                std::thread::scope(|scope| {
+                    for _ in 0..4 {
+                        scope.spawn(|| {
+                            for _ in 0..10 {
+                                domain
+                                    .read(&mut |conn| {
+                                        let max: i64 = conn.query_row(
+                                            "SELECT MAX(tag_number) FROM tags WHERE session_id='s'",
+                                            [],
+                                            |r| r.get(0),
+                                        )?;
+                                        assert_eq!(max, messages);
+                                        Ok(())
+                                    })
+                                    .unwrap();
+                            }
+                        });
+                    }
+                });
+            },
+            10,
+        ) / 40.0;
         let body = serde_json::to_vec(&serde_json::json!({"accept_reply_pages":true,"messages":(0..messages).map(|i|serde_json::json!({"id":format!("m{i}"),"text":"Read the code and adjust the dependency. ".repeat(8)})).collect::<Vec<_>>() })).unwrap();
         let reply_parse_ms = timed(
             || {
-                black_box(accepts_reply_pages(&body));
+                assert!(accepts_reply_pages(&body));
             },
             20,
         );
@@ -160,6 +186,6 @@ fn measure_module_findings() {
             },
             100,
         );
-        println!("RS fixture messages={messages} RS1_fingerprint_ms={fingerprint_ms:.3} context_write_tx_ms={context_tx_ms:.3} RS7_body_bytes={} RS7_parse_ms={reply_parse_ms:.3} RS7_sha_ms={reply_hash_ms:.3} RS9_config_ms={config_ms:.3} RS12_cached_identity_ms={identity_ms:.3}",body.len());
+        println!("RS fixture messages={messages} RS1_fingerprint_ms={fingerprint_ms:.3} context_write_tx_ms={context_tx_ms:.3} RS6_4_thread_scalar_read_ms={scalar_reads_ms:.3} RS7_body_bytes={} RS7_parse_ms={reply_parse_ms:.3} RS7_sha_ms={reply_hash_ms:.3} RS9_config_ms={config_ms:.3} RS12_cached_identity_ms={identity_ms:.3}",body.len());
     }
 }
