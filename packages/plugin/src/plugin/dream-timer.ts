@@ -158,6 +158,7 @@ interface ProjectRegistration {
 
 /** Singleton timer state. */
 let activeTimer: ReturnType<typeof setInterval> | null = null;
+let tickInFlight = false;
 let startupTickTimer: ReturnType<typeof setTimeout> | null = null;
 const startupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const startupJitters = new Map<string, number>();
@@ -354,6 +355,10 @@ export function _setDreamTimerStagesForTests(overrides: Partial<typeof tickStage
  * task scheduling for every project, on every tick, forever (issue 496).
  */
 function runTick(origin: "startup" | "interval"): void {
+    // Maintenance can outlive the interval under a busy writer or a slow task.
+    // One tick already covers every project, so do not start duplicate work.
+    if (tickInFlight) return;
+    tickInFlight = true;
     log(`[dreamer] timer tick (${origin}) — projects=${registeredProjects.size}`);
     void (async () => {
         try {
@@ -400,6 +405,8 @@ function runTick(origin: "startup" | "interval"): void {
             runSqliteOptimize(db);
         } catch (error) {
             log("[magic-context] timer-triggered maintenance check failed:", error);
+        } finally {
+            tickInFlight = false;
         }
     })();
 }

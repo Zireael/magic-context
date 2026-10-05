@@ -35,7 +35,7 @@ import {
     setPersistedTodoPermissionDenied,
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
-import { getPendingOps } from "../../features/magic-context/storage-ops";
+import { hasPendingDropOps } from "../../features/magic-context/storage-ops";
 import {
     GLOBAL_USER_PROFILE_PROJECT_PATH,
     getProjectState,
@@ -3193,7 +3193,7 @@ export function createRustModeTransform(
                 refresh: protectionFloorCacheBustingPass,
                 emergency: overflowState.needsEmergencyRecovery,
                 frozen: state.lkgRepresentationFrozen,
-                agent_drop: getPendingOps(deps.db, sessionId).length > 0,
+                agent_drop: hasPendingDropOps(deps.db, sessionId),
                 ttl:
                     state.lastAppliedAtMs !== undefined &&
                     requestObservedAtMs - state.lastAppliedAtMs >= idleBudgetMs,
