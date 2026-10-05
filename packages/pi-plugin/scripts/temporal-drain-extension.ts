@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { getTagsBySession, openDatabase, queuePendingOp, setPendingPiCompactionMarkerState, updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { registerPiContextHandler, signalPiDeferredHistoryRefresh, signalPiDeferredMaterialization } from "../src/context-handler";
-import { temporalLegacyTree } from "@magic-context/core/shared/temporal-legacy-test-fixture";
+import { temporalLegacyTree } from "./temporal-legacy-tree";
 
 /** Exercise the production context handler inside Pi, without unrelated background agents. */
 export default async function temporalDrainExtension(pi: ExtensionAPI) {

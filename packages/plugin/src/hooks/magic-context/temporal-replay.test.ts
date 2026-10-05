@@ -7,7 +7,7 @@ import {
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
 import { getTemporalDecisions } from "../../features/magic-context/temporal-decisions";
-import { temporalLegacyTree } from "../../shared/temporal-legacy-test-fixture";
+import { seedTemporalUpgradeFixture } from "../../shared/temporal-upgrade-fixture";
 import { createTestTempDir } from "../../shared/test-temp-dir";
 import { createHostSeams } from "../../v2/hooks/context";
 import type { V2Context } from "../../v2/hooks/types";
@@ -83,50 +83,21 @@ it.each([
     "OpenCode 1",
     "OpenCode 2",
 ])("%s upgrade preserves every previously served marker on the first defer", async (runtime) => {
-    const base = temporalLegacyTree();
-    const oldStorage = await import(
-        join(base, "packages/plugin/src/features/magic-context/storage.ts")
-    );
-    const oldTransform = await import(
-        join(base, "packages/plugin/src/hooks/magic-context/transform.ts")
-    );
-    const oldTagger = await import(
-        join(base, "packages/plugin/src/features/magic-context/tagger.ts")
-    );
     const root = createTestTempDir("oc-temporal-upgrade-");
     const path = join(root.dir, "context.db");
-    const sessionId = `upgrade-${runtime}`;
-    let db = oldStorage.openDatabase(path);
-    const pending = new Set([sessionId]);
+    let db = openDatabase(path)!;
+    const captured = seedTemporalUpgradeFixture(db, runtime);
+    const sessionId = captured.sessionId;
     const models = new Map([
         [sessionId, { providerID: "anthropic", modelID: "claude-sonnet-4-5" }],
     ]);
-    const raw = [
-        {
-            info: {
-                id: "prior",
-                sessionID: sessionId,
-                role: "assistant",
-                time: { created: 100_000, completed: 300_000 },
-            },
-            parts: [{ type: "text", text: "answer" }],
-        },
-        {
-            info: { id: "user", sessionID: sessionId, role: "user", time: { created: 600_000 } },
-            parts: [{ type: "text", text: "question" }],
-        },
-        {
-            info: { id: "later", sessionID: sessionId, role: "user", time: { created: 1_200_000 } },
-            parts: [{ type: "text", text: "follow up" }],
-        },
-    ];
     const read = Object.assign(() => [], { readPage: () => [], getCount: () => 0 });
     const deps = () => ({
         db,
         scheduler: { shouldExecute: () => "defer" as const },
         contextUsageMap: new Map(),
         historyRefreshSessions: new Set<string>(),
-        pendingMaterializationSessions: pending,
+        pendingMaterializationSessions: new Set<string>(),
         lastHeuristicsTurnId: new Map(),
         experimentalTemporalAwareness: true,
         historianRunnable: false,
@@ -134,43 +105,24 @@ it.each([
         protectedTokens: 0,
     });
     try {
-        const oldSeams =
-            runtime === "OpenCode 2"
-                ? (
-                      await import(join(base, "packages/plugin/src/v2/hooks/context.ts"))
-                  ).createHostSeams({}, read, read, models)
-                : {};
-        const served = structuredClone(raw);
-        await oldTransform.createTransform({
-            ...oldSeams,
-            ...deps(),
-            tagger: oldTagger.createTagger(),
-        })({}, { messages: served });
-        const before = served.filter((m) => m.info.role === "user").map((m) => m.parts[0].text);
-        expect(before[0]).toContain("<!-- +5m -->");
-        expect(before[1]).toContain("<!-- +10m -->");
-        oldStorage.updateSessionMeta(db, sessionId, {
-            lastResponseTime: Date.now(),
-            cacheTtl: "59m",
-        });
-        oldStorage.closeDatabase();
+        expect(captured.projectionJson).toContain("<!-- +5m -->");
+        expect(captured.projectionJson).toContain("<!-- +10m -->");
+        expect(getTemporalDecisions(db, sessionId).size).toBe(0);
+        closeDatabase();
         db = openDatabase(path)!;
         resetLkgSlotsForTest();
         const seams =
             runtime === "OpenCode 2" ? createHostSeams({} as V2Context, read, read, models) : {};
-        const continued = structuredClone(raw);
+        const continued = structuredClone(captured.input);
         await createTransform({ ...seams, ...deps(), tagger: createTagger() })(
             {},
             { messages: continued },
         );
-        expect(continued.filter((m) => m.info.role === "user").map((m) => m.parts[0].text)).toEqual(
-            before,
-        );
+        expect(JSON.stringify(continued)).toBe(captured.projectionJson);
         expect(getTemporalDecisions(db, sessionId).get("user")).toBe("<!-- +5m -->\n");
         expect(getTemporalDecisions(db, sessionId).get("later")).toBe("<!-- +10m -->\n");
     } finally {
-        oldStorage.closeDatabase();
         closeDatabase();
         root.cleanup();
     }
-}, 60_000);
+});

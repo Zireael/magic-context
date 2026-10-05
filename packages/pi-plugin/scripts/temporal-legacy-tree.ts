@@ -1,14 +1,14 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { createTestTempDir } from "./test-temp-dir";
+import { createTestTempDir } from "../../plugin/src/shared/test-temp-dir";
 
 let tree: string | undefined;
 
-/** The pre-temporal-ledger production tree used by the upgrade regression. */
+/** Manual capture/host-probe support only; tests must use committed fixtures. */
 export function temporalLegacyTree(repositoryRoot?: string): string {
     if (tree) return tree;
-    const repository = repositoryRoot ?? resolve(import.meta.dir, "../../../..");
+    const repository = repositoryRoot ?? resolve(import.meta.dir, "../../..");
     const root = createTestTempDir("temporal-legacy-code-").dir;
     const archive = execFileSync(
         "git",

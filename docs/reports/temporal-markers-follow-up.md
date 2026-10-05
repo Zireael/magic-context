@@ -7,19 +7,57 @@ foundation at `6528bb96`. No new migration number was added. The immutable
 review at `docs/reports/temporal-markers-review.md` remains unchanged.
 
 The review's old-to-new fixture was ported into `temporal-upgrade.test.ts`
-and the shared OpenCode temporal tests. These tests actually load the
-pre-ledger production handlers from Git revision `114e9ff6`, serve a session,
-close its database, reopen it with the current code and continue on a warm
-deferred pass. The old handlers must first serve both literal `+5m` and `+10m`.
-Pi's port reproduced the review's wire loss before the fix. OpenCode 1/2 kept
-their wire text through incidental source replay, as the review reported;
-their added persisted-choice assertions initially failed. This is not evidence
-of an old-code handoff wire failure in OpenCode.
+and the shared OpenCode temporal tests. The original ports executed the actual
+pre-ledger handlers and reproduced Pi's wire loss before the adoption fix.
+OpenCode 1/2 kept their text through incidental source replay, as the review
+reported; their added persisted-choice assertions initially failed. This is
+not evidence of an old-code handoff wire failure in OpenCode.
 
-The fixtures archive only repository code into test-owned roots and link the
-prepared dependencies. They do not copy any live store or implement a substitute
-old handler. The test checkout must contain Git object `114e9ff6`; a shallow
-checkout missing it fails explicitly rather than silently skipping this gate.
+For shallow-checkout CI, the tests now restore the committed historical session
+state and compare against `testdata/temporal-upgrade-projections.json`. That file
+captures all three old handlers' complete context-hook output arrays and their
+exact serialized bytes, not an expectation calculated by the current renderer.
+It also contains the old persisted tags, source contents, cache pair and LKG
+needed to resume without first rebuilding under the new code. Only the cache
+clock is advanced. Each test checks that temporal decisions start empty, closes
+and reopens its database, then compares the complete output bytes and adopted
+choices on a warm defer. Pi also verifies that cached m0/m1 stayed unchanged.
+
+No test imports a historical build, archives Git objects or runs the v94 host
+probe. The three historical cases and both existing cut/restart cases pass when
+`GIT_DIR` points to an absent repository, after a check confirms the old object
+cannot be accessed. The earlier per-test archive budgets are no longer needed.
+
+To regenerate the fixture manually in a full-history checkout with prepared
+dependencies:
+
+```sh
+timeout 180s bun packages/pi-plugin/scripts/capture-temporal-upgrade-fixture.ts
+```
+
+The script loads production code from the pinned `114e9ff6` commit, fixes its
+clock, and uses an empty logical project directory so the capture contains no
+checkout-specific paths or project documents. It creates only synthetic state
+under `$TMPDIR/magic-context/temporal-fixture-capture/` and never reads a live
+store. Binary SQLite values are encoded as base64 in the committed fixture.
+The history-dependent loader is confined to `packages/pi-plugin/scripts/`.
+
+The manual real-host `--handoff` probe still needs that old commit/build because
+its purpose is to launch the actual old handler and v94 storage code. It is not
+an automatically collected test or a CI gate. The ordinary drain probe does not
+load the old build. No other newly added test needs Git history or either probe.
+
+CI fixture follow-up verification: Bun 1.4.2 passed all five tests in the two
+changed regression files with `GIT_DIR` set to an absent repository; a preceding
+`git cat-file -e 114e9ff6` probe exited 128, confirming that history was inaccessible.
+The historical capture generated three cases, both package typechecks and the
+focused script typecheck passed with TypeScript 5.9.3, and the root build passed
+including all four v2 loader tests. Targeted Biome 2.5.1 checks passed.
+Neutralizing historical adoption still reddened exactly
+`Pi upgrade preserves every previously served marker on the first defer`
+against the committed complete JSON bytes, while both existing OpenCode
+cut/restart tests stayed green. That mutation also ran without Git history and
+was restored with an empty working diff.
 
 ## Adoption without a new wire edit
 
