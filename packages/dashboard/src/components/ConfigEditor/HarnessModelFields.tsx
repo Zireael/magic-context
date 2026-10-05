@@ -1,6 +1,5 @@
 import { For, Show } from "solid-js";
 import { ompModelIdToCanonical, piModelIdToCanonical } from "../../lib/model-ids";
-import LiveBadge from "./LiveBadge";
 import ModelSelect from "./ModelSelect";
 
 export type Harness = "opencode" | "pi" | "omp";
@@ -85,8 +84,9 @@ function QualifierControl(props: {
     <div class="config-field">
       <div class="config-field-header">
         <span class="config-field-label">{props.label}</span>
-        <LiveBadge path={props.path} />
-        <span class="config-field-key">{qualifier()}</span>
+        <span class="config-field-key">
+          {props.path}.{qualifier()}
+        </span>
       </div>
       <span class="config-field-desc">{props.description}</span>
       <Show
@@ -149,7 +149,6 @@ export default function HarnessModelFields(props: HarnessModelFieldsProps) {
       <div class="config-field">
         <div class="config-field-header">
           <span class="config-field-label">Model</span>
-          <LiveBadge path={`${props.agent}.${props.harness}.model`} />
           <span class="config-field-key">
             {props.agent}.{props.harness}.model
           </span>
@@ -196,7 +195,6 @@ export default function HarnessModelFields(props: HarnessModelFieldsProps) {
       <div class="config-field">
         <div class="config-field-header">
           <span class="config-field-label">Fallback Models</span>
-          <LiveBadge path={`${props.agent}.${props.harness}.fallback_models`} />
           <span class="config-field-key">
             {props.agent}.{props.harness}.fallback_models
           </span>
@@ -238,7 +236,8 @@ export default function HarnessModelFields(props: HarnessModelFieldsProps) {
                   </div>
                   <button
                     type="button"
-                    class="btn sm danger"
+                    class="config-icon-btn"
+                    aria-label={`Remove fallback ${modelId(entry)}`}
                     onClick={() => updateFallback(index(), undefined)}
                   >
                     ✕
