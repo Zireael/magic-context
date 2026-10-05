@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, renameSync, rmSync } from "node:fs";
+import { renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../shared/test-temp-dir";
 import { getV2StoreReaderDebugCounters, V2StoreReaderPool } from "./store-reader";
 
 function fixture(path: string, id = "m1") {
@@ -14,7 +15,7 @@ function fixture(path: string, id = "m1") {
 }
 
 test("pooled readers reuse one handle but see WAL edits and reject a closed lease", () => {
-    const root = mkdtempSync(join(tmpdir(), "mc-reader-pool-"));
+    const root = createTestTempDirFromPath(join(tmpdir(), "mc-reader-pool-"));
     const path = join(root, "store.db");
     const writer = fixture(path);
     writer.exec("PRAGMA journal_mode=WAL");
@@ -46,7 +47,7 @@ test("pooled readers reuse one handle but see WAL edits and reject a closed leas
 });
 
 test("pool bounds retained handles and rechecks generation after file replacement", () => {
-    const root = mkdtempSync(join(tmpdir(), "mc-reader-inode-"));
+    const root = createTestTempDirFromPath(join(tmpdir(), "mc-reader-inode-"));
     const path = join(root, "store.db");
     const secondPath = join(root, "second.db");
     fixture(path).close();
