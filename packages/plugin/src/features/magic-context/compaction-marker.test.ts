@@ -5,7 +5,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as logger from "../../shared/logger";
-import { Database } from "../../shared/sqlite";
+import { Database, withSqliteTransformPass } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
@@ -14,6 +14,10 @@ import {
     generateMessageId,
     injectCompactionMarker,
     isOpenCodeGapHistorianAbsent,
+    removeCompactionMarker,
+    removeForeignCompactionMarker,
+    removeMcOwnedCompactionMarkers,
+    replaceCompactionMarker,
 } from "./compaction-marker";
 
 const tempDirs: string[] = [];
@@ -54,6 +58,115 @@ function insertMessage(
         "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, 'ses-1', ?, ?, ?)",
     ).run(id, timeCreated, timeCreated, JSON.stringify({ role, ...data }));
 }
+
+/** A real independent writer outlives publication's 250ms acquisition budget. */
+async function whileWriterIsLocked<T>(dbPath: string, operation: () => T): Promise<T> {
+    const child = Bun.spawn(
+        [
+            "timeout",
+            "10s",
+            process.execPath,
+            "-e",
+            `import { Database } from "bun:sqlite";
+         const db = new Database(process.env.OPENCODE_DB);
+         db.exec("BEGIN IMMEDIATE");
+         console.log("locked");
+         await Bun.sleep(1200);
+         db.exec("ROLLBACK"); db.close();`,
+        ],
+        { env: { ...process.env, OPENCODE_DB: dbPath }, stdout: "pipe", stderr: "pipe" },
+    );
+    const reader = child.stdout.getReader();
+    try {
+        const signal = await reader.read();
+        expect(new TextDecoder().decode(signal.value)).toContain("locked");
+        return operation();
+    } finally {
+        reader.releaseLock();
+        expect(await child.exited).toBe(0);
+    }
+}
+
+describe("marker removal acquisition isolation", () => {
+    for (const removal of ["owned", "foreign", "compaction-off"] as const) {
+        it(`keeps ${removal} removal on the long wait inside a foreground transform`, async () => {
+            const dataHome = useTempDataHome(`marker-removal-${removal}-`);
+            const db = createOpenCodeDb(dataHome);
+            insertMessage(db, "msg_user", "user", 100);
+            const args = {
+                sessionId: "ses-1",
+                endOrdinal: 1,
+                endMessageId: "msg_user",
+                summaryText: "summary placeholder",
+                directory: dataHome,
+                resolvedBoundary: { id: "msg_user", timeCreated: 100 },
+            };
+            const marker = injectCompactionMarker(args);
+            if (!marker) throw new Error("expected marker fixture");
+            const result = await whileWriterIsLocked(
+                join(dataHome, "opencode", "opencode.db"),
+                () => {
+                    const startedAt = performance.now();
+                    const removed = withSqliteTransformPass(() => {
+                        if (removal === "owned") return removeCompactionMarker(marker);
+                        if (removal === "foreign")
+                            return removeForeignCompactionMarker(
+                                "ses-1",
+                                {
+                                    compactionPartId: marker.compactionPartId,
+                                    boundaryMessageId: marker.boundaryMessageId,
+                                    summaryMessageIds: [marker.summaryMessageId],
+                                },
+                                null,
+                            );
+                        return removeMcOwnedCompactionMarkers("ses-1", args.summaryText);
+                    });
+                    expect(performance.now() - startedAt).toBeGreaterThan(500);
+                    return removed;
+                },
+            );
+            if (removal === "compaction-off") {
+                expect(result).toMatchObject({
+                    verified: true,
+                    removedLineages: 1,
+                    removedRows: 3,
+                });
+            } else expect(result).toBe(true);
+            expect(db.prepare("SELECT count(*) AS n FROM part").get()).toEqual({ n: 0 });
+            expect(db.prepare("SELECT id FROM message ORDER BY id").all()).toEqual([
+                { id: "msg_user" },
+            ]);
+            closeQuietly(db);
+        }, 10_000);
+    }
+
+    it("keeps injection and replacement short after warming the removal connection", async () => {
+        const dataHome = useTempDataHome("marker-removal-publication-isolation-");
+        const db = createOpenCodeDb(dataHome);
+        insertMessage(db, "msg_user", "user", 100);
+        // Open the removal handle before publication ever opens its own handle.
+        expect(removeMcOwnedCompactionMarkers("ses-1", "summary placeholder").verified).toBe(true);
+        const args = {
+            sessionId: "ses-1",
+            endOrdinal: 1,
+            endMessageId: "msg_user",
+            summaryText: "summary placeholder",
+            directory: dataHome,
+            resolvedBoundary: { id: "msg_user", timeCreated: 100 },
+        };
+        await whileWriterIsLocked(join(dataHome, "opencode", "opencode.db"), () => {
+            const startedAt = performance.now();
+            expect(injectCompactionMarker(args)).toBeNull();
+            expect(performance.now() - startedAt).toBeLessThan(1000);
+            const replacementStartedAt = performance.now();
+            expect(replaceCompactionMarker(null, args).kind).toBe("definitely-no-cut");
+            expect(performance.now() - replacementStartedAt).toBeLessThan(1000);
+        });
+        expect(db.prepare("SELECT count(*) AS n FROM part").get()).toEqual({ n: 0 });
+        expect(injectCompactionMarker(args)).not.toBeNull();
+        closeQuietly(db);
+    }, 10_000);
+});
 
 afterEach(() => {
     closeCompactionMarkerDb();

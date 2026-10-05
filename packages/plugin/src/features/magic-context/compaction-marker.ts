@@ -35,7 +35,7 @@ import {
     assertOpenCodeStoreGeneration,
     resolveOpenCodeDbPath,
 } from "../../shared/opencode-db-path";
-import { Database } from "../../shared/sqlite";
+import { Database, withoutSqliteTransformPass } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 
 // ── ID Generation ────────────────────────────────────────────────
@@ -88,10 +88,20 @@ export function getOpenCodeDbPath(): string {
 }
 
 let cachedWriteDb: { path: string; db: Database } | null = null;
+let cachedRemovalDb: { path: string; db: Database } | null = null;
 
 // Marker publication already retains failed requests for the next consuming
 // pass. Do not block that pass for seconds behind OpenCode's streaming writer.
 const MARKER_BUSY_TIMEOUT_MS = 250;
+const MARKER_REMOVAL_BUSY_TIMEOUT_MS = 5000;
+
+/** One-shot cleanup callers cannot retain a failed deletion for the next pass. */
+function runMarkerRemovalTransaction<T>(db: Database, operation: () => T): T {
+    // A foreground transform normally shortens BEGIN admission to its shared
+    // 250ms lease. Cleanup must keep the removal connection's full timeout,
+    // including fork hygiene performed inside that foreground transform.
+    return withoutSqliteTransformPass(() => db.transaction(operation).immediate());
+}
 
 /** Time the outer host-store lock, including COMMIT/rollback but not a nested savepoint. */
 function runMarkerWriteTransaction<T>(db: Database, site: string, operation: () => T): T {
@@ -203,18 +213,21 @@ function isOpenCodeSchemaCompatible(db: Database, dbPath: string): boolean {
     }
 }
 
-function getWritableOpenCodeDb(): Database {
+function getWritableOpenCodeDb(purpose: "publication" | "removal" = "publication"): Database {
     if (!harnessOwnsOpenCodeStore()) {
         throw new Error("OpenCode database is not writable from a Pi-compatible process");
     }
     const resolution = resolveOpenCodeDbPath();
     const dbPath = resolution.path;
-    if (cachedWriteDb?.path === dbPath) {
-        return cachedWriteDb.db;
+    // busy_timeout is connection-wide. Keep retryable publication separate
+    // from cleanup, whose event/hygiene callers can discard the failure.
+    const cached = purpose === "removal" ? cachedRemovalDb : cachedWriteDb;
+    if (cached?.path === dbPath) {
+        return cached.db;
     }
-    if (cachedWriteDb) {
+    if (cached) {
         try {
-            closeQuietly(cachedWriteDb.db);
+            closeQuietly(cached.db);
         } catch {
             // ignore
         }
@@ -238,23 +251,29 @@ function getWritableOpenCodeDb(): Database {
         closeQuietly(db);
         throw error;
     }
-    // Setting WAL can need the file lock too; bound cold-open waiting as well
-    // as BEGIN IMMEDIATE. Both failures take the existing retained-retry path.
-    db.exec(`PRAGMA busy_timeout=${MARKER_BUSY_TIMEOUT_MS}`);
+    // Set the operation's timeout before WAL setup, which can need a lock too.
+    // Confine the short deadline to publication: some removal callers discard
+    // a failure rather than retaining a retry.
+    const timeoutMs =
+        purpose === "removal" ? MARKER_REMOVAL_BUSY_TIMEOUT_MS : MARKER_BUSY_TIMEOUT_MS;
+    db.exec(`PRAGMA busy_timeout=${timeoutMs}`);
     db.exec("PRAGMA journal_mode=WAL");
-    cachedWriteDb = { path: dbPath, db };
+    if (purpose === "removal") cachedRemovalDb = { path: dbPath, db };
+    else cachedWriteDb = { path: dbPath, db };
     return db;
 }
 
 export function closeCompactionMarkerDb(): void {
-    if (cachedWriteDb) {
+    for (const cached of [cachedWriteDb, cachedRemovalDb]) {
+        if (!cached) continue;
         try {
-            closeQuietly(cachedWriteDb.db);
+            closeQuietly(cached.db);
         } catch {
             // ignore
         }
-        cachedWriteDb = null;
     }
+    cachedWriteDb = null;
+    cachedRemovalDb = null;
     // Reset the schema-probe cache too — next open may be a different process
     // or a different opencode.db path (e.g. test isolation via XDG_DATA_HOME).
     cachedSchemaCompatible = null;
@@ -824,7 +843,8 @@ export function listSessionCompactionMarkers(sessionId: string): SessionCompacti
  * foreign boundary newer than ours should always differ).
  *
  * Returns false (without throwing) when the DELETE transaction fails, e.g.
- * SQLITE_BUSY; the caller retries on a later pass.
+ * SQLITE_BUSY. The hygiene caller reports failure, but its transform trigger
+ * only runs once per degraded episode, so a later-pass retry is not guaranteed.
  */
 export function removeForeignCompactionMarker(
     sessionId: string,
@@ -832,8 +852,8 @@ export function removeForeignCompactionMarker(
     protectedSummaryMessageId: string | null,
 ): boolean {
     try {
-        const db = getWritableOpenCodeDb();
-        db.transaction(() => {
+        const db = getWritableOpenCodeDb("removal");
+        runMarkerRemovalTransaction(db, () => {
             const deletePartsOfMessage = db.prepare(
                 "DELETE FROM part WHERE +session_id = ? AND message_id = ?",
             );
@@ -847,7 +867,7 @@ export function removeForeignCompactionMarker(
                 sessionId,
                 marker.compactionPartId,
             );
-        }).immediate();
+        });
         return true;
     } catch (error) {
         log(
@@ -949,7 +969,7 @@ export function removeMcOwnedCompactionMarkers(
     sessionId: string,
     summaryText: string,
 ): McOwnedMarkerCleanupResult {
-    const db = getWritableOpenCodeDb();
+    const db = getWritableOpenCodeDb("removal");
     if (!isOpenCodeSchemaCompatible(db, getOpenCodeDbPath())) {
         // Schema drift: we cannot prove our DELETEs match the live schema, so
         // leave every row in place. The marker stays inert-but-present; the
@@ -1122,15 +1142,13 @@ export function removeMcOwnedCompactionMarkers(
         }
 
         // Caveat 1: compaction part + summary rows deleted TOGETHER.
-        const rows = db
-            .transaction(() => {
-                let changed = deleteSummaries(summaryIds);
-                for (const partId of mcPartIds) {
-                    changed += deletePart.run(sessionId, partId).changes;
-                }
-                return changed;
-            })
-            .immediate();
+        const rows = runMarkerRemovalTransaction(db, () => {
+            let changed = deleteSummaries(summaryIds);
+            for (const partId of mcPartIds) {
+                changed += deletePart.run(sessionId, partId).changes;
+            }
+            return changed;
+        });
         if (rows > 0 || summaryIds.size > 0 || mcPartIds.length > 0) {
             removedLineages += 1;
             removedRows += rows;
@@ -1149,7 +1167,7 @@ export function removeMcOwnedCompactionMarkers(
         if (survivingPartsReferenceDeletion || messageFieldReferencesDeletion) {
             retainedLineages += 1;
         } else {
-            const rows = db.transaction(() => deleteSummaries(orphanSummaryIds)).immediate();
+            const rows = runMarkerRemovalTransaction(db, () => deleteSummaries(orphanSummaryIds));
             removedLineages += 1;
             removedRows += rows;
         }
@@ -1170,17 +1188,17 @@ export function removeMcOwnedCompactionMarkers(
 
 /**
  * Remove an existing compaction marker (all 3 rows).
- * Used when moving the boundary forward or on session cleanup.
+ * Used on removed-message, native-compaction and session-deletion events.
  */
 export function removeCompactionMarker(state: CompactionMarkerState): boolean {
     try {
-        const db = getWritableOpenCodeDb();
-        db.transaction(() => {
+        const db = getWritableOpenCodeDb("removal");
+        runMarkerRemovalTransaction(db, () => {
             // Delete in reverse order of dependencies
             db.prepare("DELETE FROM part WHERE id = ?").run(state.summaryPartId);
             db.prepare("DELETE FROM message WHERE id = ?").run(state.summaryMessageId);
             db.prepare("DELETE FROM part WHERE id = ?").run(state.compactionPartId);
-        }).immediate();
+        });
         return true;
     } catch (error) {
         log(

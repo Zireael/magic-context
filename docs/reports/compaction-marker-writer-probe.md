@@ -26,7 +26,9 @@ Changes:
   This uses the existing message index; it does not create an index or migrate
   OpenCode's store.
 * Keep `BEGIN IMMEDIATE` and atomic replacement, but bound native busy waiting
-  (including cold-open WAL setup) to 250ms instead of 5000ms. Failure before
+  for injection/replacement (including cold-open WAL setup) to 250ms instead of
+  5000ms. Removal operations retain 5000ms on a separate cached connection.
+  Failure before
   callback entry remains `definitely-no-cut`; the manager retains its retry
   and old marker. The shared transform lease can shorten this further.
 * Every outer injection/replacement emits
@@ -36,6 +38,46 @@ Changes:
   `end_ms` is COMMIT on success, or transaction unwinding on failure. A large
   `end_ms` identifies finalization/I/O, not necessarily a checkpoint versus
   fsync. A failed acquisition has zero hold/work/end and `not_acquired`.
+
+### Removal caller audit and timeout isolation
+
+All production removal callers were checked, not just each function's return
+type or comments:
+
+| Removal | Actual caller and failure behavior | Retry? |
+| --- | --- | --- |
+| `removeCompactionMarker` | `removeCompactionMarkerForSession` ignores its false result and clears persisted marker state. Invoked by `event-handler.ts` for `message.removed`, `session.compacted` and `session.deleted`. A surviving marker loses its durable ownership; a future publication is not a guaranteed deletion retry. | No retained marker-removal retry. |
+| `removeForeignCompactionMarker` | `reconcileForkOrphanedCompactionMarkers` reports `failed`, but `prepareCompartmentInjection` discards the result and invokes hygiene only when `degradedCount === 1`. The next pass of the same degraded episode does not retry. | No immediate retry; another degraded episode may revisit it. |
+| `removeMcOwnedCompactionMarkers` | `cleanupOffMarkers` propagates SQLITE_BUSY into `reconcileCompactionMode`. The first flip stages `off_notice_pending` before cleanup; the transform catch fails the managed pass with `compaction-mode-transition-failure` rather than settling it. Later passes retry that pending transition. An existing `off_cleanup_pending` record also remains pending on failure. | Durable retry on subsequent transforms/restarts. |
+
+Since two removals have no retained retry, **all three** keep their original
+5000ms native wait on a dedicated cached removal connection, including WAL
+setup. Publication keeps its separate 250ms connection; removal success or
+failure cannot leak a longer timeout into injection/replacement. Both handles
+are closed/reset by `closeCompactionMarkerDb`.
+
+Removal transactions explicitly run outside the shared foreground-transform
+acquisition lease, which otherwise shortens BEGIN to 250ms even on a connection
+configured with 5000ms. The surrounding transform lease remains unchanged.
+Tests exercise every removal with an independent process holding the writer
+beyond 250ms, inside a foreground transform scope, then verify the actual rows
+are removed. Additional tests verify publication stays short after the removal
+connection is warm and that compaction-off cleanup retains its durable retry
+when SQLITE_BUSY is raised.
+
+This preserves the old removal wait, not an unlimited deletion guarantee. A
+writer busy beyond 5000ms can still leave one-shot cleanup incomplete; adding
+durable retries to those callers would be a separate change. Compaction-off
+cleanup already has the durable retry described above.
+
+Follow-up verification passed 62 tests / 266 assertions across the marker,
+manager and compaction-off suites. The 150k-message/1M-part probe still matched
+the independent baseline row hash; its publication acquisition rejected the
+competing writer in 251ms. The additional artifact is
+`<root>/data/opencode/marker-probe-removal-followup.json`. Scoped mutations
+proved the tests fail when the foreground lease exemption is removed, when
+the removal connection is shortened to 250ms, or when publication is lengthened
+to 5000ms; all mutations were restored.
 
 ## Isolation, schema and fixture
 
