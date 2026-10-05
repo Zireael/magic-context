@@ -1081,12 +1081,31 @@ describe("createTransform", () => {
         useTempDataHome("context-transform-hotpath-snapshot-");
         const realDb = openDatabase();
         const preparedSql: string[] = [];
+        const tokenQueryIds: string[][] = [];
         const db = new Proxy(realDb, {
             get(target, prop, receiver) {
                 if (prop === "prepare") {
                     return (sql: string) => {
                         preparedSql.push(sql);
-                        return target.prepare.call(target, sql);
+                        const statement = target.prepare.call(target, sql);
+                        if (
+                            !sql.includes("tags.reasoning_token_count") ||
+                            !sql.includes("status = 'active'")
+                        )
+                            return statement;
+                        // Observe executions rather than compiles: the prepared
+                        // exact-owner statement survives between transform passes.
+                        return new Proxy(statement, {
+                            get(stmt, key) {
+                                if (key === "all")
+                                    return (...params: Parameters<typeof stmt.all>) => {
+                                        tokenQueryIds.push(JSON.parse(String(params[0])));
+                                        return stmt.all(...params);
+                                    };
+                                const value = Reflect.get(stmt, key);
+                                return typeof value === "function" ? value.bind(stmt) : value;
+                            },
+                        });
                     };
                 }
                 const value = Reflect.get(target, prop, receiver);
@@ -1140,6 +1159,8 @@ describe("createTransform", () => {
 
         const first = structuredClone(input);
         await transform({}, { messages: first });
+        expect(tokenQueryIds).toHaveLength(1);
+        tokenQueryIds.length = 0;
         preparedSql.length = 0;
         const second = structuredClone(input);
         await transform({}, { messages: second });
@@ -1154,26 +1175,14 @@ describe("createTransform", () => {
         expect(preparedSql.some((sql) => sql.includes("SELECT last_response_time FROM"))).toBe(
             false,
         );
-        expect(
-            preparedSql.some(
-                (sql) =>
-                    sql.includes("SELECT type, message_id, tool_owner_message_id") &&
-                    sql.includes("status = 'active'"),
-            ),
-        ).toBe(false);
+        expect(tokenQueryIds).toHaveLength(0);
 
         clearMessageTokensCache(sessionId, "hotpath-0");
         preparedSql.length = 0;
         const afterRemovalInvalidation = structuredClone(input);
         await transform({}, { messages: afterRemovalInvalidation });
         expect(digest(afterRemovalInvalidation)).toBe(digest(second));
-        expect(
-            preparedSql.some(
-                (sql) =>
-                    sql.includes("SELECT type, message_id, tool_owner_message_id") &&
-                    sql.includes("status = 'active'"),
-            ),
-        ).toBe(true);
+        expect(tokenQueryIds).toEqual([["hotpath-0"]]);
     });
 
     it("refuses the pass and leaves the raw array untouched when session metadata is unreadable", async () => {

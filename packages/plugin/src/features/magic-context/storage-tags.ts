@@ -441,17 +441,66 @@ export function getTriggerTagTokenUpperBound(
     return { bound: row?.bound ?? 0, nullCount: row?.null_count ?? 0 };
 }
 
+const scopedActiveTokenTotalStatements = new WeakMap<Database, PreparedStatement>();
+
 export function getActiveTagTokenTotalsByMessage(
     db: Database,
     sessionId: string,
+    messageIds?: readonly string[],
 ): Map<string, MessageTokenTotal> {
-    const rows = db
-        .prepare(
-            `SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
+    if (messageIds?.length === 0) return new Map();
+    const fields =
+        "id, tag_number, type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count"
+            .split(", ")
+            .map((field) => `tags.${field}`)
+            .join(", ");
+    let scoped = scopedActiveTokenTotalStatements.get(db);
+    if (messageIds && !scoped) {
+        // Seek exact owners through existing indexes. Do not use a tag-number
+        // floor: a visible result can belong to an older invocation below it.
+        // UNION includes id so overlapping owner ranges cannot double-count a row.
+        scoped = db.prepare(`
+            SELECT ${fields} FROM json_each(?) AS owners
+            CROSS JOIN tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND tags.type != 'tool' AND +status = 'active'
+              AND message_id >= owners.value || ':' AND message_id < owners.value || ';'
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND type != 'tool' AND +status = 'active'
+              AND message_id IN (SELECT value FROM json_each(?))
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_pi_fallback_tool_owner
+            WHERE session_id = ? AND type = 'tool' AND +status = 'active'
+              AND tool_owner_message_id IN (SELECT value FROM json_each(?))
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND type = 'tool' AND +status = 'active'
+              AND tool_owner_message_id IS NULL AND message_id IN (SELECT value FROM json_each(?))
+            ORDER BY tag_number, id`);
+        scopedActiveTokenTotalStatements.set(db, scoped);
+    }
+    const owners = messageIds ? new Set(messageIds) : undefined;
+    const encoded = owners ? JSON.stringify([...owners]) : "";
+    const rows = (
+        messageIds && scoped
+            ? scoped.all(
+                  encoded,
+                  sessionId,
+                  sessionId,
+                  encoded,
+                  sessionId,
+                  encoded,
+                  sessionId,
+                  encoded,
+              )
+            : db
+                  .prepare(
+                      `SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
              FROM tags
              WHERE session_id = ? AND status = 'active'`,
-        )
-        .all(sessionId) as Array<{
+                  )
+                  .all(sessionId)
+    ) as Array<{
         type: string;
         message_id: string;
         tool_owner_message_id: string | null;
@@ -462,6 +511,7 @@ export function getActiveTagTokenTotalsByMessage(
     const out = new Map<string, MessageTokenTotal>();
     for (const row of rows) {
         const owner = ownerMessageIdForTagRow(row);
+        if (owners && !owners.has(owner)) continue;
         let entry = out.get(owner);
         if (!entry) {
             entry = { conversation: 0, toolCall: 0, toolOutput: 0, hasNull: false };

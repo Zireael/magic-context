@@ -4,6 +4,7 @@ import { readFrozenMergedReasoningParts } from "./merged-reasoning-decisions";
 import { initializeDatabase } from "./storage-db";
 import { getSourceContents, replaceSourceContent, saveSourceContent } from "./storage-source";
 import {
+    getActiveTagTokenTotalsByMessage,
     getDroppedTagsByNumbers,
     getInertWhitespaceAssistantTags,
     getTagById,
@@ -23,6 +24,37 @@ function database() {
     initializeDatabase(db);
     return db;
 }
+
+it("scopes token totals to exact missing owners without losing old tool or content-derived tags", () => {
+    const db = database();
+    const ids = ["a", "a:b", "a_%", "legacy-call"];
+    const contentIds = [
+        "a:p0",
+        "a:file1",
+        "a:mc-text-v1:abcd:0123:o1",
+        "a:invalid-suffix",
+        "a:b:p0",
+        "a_%:p0",
+        "legacy-call",
+        "tool-call",
+    ];
+    contentIds.forEach((id, index) => {
+        insertTag(db, "totals", id, index >= 6 ? "tool" : "message", 1, index + 1);
+    });
+    db.prepare(
+        "UPDATE tags SET token_count = tag_number, input_token_count = 2, reasoning_token_count = 3 WHERE session_id = ?",
+    ).run("totals");
+    db.prepare("UPDATE tags SET tool_owner_message_id = 'a' WHERE message_id = 'tool-call'").run();
+    db.prepare("UPDATE tags SET token_count = NULL WHERE message_id = 'a:b:p0'").run();
+    const all = getActiveTagTokenTotalsByMessage(db, "totals");
+    const expected = new Map([...all].filter(([id]) => ids.includes(id)));
+    expect(getActiveTagTokenTotalsByMessage(db, "totals", [...ids, "a"])).toEqual(expected);
+    expect(getActiveTagTokenTotalsByMessage(db, "totals", ["a"]).get("a")).toEqual(all.get("a"));
+    expect(getActiveTagTokenTotalsByMessage(db, "totals", [])).toEqual(new Map());
+    updateTagStatus(db, "totals", 8, "dropped");
+    expect(getActiveTagTokenTotalsByMessage(db, "totals", ["a"]).get("a")?.toolCall).toBe(0);
+    expect(getActiveTagTokenTotalsByMessage(db, "other", ids).size).toBe(0);
+});
 
 it("reads large source-id sets with one reusable statement and no stale content", () => {
     const db = database();
