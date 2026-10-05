@@ -153,7 +153,10 @@ export function renderSeedExamplesBlock(seeds: ReferenceSeed[]): string {
  * tiers) fall back to flat `content`. Keep episode_type in both groups, but
  * show importance only on diverse examples: newest scores cause anchoring.
  */
-function renderSessionRefCompartment(c: ReferenceCompartment, showImportance: boolean): string {
+export function renderSessionRefCompartment(
+    c: ReferenceCompartment,
+    showImportance: boolean,
+): string {
     const importance = c.importance ?? 50;
     const attrs =
         `start="${c.startMessage}" end="${c.endMessage}" title="${escapeXmlAttr(c.title)}"` +

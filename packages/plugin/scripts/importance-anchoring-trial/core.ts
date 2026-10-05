@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { renderSessionReferencesBlock, selectSeeds, type ReferenceCompartment } from "../../src/hooks/magic-context/reference-retrieval";
+import { renderSessionRefCompartment, selectSeeds, type ReferenceCompartment } from "../../src/hooks/magic-context/reference-retrieval";
 import { REFERENCE_SEEDS } from "../../src/hooks/magic-context/reference-seeds.generated";
 import { isNoContentCompartment } from "../../src/features/magic-context/no-content-compartment";
 
@@ -59,9 +59,9 @@ export function selectD(history: HistoricalReference[], session: string, start: 
 }
 export function variantD(prompt: string, history: HistoricalReference[], session: string, start: number) {
     const selected = selectD(history, session, start);
-    // The production renderer caps a whole block at six. Render one at a time
-    // to preserve its escaping/tier behavior while admitting D's seven refs.
-    const body = selected.references.map(c => renderSessionReferencesBlock([c]).replace(/^<session_references>\n|\n<\/session_references>$/g, "")).join("\n\n");
+    // D as trialled showed importance on all seven references. Render each with
+    // the production per-compartment renderer (escaping and tiers), scores on.
+    const body = selected.references.map(c => renderSessionRefCompartment(c, true)).join("\n\n");
     const seeds = `<compartment_examples_from_other_projects>\n${selected.seeds.map(s => s.block).join("\n\n")}\n</compartment_examples_from_other_projects>`;
     // Callback replacement preserves literal $& / $` strings in historical code.
     return { prompt: prompt.replace(/<compartment_examples_from_other_projects>[\s\S]*?<\/compartment_examples_from_other_projects>/, () => seeds).replace(/<session_references>[\s\S]*?<\/session_references>/, () => `<session_references>\n${body}\n</session_references>`), selected };
