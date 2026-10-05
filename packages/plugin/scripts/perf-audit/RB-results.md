@@ -1,13 +1,14 @@
-# Rust-mode bridge performance audit: partial delivery
+# Rust-mode bridge performance audit: measurements and verification
 
 Baseline: `ee9d82912cd8105322672a1f5dd1bbb7172a2f46`. Measurements preceded the
 corresponding production edits. Bun 1.4.2, TypeScript 5.9.3, macOS. No live host,
 live database, credentials, config, cache epoch, or persisted format was changed.
 
-**Initial delivery was blocked on required Rust verification.** The ordinary
-prebuilt lane is now green; see the follow-up record below. Specialized fixtures,
-served-wire differential and the Pi startup investigation are still pending in
-this checkpoint, so it is not yet a full green-lane claim.
+**The initial verification gap is closed.** The complete Rust manifest is green,
+the requested baseline/branch served-wire differential is identical, and the Pi
+startup cases pass in isolation on both baseline and branch. The original
+failed runs remain recorded below rather than erased; the final follow-up
+sections distinguish their load-sensitive failures from the successful gates.
 Five narrow optimizations are committed; several expensive findings remain
 unchanged because the proposed shortcut breaks an identity/isolation fence or
 changes request bytes. The table distinguishes those from the actual fixes.
@@ -119,7 +120,7 @@ a non-empty unstaged diff while applied and an empty diff after
 | Cached comparator keys | sorts canonical seeds byte-identically with one key read per seed | carries frozen placeholder, stale-reduce, and image ids plus the tag watermark |
 | Deferred page digests | hashes only stabilized pages while preserving canonical digests and wire sizes | hashes map slices with the Rust canonical page digest |
 
-## Tool issues and exact next action
+## Initial tool issues and blocked next action (resolved below)
 
 `timeout 3600 scripts/run-rust-hermetic-e2e.sh` exited **124**. Its first suites
 could not finish harness construction: ck-mc release compilation repeatedly
@@ -131,7 +132,8 @@ with secondary `h.dispose` errors because no harness existed. No Rust assertion
 pass is claimed, and no second heavy build was started. No own task process
 remained after timeout.
 
-**Next action:** after shared compile slots are available, run the required Rust
+**Next action at initial delivery (now completed below):** after shared compile
+slots are available, run the required Rust
 hermetic lane on this branch, then the before/after served-wire replay against
 `ee9d829`. Alternatively supply the harness a matched current-tree prebuilt
 module/daemon pair via its existing prebuilt environment seams. Resolve the two
@@ -183,5 +185,89 @@ concurrently with it. Fixture SHA-256 values:
 - delayed synchronous-dispatch probe:
   `674cf1a43f6eee6b0b205b5a9550c40278217829cba20b167943e7466fa3eac9`.
 
-The production module is not substituted for either fault/probe fixture. The
-next verification phases will run sequentially with their actual artifacts.
+The production module is not substituted for either fault/probe fixture.
+
+## Follow-up: specialized fixtures and complete Rust coverage
+
+The remaining files ran sequentially through the same script and shard seam,
+with `MC_E2E_CK_MC_DRIVE_FAULT_BIN` set to the real drive-fault artifact and
+`MC_E2E_SLOW_TRANSFORM_PROBE_BIN` set to the real delayed-dispatch artifact:
+
+| Manifest shard | File | Result |
+|---|---|---|
+| 38/57 | rust-oversize-reply.test.ts | 2 pass, 0 fail: screenshot output above 4 MiB is byte-identical without disconnect; health responds within 1 second during deliberately slow synchronous dispatch |
+| 50/57 | rust-timeout-double-hard.test.ts | 1 pass, 0 fail |
+| 51/57 | rust-timeout-epoch-recovery.test.ts | 1 pass, 0 fail |
+
+This background phase completed in 176 seconds, exit 0, without retries.
+Combined with the ordinary phase, **all 57 Rust manifest files are covered:
+112 pass, 154 mode-inapplicable skips, 0 fail**. The phases were disjoint and
+sequential; no file was silently excluded and no test fixture was substituted.
+All package source and Cargo.lock remained unchanged during follow-up.
+
+## Follow-up: served-wire differential
+
+With the copied default module/daemon pair, ran:
+
+```sh
+timeout 1800 bun packages/e2e-tests/scripts/pure-replay-differential.ts \
+  ee9d82912cd8105322672a1f5dd1bbb7172a2f46 \
+  alfonso/task/bg_d9e9d2c11a15577e-perf-audit-rb-rust-mode-ts-bridge-and-opencode-1
+```
+
+Compared baseline with `7b131e8279f50f95c27664cb5a37ccb5e1a44ce4`, which has
+the same production source as the final report commit. Exit 0:
+`RESULT IDENTICAL defer_passes=4`. Both refs observed four actual defer
+decisions and retained their established m0 generation. Message bytes/hashes:
+
+| Pass | Bytes on each ref | SHA-256 on each ref |
+|---|---:|---|
+| 1 | 588 | `8e44911693c99c96462f474ea2c8c327799333f11a19ad15ad802fb7ac130221` |
+| 2 | 754 | `a6391f075ba8a95501c2b241a3f04e0bb5104ad48a49ebfcaa69be8b295695dd` |
+| 3 | 920 | `4a86507e5ba0bd6b7083a0af0357e2f15c4f550eb48385e50add5707f3430739` |
+| 4 | 1088 | `c03c4fc133c46c4cca6401fa2a3c1cf3fd80be378077fa353c49f0676b57f53a` |
+
+Every system hash is
+`79b95b263eddd8b87a79391dcce93cb4d4fb5886dbf0ce553c47f7ae9da8e0aa`;
+every tool hash is
+`535ac4ab4b870c8a61b892f39defb0d0c4e7c594f1465dd3f2d939f08f411f65`.
+The existing differential's default fixture uses `startInTsMode: true`; this
+result is not mislabeled as a Rust transform-only differential. Real Rust
+request/replay coverage comes from the full green manifest above and the
+independent request/seed/persisted-slot byte checks in the instrument.
+
+## Follow-up: Pi startup timeout investigation
+
+No source or timeout was changed. Ran the two affected tests alone from the
+Pi package directory so its normal isolation preload applied:
+
+```sh
+timeout 180 bun test --timeout 30000 src/index-in-process-latch.test.ts \
+  -t 'claims process-wide startup maintenance from the full runtime|registers independent sessions in the same process'
+```
+
+- Current branch: **2 pass, 0 fail**, 10 assertions. Cold startup test
+  5,978.10 ms; subsequent independent-session test 6.39 ms.
+- Untouched `ee9d829` archive in the worktree's throwaway root, with the same
+  installed dependencies: **2 pass, 0 fail**, 10 assertions. Cold startup
+  8,986.39 ms; subsequent test 4.89 ms. The archived core source was checked
+  byte-for-byte against the Git baseline object, not borrowed from the branch.
+- Then the entire lifecycle file alone on the branch:
+  `timeout 240 bun test --timeout 30000 src/index-in-process-latch.test.ts`:
+  **17 pass, 0 fail**, 107 assertions, including all five cases that failed in
+  the original parallel suite. Cold startup 5,316.83 ms; total 8.39 seconds.
+
+Conclusion: the earlier timeouts are load/concurrency-sensitive startup limits,
+not an RB optimization regression. The cold path is already seconds long on
+the untouched baseline, against an explicit 15-second test deadline. These two
+tests register runtimes but never dispatch a context or status request, so the
+changed token-count/request algorithms are not exercised by their test bodies.
+Their storage/config/embedding bootstrap implementations are unchanged. The
+initial parallel Pi suite remains accurately recorded as failed; its isolated
+impacted-file rerun is now green, rather than claiming that the original full
+suite magically passed or increasing a timeout to hide the failure.
+
+The renamed staging pointer and specialized-fixture requirements were resolved
+through a parent decision: use the exact versioned default build, finish the
+ordinary lane first, then build only the missing fault/probe targets and run
+their files. No new optimization was made during this verification follow-up.
