@@ -43,6 +43,13 @@ async function main(): Promise<void> {
                 post({ type: "lock-wait", waiting: false });
             },
         });
+        // Close before reporting done. Closing the last connection checkpoints the
+        // WAL under a lock, and the caller reads the schema as soon as it hears
+        // "done": reporting first let that read race this checkpoint and fail
+        // with SQLITE_BUSY when the caller's busy timeout is short.
+        const finished = db;
+        db = undefined;
+        finished.close();
         post({ type: "done" });
     } catch (error) {
         post({

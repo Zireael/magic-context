@@ -550,9 +550,11 @@ type FinalizableStatement = Statement & { finalize(): void };
 interface StatementOwner {
     references: Set<WeakRef<FinalizableStatement>>;
     registered: WeakSet<FinalizableStatement>;
-    collected: FinalizationRegistry<WeakRef<FinalizableStatement>>;
+    /** Set size at which collected references are next swept out. */
+    pruneAt: number;
 }
 const statementOwners = new WeakMap<Database, StatementOwner>();
+const FIRST_PRUNE_AT = 256;
 
 function ownPreparedStatement(db: Database, statement: Statement): Statement {
     const finalizable = statement as FinalizableStatement;
@@ -561,14 +563,9 @@ function ownPreparedStatement(db: Database, statement: Statement): Statement {
     let owner = statementOwners.get(db);
     if (!owner) {
         const references = new Set<WeakRef<FinalizableStatement>>();
-        owner = {
-            references,
-            registered: new WeakSet(),
-            collected: new FinalizationRegistry((reference) => references.delete(reference)),
-        };
+        owner = { references, registered: new WeakSet(), pruneAt: FIRST_PRUNE_AT };
         statementOwners.set(db, owner);
         const close = db.close.bind(db) as (...args: unknown[]) => unknown;
-        const { collected } = owner;
         Object.defineProperty(db, "close", {
             configurable: true,
             writable: true,
@@ -580,7 +577,6 @@ function ownPreparedStatement(db: Database, statement: Statement): Statement {
                     } catch (error) {
                         failure ??= error;
                     }
-                    collected.unregister(reference);
                 }
                 references.clear();
                 const result = close(...args);
@@ -590,10 +586,18 @@ function ownPreparedStatement(db: Database, statement: Statement): Statement {
         });
     }
     if (!owner.registered.has(finalizable)) {
-        const reference = new WeakRef(finalizable);
-        owner.references.add(reference);
+        // No FinalizationRegistry: its callbacks run at GC time, where a throw
+        // is uncaught (seen in Bun's parallel test runner). Sweep references to
+        // collected statements whenever the set doubles instead, so one-shot
+        // statements in a long-running host stay bounded.
+        if (owner.references.size >= owner.pruneAt) {
+            for (const reference of owner.references) {
+                if (reference.deref() === undefined) owner.references.delete(reference);
+            }
+            owner.pruneAt = Math.max(FIRST_PRUNE_AT, owner.references.size * 2);
+        }
+        owner.references.add(new WeakRef(finalizable));
         owner.registered.add(finalizable);
-        owner.collected.register(finalizable, reference, reference);
     }
     return statement;
 }
