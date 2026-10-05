@@ -6,6 +6,9 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { closeCompactionMarkerDb, injectCompactionMarker } from "../../plugin/src/features/magic-context/compaction-marker";
+import { MARKER_SUMMARY_TEXT } from "../../plugin/src/hooks/magic-context/compaction-marker-manager";
+import { stableStringify } from "../../plugin/src/shared/stable-json";
 import { RustTestHarness } from "../src/rust-harness";
 import { rustPrereqs } from "../src/rust-scenario-support";
 
@@ -316,4 +319,121 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
         },
         600_000,
     );
+
+    it("recovers ALF-like seven sparse gaps but preserves the old cut when a post-marker gap contains a real message", async () => {
+        const initialSession = await h.createSession();
+        await h.sendPrompt(initialSession, "initial isolation probe");
+        assertHermeticStores(h);
+        for (const realGap of [false, true]) {
+            // Stage an old TS-era cut before this session's first Rust transform.
+            // This is generated fixture content, never a copy of the live store.
+            await h.restart({ rust: false, magicContextConfig: FOLD_CONFIG });
+            assertHermeticStores(h);
+            const sessionId = await h.createSession();
+            h.mock.setDefault({ text: "fixture seed", usage: { input_tokens: 500, output_tokens: 20 } });
+            await h.sendPrompt(sessionId, "seed sparse history");
+            h.appendSyntheticHistory(sessionId, { count: 160, textBytes: 64 });
+            const oc = new Database(join(h.env.dataDir, "opencode", "opencode.db"));
+            const context = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
+            let seedBoundaryId = "";
+            try {
+                oc.exec("PRAGMA busy_timeout=30000");
+                context.exec("PRAGMA busy_timeout=30000");
+                const raw = oc.query("SELECT id,time_created FROM message WHERE session_id=? AND json_extract(data,'$.summary') IS NOT 1 ORDER BY time_created,id").all(sessionId) as Array<{ id: string; time_created: number }>;
+                seedBoundaryId = `${raw[139]!.id}#0`;
+                const ranges = [[1,15],[17,28],[30,42],[44,62],[64,74],[76,84],[87,108],[111,140]];
+                const notices = [16,29,43,63,75,85,86,109,110];
+                for (const ordinal of notices) {
+                    const message = raw[ordinal-1]!;
+                    oc.query("UPDATE part SET data=json_set(data,'$.synthetic',json('true')) WHERE session_id=? AND message_id=?").run(sessionId, message.id);
+                }
+                if (realGap) {
+                    const message = raw[84]!;
+                    oc.query("INSERT INTO part (id,session_id,message_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)").run("prt_real_gap", sessionId, message.id, message.time_created+1, message.time_created+1, '{"type":"text","text":"REAL UNSUMMARIZED GAP CONTENT"}');
+                }
+                for (const [sequence, [start, end]] of ranges.entries()) {
+                    context.query(`INSERT INTO compartments(session_id,sequence,start_message,end_message,start_message_id,end_message_id,start_block_index,end_block_index,title,content,p1,importance,episode_type,created_at)
+                        VALUES (?,?,?,?,?,?,0,0,'fixture','covered generated history','covered generated history',50,'feature',1)`).run(sessionId, sequence, start!, end!, raw[start!-1]!.id, raw[end!-1]!.id);
+                }
+                const previousDb = process.env.OPENCODE_DB;
+                try {
+                    process.env.OPENCODE_DB = join(h.env.dataDir, "opencode", "opencode.db");
+                    const marker = injectCompactionMarker({ sessionId, endOrdinal: 50, endMessageId: raw[49]!.id, summaryText: MARKER_SUMMARY_TEXT, directory: h.env.workdir });
+                    expect(marker).not.toBeNull();
+                    context.query("UPDATE session_meta SET compaction_marker_state=?, pending_compaction_marker_state=NULL WHERE session_id=?").run(JSON.stringify({ ...marker, boundaryOrdinal: 50, targetEndMessageId: raw[49]!.id }), sessionId);
+                } finally {
+                    closeCompactionMarkerDb();
+                    if (previousDb === undefined) delete process.env.OPENCODE_DB;
+                    else process.env.OPENCODE_DB = previousDb;
+                }
+            } finally { oc.close(); context.close(); }
+            // Import the legacy history with its actual last-block anchor, which
+            // remains visible after the old host cut. A missing TS-era anchor
+            // would correctly trigger pending_rewrite instead of marker recovery.
+            const seed = await h.subc.moduleRequest(sessionId, h.env.workdir, { method: "state_sync", shadow_generation: 0, expected_shadow_seq: 0, seed_boundary_id: seedBoundaryId });
+            expect(seed.ok).toBe(true);
+            h.subc.writeModuleConfig(FOLD_CONFIG);
+            await h.restart({ rust: true, magicContextConfig: FOLD_CONFIG });
+            assertHermeticStores(h);
+            const before = h.readRustPasses().length;
+            const providerRequestsBefore = h.mainRequests().length;
+            await h.sendPrompt(sessionId, "recover this sparse history on a genuine bust");
+            const pass = (await h.waitForRustPasses(before+1)).at(-1)!;
+            if (realGap) {
+                // The real module independently refuses a PRESENT uncovered item
+                // before even reaching host repair. Require that precise safe
+                // refusal, not any startup error, and never send a lossy prefix.
+                expect(pass.applied).toBe(false);
+                expect(pass.servedFrom).toBe("refused");
+                expect(h.diagnosticLog()).toContain("(ordinal 85) sits at or below coverage end Some(140) but no compartment covers it");
+                expect(h.mainRequests().length).toBe(providerRequestsBefore);
+            } else {
+                expect(pass.applied).toBe(true);
+                expect(pass.servedFrom).toBe("transform");
+                expect(pass.decision).toMatch(/^(HARD|SOFT|MIGRATE_HARD)$/);
+            }
+            const state = (h.contextDb().query("SELECT compaction_marker_state FROM session_meta WHERE session_id=?").get(sessionId) as { compaction_marker_state: string }).compaction_marker_state;
+            const marker = JSON.parse(state) as { boundaryOrdinal: number };
+            expect(marker.boundaryOrdinal).toBe(realGap ? 50 : 140);
+            console.log(`ALF-like gaps=7, sizes=1,1,1,1,1,2,2, behind-marker=3, real-gap=${realGap}, marker=${marker.boundaryOrdinal}`);
+        }
+    }, 300_000);
+
+    it("real producer metadata-only committed execute cannot drain pending markers on unchanged SOFT+", async () => {
+        const isolationSession = await h.createSession();
+        await h.sendPrompt(isolationSession, "metadata fixture isolation probe");
+        assertHermeticStores(h);
+        const config = { ...FOLD_CONFIG, cache_ttl: "5m" };
+        h.subc.writeModuleConfig(config);
+        await h.restart({ rust: true, magicContextConfig: config });
+        const sessionId = await h.createSession();
+        h.mock.setDefault({ text: "metadata reply", usage: { input_tokens: 50_000, output_tokens: 20 } });
+        const warmBefore = h.readRustPasses().length;
+        await h.sendPrompt(sessionId, "warm the metadata-only execute fixture");
+        await h.waitForRustPasses(warmBefore + 1);
+        assertHermeticStores(h);
+        // Anthropic merges adjacent user messages; compare the two frozen history
+        // blocks, not the growing user/assistant tail or moving tail breakpoint.
+        const historyBlocks = () => (JSON.parse(h.lastMainWireSerialized()) as Array<{ content: unknown[] }>)[0]!.content.slice(0,2);
+        const first = historyBlocks();
+        const firstUser = (await h.listMessages(sessionId)).find(message => message.info?.role === "user")!.info!.id!;
+        const context = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
+        const pending = { ordinal: 1, endMessageId: firstUser, publishedAt: 1, injectAttempts: 3 };
+        try {
+            context.query(`UPDATE session_meta SET cache_ttl='5m', trailing_blank_decisions=json_set(trailing_blank_decisions,
+                '$.cacheTtlPolicy.value','5m','$.cacheTtlPolicy.config','5m'), pending_compaction_marker_state=? WHERE session_id=?`).run(stableStringify(pending), sessionId);
+        }
+        finally { context.close(); }
+        const before = h.readRustPasses().length;
+        await h.sendPrompt(sessionId, "execute with no new published history");
+        const pass = (await h.waitForRustPasses(before+1)).at(-1)!;
+        expect(pass.decision).toBe("SOFT+");
+        expect(pass.raw).toContain("scheduler=execute");
+        expect(pass.raw).toContain("committed=true");
+        expect(pass.servedFrom).toBe("transform");
+        expect(historyBlocks()).toEqual(first);
+        const row = h.contextDb().query("SELECT pending_compaction_marker_state FROM session_meta WHERE session_id=?").get(sessionId) as { pending_compaction_marker_state: string };
+        expect(JSON.parse(row.pending_compaction_marker_state)).toEqual(pending);
+        console.log(`real metadata-only execute: ${pass.raw}`);
+    }, 180_000);
 });

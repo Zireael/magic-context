@@ -1341,26 +1341,45 @@ describe("Rust mode authority adapter", () => {
         );
     });
 
-    it("accepts materialized boundaries only from a committed non-defer response", () => {
+    it("accepts materialized boundaries only from a committed execute with served bust permission", () => {
         expect(
-            __rustModeTransformTest.materializedCompactionBoundary({
-                decision: "HARD",
-                scheduler_decision: "execute",
-                committed: true,
-                row_version: 12,
-                coverage_ordinal: 9_590,
-                boundary_id: "msg_boundary#3",
-            }),
+            __rustModeTransformTest.materializedCompactionBoundary(
+                {
+                    decision: "HARD",
+                    scheduler_decision: "execute",
+                    committed: true,
+                    row_version: 12,
+                    coverage_ordinal: 9_590,
+                    boundary_id: "msg_boundary#3",
+                },
+                true,
+            ),
         ).toEqual({ rowVersion: 12, ordinal: 9_590, endMessageId: "msg_boundary" });
         expect(
-            __rustModeTransformTest.materializedCompactionBoundary({
-                decision: "SOFT+",
-                scheduler_decision: "defer",
-                committed: true,
-                row_version: 12,
-                coverage_ordinal: 9_590,
-                boundary_id: "msg_boundary#3",
-            }),
+            __rustModeTransformTest.materializedCompactionBoundary(
+                {
+                    decision: "SOFT+",
+                    scheduler_decision: "defer",
+                    committed: true,
+                    row_version: 12,
+                    coverage_ordinal: 9_590,
+                    boundary_id: "msg_boundary#3",
+                },
+                false,
+            ),
+        ).toBeUndefined();
+        expect(
+            __rustModeTransformTest.materializedCompactionBoundary(
+                {
+                    decision: "SOFT+",
+                    scheduler_decision: "execute",
+                    committed: true,
+                    row_version: 12,
+                    coverage_ordinal: 9_590,
+                    boundary_id: "msg_boundary#3",
+                },
+                false,
+            ),
         ).toBeUndefined();
     });
 
