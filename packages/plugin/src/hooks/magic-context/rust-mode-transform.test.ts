@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { listSessionCompactionMarkers } from "../../features/magic-context/compaction-marker";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { insertMemory } from "../../features/magic-context/memory";
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
@@ -339,7 +340,7 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 
 describe("Rust mode authority adapter", () => {
     function markerFaultFixture(
-        fault: "after-marker" | "capture" | "bookkeeping",
+        fault: "fence" | "after-marker" | "capture" | "bookkeeping",
         queueOldCapture = false,
     ) {
         const sid = `marker-admission-${fault}-${Date.now()}`;
@@ -373,17 +374,21 @@ describe("Rust mode authority adapter", () => {
         let step = 0;
         let fail = true;
         let captureCompleted = false;
+        let deferRebuild = false;
         const queuedCaptures: Array<() => void> = [];
         const calls: string[] = [];
+        const transformRequests: Record<string, unknown>[] = [];
         const moduleClient: RustModeModuleClient = {
-            call: async ({ method }) => {
+            call: async ({ method, body }) => {
                 calls.push(method);
                 if (method !== "transform") return { ok: true };
+                transformRequests.push(body as Record<string, unknown>);
                 step++;
                 captureCompleted = false;
                 const oldRepresentation = step === 1 || (queueOldCapture && step === 2);
                 return {
-                    decision: queueOldCapture && step === 2 ? "SOFT+" : "HARD",
+                    decision:
+                        deferRebuild || (queueOldCapture && step === 2) ? "SOFT+" : "HARD",
                     scheduler_decision: queueOldCapture && step === 2 ? "defer" : "execute",
                     row_version: step,
                     native_messages: oldRepresentation
@@ -411,6 +416,13 @@ describe("Rust mode authority adapter", () => {
         const build = () => {
             const originalPrepare = db.prepare.bind(db);
             prepareSpy = spyOn(db, "prepare").mockImplementation((sql) => {
+                if (
+                    fault === "fence" &&
+                    fail &&
+                    step >= 2 &&
+                    String(sql).startsWith("UPDATE session_meta SET trailing_blank_decisions = ?")
+                )
+                    throw new Error("injected durable marker admission fence failure");
                 if (
                     fault === "bookkeeping" &&
                     fail &&
@@ -466,11 +478,15 @@ describe("Rust mode authority adapter", () => {
                 return db;
             },
             calls,
+            transformRequests,
             serve,
             invoke,
             queuedCaptures,
             stopFault: () => {
                 fail = false;
+            },
+            setDeferredRebuild: (deferred: boolean) => {
+                deferRebuild = deferred;
             },
             restart: () => {
                 transform.dispose();
@@ -499,6 +515,7 @@ describe("Rust mode authority adapter", () => {
                 expect(
                     getPersistedCompactionMarkerState(fixture.db, fixture.sid)?.boundaryOrdinal,
                 ).toBe(1);
+                expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(1);
                 expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
                 expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
                 fixture.stopFault();
@@ -506,6 +523,10 @@ describe("Rust mode authority adapter", () => {
                 expect(rebuilt).not.toBe(old);
                 expect(rebuilt).toContain("new admitted prefix");
                 expect(fixture.calls).toContain("session.flush");
+                expect(fixture.transformRequests.at(-1)?.tail_delta).toBeUndefined();
+                expect(fixture.transformRequests.at(-1)?.native_messages).toEqual(
+                    makeMessages(fixture.sid),
+                );
                 expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
                 expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(rebuilt);
             } finally {
@@ -513,6 +534,42 @@ describe("Rust mode authority adapter", () => {
             }
         });
     }
+
+    it("a failed durable admission fence prevents the host cut and preserves restart-safe old LKG", async () => {
+        const fixture = markerFaultFixture("fence");
+        try {
+            const old = await fixture.serve();
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(0);
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(old);
+            fixture.restart();
+            expect(getSlot(fixture.sid)?.jsonPrefix).toBe(old);
+            fixture.stopFault();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("a post-cut SOFT+ response cannot release the refusal fence even with committed execute metadata", async () => {
+        const fixture = markerFaultFixture("capture");
+        try {
+            await fixture.serve();
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            fixture.stopFault();
+            fixture.setDeferredRebuild(true);
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+            fixture.setDeferredRebuild(false);
+            expect(await fixture.serve()).toContain("new admitted prefix");
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+        } finally {
+            fixture.dispose();
+        }
+    });
 
     it("persistent post-cut capture faults refuse every rebuilding pass without old LKG or raw fallback", async () => {
         const fixture = markerFaultFixture("capture");
@@ -652,6 +709,8 @@ describe("Rust mode authority adapter", () => {
         expect(await serve()).toBe(first);
         expect(transform.getState(sid).lkgRepresentationFrozen).toBe(true);
         expect(getPersistedCompactionMarkerState(db, sid)).toBeNull();
+        expect(listSessionCompactionMarkers(sid)).toHaveLength(0);
+        expect(isRustMarkerAdmissionFenced(db, sid)).toBe(false);
     });
     it("retains pending indexed markers while a healthy SOFT+ serves the frozen representation", async () => {
         const sessionId = `rust-frozen-marker-${Date.now()}`;
