@@ -7698,18 +7698,47 @@ impl McHandler {
             .map(|row| (row.tag_number, &row.block_id))
             .collect::<HashMap<_, _>>();
         let requested_numbers = numbers;
+        let cached_messages = self.cached_expand_messages(session_id);
+        let ctx_reduce_self_stamps = ctx_reduce_self_stamp_tag_numbers(
+            &tags,
+            &requested_numbers,
+            cached_messages.as_deref(),
+        );
+        let ctx_reduce_self_stamp_set = ctx_reduce_self_stamps
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
         let unknown_numbers = requested_numbers
             .iter()
             .copied()
             .filter(|number| !by_number.contains_key(&(*number as i64)))
             .collect::<Vec<_>>();
+        let accepted_tag_numbers = requested_numbers
+            .iter()
+            .copied()
+            .filter(|number| {
+                by_number.contains_key(&(*number as i64))
+                    && !ctx_reduce_self_stamp_set.contains(number)
+            })
+            .collect::<Vec<_>>();
         let mut drop_ids = requested_numbers
-            .into_iter()
+            .iter()
+            .copied()
+            .filter(|number| !ctx_reduce_self_stamp_set.contains(number))
             .filter_map(|number| by_number.get(&(number as i64)).map(|id| (*id).clone()))
             .collect::<Vec<_>>();
         drop_ids.sort();
         drop_ids.dedup();
         if drop_ids.is_empty() {
+            if !ctx_reduce_self_stamps.is_empty() && unknown_numbers.is_empty() {
+                let mut response = json!({ "ok": true, "queued": 0 });
+                add_ctx_reduce_stamp_fields(
+                    &mut response,
+                    &ctx_reduce_self_stamps,
+                    &accepted_tag_numbers,
+                );
+                return respond(response);
+            }
             return HandlerOutcome::Error {
                 code: "bad_request".to_string(),
                 message: format!(
@@ -7727,13 +7756,24 @@ impl McHandler {
             false,
         ) {
             Ok(outcome) if outcome.duplicate => {
-                respond(json!({ "ok": true, "queued": 0, "duplicate": true }))
+                let mut response = json!({ "ok": true, "queued": 0, "duplicate": true });
+                add_ctx_reduce_stamp_fields(
+                    &mut response,
+                    &ctx_reduce_self_stamps,
+                    &accepted_tag_numbers,
+                );
+                respond(response)
             }
             Ok(outcome) => {
                 let mut resp = json!({ "ok": true, "queued": outcome.queued });
                 if let Some(disposition) = &outcome.disposition {
                     resp["disposition"] = json!(disposition);
                 }
+                add_ctx_reduce_stamp_fields(
+                    &mut resp,
+                    &ctx_reduce_self_stamps,
+                    &accepted_tag_numbers,
+                );
                 respond(resp)
             }
             Err(error) => HandlerOutcome::Error {
@@ -12881,6 +12921,14 @@ impl McHandler {
             .iter()
             .map(|tag| (tag.tag_number as u64, tag))
             .collect::<HashMap<_, _>>();
+        let cached_messages = self.cached_expand_messages(session_id);
+        let ctx_reduce_self_stamps =
+            ctx_reduce_self_stamp_tag_numbers(&tags, &requested, cached_messages.as_deref());
+        let ctx_reduce_self_stamp_set = ctx_reduce_self_stamps
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let ctx_reduce_self_stamp_note = ctx_reduce_self_stamp_notes(&ctx_reduce_self_stamps);
         let pending_ids = pending
             .iter()
             .map(|drop| drop.target_id.as_str())
@@ -12893,6 +12941,7 @@ impl McHandler {
         let already_queued = requested
             .iter()
             .copied()
+            .filter(|number| !ctx_reduce_self_stamp_set.contains(number))
             .filter(|number| {
                 by_number
                     .get(number)
@@ -12902,6 +12951,7 @@ impl McHandler {
         let queueable = requested
             .iter()
             .copied()
+            .filter(|number| !ctx_reduce_self_stamp_set.contains(number))
             .filter(|number| {
                 by_number
                     .get(number)
@@ -12909,15 +12959,26 @@ impl McHandler {
             })
             .collect::<Vec<_>>();
         if queueable.is_empty() {
+            if !ctx_reduce_self_stamp_note.is_empty()
+                && unknown.is_empty()
+                && already_queued.is_empty()
+            {
+                return mcp_text_result(ctx_reduce_self_stamp_note, false);
+            }
             let reason = ctx_reduce_ack_details(&unknown, &already_queued);
-            return tool_error_result(format!(
+            let mut refusal = format!(
                 "Refused: no valid tags to queue. {}",
                 if reason.is_empty() {
                     "No requested tags are available for delivery.".to_string()
                 } else {
                     reason
                 }
-            ));
+            );
+            if !ctx_reduce_self_stamp_note.is_empty() {
+                refusal.push(' ');
+                refusal.push_str(&ctx_reduce_self_stamp_note);
+            }
+            return tool_error_result(refusal);
         }
 
         let loaded = match store.load(session_id) {
@@ -12971,6 +13032,10 @@ impl McHandler {
             reply.push_str(&ctx_reduce_held_reply(&deferred));
         }
         reply.push_str(" Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later.");
+        if !ctx_reduce_self_stamp_note.is_empty() {
+            reply.push(' ');
+            reply.push_str(&ctx_reduce_self_stamp_note);
+        }
         mcp_text_result(reply, false)
     }
 
@@ -16884,6 +16949,63 @@ fn ctx_reduce_ack_details(unknown: &[u64], already_queued: &[u64]) -> String {
         ));
     }
     details.join("; ")
+}
+
+const CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE: &str =
+    "§N§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.";
+
+fn ctx_reduce_self_stamp_message(tag_number: u64) -> String {
+    CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE.replace("§N§", &format!("§{tag_number}§"))
+}
+
+fn cached_tool_name_for_tag(
+    messages: Option<&[ck_wire::CkIngressMessage]>,
+    block_id: &str,
+) -> Option<String> {
+    let messages = messages?;
+    let (mid, block_index) = ck_wire::split_block_id(block_id)?;
+    let message = messages.iter().find(|message| message.mid == mid)?;
+    let block = message.ck.content.get(block_index)?;
+    match &block.kind {
+        ck_wire::CkKind::ToolCall { name, .. } => Some(name.clone()),
+        ck_wire::CkKind::ToolResult { tool_name, .. } => Some(tool_name.clone()),
+        _ => None,
+    }
+}
+
+fn ctx_reduce_self_stamp_tag_numbers(
+    tags: &[McTagRow],
+    requested: &[u64],
+    cached_messages: Option<&[ck_wire::CkIngressMessage]>,
+) -> Vec<u64> {
+    let mut refused = Vec::new();
+    for number in requested {
+        let Some(tag) = tags.iter().find(|tag| tag.tag_number == *number as i64) else {
+            continue;
+        };
+        if cached_tool_name_for_tag(cached_messages, &tag.block_id)
+            .is_some_and(|tool_name| tool_name == "ctx_reduce")
+            && !refused.contains(number)
+        {
+            refused.push(*number);
+        }
+    }
+    refused
+}
+
+fn ctx_reduce_self_stamp_notes(numbers: &[u64]) -> String {
+    numbers
+        .iter()
+        .map(|number| ctx_reduce_self_stamp_message(*number))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn add_ctx_reduce_stamp_fields(response: &mut Value, refused: &[u64], accepted: &[u64]) {
+    if !refused.is_empty() {
+        response["ctx_reduce_self_stamps"] = json!(refused);
+        response["ctx_reduce_queued_tags"] = json!(accepted);
+    }
 }
 
 fn format_plain_tag_numbers(numbers: &[u64]) -> String {
@@ -21314,6 +21436,63 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         handler.bind_route(7, binding(project.to_str().unwrap(), "ses"));
         (handler, store, dir, project)
+    }
+
+    fn cache_last_served_test_messages(
+        handler: &McHandler,
+        session_id: &str,
+        messages: Vec<CkIngressMessage>,
+    ) {
+        let request = serde_json::from_value::<TransformRequest>(json!({
+            "serializer_profile": "opencode",
+            "session_id": session_id,
+            "render_config": "",
+            "messages": messages,
+        }))
+        .expect("test transform request");
+        let mut snapshots = handler.transform_snapshots.lock().unwrap();
+        let generation = snapshots.begin(session_id);
+        snapshots.finish_ready(session_id, generation, Arc::new(request), 0, 1);
+    }
+
+    fn cached_tool_result(mid: &str, tool_name: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "tool",
+                vec![CkWireBlock::bare(CkKind::ToolResult {
+                    id: format!("call-{mid}"),
+                    tool_name: tool_name.to_string(),
+                    output: CkToolOutput::bare(CkOutputKind::Text {
+                        text: "tool output".to_string(),
+                    }),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        }
+    }
+
+    fn cached_tool_call(mid: &str, tool_name: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(CkKind::ToolCall {
+                    id: format!("call-{mid}"),
+                    name: tool_name.to_string(),
+                    input: json!({}),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        }
     }
 
     /// The project key the claim lane resolves for a channel bound to this project
@@ -30231,6 +30410,114 @@ mod tests {
         assert!(
             handler.store.get().is_none(),
             "an unresolved session must not open storage to validate tags"
+        );
+    }
+
+    #[test]
+    fn ctx_reduce_self_stamp_message_matches_typescript_golden() {
+        let golden =
+            include_str!("../../../packages/plugin/src/tools/ctx-reduce/self-stamp-message.golden")
+                .trim_end();
+        assert_eq!(CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE, golden);
+        assert_eq!(
+            ctx_reduce_self_stamp_message(41),
+            golden.replace("§N§", "§41§")
+        );
+        let cached_calls = vec![cached_tool_call("call-mid", "ctx_reduce")];
+        assert_eq!(
+            cached_tool_name_for_tag(Some(&cached_calls), "call-mid#0").as_deref(),
+            Some("ctx_reduce")
+        );
+        assert_eq!(
+            cached_tool_name_for_tag(Some(&cached_calls), "other-mid#0"),
+            None,
+            "a same-position block in another message is not evidence",
+        );
+        assert_eq!(cached_tool_name_for_tag(None, "call-mid#0"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_ctx_reduce_skips_its_own_cached_call_but_applies_other_tags() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        store
+            .seed_tags_for_test(
+                "ses",
+                &[
+                    TagMintInput {
+                        block_id: "m1#0".to_string(),
+                        kind: "tool_result".to_string(),
+                        token_count: 100,
+                        source_bytes: b"self output".to_vec(),
+                    },
+                    TagMintInput {
+                        block_id: "m2#0".to_string(),
+                        kind: "tool_result".to_string(),
+                        token_count: 100,
+                        source_bytes: b"sibling output".to_vec(),
+                    },
+                    TagMintInput {
+                        block_id: "stale#0".to_string(),
+                        kind: "tool_result".to_string(),
+                        token_count: 100,
+                        source_bytes: b"cache-miss output".to_vec(),
+                    },
+                ],
+                1_000,
+            )
+            .unwrap();
+        cache_last_served_test_messages(
+            &handler,
+            "ses",
+            vec![
+                cached_tool_result("m1", "ctx_reduce"),
+                cached_tool_result("m2", "read"),
+            ],
+        );
+
+        let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1,2,3" })).await);
+        assert!(
+            ack.contains("Held: §2§, §3§ are inside the protected working set"),
+            "{ack}"
+        );
+        assert!(!ack.contains("drop §1§"), "{ack}");
+        assert!(
+            ack.contains(
+                "§1§ is a ctx_reduce call; leave those alone, they are cleaned up automatically."
+            ),
+            "{ack}"
+        );
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+        assert_eq!(
+            tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1" })).await),
+            "§1§ is a ctx_reduce call; leave those alone, they are cleaned up automatically."
+        );
+
+        let delivered = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1,2,3",
+                "command_id": "self-stamp-delivery",
+            }),
+        );
+        let delivered = tool_body(delivered);
+        assert_eq!(delivered["queued"], json!(2));
+        assert_eq!(delivered["ctx_reduce_self_stamps"], json!([1]));
+        assert_eq!(delivered["ctx_reduce_queued_tags"], json!([2, 3]));
+        assert_eq!(
+            store
+                .load_pending_agent_drops("ses")
+                .unwrap()
+                .into_iter()
+                .map(|drop| drop.target_id)
+                .collect::<Vec<_>>(),
+            vec!["m2#0", "stale#0"]
         );
     }
 

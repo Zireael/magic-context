@@ -118,6 +118,42 @@ describe("Pi ctx_reduce tool", () => {
 		expect(ops[0].tagId).toBe(2);
 	});
 
+	it("skips ctx_reduce stamps while still queueing sibling tags", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-reduce-self-stamp";
+		seedTags(db, sessionId, [
+			{ tagNumber: 41, messageId: "m41" },
+			{ tagNumber: 42, messageId: "m42" },
+		]);
+		db.prepare(
+			"UPDATE tags SET type = 'tool', tool_name = 'ctx_reduce' WHERE session_id = ? AND tag_number = 41",
+		).run(sessionId);
+		db.prepare(
+			"UPDATE tags SET type = 'tool', tool_name = 'read' WHERE session_id = ? AND tag_number = 42",
+		).run(sessionId);
+
+		try {
+			const { isError, text } = await callDrop({
+				db,
+				sessionId,
+				drop: "41,42",
+				floor: 0,
+			});
+
+			expect(isError).toBe(false);
+			expect(text).toBe(
+				"Queued: deferred drop §42§. §41§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+			);
+			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([42]);
+			const selfOnly = await callDrop({ db, sessionId, drop: "41", floor: 0 });
+			expect(selfOnly.text).toBe(
+				"§41§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("parses comma + dash ranges (3-5,7,9 → [3,4,5,7,9])", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-reduce-range";

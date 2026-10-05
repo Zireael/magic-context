@@ -27,7 +27,10 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { getInertWhitespaceAssistantTags } from "@magic-context/core/features/magic-context/storage-tags";
 import { getErrorMessage } from "@magic-context/core/shared/error-message";
-import { CTX_REDUCE_DESCRIPTION } from "@magic-context/core/tools/ctx-reduce/constants";
+import {
+	CTX_REDUCE_DESCRIPTION,
+	ctxReduceSelfStampMessage,
+} from "@magic-context/core/tools/ctx-reduce/constants";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
@@ -109,6 +112,18 @@ export function createCtxReduceTool(
 					`Error: Unknown tag(s) ${formatIds(unknownIds)}. Check available tags in conversation.`,
 				);
 			}
+
+			const ctxReduceSelfStampIds = new Set(
+				allTags
+					.filter((tag) => tag.toolName?.toLowerCase() === "ctx_reduce")
+					.map((tag) => tag.tagNumber),
+			);
+			const ctxReduceSelfStampNote = dropIds
+				.filter((id) => ctxReduceSelfStampIds.has(id))
+				.filter((id, index, ids) => ids.indexOf(id) === index)
+				.map(ctxReduceSelfStampMessage)
+				.join(" ");
+			dropIds = dropIds.filter((id) => !ctxReduceSelfStampIds.has(id));
 
 			const activeTags = allTags.filter((tag) => tag.status === "active");
 
@@ -207,11 +222,14 @@ export function createCtxReduceTool(
 			);
 
 			if (dropIds.length === 0) {
-				return ok(
-					[inertNote, skippedNote, "No new action is needed."]
-						.filter(Boolean)
-						.join(" "),
-				);
+				const noActionNotes = [
+					ctxReduceSelfStampNote,
+					inertNote,
+					skippedNote,
+				].filter(Boolean);
+				if (!ctxReduceSelfStampNote)
+					noActionNotes.push("No new action is needed.");
+				return ok(noActionNotes.join(" "));
 			}
 
 			try {
@@ -247,7 +265,7 @@ export function createCtxReduceTool(
 			if (deferredDropIds.length > 0)
 				parts.push(`deferred drop ${formatIds(deferredDropIds)}`);
 			return ok(
-				`Queued: ${parts.join(", ")}.${skippedNote ? ` ${skippedNote}` : ""}${inertNote ? ` ${inertNote}` : ""}`,
+				`Queued: ${parts.join(", ")}.${skippedNote ? ` ${skippedNote}` : ""}${inertNote ? ` ${inertNote}` : ""}${ctxReduceSelfStampNote ? ` ${ctxReduceSelfStampNote}` : ""}`,
 			);
 		},
 	};
