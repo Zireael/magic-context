@@ -7608,6 +7608,7 @@ pub fn migrate_store_to_pre_single_store(path: &Path) -> Result<u32, McStoreErro
         },
     };
     let inner = open_sqlite(&descriptor)?;
+    inner.with_conn(single_store_domain::set_synchronous_normal_if_wal)?;
     inner.with_conn(register_legacy_trigger_functions)?;
     let end = MIGRATIONS
         .iter()
@@ -7858,6 +7859,7 @@ impl McStore {
 
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
         let inner = open_sqlite(descriptor)?;
+        inner.with_conn(single_store_domain::set_synchronous_normal_if_wal)?;
         // Registered before migrating: the older migrations of a store below v53 install
         // triggers that call these functions.
         inner.with_conn(register_legacy_trigger_functions)?;
@@ -17580,6 +17582,24 @@ mod tests {
     // migration as one merged chain.
     mod gate_a1_b0;
     mod tag_cache_migration;
+
+    #[test]
+    fn freshly_opened_cache_store_uses_wal_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                let journal: String =
+                    conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+                let synchronous: i64 =
+                    conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+                assert_eq!(journal, "wal");
+                assert_eq!(synchronous, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         StorageDescriptor {

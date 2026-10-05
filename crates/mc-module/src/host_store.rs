@@ -868,6 +868,12 @@ impl HostStore {
                 path: path.display().to_string(),
                 reason: format!("could not confirm WAL journaling: {error}"),
             })?;
+        mc_store::single_store_domain::set_wal_synchronous_normal(&conn).map_err(|error| {
+            HostStoreError::OpenFailed {
+                path: path.display().to_string(),
+                reason: format!("could not configure WAL durability: {error}"),
+            }
+        })?;
         conn.busy_timeout(std::time::Duration::from_millis(u64::from(
             CONTEXT_BUSY_TIMEOUT_MS,
         )))
@@ -2077,6 +2083,23 @@ mod tests {
             "DOMAIN_TABLE_FINGERPRINTS is stale. Replace the drifted entries with:\n{}",
             drift.join("\n")
         );
+    }
+
+    #[test]
+    fn freshly_opened_host_store_uses_wal_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture_db(dir.path(), "context.db");
+        let store = HostStore::open(&path).unwrap();
+        let journal: String = store
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = store
+            .conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        assert_eq!(synchronous, 1);
     }
 
     /// The lane alone refuses nothing: a database migrated past this binary whose domain

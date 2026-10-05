@@ -71,6 +71,30 @@ pub fn context_sql_error(error: rusqlite::Error) -> McStoreError {
     context_error(code, error)
 }
 
+/// Use WAL's checkpoint durability rather than syncing each commit. The cache and
+/// domain databases are backed up and restored together. Never apply this policy to
+/// a rollback-journal transaction, whose cross-file atomicity needs FULL syncing.
+pub fn set_wal_synchronous_normal(conn: &Connection) -> rusqlite::Result<()> {
+    let journal: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !journal.eq_ignore_ascii_case("wal") {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!("synchronous=NORMAL requires WAL, found {journal}")),
+        ));
+    }
+    conn.pragma_update(None, "synchronous", "NORMAL")
+}
+
+/// Offline tools may also open rollback-journal databases. Keep their existing
+/// durability policy; use the runtime policy only when WAL is already active.
+pub fn set_synchronous_normal_if_wal(conn: &Connection) -> rusqlite::Result<()> {
+    let journal: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if journal.eq_ignore_ascii_case("wal") {
+        set_wal_synchronous_normal(conn)?;
+    }
+    Ok(())
+}
+
 /// A plain two-connection [`ContextDomain`]: one reader, one writer, no schema fence.
 ///
 /// The module wraps its fenced writer instead; this one serves tests and tools that open
@@ -95,11 +119,41 @@ impl SqliteContextDomain {
                 row.get::<_, String>(0)
             })
             .map_err(context_sql_error)?;
+        set_wal_synchronous_normal(&writer).map_err(context_sql_error)?;
         let reader = open().map_err(context_sql_error)?;
+        set_wal_synchronous_normal(&reader).map_err(context_sql_error)?;
         Ok(Self {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
         })
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    #[test]
+    fn freshly_opened_context_connections_use_wal_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = SqliteContextDomain::open(&dir.path().join("context.db")).unwrap();
+        for connection in [&domain.reader, &domain.writer] {
+            let conn = connection.lock().unwrap();
+            let journal: String = conn
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .unwrap();
+            let synchronous: i64 = conn
+                .pragma_query_value(None, "synchronous", |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal, "wal");
+            assert_eq!(synchronous, 1);
+        }
+    }
+
+    #[test]
+    fn normal_policy_refuses_a_non_wal_connection() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(set_wal_synchronous_normal(&conn).is_err());
     }
 }
 
