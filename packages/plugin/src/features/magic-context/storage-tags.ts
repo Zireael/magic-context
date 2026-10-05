@@ -757,7 +757,9 @@ function getTagNumberByMessageIdStatement(db: Database): PreparedStatement {
     let stmt = getTagNumberByMessageIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT tag_number FROM tags WHERE session_id = ? AND message_id = ? ORDER BY tag_number ASC LIMIT 1",
+            // Without the owner index SQLite may walk the entire session in tag
+            // order to satisfy LIMIT, making repeated whitespace probes quadratic.
+            "SELECT tag_number FROM tags INDEXED BY idx_tags_session_message_id WHERE session_id = ? AND message_id = ? ORDER BY tag_number ASC LIMIT 1",
         );
         getTagNumberByMessageIdStatements.set(db, stmt);
     }
@@ -968,6 +970,8 @@ export function markWhitespaceAssistantTagInert(
     );
 }
 
+const inertWhitespaceStatements = new WeakMap<Database, PreparedStatement>();
+
 /** Load legacy whitespace tags for cache-stable prefix replay; these rows are never active. */
 export function getInertWhitespaceAssistantTags(
     db: Database,
@@ -977,25 +981,35 @@ export function getInertWhitespaceAssistantTags(
     if (messageIds) {
         // The fingerprint index lets the wire reader seek each visible owner instead
         // of scanning every compacted tag. Keep the unscoped API for reduction tools.
-        const statement = db.prepare(
-            `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
-             FROM tags
-             WHERE session_id = ? AND type = 'message' AND status = 'compacted'
-               AND entry_fingerprint >= ? AND entry_fingerprint < ?`,
-        );
-        return [...new Set(messageIds)].flatMap((messageId) => {
-            const prefix = `${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}${messageId}:p`;
-            const rows = statement.all(sessionId, prefix, `${prefix.slice(0, -1)}q`) as Array<{
-                tagNumber: number;
-                entryFingerprint: string;
-            }>;
-            return rows.map((row) => ({
-                tagNumber: row.tagNumber,
-                contentId: row.entryFingerprint.slice(
-                    WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
-                ),
-            }));
-        });
+        let statement = inertWhitespaceStatements.get(db);
+        if (!statement) {
+            // CROSS JOIN keeps the small owner list outside the fingerprint index
+            // seek, rather than scanning every retired row in a long session.
+            statement = db.prepare(
+                `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
+                 FROM json_each(?) AS owners CROSS JOIN tags
+                 WHERE tags.session_id = ? AND tags.type = 'message' AND tags.status = 'compacted'
+                   AND entry_fingerprint >= ? || owners.value || ':p'
+                   AND entry_fingerprint < ? || owners.value || ':q'
+                 ORDER BY CAST(owners.key AS INTEGER), entry_fingerprint, tags.id`,
+            );
+            inertWhitespaceStatements.set(db, statement);
+        }
+        const rows = statement.all(
+            JSON.stringify([...new Set(messageIds)]),
+            sessionId,
+            WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX,
+            WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX,
+        ) as Array<{
+            tagNumber: number;
+            entryFingerprint: string;
+        }>;
+        return rows.map((row) => ({
+            tagNumber: row.tagNumber,
+            contentId: row.entryFingerprint.slice(
+                WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
+            ),
+        }));
     }
     const rows = db
         .prepare(
@@ -2334,6 +2348,8 @@ export function getTagsByNumbers(
     return rows.map(toTagEntry);
 }
 
+const droppedNumberStatements = new WeakMap<Database, PreparedStatement>();
+
 /** Return only dropped tags whose numbers are visible replay targets. */
 export function getDroppedTagsByNumbers(
     db: Database,
@@ -2350,13 +2366,14 @@ export function getDroppedTagsByNumbers(
         return all;
     }
 
-    const placeholders = tagNumbers.map(() => "?").join(",");
-    const rows = db
-        .prepare(
-            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' AND tag_number IN (${placeholders}) ORDER BY tag_number ASC, id ASC`,
-        )
-        .all(sessionId, ...tagNumbers)
-        .filter(isTagRow);
+    let statement = droppedNumberStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' AND tag_number IN (SELECT value FROM json_each(?)) ORDER BY tag_number ASC, id ASC`,
+        );
+        droppedNumberStatements.set(db, statement);
+    }
+    const rows = statement.all(sessionId, JSON.stringify(tagNumbers)).filter(isTagRow);
 
     return rows.map(toTagEntry);
 }
@@ -2375,10 +2392,17 @@ export function getMaxDroppedTagNumber(db: Database, sessionId: string): number 
     return isMaxTagNumberRow(row) ? row.max_tag_number : 0;
 }
 
+const tagByIdStatements = new WeakMap<Database, PreparedStatement>();
+
 export function getTagById(db: Database, sessionId: string, tagId: number): TagEntry | null {
-    const result = db
-        .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND tag_number = ?`)
-        .get(sessionId, tagId);
+    let statement = tagByIdStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND tag_number = ?`,
+        );
+        tagByIdStatements.set(db, statement);
+    }
+    const result = statement.get(sessionId, tagId);
 
     if (!isTagRow(result)) {
         return null;

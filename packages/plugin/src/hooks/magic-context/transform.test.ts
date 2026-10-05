@@ -933,7 +933,13 @@ describe("createTransform", () => {
                                     return (...params: Parameters<typeof stmt.all>) => {
                                         const rows = stmt.all(...params);
                                         replayRows.push(...(rows as Array<{ status: string }>));
-                                        replayChunkSizes.push(params.length - 1);
+                                        // Count requested ids, not SQLite binds: the cached
+                                        // statement carries each unchanged chunk as JSON.
+                                        replayChunkSizes.push(
+                                            sql.includes("json_each")
+                                                ? JSON.parse(String(params[1])).length
+                                                : params.length - 1,
+                                        );
                                         return rows;
                                     };
                                 }
