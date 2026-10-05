@@ -1531,7 +1531,7 @@ async function startPiMagicContextRuntime(
 	): PiContextHandlerOptions => ({
 		db: database,
 		cacheTtlConfig: cfg.cache_ttl,
-		smartDrops: cfg.smart_drops === true,
+		protectedTools: cfg.protected_tools,
 		protectedTokens: cfg.protected_tokens,
 		protectedTokenTierOverrides: getProtectedTokensTierOverrides(cfg) ?? {},
 		protectedTags: cfg.protected_tags ?? 20,

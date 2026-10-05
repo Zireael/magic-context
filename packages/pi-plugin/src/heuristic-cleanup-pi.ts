@@ -33,6 +33,7 @@
  */
 
 import { freezePiContentDecision } from "@magic-context/core/features/magic-context/pi-content-decisions";
+import { protectedToolTagNumbers } from "@magic-context/core/features/magic-context/reclaim-protection";
 import { sessionDecisionCalibration } from "@magic-context/core/features/magic-context/session-decision-calibration";
 import {
 	type ContextDatabase,
@@ -95,6 +96,8 @@ const DEDUP_SAFE_TOOLS = new Set([
 ]);
 
 export interface PiHeuristicCleanupConfig {
+	protectedTools?: Readonly<Record<string, number>>;
+	protectedToolTags?: ReadonlySet<number>;
 	protectedTags: number;
 	/** Token-window cutoff; null means no tool-backed protection window exists. */
 	protectedCutoff?: number | null;
@@ -339,6 +342,9 @@ export function applyPiHeuristicCleanup(
 	// All work in this function short-circuits on `tag.status !== "active"`.
 	// See OpenCode `applyHeuristicCleanup` for the full P0 perf rationale.
 	const tags = preloadedTags ?? getActiveTagsBySession(db, sessionId);
+	const protectedTools =
+		config.protectedToolTags ??
+		protectedToolTagNumbers(tags, config.protectedTools);
 	// `maxTag` must reflect the true session max (including dropped/compacted)
 	// so the protected-cutoff window is anchored to the most recent tag
 	// regardless of status. `getMaxTagNumberBySession` resolves with a
@@ -423,6 +429,7 @@ export function applyPiHeuristicCleanup(
 			priorInputSample,
 			hasPriorDrop: priorInputSample > 0,
 			passAlreadyPriced: emergency.passAlreadyPriced === true,
+			protectedToolTags: protectedTools,
 		});
 		if (plan.shouldDrop) {
 			const toDrop = new Set(plan.tagNumbers);
@@ -603,6 +610,7 @@ export function applyPiHeuristicCleanup(
 					const tag = group[i];
 					if (tag.tagNumber > protectedCutoff) continue;
 					const target = targets.get(tag.tagNumber);
+					if (protectedTools.has(tag.tagNumber)) continue;
 					if (target?.canDrop?.() === false) continue;
 					// Deduplication stays full-drop; only emergency recent arcs keep
 					// skeletons. A call that cannot be removed keeps real arguments.

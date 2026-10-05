@@ -434,6 +434,7 @@ export interface TransformDeps {
      *  later call supersedes, on top of the age-based auto-drop. Off → messages
      *  sent to the model are byte-identical to the age-based-only behavior. */
     smartDrops?: boolean;
+    protectedTools?: Readonly<Record<string, number>>;
     clearReasoningAge: number;
     /** Commit-cluster historian trigger config (`commit_cluster_trigger`). */
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
@@ -2663,6 +2664,7 @@ export function createTransform(deps: TransformDeps) {
             // the primary agent that spawned them.
             cavemanTextCompression: !reducedMode ? deps.cavemanTextCompression : undefined,
             smartDrops: deps.smartDrops === true,
+            protectedTools: deps.protectedTools,
             // Pass the single resolved provider through to postprocess so every
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.

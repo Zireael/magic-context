@@ -3466,7 +3466,7 @@ describe("issue #386 sustained execute-pressure batching", () => {
     });
 });
 
-describe("smart-drops supersession reclaim (flag-gated)", () => {
+describe("ride-only supersession reclaim", () => {
     function tagStatuses(sessionId: string): Map<number, string> {
         return new Map(getTagsBySession(db, sessionId).map((tag) => [tag.tagNumber, tag.status]));
     }
@@ -3499,11 +3499,28 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
         return { trigger, older, newer, recentTail };
     }
 
-    it("OFF (default): superseded todowrite is NOT dropped even on a mutating execute pass", async () => {
+    it("legacy smart_drops false backlog stays byte-identical on defer and lands on the first rebuilding pass", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-smart-off";
         const { trigger, older, newer, recentTail } = seedTodowriteSession(sessionId);
+        const messages = [trigger, older, newer, ...recentTail];
+        const before = JSON.stringify(messages);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "defer",
+                smartDrops: false,
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: new Map([
+                    [1, makeDropTarget(trigger)],
+                    [2, makeDropTarget(older)],
+                    [3, makeDropTarget(newer)],
+                ]),
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+        expect(JSON.stringify(messages)).toBe(before);
+        expect(tagStatuses(sessionId).get(2)).toBe("active");
 
         await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, [trigger, older, newer, ...recentTail], {
@@ -3522,8 +3539,79 @@ describe("smart-drops supersession reclaim (flag-gated)", () => {
 
         const statuses = tagStatuses(sessionId);
         expect(statuses.get(1)).toBe("dropped"); // dropped by its own queued drop, not smart-drops
-        expect(statuses.get(2)).toBe("active"); // untouched: flag off
+        expect(statuses.get(2)).toBe("dropped"); // backlog rides the existing rebuild, never the legacy flag
         expect(statuses.get(3)).toBe("active");
+
+        const afterRebuild = JSON.stringify(messages);
+        const args = (schedulerDecision: "defer" | "execute") =>
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision,
+                protectedTools: { todowrite: 0 },
+                ...(schedulerDecision === "execute"
+                    ? { pendingMaterializationSessions: new Set([sessionId]) }
+                    : {}),
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: new Map([
+                    [1, makeDropTarget(trigger)],
+                    [2, makeDropTarget(older)],
+                    [3, makeDropTarget(newer)],
+                ]),
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            });
+        await runPostTransformPhase(args("defer"));
+        expect(JSON.stringify(messages)).toBe(afterRebuild);
+        expect(tagStatuses(sessionId).get(3)).toBe("active");
+        await runPostTransformPhase(args("execute"));
+        expect(tagStatuses(sessionId).get(3)).toBe("dropped");
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "defer",
+                protectedTools: { todowrite: 20 },
+                tags: getActiveTagsBySession(db, sessionId),
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+        expect(tagStatuses(sessionId).get(3)).toBe("dropped");
+    });
+
+    it("protected tool N+1 rotation never originates a bust", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-protection-rotation";
+        const { trigger, older, newer, recentTail } = seedTodowriteSession(sessionId);
+        const arriving = structuredClone(newer);
+        arriving.info.id = "tool-24";
+        insertTag(db, sessionId, "tool-24", "tool", 4000, 24, 0, "todowrite", 0, "tool-24");
+        const messages = [trigger, older, newer, ...recentTail, arriving];
+        const before = JSON.stringify(messages);
+        const targets = new Map([
+            [1, makeDropTarget(trigger)],
+            [2, makeDropTarget(older)],
+            [3, makeDropTarget(newer)],
+            [24, makeDropTarget(arriving)],
+        ]);
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "defer",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets,
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+        expect(result.bustedThisPass).toBe(false);
+        expect(JSON.stringify(messages)).toBe(before);
+        expect(tagStatuses(sessionId).get(3)).toBe("active");
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
+                tags: getActiveTagsBySession(db, sessionId),
+                targets,
+                sessionMeta: getOrCreateSessionMeta(db, sessionId),
+            }),
+        );
+        expect(tagStatuses(sessionId).get(3)).toBe("dropped");
+        expect(tagStatuses(sessionId).get(24)).toBe("active");
     });
 
     it("ON: superseded todowrite is dropped, newest kept, on a mutating execute pass", async () => {

@@ -4776,6 +4776,7 @@ impl McHandler {
                 temporal_awareness: true,
                 prompt_surface_guidance_override: None,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
             },
         )
@@ -10327,6 +10328,7 @@ impl McHandler {
                 // additive-only memory/docs transform for every consumer profile.
                 compaction_enabled: binding.config.compaction_enabled,
                 smart_drops: binding.config.smart_drops,
+                protected_tools: binding.config.protected_tools.clone(),
                 // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the
                 // request's model while retaining whether the walk actually matched an entry.
                 cache_ttl: resolved_cache_ttl.value,
@@ -21592,6 +21594,7 @@ mod tests {
             temporal_awareness: true,
             prompt_surface_guidance_override: None,
             smart_drops: false,
+            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
         }
     }
@@ -36381,6 +36384,7 @@ mod tests {
                 protected_tokens_provenance: "derived",
                 compaction_enabled: true,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,
@@ -37364,6 +37368,7 @@ mod tests {
                 protected_tokens_provenance: "derived",
                 compaction_enabled: true,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,

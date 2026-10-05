@@ -17,7 +17,7 @@ export interface TagEntry {
      *  - "edit_marker": like "truncated" but for an edit/write superseded by a
      *    later edit to the same file; keep the filePath verbatim and a short
      *    region-hint prefix of the diff, so the agent still sees WHICH file and
-     *    region it edited. Only produced when the smart_drops config is on.
+     *    region it edited. Produced by automatic supersession on rebuilding passes.
      */
     dropMode:
         | "full"

@@ -596,8 +596,9 @@ pub struct ProducerContext<'a> {
     /// Whether the full compaction pipeline is enabled. When false, the module emits only
     /// additive m0/m1 memory and project-doc blocks ahead of the unchanged live array.
     pub compaction_enabled: bool,
-    /// Smart-drop selector gate frozen at route bind.
+    /// Deprecated caller input, ignored by selection.
     pub smart_drops: bool,
+    pub protected_tools: std::collections::BTreeMap<String, usize>,
     /// Effective cache TTL used by the host-side idle predicate.
     pub cache_ttl: String,
     /// Whether the model-resolution walk selected a per-model entry or fell through to the default.
@@ -4805,7 +4806,7 @@ fn apply_once(
                 .map(|block| block.id.clone())
         })
         .collect::<HashSet<_>>();
-    let protected_block_ids = tag_window_protected_block_ids
+    let mut protected_block_ids = tag_window_protected_block_ids
         .union(&exempt_message_protected_block_ids)
         .cloned()
         .collect::<HashSet<_>>();
@@ -4872,12 +4873,14 @@ fn apply_once(
             },
             &SelectionConfig {
                 smart_drops: ctx.smart_drops,
+                protected_tools: ctx.protected_tools.clone(),
             },
         )
     } else {
         SelectionOutcome::default()
     };
     timings.selection = elapsed_ms(selection_started_at);
+    protected_block_ids.extend(selection_outcome.protected_tool_block_ids.iter().cloned());
     let count_to_u64 =
         |count: Option<usize>| count.map(|value| u64::try_from(value).unwrap_or(u64::MAX));
     let eligible_supersession_count = count_to_u64(selection_outcome.eligible_supersession_count);
@@ -18629,6 +18632,7 @@ pub(crate) mod tests {
             protected_tokens_provenance: "derived",
             compaction_enabled: true,
             smart_drops: false,
+            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
             cache_ttl_provenance: CacheTtlProvenance::Default,
             model_key: None,
@@ -20883,7 +20887,10 @@ pub(crate) mod tests {
             &items,
             &HashSet::new(),
             &ctx,
-            &SelectionConfig { smart_drops: false },
+            &SelectionConfig {
+                smart_drops: false,
+                ..SelectionConfig::default()
+            },
         );
         let mut applied = first
             .decisions
@@ -20928,7 +20935,10 @@ pub(crate) mod tests {
             &items,
             &applied,
             &ctx,
-            &SelectionConfig { smart_drops: false },
+            &SelectionConfig {
+                smart_drops: false,
+                ..SelectionConfig::default()
+            },
         );
         assert!(still_protected.decisions.is_empty());
 
@@ -20957,7 +20967,10 @@ pub(crate) mod tests {
             &items,
             &applied,
             &ctx,
-            &SelectionConfig { smart_drops: false },
+            &SelectionConfig {
+                smart_drops: false,
+                ..SelectionConfig::default()
+            },
         );
         // The later bust may also reclaim unprotected call blocks automatically;
         // count the explicit queue targets separately from those arc decisions.

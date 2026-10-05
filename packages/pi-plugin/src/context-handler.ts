@@ -62,7 +62,7 @@ import {
 	computeProtectionWindow,
 	getProtectionWindowForSession,
 } from "@magic-context/core/features/magic-context/protection-window";
-import { newestCtxReduceTagNumbers } from "@magic-context/core/features/magic-context/reclaim-protection";
+import { protectedToolTagNumbers } from "@magic-context/core/features/magic-context/reclaim-protection";
 import {
 	createScheduler,
 	parseCacheTtl,
@@ -95,7 +95,7 @@ import {
 	getPendingPiCompactionMarkerState,
 	getPersistedToolTagAccounting,
 	getTagsByNumbers,
-	getTagsBySession,
+	type getTagsBySession,
 	getTagsForPendingOperations,
 	isWrapupInProgress,
 	setSessionWorkMetrics,
@@ -1239,6 +1239,7 @@ export interface PiContextHandlerOptions {
 	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
 	 *  sent to the model are byte-identical to the age-based-only behavior. */
 	smartDrops?: boolean;
+	protectedTools?: Readonly<Record<string, number>>;
 	/**
 	 * Heuristic-cleanup config (tiered emergency drop + caveman). When
 	 * omitted, heuristic cleanup is disabled — tagging and queued-drop
@@ -3397,6 +3398,7 @@ export function registerPiContextHandler(
 					lkgInputIdByRef.get(message),
 				),
 				smartDrops: options.smartDrops === true,
+				protectedTools: options.protectedTools,
 				protectedTags: options.protectedTags ?? 20,
 				protectedTokens: options.protectedTokens,
 				protectedTokenTierOverrides: options.protectedTokenTierOverrides,
@@ -3813,6 +3815,10 @@ export function registerPiContextHandler(
 						protectedTagNumbers,
 						pendingDropTagNumbers,
 						stableId,
+						protectedToolTags: protectedToolTagNumbers(
+							tags,
+							options.protectedTools,
+						),
 						syntheticLeadingCount: result.syntheticLeadingCount,
 						cacheBusting: result.bustedThisPass,
 						previous: getPiChannel1Baseline(sessionId),
@@ -5063,6 +5069,7 @@ interface RunPipelineArgs {
 	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
 	 *  sent to the model are byte-identical to the age-based-only behavior. */
 	smartDrops?: boolean;
+	protectedTools?: Readonly<Record<string, number>>;
 	protectedTags: number;
 	protectedTokens?: number;
 	protectedTokenTierOverrides?: ProtectedTokensTierOverrides;
@@ -6103,7 +6110,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.db,
 				targets,
 				args.contextUsage.percentage >= 95
-					? newestCtxReduceTagNumbers(getTagsBySession(args.db, args.sessionId))
+					? new Set<number>()
 					: protectedTagNumbersForPass,
 				pendingOperationTags,
 				pendingOps,
@@ -6293,6 +6300,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// active projection; Channel-1 baseline construction reuses the full set.
 	const allTagsForPass = getPiTagSnapshot(args.db, args.sessionId);
 	const activeTags = allTagsForPass.filter((tag) => tag.status === "active");
+	const protectedToolTags = protectedToolTagNumbers(
+		activeTags,
+		args.protectedTools,
+	);
 	logTransformTiming(
 		args.sessionId,
 		"getTagsBySessionSnapshot",
@@ -6358,6 +6369,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.messages,
 				{
 					protectedTags: args.protectedTags,
+					protectedToolTags,
 					protectedCutoff: usesTokenProtection
 						? protectionWindowForPass.cutoff
 						: undefined,
@@ -6394,6 +6406,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					args.messages,
 					{
 						protectedTags: args.protectedTags,
+						protectedToolTags,
 						protectedCutoff: usesTokenProtection
 							? protectionWindowForPass.cutoff
 							: undefined,
@@ -6633,6 +6646,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			sessionId: args.sessionId,
 			targets,
 			watermark: reclaimMeta.toolReclaimWatermark ?? 0,
+			protectedToolTags,
 			pendingOps,
 		});
 		// Smart-drops: also reclaim older todowrite/ctx_reduce/meta outputs that
@@ -6641,7 +6655,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// already-gated drop apply as the age-based sweep above. Dedupe (a tag
 		// can qualify under more than one rule).
 		const editMarkerTagIds = new Set<number>();
-		if (args.smartDrops) {
+		{
 			const recentMessageIds = recentSupersessionOwnerMessageIds(
 				args.db,
 				args.sessionId,
@@ -6653,6 +6667,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				targets,
 				pendingOps,
 				recentMessageIds,
+				protectedToolTags,
 			});
 			for (const op of supersessionOps) {
 				if (!selectedIds.has(op.tagId)) {
@@ -6666,6 +6681,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				targets,
 				pendingOps,
 				recentMessageIds,
+				protectedToolTags,
 			});
 			for (const op of editReclaim.ops) {
 				// Drop wins over compress: only compress an edit no earlier rule

@@ -3350,6 +3350,7 @@ mod tests {
             protected_tokens_provenance: "derived",
             compaction_enabled: true,
             smart_drops: false,
+            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
             cache_ttl_provenance: crate::config::CacheTtlProvenance::Default,
             model_key: None,

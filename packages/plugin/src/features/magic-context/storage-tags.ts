@@ -2,7 +2,6 @@ import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
-import { newestCtxReduceTagNumbers } from "./reclaim-protection";
 import type { TagEntry } from "./types";
 
 declare module "./types" {
@@ -356,7 +355,7 @@ const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedS
 
 /**
  * Return age-reclaim candidates with the same persisted token estimate used by reclaim hints.
- * The newest ctx_reduce exemplars are omitted before the watermark/value checks in the caller.
+ * Protection is applied by the caller using its shared per-selection snapshot.
  * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
  */
 export function getActiveToolTagsForAgeReclaim(
@@ -394,8 +393,7 @@ export function getActiveToolTagsForAgeReclaim(
                         : (outputTokens ?? 0) + (inputTokens ?? 0),
             };
         });
-    const protectedCtxReduceTags = newestCtxReduceTagNumbers(tags);
-    return tags.filter((tag) => !protectedCtxReduceTags.has(tag.tagNumber));
+    return tags;
 }
 
 /**
