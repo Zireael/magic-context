@@ -25,7 +25,8 @@ export function prepareCompartmentDrops(
     const candidates = getActiveTagsBySession(db, sessionId).filter((tag) => {
         if (tag.type !== "tool") return observedKeys.messageFileKeys.has(tag.messageId);
         const observedOwners = observedKeys.toolObservations.get(tag.messageId);
-        // Legacy NULL owners retain the call-id fallback until tagging adopts an owner.
+        // Tool tags written before owner tracking have no owner message; they match on the
+        // call id alone until a later tagging pass records which message owns the call.
         return (
             observedOwners !== undefined &&
             (tag.toolOwnerMessageId === null || observedOwners.has(tag.toolOwnerMessageId))
