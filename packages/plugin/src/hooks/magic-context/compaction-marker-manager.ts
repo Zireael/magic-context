@@ -17,6 +17,7 @@ import {
     compareOpenCodeMessagesByCanonicalOrder,
     findBoundaryUserMessage,
     getOpenCodeMessageById,
+    isOpenCodeGapHistorianAbsent,
     listSessionCompactionMarkers,
     removeCompactionMarker,
     removeForeignCompactionMarker,
@@ -24,7 +25,7 @@ import {
 } from "../../features/magic-context/compaction-marker";
 import {
     getCompartmentsByEndMessageId,
-    hasPartialCompartmentEndThrough,
+    getUncoveredCompartmentEndsThrough,
 } from "../../features/magic-context/compartment-storage";
 import {
     getPersistedCompactionMarkerState,
@@ -120,7 +121,7 @@ function validatePendingTarget(
     db: Database,
     sessionId: string,
     pending: PendingCompactionMarker,
-): "ok" | "compartment-removed" | "target-superseded" | "partial-message-boundary" {
+): "ok" | "compartment-removed" | "target-superseded" {
     // 1. PRIMARY: raw OpenCode message must still exist. May throw on DB
     //    failure; caller catches and returns retryable-failure.
     const ocMessage = getOpenCodeMessageById(sessionId, pending.endMessageId);
@@ -143,7 +144,6 @@ function validatePendingTarget(
         return "compartment-removed";
     }
     const compartment = compartments[0];
-    if (compartment.endBlockIndex != null) return "partial-message-boundary";
     if (compartment.endMessage !== pending.ordinal) {
         // Same end-message id but different ordinal — a later publish already
         // moved the marker past us. Skip this stale pending and let the newer
@@ -218,6 +218,55 @@ function existingMarkerAlreadyCoversTarget(
     return true;
 }
 
+function boundaryWouldDiscardUncoveredMessage(
+    db: Database,
+    sessionId: string,
+    ordinal: number,
+    boundaryMessageId: string,
+): boolean {
+    const current = getPersistedCompactionMarkerState(db, sessionId);
+    const partials = getUncoveredCompartmentEndsThrough(db, sessionId, ordinal);
+    // Unknown raw ordering is not proof of coverage. The boundary is kept by
+    // filterCompacted, so an indexed end at/after it is safe, not a blanket veto.
+    for (const partial of partials) {
+        // boundaryOrdinal is the summary target, not the retained user. An
+        // assistant target and the rest of its turn can still be in host input.
+        // Only a strict canonical comparison to the actual old cut proves an
+        // endpoint already discarded; equality and unknown ordering stay guarded.
+        if (
+            current &&
+            compareOpenCodeMessagesByCanonicalOrder(
+                sessionId,
+                partial.endMessageId,
+                current.boundaryMessageId,
+            ) === -1
+        )
+            continue;
+        const ordering = compareOpenCodeMessagesByCanonicalOrder(
+            sessionId,
+            boundaryMessageId,
+            partial.endMessageId,
+        );
+        if (ordering !== null && ordering <= 0) continue;
+        // Successors advance to the next PRESENT ordinal, not necessarily end+1.
+        // Missing successors/anchors never prove coverage. Background notices are
+        // absent only by the same synthetic policy the real historian uses.
+        if (
+            partial.successorStartMessageId &&
+            partial.successorStartMessage !== null &&
+            partial.successorStartMessage > partial.endMessage + 1 &&
+            isOpenCodeGapHistorianAbsent(
+                sessionId,
+                partial.endMessageId,
+                partial.successorStartMessageId,
+            )
+        )
+            continue;
+        return true;
+    }
+    return false;
+}
+
 /**
  * Apply a deferred compaction-marker mutation owned by a specific pending
  * blob. Called from the transform postprocess drain — see
@@ -258,13 +307,9 @@ export function applyDeferredCompactionMarker(
             trustedBoundary.rowVersion > 0 &&
             trustedBoundary.ordinal === pending.ordinal &&
             trustedBoundary.endMessageId === pending.endMessageId;
-        // Host compaction markers discard whole messages. An indexed end may leave
-        // later blocks unsummarized, so such a marker would lose those blocks.
-        const validation = hasPartialCompartmentEndThrough(db, sessionId, pending.ordinal)
-            ? "partial-message-boundary"
-            : responseFencesTarget
-              ? "ok"
-              : validatePendingTarget(db, sessionId, pending);
+        const validation = responseFencesTarget
+            ? "ok"
+            : validatePendingTarget(db, sessionId, pending);
         if (validation !== "ok") {
             sessionLog(
                 sessionId,
@@ -299,6 +344,18 @@ export function applyDeferredCompactionMarker(
                     `no user boundary found at or before endMessageId ${pending.endMessageId} (ordinal ${pending.ordinal}); preserving existing marker`,
                 ),
             };
+        }
+
+        // Resolve from the partial message itself: the nearest user at or before
+        // it keeps that entire tool turn raw. Older indexed ends only veto the cut
+        // when their successor has not covered the remainder and they lie before
+        // the user boundary. Rust's last-block anchors alone do not make a gap.
+        if (boundaryWouldDiscardUncoveredMessage(db, sessionId, pending.ordinal, boundary.id)) {
+            sessionLog(
+                sessionId,
+                `compaction-marker drain: stale-skip (partial-message-boundary) for ordinal ${pending.ordinal} endMessageId=${pending.endMessageId}`,
+            );
+            return { kind: "stale-skip", reason: "partial-message-boundary" };
         }
 
         // Replace both host-store row sets under one BEGIN IMMEDIATE. A busy
@@ -396,9 +453,6 @@ export function updateCompactionMarkerAfterPublication(
         return false;
     }
 
-    if (hasPartialCompartmentEndThrough(db, sessionId, lastCompartmentEnd)) {
-        return false;
-    }
     const existing = getPersistedCompactionMarkerState(db, sessionId);
     const removedSummaryMessageId = existing?.summaryMessageId ?? null;
 
@@ -426,6 +480,10 @@ export function updateCompactionMarkerAfterPublication(
             sessionId,
             `compaction-marker: no user boundary found at or before endMessageId ${targetEndMessageId} (ordinal ${lastCompartmentEnd}); preserving existing marker`,
         );
+        return false;
+    }
+
+    if (boundaryWouldDiscardUncoveredMessage(db, sessionId, lastCompartmentEnd, boundary.id)) {
         return false;
     }
 

@@ -887,19 +887,57 @@ export function escapeXmlContent(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** An indexed end may leave later blocks uncovered, so the host must retain the whole message. */
-export function hasPartialCompartmentEndThrough(
+/**
+ * The earliest indexed end whose remainder is not provably covered by its successor.
+ * Keep that message raw. Historian indices are last-block anchors, not coverage
+ * starts: continuation on the next ordinal, or the same message at a later block,
+ * proves coverage without requiring start_block_index to be zero or end + 1.
+ * A missing successor, ordinal gap, or unknown same-message block stays protected.
+ */
+export function getUncoveredCompartmentEndThrough(
     db: Database,
     sessionId: string,
-    endOrdinal: number,
-): boolean {
-    return Boolean(
-        db
-            .prepare(
-                "SELECT 1 FROM compartments WHERE session_id=? AND end_message<=? AND end_block_index IS NOT NULL LIMIT 1",
-            )
-            .get(sessionId, endOrdinal),
-    );
+    endOrdinal = Number.MAX_SAFE_INTEGER,
+): { endMessageId: string; endMessage: number } | null {
+    const end = getUncoveredCompartmentEndsThrough(db, sessionId, endOrdinal)[0];
+    return end ? { endMessageId: end.endMessageId, endMessage: end.endMessage } : null;
+}
+
+/** Enumerate candidates: callers may prove sparse gaps absent, or select a visible end. */
+export function getUncoveredCompartmentEndsThrough(
+    db: Database,
+    sessionId: string,
+    endOrdinal = Number.MAX_SAFE_INTEGER,
+    afterOrdinal = -1,
+): Array<{
+    endMessageId: string;
+    endMessage: number;
+    successorStartMessageId: string | null;
+    successorStartMessage: number | null;
+}> {
+    const rows = db
+        .prepare(
+            `SELECT k.end_message_id, k.end_message,
+                n.start_message_id AS successor_id, n.start_message AS successor_start FROM compartments k
+         LEFT JOIN compartments n ON n.session_id = k.session_id AND n.sequence = k.sequence + 1
+         WHERE k.session_id = ?1 AND k.end_message <= ?2 AND k.end_message > ?3 AND k.end_block_index IS NOT NULL
+           AND NOT COALESCE(n.sequence IS NOT NULL AND (
+               (n.start_message_id = k.end_message_id AND n.start_block_index > k.end_block_index)
+               OR n.start_message = k.end_message + 1), 0)
+         ORDER BY k.sequence`,
+        )
+        .all(sessionId, endOrdinal, afterOrdinal) as Array<{
+        end_message_id: string;
+        end_message: number;
+        successor_id: string | null;
+        successor_start: number | null;
+    }>;
+    return rows.map((row) => ({
+        endMessageId: row.end_message_id,
+        endMessage: row.end_message,
+        successorStartMessageId: row.successor_id,
+        successorStartMessage: row.successor_start,
+    }));
 }
 
 export function isPartialCompartmentEnd(
