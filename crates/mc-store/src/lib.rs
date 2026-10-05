@@ -16199,12 +16199,24 @@ fn promote_facts_tx(
     now_ms: i64,
 ) -> rusqlite::Result<Vec<PromotedRef>> {
     let mut active_content = HashSet::new();
-    {
-        let mut stmt = tx.prepare(
-            "SELECT content FROM memories
-             WHERE project_path = ?1 AND status IN ('active', 'permanent')",
-        )?;
-        let rows = stmt.query_map(params![project_path], |r| r.get::<_, String>(0))?;
+    // Probe only this fold's exact contents. Large folds are split below SQLite's
+    // parameter limit; ordinary folds make one scan without copying the project pool.
+    let contents: Vec<&str> = facts
+        .iter()
+        .filter(|fact| !fact.category.trim().is_empty() && !fact.content.trim().is_empty())
+        .map(|fact| fact.content.as_str())
+        .collect();
+    for batch in contents.chunks(128) {
+        let sql = format!(
+            "SELECT content FROM memories WHERE project_path = ?1
+            AND status IN ('active', 'permanent') AND content IN ({})",
+            vec!["?"; batch.len()].join(",")
+        );
+        let mut stmt = tx.prepare_cached(&sql)?;
+        let values = std::iter::once(project_path).chain(batch.iter().copied());
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
+            r.get::<_, String>(0)
+        })?;
         for row in rows {
             active_content.insert(row?);
         }
@@ -16247,13 +16259,16 @@ fn promote_facts_tx(
             ],
         )?;
         let memory_id = tx.last_insert_rowid();
-        raise_embedding_watermark_tx(tx, project_path, memory_id, now_ms)?;
         active_content.insert(fact.content.clone());
         promoted.push(PromotedRef {
             memory_id,
             content: fact.content.clone(),
         });
         next_nonce += 1;
+    }
+
+    if let Some(last) = promoted.last() {
+        raise_embedding_watermark_tx(tx, project_path, last.memory_id, now_ms)?;
     }
 
     Ok(promoted)
@@ -17581,6 +17596,7 @@ mod tests {
     // Adversarial gate over the claim-lane migration and the single-store marker
     // migration as one merged chain.
     mod gate_a1_b0;
+    mod perf_audit;
     mod tag_cache_migration;
 
     #[test]
