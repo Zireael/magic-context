@@ -12,6 +12,7 @@ import {
     readFileSync,
     realpathSync,
     rmSync,
+    statSync,
     symlinkSync,
     writeFileSync,
 } from "node:fs";
@@ -66,6 +67,7 @@ function inventory(pid) {
         encoding: "utf8",
     });
     assert.equal(child.status, 0, child.stderr);
+    writeFileSync(join(root, `lsof-${pid}.txt`), child.stdout);
     const paths = child.stdout
         .split("\n")
         .filter((s) => /^n.*\.db(?:-wal|-shm|-journal)?$/.test(s))
@@ -201,39 +203,45 @@ async function host(version, fixture, entry, responseCounter = 0) {
         version === 1
             ? createOpencodeClient({ baseUrl: listen.url, directory: cwd })
             : OpenCode.make({ baseUrl: listen.url, headers });
-    const samples = [],
-        pending = new Set();
-    const probe = () => {
-        const started = performance.now();
-        const wallStarted = Date.now();
-        const promise = fetch(`${listen.url}/health`, {
-            headers,
-            signal: AbortSignal.timeout(1000),
-        })
-            .then(async (response) => {
-                await response.arrayBuffer();
-                samples.push({
-                    started,
-                    ended: performance.now(),
-                    wallStarted,
-                    wallEnded: Date.now(),
-                    status: response.status,
-                });
-            })
-            .catch((error) =>
-                samples.push({
-                    started,
-                    ended: performance.now(),
-                    wallStarted,
-                    wallEnded: Date.now(),
-                    error: String(error),
-                }),
-            )
-            .finally(() => pending.delete(promise));
-        pending.add(promise);
-    };
-    probe();
-    const timer = setInterval(probe, 250);
+    const samples = [];
+    const sampler = spawn(
+        "timeout",
+        [
+            "300",
+            process.execPath,
+            join(import.meta.dir, "migration-batch-health-probe.mjs"),
+            listen.url,
+            JSON.stringify(headers),
+        ],
+        { env, cwd, stdio: ["pipe", "pipe", "pipe"] },
+    );
+    let samplerOutput = "",
+        samplerError = "";
+    let markPrimed;
+    const primed = new Promise((done) => {
+        markPrimed = done;
+    });
+    sampler.stdout.on("data", (data) => {
+        samplerOutput += String(data);
+        let newline;
+        while ((newline = samplerOutput.indexOf("\n")) >= 0) {
+            const message = JSON.parse(samplerOutput.slice(0, newline));
+            samplerOutput = samplerOutput.slice(newline + 1);
+            if (message.type === "primed") markPrimed();
+            else samples.push(message);
+        }
+    });
+    sampler.stderr.on("data", (data) => {
+        samplerError += String(data);
+    });
+    const samplerClosed = new Promise((done) => sampler.once("close", done));
+    const priming = setTimeout(() => sampler.stdin.end("stop\n"), 10000);
+    const first = await Promise.race([
+        primed.then(() => "primed"),
+        samplerClosed.then(() => "closed"),
+    ]);
+    clearTimeout(priming);
+    assert.equal(first, "primed", `health sampler could not prime: ${samplerError}`);
     const ready = async () => {
         if (version === 2)
             await awaitPluginActivation(client, cwd, "opencode-magic-context", 60000);
@@ -269,8 +277,9 @@ async function host(version, fixture, entry, responseCounter = 0) {
         }
     };
     const stopSampling = async () => {
-        clearInterval(timer);
-        await Promise.all(pending);
+        if (!sampler.stdin.destroyed) sampler.stdin.end("stop\n");
+        const code = await samplerClosed;
+        assert.equal(code, 0, samplerError);
     };
     const stop = async () => {
         await stopSampling();
@@ -290,6 +299,7 @@ async function host(version, fixture, entry, responseCounter = 0) {
         ready,
         prompt,
         samples,
+        samplerPid: sampler.pid,
         stopSampling,
         stop,
         counter: () => counter,
@@ -386,6 +396,18 @@ function contextCounts(path) {
     }
 }
 const expectedCounts = contextCounts(join(root, "context.db"));
+if (process.argv.includes("--full-size-health")) {
+    const seed = statSync(join(root, "context.db"));
+    assert.ok((seed.mode & 0o222) === 0, "full-size-host-read-only-seed");
+    assert.ok(
+        seed.size >= 5 * 1024 ** 3 &&
+            expectedCounts.schema === 94 &&
+            expectedCounts.tags >= 2_000_000 &&
+            expectedCounts.messageMap >= 300_000 &&
+            expectedCounts.gitFts >= 40_000,
+        "full-size-host-seed-corpus-floor",
+    );
+}
 const healthCases = [1, 2].flatMap((version) =>
     process.argv.includes("--full-size-health")
         ? [
@@ -406,6 +428,11 @@ for (const { version, holder } of healthCases) {
     const contextPath = join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR, "context.db");
     for (const suffix of ["", "-wal", "-shm"]) rmSync(contextPath + suffix, { force: true });
     copy(join(root, "context.db"), contextPath);
+    if (existsSync(join(root, "store.db"))) {
+        const storePath = join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR, "store.db");
+        for (const suffix of ["", "-wal", "-shm"]) rmSync(storePath + suffix, { force: true });
+        copy(join(root, "store.db"), storePath);
+    }
     const startingCounts = contextCounts(contextPath);
     assert.deepEqual(startingCounts, expectedCounts);
     let holderProcess,
@@ -480,9 +507,12 @@ for (const { version, holder } of healthCases) {
         const migrationStart = timestamp("current upstream migration lane: 94");
         const commitAt = timestamp("applied v95");
         const workerStart = timestamp("applying pending migrations on a worker thread");
+        const workerReady = timestamp("migration worker ready");
         const migrationEnd = timestamp("migration worker connection closed");
         assert.ok(
-            Number.isFinite(migrationStart) &&
+            Number.isFinite(workerStart) &&
+                workerReady >= workerStart &&
+                migrationStart >= workerStart &&
                 migrationEnd >= commitAt &&
                 commitAt >= migrationStart,
         );
@@ -507,37 +537,55 @@ for (const { version, holder } of healthCases) {
         );
         assert.ok(overlapping.length > 0);
         const longestGapMs = Math.max(...overlapping.map((gap) => gap.gap));
+        const workerGaps = gaps.filter(
+            (gap) => gap.end >= workerStart && gap.start <= migrationEnd,
+        );
+        assert.ok(
+            completed[0] < workerStart && completed.at(-1) > migrationEnd,
+            "health must bracket worker start through close, including module loading",
+        );
+        const workerLongestGapMs = Math.max(...workerGaps.map((gap) => gap.gap));
+        const hostCounts = contextCounts(contextPath);
+        assert.deepEqual(hostCounts, { ...expectedCounts, schema: 95 });
         writeFileSync(
             join(root, `${label}-samples.json`),
             JSON.stringify(
-                { workerStart, migrationStart, commitAt, migrationEnd, samples: server.samples },
+                {
+                    workerStart,
+                    workerReady,
+                    migrationStart,
+                    commitAt,
+                    migrationEnd,
+                    samples: server.samples,
+                },
                 null,
                 2,
             ),
         );
-        assert.ok(
-            live.every((s) => !s.error && s.status === 200),
-            JSON.stringify(live),
-        );
-        assert.ok(longestGapMs <= 1000, `${longestGapMs}ms health gap`);
         const files = inventory(server.child.pid);
         const result = {
             version,
             label,
             holder,
             startingCounts,
-            hostCounts: contextCounts(contextPath),
+            hostCounts,
             holderFiles,
+            hostGroupPid: server.child.pid,
+            samplerPid: server.samplerPid,
+            holderGroupPid: holderProcess?.pid ?? null,
             mainThreadMigrationBodies: 0,
             workerStart,
+            workerReady,
             commitAt,
             workerClosedAt: migrationEnd,
             probes: server.samples.length,
             migrationProbes: live.length,
+            migrationHealthFailures: live.filter((s) => s.error || s.status !== 200).length,
             migrationDurationMs: migrationEnd - migrationStart,
             wholeBootFailures: server.samples.filter((s) => s.error || s.status !== 200).length,
             wholeBootLongestGapMs: Math.max(...gaps.map((gap) => gap.gap)),
             longestGapMs,
+            workerLongestGapMs,
             files,
             migrationLogs: logs
                 .split("\n")
@@ -586,6 +634,8 @@ for (const { version, holder } of healthCases) {
             .filter((s) => !s.error && s.status === 200)
             .map((s) => s.wallEnded)
             .sort((a, b) => a - b);
+        const restartCounts = contextCounts(contextPath);
+        assert.deepEqual(restartCounts, { ...expectedCounts, schema: 95 });
         const restart = {
             label,
             version,
@@ -593,11 +643,11 @@ for (const { version, holder } of healthCases) {
             failures: server.samples.length - successful.length,
             longestGapMs: Math.max(...successful.slice(1).map((t, i) => t - successful[i])),
             mainThreadMigrationBodies: 0,
-            counts: contextCounts(contextPath),
+            counts: restartCounts,
+            hostGroupPid: server.child.pid,
+            samplerPid: server.samplerPid,
             files: inventory(server.child.pid),
         };
-        assert.equal(restart.failures, 0, JSON.stringify(restart));
-        assert.ok(restart.longestGapMs <= 1000, JSON.stringify(restart));
         result.restart = restart;
         console.log(JSON.stringify({ stage: "restart", ...restart }));
         writeFileSync(join(root, "hosts.json"), JSON.stringify(report, null, 2));
@@ -762,7 +812,20 @@ for (const version of [1, 2]) {
         }
     }
 }
+// Record every holder/restart lane before failing a responsiveness budget. A
+// long post-close initialization gap must not erase the remaining measurements.
+report.healthBudgetViolations = report.health
+    .filter(
+        (lane) =>
+            lane.migrationHealthFailures > 0 ||
+            lane.longestGapMs > 1000 ||
+            lane.workerLongestGapMs > 1000 ||
+            lane.restart.failures > 0 ||
+            lane.restart.longestGapMs > 1000,
+    )
+    .map((lane) => lane.label);
 writeFileSync(join(root, "hosts.json"), JSON.stringify(report, null, 2));
+assert.deepEqual(report.healthBudgetViolations, [], "one-second host health budget exceeded");
 console.log(
     `PASS: one large-copy migration, ${report.health.length} recorded off-thread health lanes and ${report.wire.reduce((n, arm) => n + arm.comparisons, 0)} literal real-host wire comparisons`,
 );

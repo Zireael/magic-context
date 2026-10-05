@@ -142,3 +142,165 @@ advanced independently of the committed lock (subc-core 0.20.55→0.20.56,
 subc-daemon 0.31.1→0.32.0, subc-os 0.1.5→0.1.6). The scoped check used temporary
 offline resolution, then restored the staged original Cargo.lock. No dependency
 or lockfile upgrade is part of this delivery; no network install was attempted.
+
+## S3 — full-size host, holder and restart observations
+
+Preflight found **193 GiB free**. The permitted read-only snapshots are
+**6,155,116,544 bytes** (context.db) and **1,108,799,488 bytes** (store.db).
+Owner-read-only APFS seed clones live in a private throwaway root; each host
+receives its own writable clone of **both** stores. No source permissions or
+contents are changed. The context corpus is v94 with **2,070,685 tags**,
+**344,457 message-map rows**, **47,897 git FTS rows**, and **13,735 metadata
+rows**. The instrument rejects a writable or undersized seed rather than
+silently treating a synthetic host fixture as a full-size rehearsal.
+
+The fresh standalone actual-runner rehearsal took **7,321.072 ms** through
+commit, with a **4.292 ms** no-op. Streaming metadata/tag/FTS-with-rowid hashes
+are identical before/after; quick_check is `ok` and foreign-key violations are
+**0**. That transaction is intentionally in the **driver**, not a host; it is
+not substituted for the worker/health measurements below.
+
+### Measurement controls and the initial failed health budget
+
+The initial host instrument used a timer in its own SDK-driving process. Its
+OpenCode 1 alone/reader/restart cases passed, but OpenCode 2 alone recorded a
+**2,142 ms** completion gap overlapping the end of the worker interval and
+aborted the matrix. The worker closed at **18:47:06.063 UTC**; the four timed-out
+probes began at **06.221, 06.472, 06.723 and 06.974**, all **after close**. The
+last pre-close success was **05.968**, next success **08.110**. There were no
+timed-out probes overlapping the migration body. This is real failed startup
+responsiveness evidence, not a main-thread migration counterexample, and is
+not discarded in favor of a faster run.
+
+The final instrument puts 250-ms/1-second-timeout probes in a **separate Bun
+process**, preventing SDK/module work in the driver from suppressing observations.
+Its regression test deliberately occupies the driver's event loop and proves
+requests are still scheduled during that interval. Neutralizing the probe timer
+reddens only **“health sampler schedules requests even while the rehearsal
+driver is busy”**; restored test **1 passed**, four assertions. A second named
+preflight control rejects zero tags before any host launch with
+`full-size-host-seed-corpus-floor`; its staged source is restored before
+measurement. The named opt-in test **“full-size host preflight validates the
+read-only v94 rehearsal corpus”** alone reddens, with the sampler peer passing.
+It is opt-in so ordinary tests never need or discover a developer's large stores.
+
+The script retains the one-second budget check, but now applies it **after**
+recording the complete host/holder/restart matrix, so a failed budget cannot
+erase the remaining requested evidence. Worker start, ready receipt, v95 start,
+COMMIT and connection close are all recorded with raw health samples. Both
+worker-start→close and migration-body→close gaps are reported. Corpus counts
+are independently read and asserted on each host's actual file before/after
+upgrade and restart. All lsof process-group output is retained, with PIDs in
+the report; every DB/WAL/SHM path must be under the resolved private root.
+
+### Completed independent-observer matrix
+
+All dates below are **2026-10-05 UTC**. The emitted plugin is the fresh build
+from this continuation. The driver checks each executable's exact version:
+**OpenCode 1.18.30** and **2.0.22**. Each context starts from a fresh full v94
+clone and ends at 95 with the three corpus counts unchanged. This repeat reuses
+the per-case **synthetic** OpenCode stores/caches from the initial attempt;
+it is warm/load-sensitive evidence, not an unconditional cold-boot health SLA.
+The initial 2,142-ms gap remains part of the result.
+
+| Host / case | Worker start → COMMIT → close | Body start→close ms | Probes / during body | Longest worker/body-overlapping gap ms | Whole-startup gap ms / failures |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1.18.30 alone | 18:58:15.435 → 15.780 → 15.783 | 298 | 9 / 1 | **302 / 302** | 302 / 0 |
+| 1.18.30 reader holder | 18:58:21.088 → 21.366 → 21.369 | 264 | 9 / 1 | **309 / 309** | 309 / 0 |
+| 2.0.22 alone | 18:58:26.562 → 26.914 → 26.917 | 316 | 11 / 1 | **250 / 250** | 336 / 0 |
+| 2.0.22 reader holder | 18:58:32.190 → 32.468 → 32.470 | 267 | 11 / 1 | **274 / 274** | 439 / 0 |
+
+Worker-ready receipt times are **15.447, 21.100, 26.572, 32.198** respectively.
+All four initial opens and all four restarts log **main-thread migration-body
+count 0 (total=0)**. The restarts use the **same full v95 files**, with **no
+worker launch or applied-v95 log**, unchanged corpus counts, and zero failures:
+
+| Restart | Successful probes | Longest gap ms |
+| --- | ---: | ---: |
+| 1.18.30 alone | 7 | 311 |
+| 1.18.30 after reader holder | 7 | 331 |
+| 2.0.22 alone | 8 | 271 |
+| 2.0.22 after reader holder | 8 | 294 |
+
+The holder is a separate Bun process pinning a **v94 read snapshot** on the
+same working copy throughout migration. Its handle is read-write solely for
+WAL/SHM bookkeeping; its statements are BEGIN/SELECT only. This is an open
+reader/holder case, **not** a writer-lock admission latency measurement and not
+a bypass of the older-host migration guard.
+
+### lsof proof
+
+`timeout 30 lsof -g <group-pid> -Fn` covers the actual host and all descendants,
+not just the timeout wrapper. The independently validated raw captures name:
+
+| Case | Group / actual host PID | Holder group / actual PID | Restart group / actual host PID |
+| --- | --- | --- | --- |
+| 1.18.30 alone | 55282 / 55283 | — | 55811 / 55812 |
+| 1.18.30 reader holder | 56241 / 56242 | 56190 / 56191 | 56686 / 56687 |
+| 2.0.22 alone | 57086 / 57088 | — | 57536 / 57537 |
+| 2.0.22 reader holder | 57934 / 57935 | 57879 / 57882 | 58367 / 58368 |
+
+Every host/restart capture has exactly these **six unique database paths**,
+relative to
+`/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/migration-v95-follow-up-bg_9a93f47f4bc5a770/hosts/`:
+
+```text
+<case>/context/context.db
+<case>/context/context.db-wal
+<case>/context/context.db-shm
+<case>/opencode.db       # OpenCode 1; opencode2.db for OpenCode 2
+<case>/opencode.db-wal   # OpenCode 1; opencode2.db-wal for OpenCode 2
+<case>/opencode.db-shm   # OpenCode 1; opencode2.db-shm for OpenCode 2
+```
+
+Cases are `health-v1`, `health-v1-reader-holder`, `health-v2` and
+`health-v2-reader-holder`. Each holder capture contains only its case's three
+context.db paths above. No live database descriptor is present. Each full-size
+store.db clone is present but **not opened by these TypeScript hosts**; only
+context.db needs the v95 upgrade.
+
+Fresh verification: the completed matrix exits **0**, with **4 upgrades / 4
+no-op restarts**, **40 initial / 30 restart health responses**, zero timeouts and
+an empty one-second budget-violation list. An independent **Node v24.16.0** audit
+passes **62 checks** over actual report/corpus counts, zero-body logs,
+start/commit/close ordering, every raw lsof capture versus its reported file
+set, holder identity and paired store-copy sizes. Plugin tsc passes all three
+projects; Biome **2.5.1** checks **1,225 files**, no errors (the same baseline
+warnings/infos). AFT remains partial, not a clean diagnostic claim.
+The restored observer plus opt-in preflight tests pass **2/2**, five assertions.
+
+Reproduction, after preparing the permitted read-only seed pair and fencing
+the driver's HOME/XDG/storage environment as above:
+
+```sh
+timeout 1800 bun packages/plugin/scripts/perf-audit/migration-batch-hosts.mjs "$ROOT" --health-only --full-size-health
+```
+
+For the recorded repeat, the verified standalone rehearsal record was retained,
+the initial failed health/sample records archived, and `health`/`wire` lists
+reset to empty before adding `--skip-rehearsal` to that command. A skipped
+rehearsal does not itself reset an existing partial health list.
+
+Raw samples, original failed-run records, final `hosts.json`, and `lsof-<group>.txt`
+captures are retained in the private task root. Database copies are disposable;
+the permitted source pair remains untouched. No live service is restarted,
+binary installed, or live-store migration performed. No fresh Pi full-size run
+or provider-body differential is claimed here; B1's actual Pi refusal and the
+earlier separately recorded rehearsal are not conflated with this host matrix.
+
+### Additional native verification
+
+The recovered Rust HostStore/fence changes were checked too: **28 HostStore
+tests passed, 2 measurement-only tests ignored**, with one path-resolution test
+initially failing because the worker's explicit `MAGIC_CONTEXT_STORAGE_DIR`
+ended in `storage` rather than the test's assumed default `magic-context`.
+Rerunning **only that test** with the override unset (HOME/XDG still fenced)
+passes **1/1**. The supported-fences ceiling test passes **1/1** at context 95.
+No assertion or production path resolver was changed.
+
+During those checks sibling path crates also advanced cortexkit-lease
+0.1.0→0.1.1 and cortexkit-store 0.2.1→0.2.2. All native checks used temporary
+offline lock resolution and restored the staged original Cargo.lock afterward.
+The completed host repeat overlapped the beginning of the scoped native build;
+its figures therefore include ordinary shared-machine contention, not an
+unloaded-machine promise. No broad native workspace build/clippy suite was run.
