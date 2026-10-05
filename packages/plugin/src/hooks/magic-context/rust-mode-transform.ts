@@ -411,7 +411,7 @@ interface RustSessionState extends ModuleStateSyncState {
     lkgLastServedCaptureSequence: number | null;
     lkgLastCapturedRowVersion: number;
     lkgSyncCaptureRequired: boolean;
-    /** Old replay is fenced until a rebuilding pass is fully admitted. */
+    /** Block last-known-good request (LKG) replay until rebuilt messages pass all send checks. */
     markerAdmissionFenced: boolean;
     lastPassMarkerApplyAttempted: boolean;
     lkgAcceptedCapture?: {
@@ -2075,13 +2075,14 @@ export function createRustModeTransform(
     ): void => {
         state.markerAdmissionFenced = true;
         state.forceFullWire = true;
-        // A queued defer capture from before the cut must not resurrect old
-        // durable bytes after this pass fails before preparing its new capture.
+        // Cancel any queued SOFT+ snapshot write from before the marker attempt;
+        // it must not restore an outdated saved request after this pass fails.
         state.lkgCaptureSequence += 1;
         state.lkgLastServedCaptureSequence = null;
-        // Quarantine old bytes behind a durable write-ahead fence until the host
-        // reports whether it cut. Destruction is reserved for committed/uncertain
-        // outcomes, so a verified non-commit can retain its still-safe replay.
+        // Persist the replay-blocking flag before attempting to move the host marker.
+        // Keep the saved request but hide it until the outcome is known. Delete it
+        // if the marker changed or might have changed; retain it only when no change
+        // is proven.
         deps.db
             .transaction(() => {
                 setRustMarkerAdmissionFence(deps.db, sessionId, true);
@@ -2193,8 +2194,9 @@ export function createRustModeTransform(
                     state.markerAdmissionFenced ||
                     isRustMarkerAdmissionFenced(deps.db, sessionId)
                 ) {
-                    // The outer storage-busy wrapper is not allowed to turn a
-                    // post-cut failure into an old-prefix/raw serve either.
+                    // The messages-transform wrapper catches storage-busy errors outside
+                    // this adapter. If the marker may have moved, refuse rather than send
+                    // a saved request or raw messages built for the previous history boundary.
                     fenceMarkerAdmission(sessionId, state);
                     return true;
                 }
@@ -2483,8 +2485,8 @@ export function createRustModeTransform(
                 admissionFenced =
                     state.markerAdmissionFenced || isRustMarkerAdmissionFenced(deps.db, sessionId);
             } catch (error) {
-                // Preserve the ordinary unreadable-storage refusal contract;
-                // unknown admission state still cannot authorize raw fallback.
+                // If storage cannot tell us whether replay is blocked, refuse rather
+                // than send raw history that may belong to the previous marker position.
                 throw new RawFallbackContextLimitError(Number.POSITIVE_INFINITY, 0, {
                     cause: error,
                 });
@@ -3621,9 +3623,9 @@ export function createRustModeTransform(
                 return result.response;
             };
             if (markerAdmissionRecovery) {
-                // A prior rebuilding pass failed after it could change the cut.
-                // Recompose the full NEW cut; this is recovery, not a timer that
-                // grants ordinary queued markers their own independent bust.
+                // A failed earlier pass may have moved the marker without completing
+                // its request. Rebuild from the host's current retained history. This
+                // retry is for that failure; queued marker work alone must not cause a bust.
                 const flushed = await options.moduleClient.call({
                     sessionId,
                     projectRoot,
@@ -3831,7 +3833,7 @@ export function createRustModeTransform(
                 decisionUpper === "MIGRATE_HARD" ||
                 decisionUpper === "EXECUTE" ||
                 // SOFT re-renders m1 (delta folds, coverage folds): the served bytes changed,
-                // so the previous last-known-good (LKG) snapshot is already stale.
+                // so the previously saved request is already stale.
                 decisionUpper === "SOFT";
             // The module's own permission. A released frozen replay below also makes the
             // pass priced, but it changes bytes only from the first message the freeze
@@ -3898,8 +3900,8 @@ export function createRustModeTransform(
                 let replayedFrozenRepresentation = false;
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
-                    // Validate the producer's head before marker-changing
-                    // postprocess can write anything into the host's store.
+                    // An invalid Rust m[0] must not move the host marker. Check its
+                    // synthetic-message shape and session before postprocess writes.
                     assertNativeBoundary(moduleMessages, sessionId, boundaryId);
                 }
                 const markerCandidate =
@@ -4082,8 +4084,8 @@ export function createRustModeTransform(
                             fenceMarkerAdmission(sessionId, state, true);
                         },
                         afterMarkerApply: (outcome) => {
-                            // A non-commit on this attempt cannot clear a fence
-                            // left by a previous, potentially committed attempt.
+                            // An unchanged marker now does not undo an earlier possible move.
+                            // Keep the old saved request blocked until recovery finishes.
                             markerDefinitelyNoCut =
                                 !markerAdmissionRecovery &&
                                 markerUpdateDefinitelyDidNotCut(outcome);
@@ -4416,9 +4418,9 @@ export function createRustModeTransform(
                 sessionLog(sessionId, "single-store embedding drain failed (ignored):", error);
             });
             finishPass(true);
-            // Last fallible admission step: all validation, installation,
-            // priced capture and bookkeeping have completed. Until this strict
-            // clear succeeds a restart must request a rebuilding pass, not LKG.
+            // Validation, message replacement, synchronous LKG persistence and
+            // bookkeeping have finished. Clear the persisted replay block last; if
+            // this write fails, a restarted process must rebuild instead of replaying.
             if (state.markerAdmissionFenced) {
                 setRustMarkerAdmissionFence(deps.db, sessionId, false);
                 state.markerAdmissionFenced = false;
@@ -4426,9 +4428,9 @@ export function createRustModeTransform(
         } catch (error) {
             if (markerDefinitelyNoCut) {
                 try {
-                    // Later capture/bookkeeping can overwrite a slot even when
-                    // the host cut never moved. Restore the quarantined request
-                    // durably before making it replayable again.
+                    // A snapshot write can finish before later bookkeeping fails, even
+                    // when the host marker stayed unchanged. Restore the previous saved
+                    // request in storage before allowing it to be replayed.
                     deps.db
                         .transaction(() => {
                             if (markerSafeSnapshot) {
@@ -4440,9 +4442,9 @@ export function createRustModeTransform(
                             setRustMarkerAdmissionFence(deps.db, sessionId, false);
                         })
                         .immediate();
-                    // Discard this attempt's unadmitted in-memory capture before
-                    // reinstalling the older, proven-safe slot. Normal captures
-                    // keep their monotonic row-version rejection unchanged.
+                    // Remove this failed pass's in-memory snapshot before restoring the
+                    // older safe request. Ordinary captures still reject older row versions
+                    // so delayed writes cannot overwrite newer snapshots.
                     forgetInMemorySlot(sessionId);
                     if (markerSafeSnapshot && !captureSlot(sessionId, markerSafeSnapshot))
                         throw new Error("could not restore the unchanged-boundary LKG in memory");
@@ -4463,12 +4465,13 @@ export function createRustModeTransform(
                 }
             }
             if (markerApplyAttempted || markerAdmissionRecovery || state.markerAdmissionFenced) {
-                // A thrown strategy has no non-commit proof. Its quarantined old
-                // snapshot must never be revived, including across a restart.
+                // The host marker writer may throw after committing its change.
+                // Without proof that the marker stayed unchanged, keep the previous
+                // saved request unavailable, including after a restart.
                 try {
                     fenceMarkerAdmission(sessionId, state);
                 } catch {
-                    /* the durable fence already hides quarantined bytes */
+                    // Failure to save the replay-blocking flag must not allow a send.
                 }
                 state.markerAdmissionFenced = true;
                 state.forceFullWire = true;
@@ -4476,8 +4479,9 @@ export function createRustModeTransform(
                 servedFrom = "refused";
                 decision = "error";
                 materializeReason = "marker_admission_failed";
-                // The cut may have committed even if its context-state mirror
-                // failed. Never replay LKG or raw input from before that cut.
+                // The host marker may have committed before saving its context.db copy
+                // failed. Neither the previous LKG nor this pass's original raw input
+                // is then known to match the host's next history boundary.
                 try {
                     finishPass(false, false);
                 } catch {
@@ -4625,8 +4629,8 @@ export function createRustModeTransform(
                 try {
                     void withoutSqliteTransformPass(() => resolveHostRunner()?.pump(sessionId));
                 } catch (error) {
-                    // Background launch is not allowed to reject an already
-                    // admitted post-cut representation after the fence cleared.
+                    // Failure to start background summarization must not reject the request
+                    // already validated and saved for the host's current history.
                     sessionLog(sessionId, "rust host runner launch failed (ignored):", error);
                 }
             }

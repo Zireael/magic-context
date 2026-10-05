@@ -888,11 +888,12 @@ export function escapeXmlContent(s: string): string {
 }
 
 /**
- * The earliest indexed end whose remainder is not provably covered by its successor.
- * Keep that message raw. Historian indices are last-block anchors, not coverage
- * starts: continuation on the next ordinal, or the same message at a later block,
- * proves coverage without requiring start_block_index to be zero or end + 1.
- * A missing successor, ordinal gap, or unknown same-message block stays protected.
+ * Return the earliest indexed end, a summary that may stop partway through a
+ * message, whose remaining content is not covered by the next summary.
+ * Keep that message raw unless the next summary starts on it at a later block
+ * or at the next message ordinal. Historian indices mark the last covered block
+ * ("last-block anchors"), not the first block of the range. Continuation need not
+ * start at block 0 or end_block_index + 1; missing or unknown coverage is unsafe.
  */
 export function getUncoveredCompartmentEndThrough(
     db: Database,
@@ -903,7 +904,11 @@ export function getUncoveredCompartmentEndThrough(
     return end ? { endMessageId: end.endMessageId, endMessage: end.endMessage } : null;
 }
 
-/** Enumerate candidates: callers may prove sparse gaps absent, or select a visible end. */
+/**
+ * List summary ends that may still have unsummarized message parts. Callers use
+ * these to stop history trimming, or check raw messages between summaries to
+ * prove that none would be read by the historian.
+ */
 export function getUncoveredCompartmentEndsThrough(
     db: Database,
     sessionId: string,

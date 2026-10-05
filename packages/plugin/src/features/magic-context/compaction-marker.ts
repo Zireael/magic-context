@@ -327,12 +327,12 @@ export function compareOpenCodeMessagesByCanonicalOrder(
 }
 
 /**
- * Prove a sparse successor gap contains no historian-present raw message.
- * Rust skips ingress messages with ck.meta.synthetic; module-wire marks that
- * only when every non-compaction part is synthetic/syntheticTodoMarker. Use the
- * identical boolean policy, not text matching or a missing FTS/ordinal row.
- * Both endpoints must still exist in canonical order. Empty/unknown/mixed-real
- * rows remain present. This bounded key range never reads the whole raw history.
+ * Check that no message the historian would read lies between these two messages.
+ * Skip completed summaries and messages whose non-compaction parts all have
+ * synthetic:true or syntheticTodoMarker:true as actual JSON booleans, with at
+ * least one such part. Empty, unknown or mixed real/synthetic messages prevent
+ * skipping history. Both endpoint messages must exist in timestamp/ID order;
+ * only rows between them are read.
  */
 export function isOpenCodeGapHistorianAbsent(
     sessionId: string,
