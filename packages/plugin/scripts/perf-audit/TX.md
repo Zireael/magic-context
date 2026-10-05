@@ -2,9 +2,9 @@
 
 ## Scope and method
 
-Baseline: the supplied worktree base, `ee9d82912cd8105322672a1f5dd1bbb7172a2f46`. Measurements started before any runtime edits. No parent checkout, live database, real host, migration, persisted format/epoch, config schema, or public CLI was changed. Bun 1.4.2, TypeScript 5.9.3, Biome 2.5.1, macOS arm64. Timings are medians of three warm samples; the shared machine introduces noticeable variance.
+Baseline: the supplied worktree base, `ee9d82912cd8105322672a1f5dd1bbb7172a2f46`. Measurements started before any runtime edits. No parent checkout, live database, migration, persisted format/epoch, config schema, or public CLI was changed. The original measurements used library fixtures; subsequent real-host verification is reported separately. Bun 1.4.2, TypeScript 5.9.3, Biome 2.5.1, macOS arm64. Timings are medians of three warm samples; the shared machine introduces noticeable variance.
 
-The fixture has 1k, 10k, or 60k tagged messages with distinct ~600-character bodies and stored token counts. Head-injection measurements use ~48 KiB m0 and ~12 KiB m1; a separate clone measurement includes a 2 MiB mural URL. The 60k *full wire* is an intentionally oversized stress fixture, not a claim that a real provider accepts millions of tokens. SQLite fixtures are throwaway files or `:memory:` databases. Before/after differential code is extracted from git into a temporary directory inside this worktree, with dependencies linked only to this worktree; it is removed afterward. No host processes were started, so the live-host `lsof` requirement does not apply.
+The fixture has 1k, 10k, or 60k tagged messages with distinct ~600-character bodies and stored token counts. Head-injection measurements use ~48 KiB m0 and ~12 KiB m1; a separate clone measurement includes a 2 MiB mural URL. The 60k *full wire* is an intentionally oversized stress fixture, not a claim that a real provider accepts millions of tokens. SQLite fixtures are throwaway files or `:memory:` databases. Before/after differential code is extracted from git into a temporary directory inside this worktree, with dependencies linked only to this worktree; it is removed afterward. The original library fixtures did not launch hosts; the follow-up host instrument collects `lsof` ownership evidence.
 
 The parent explicitly chose **safe reductions with exact historical-edit detection**, rather than weakening undo/edit safety to claim a strictly tail-only pass. TX-9 stops at measurement. Whole-message validation remains linear, but tokenizing, serializing and hashing unchanged message content no longer happens in the append baseline refresh.
 
@@ -66,6 +66,30 @@ Pi imports the shared hygiene, token-estimate, tag/source and frozen-decision co
 
 `tx-replay.ts` runs the actual before/after `createTransform`: one initial HARD render and three DEFER append passes per size. All **12 returned transform arrays**, three persisted tag-decision snapshots, effective U/T pairs, and persisted m0/m1 plus frozen-strip decisions matched. This is an isolated equivalent before/after wire comparison, not a live-host capture. The extra dropped-read comparison matched 12 before/after array pairs at 98% active tags. Existing pinned served-wire digest, replay, image/mural, whitespace, fold, pressure and TS/Rust-mode host parity tests passed in the full suites.
 
+### Follow-up: real OpenCode 1 host
+
+The requested `packages/e2e-tests/scripts/pure-replay-differential.ts --ts-only` comparison was subsequently run between `ee9d82912cd8105322672a1f5dd1bbb7172a2f46` and the verified runtime branch commit `882e2413d9e65b1e377133db98bcec20cafa68bc`, on the installed **OpenCode 1.18.30** host with Bun 1.4.2. It ran alone as a background command under an outer 3,600-second timeout and exited 0 after ~29 seconds. Baseline and candidate hosts were sequential, with fresh throwaway HOME/XDG/config/data roots inside this worktree. No further optimization or product/harness change was made.
+
+The standard instrument reported **`RESULT IDENTICAL defer_passes=4`**: all four paired DEFER message arrays, system prompts and tool definitions matched, and neither host changed its warmed m0 generation. `tx-host-replay.ts` adds only archive-root plumbing and read-only observations to a temporary copy of that instrument. Its stronger check compares the actual mock-provider `rawBody` buffers, without parsing/re-serializing or removing `cache_control`/metadata. **All six paired main-provider HTTP request bodies matched byte-for-byte**, including both warmups and all four DEFER passes:
+
+| Main request | Bytes, each host | SHA-256, identical on both hosts |
+|---|---:|---|
+| Warmup 1 | 49,828 | `a2ef8fbd2bc3e9e4a18386871cc472d8863fda45bcf557466aa9c27582f8cdab` |
+| Warmup 2 | 49,991 | `15230c2179ff764cb3a9c6ed25c46f5659b8f26d6625e2441fbb59d780a1f9ff` |
+| DEFER 1 | 50,157 | `ac73819f638194a9053983827f80b11b1a0768cec7060070c9d8c259658daf1b` |
+| DEFER 2 | 50,323 | `913220f7970291aaf4b067c82f64a24fb2d74acf3c024debdec56a44450b3d5f` |
+| DEFER 3 | 50,489 | `13f87077c5b7260c8ecd527d1244a6920697f38f51be16eabcb66fee8a76af4b` |
+| DEFER 4 | 50,657 | `c0a18968d8439c7067a9e8b0702b4ea3d613085d3e157b1c58c1c1d2f680f888` |
+
+After every main request, `lsof -nP -p <host pid> -Fin` inventories were checked against the actual `stat` inodes of both databases, not merely against path strings or a wrapper PID. All open database/WAL/SHM paths were inside that host's fixture, and no operator OpenCode/CortexKit store/config path was present. The existing lsof guard's three positive/negative ownership tests also passed.
+
+| Ref | Host PID | Fixture below `.tx-host-replay-HvgEC9/tmp/` | context.db inode | opencode.db inode | Last lsof inventory SHA-256 |
+|---|---:|---|---:|---:|---|
+| Baseline | 25236 | `opencode-e2e-RDVAUO` | 2283789320 | 2283789463 | `09ea175e53ea0eb7d10c5bdde67d7a85195f88a580656d3bc156b9fb58689780` |
+| Candidate | 26221 | `opencode-e2e-nqfYyS` | 2283804305 | 2283804444 | `e36978e09020f0c23b770dc9f4149c74d482f31d5fe97f6c74dc3f6df558981e` |
+
+Both hosts were disposed and the entire temporary launcher/archive/config/data/proof tree was removed. `/tmp/mc-tx-real-host-final.log` contains the standard comparison, all raw-body hashes and the per-request lsof evidence; no raw log or database was committed. The follow-up changes are solely this report and the reproducible verification wrapper. Plugin script typecheck passed again; the previously recorded complete product suites remain applicable because no runtime code changed.
+
 | Gate | Result |
 |---|---|
 | `timeout 1200 bun run --cwd packages/plugin test` | Bun 1.4.2: 6,777 passed, 4 skipped, 0 failed; 6,781 tests / 652 files |
@@ -89,6 +113,7 @@ timeout 180 bun packages/plugin/scripts/perf-audit/tx-replay.ts --stages-only --
 MAGIC_CONTEXT_DEBUG_ASSERTIONS=1 timeout 120 bun packages/plugin/scripts/perf-audit/tx.ts --after --only='TX-3 assertion'
 timeout 600 bun packages/plugin/scripts/perf-audit/tx-replay.ts
 timeout 180 bun packages/plugin/scripts/perf-audit/tx-replay.ts --reads-only
+timeout 3600 bun packages/plugin/scripts/perf-audit/tx-host-replay.ts
 ```
 
 `--base=<commit>` selects another baseline for the differential driver. `--stages-only` copies the *same current stage fixture* into the archived baseline and runs both versions; it can take several minutes because the old all-whitespace probe is quadratic. These are benchmark-only options, not product CLI/settings.
@@ -98,3 +123,4 @@ timeout 180 bun packages/plugin/scripts/perf-audit/tx-replay.ts --reads-only
 - The first bash/read calls briefly returned “tool plane unavailable”; retry succeeded, with an initially clean worktree.
 - AFT inspection was PARTIAL (Biome producer unavailable; later TypeScript publication timed out); authoritative package tsc and Biome commands above passed instead. The borrowed call graph warned that its parent index was ahead of this task's base; source was checked in this worktree.
 - Targeted formatter initially used the root path and encountered a nested Biome config; running the installed tool from the plugin package resolved it. Product lint always used `bun run lint`.
+- The first follow-up verifier attempt stopped before launching a host because git archive was invoked from the nested launcher and emitted an empty subtree. The wrapper now archives from this worktree's real git root while extracted child imports retain their own roots; the corrected real-host run passed.
