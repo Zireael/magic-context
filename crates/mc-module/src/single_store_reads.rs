@@ -53,6 +53,8 @@ impl ModuleContextDomain {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(context_sql_error)?;
+        mc_store::single_store_domain::set_wal_synchronous_normal(&reader)
+            .map_err(context_sql_error)?;
         reader
             .pragma_update(None, "query_only", "ON")
             .map_err(context_sql_error)?;
@@ -225,6 +227,8 @@ pub fn attach(
             }
             let conn = Connection::open_with_flags(context_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
                 .map_err(context_sql_error)?;
+            mc_store::single_store_domain::set_wal_synchronous_normal(&conn)
+                .map_err(context_sql_error)?;
             conn.busy_timeout(std::time::Duration::from_millis(u64::from(
                 CONTEXT_BUSY_TIMEOUT_MS,
             )))
@@ -318,6 +322,22 @@ mod tests {
             .to_string()
             .contains("npx @cortexkit/magic-context doctor store init"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn freshly_opened_module_context_reader_uses_wal_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = context_db(dir.path(), Some(("migrated", Some(0))));
+        let domain = ModuleContextDomain::open(&path).unwrap();
+        let reader = domain.reader.lock().unwrap();
+        let journal: String = reader
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = reader
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        assert_eq!(synchronous, 1);
     }
 
     #[test]

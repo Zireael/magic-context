@@ -106,13 +106,14 @@ fn same_compartment(stored: &StoredCompartment, desired: &StoredCompartment) -> 
 fn read_session_compartments(
     tx: &rusqlite::Connection,
     session_id: &str,
+    min_sequence: i64,
 ) -> rusqlite::Result<Vec<(i64, StoredCompartment)>> {
     let mut statement = tx.prepare(&format!(
-        "SELECT id, {} FROM compartments WHERE session_id = ?1 ORDER BY sequence ASC",
+        "SELECT id, {} FROM compartments WHERE session_id = ?1 AND sequence >= ?2 ORDER BY sequence ASC",
         crate::COMPARTMENT_SELECT_COLUMNS
     ))?;
     let rows = statement
-        .query_map(params![session_id], |row| {
+        .query_map(params![session_id, min_sequence], |row| {
             let id: i64 = row.get(0)?;
             Ok((
                 id,
@@ -157,17 +158,22 @@ fn upsert_compartments_tx(
     desired: &[StoredCompartment],
     harness: &str,
 ) -> rusqlite::Result<UpsertOutcome> {
-    let stored = read_session_compartments(tx, session_id)?;
+    let Some(min_sequence) = desired.iter().map(|row| row.sequence).min() else {
+        return Ok(UpsertOutcome::default());
+    };
+    let mut stored = std::collections::HashMap::new();
+    for (id, row) in read_session_compartments(tx, session_id, min_sequence)? {
+        // Keep the first row, as the chronological scan did on older schemas that
+        // permitted more than one row at a sequence.
+        stored.entry(row.sequence).or_insert((id, row));
+    }
     let mut outcome = UpsertOutcome::default();
     for compartment in desired {
         let (start_id, start_block) =
             crate::context_boundaries::canonical_boundary_parts(&compartment.start_message_id)?;
         let (end_id, end_block) =
             crate::context_boundaries::canonical_boundary_parts(&compartment.end_message_id)?;
-        match stored
-            .iter()
-            .find(|(_, row)| row.sequence == compartment.sequence)
-        {
+        match stored.get(&compartment.sequence) {
             Some((_, row)) if same_compartment(row, compartment) => {}
             Some((id, _)) => {
                 tx.execute(
@@ -387,14 +393,16 @@ fn apply_pending_tx(
             let keep: std::collections::BTreeSet<i64> =
                 compartments.iter().map(|row| row.sequence).collect();
             let mut deleted = 0;
-            for (_, stored) in read_session_compartments(tx, session_id)? {
-                if !keep.contains(&stored.sequence) {
-                    deleted += delete_compartments_where_tx(
-                        tx,
-                        session_id,
-                        "sequence = ?2",
-                        stored.sequence,
-                    )?;
+            let sequences = tx
+                .prepare_cached(
+                    "SELECT sequence FROM compartments WHERE session_id = ?1 ORDER BY sequence ASC",
+                )?
+                .query_map(params![session_id], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for sequence in sequences {
+                if !keep.contains(&sequence) {
+                    deleted +=
+                        delete_compartments_where_tx(tx, session_id, "sequence = ?2", sequence)?;
                 }
             }
             if upsert.updated + deleted > 0 {
@@ -439,6 +447,15 @@ fn apply_pending_tx(
             Ok(Vec::new())
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn perf_apply_pending(
+    tx: &rusqlite::Connection,
+    session_id: &str,
+    write: &PendingContextWrite,
+) -> rusqlite::Result<Vec<PromotedRef>> {
+    apply_pending_tx(tx, session_id, write)
 }
 
 /// Record `write` as the session's pending `context.db` half, inside the caller's

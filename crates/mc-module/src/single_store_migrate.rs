@@ -2901,6 +2901,7 @@ pub(crate) fn backup_files(options: &EngineOptions) -> Result<(), EngineError> {
             file_len(source) as f64 / 1e9
         );
         let conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        mc_store::single_store_domain::set_synchronous_normal_if_wal(&conn)?;
         conn.busy_timeout(std::time::Duration::from_millis(u64::from(
             CONTEXT_BUSY_TIMEOUT_MS,
         )))?;
@@ -2913,6 +2914,7 @@ pub(crate) fn backup_files(options: &EngineOptions) -> Result<(), EngineError> {
             let digest = scope.spawn(|| sha256_file(&target));
             let check = (|| -> rusqlite::Result<(String, i64)> {
                 let copy = Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                mc_store::single_store_domain::set_synchronous_normal_if_wal(&copy)?;
                 let check: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
                 let version = if name == "context.db" {
                     context_version(&copy)?
@@ -3022,6 +3024,7 @@ pub(crate) fn open_existing(path: &Path) -> Result<Connection, EngineError> {
         )));
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    mc_store::single_store_domain::set_synchronous_normal_if_wal(&conn)?;
     conn.busy_timeout(std::time::Duration::from_millis(u64::from(
         CONTEXT_BUSY_TIMEOUT_MS,
     )))?;
@@ -3030,11 +3033,22 @@ pub(crate) fn open_existing(path: &Path) -> Result<Connection, EngineError> {
 
 fn restore_wal(conn: &Connection) {
     for schema in ["main", "ctx"] {
-        if let Err(error) =
-            conn.query_row(&format!("PRAGMA {schema}.journal_mode = WAL"), [], |row| {
-                row.get::<_, String>(0)
-            })
-        {
+        let restore = (|| -> rusqlite::Result<()> {
+            let journal =
+                conn.query_row(&format!("PRAGMA {schema}.journal_mode = WAL"), [], |row| {
+                    row.get::<_, String>(0)
+                })?;
+            if journal != "wal" {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let database = if schema == "main" {
+                rusqlite::DatabaseName::Main
+            } else {
+                rusqlite::DatabaseName::Attached("ctx")
+            };
+            conn.pragma_update(Some(database), "synchronous", "NORMAL")
+        })();
+        if let Err(error) = restore {
             eprintln!("could not restore WAL mode on {schema}: {error}");
         }
     }
@@ -3257,6 +3271,9 @@ fn migrate_files(
     let store_bytes_before = file_len(&options.store_db);
 
     let conn = open_existing(&options.store_db)?;
+    // The attached two-file migration intentionally uses rollback journals so SQLite's
+    // super-journal can commit both files atomically. It must not inherit WAL's NORMAL.
+    conn.pragma_update(None, "synchronous", "FULL")?;
     conn.query_row("PRAGMA main.journal_mode = DELETE", [], |row| {
         row.get::<_, String>(0)
     })?;
@@ -3267,6 +3284,11 @@ fn migrate_files(
     conn.query_row("PRAGMA ctx.journal_mode = DELETE", [], |row| {
         row.get::<_, String>(0)
     })?;
+    conn.pragma_update(
+        Some(rusqlite::DatabaseName::Attached("ctx")),
+        "synchronous",
+        "FULL",
+    )?;
     let started = Instant::now();
     let outcome = migrate_in_transaction(&conn, options, hooks);
     let transaction_ms = started.elapsed().as_millis() as u64;
@@ -3298,6 +3320,7 @@ fn restore_both_wal(options: &EngineOptions) {
             let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
                 row.get::<_, String>(0)
             });
+            let _ = mc_store::single_store_domain::set_wal_synchronous_normal(&conn);
         }
     }
 }
