@@ -1,5 +1,5 @@
 import { queuePendingOp } from "../../features/magic-context/storage-ops";
-import { getTagsBySession } from "../../features/magic-context/storage-tags";
+import { getActiveTagsBySession } from "../../features/magic-context/storage-tags";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { getRawSessionTagKeysThrough, type RawSessionTagKeys } from "./read-session-chunk";
@@ -39,7 +39,7 @@ export function queueDropsForCompartmentalizedMessages(
         );
     }
 
-    const tags = getTagsBySession(db, sessionId);
+    const tags = getActiveTagsBySession(db, sessionId);
     let dropsQueued = 0;
 
     for (const tag of tags) {

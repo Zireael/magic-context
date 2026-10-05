@@ -281,6 +281,49 @@ export interface LkgInputSnapshot {
     fields: readonly LkgContentField[];
 }
 
+const digestMemo = new Map<
+    string,
+    { fields: readonly LkgContentField[]; digest: string; bytes: number }
+>();
+const DIGEST_MEMO_MAX_BYTES = 16 * 1024 * 1024;
+let digestMemoBytes = 0;
+
+/** Share pristine digests across entry capture and projection after exact typed-field comparison. */
+export function memoizedLkgContentDigestFromFields(
+    id: string,
+    fields: readonly LkgContentField[],
+): string {
+    const prior = digestMemo.get(id);
+    if (prior && equalContentFields(fields, prior.fields)) {
+        digestMemo.delete(id);
+        digestMemo.set(id, prior);
+        return prior.digest;
+    }
+    const digest = lkgContentDigestFromFields(fields);
+    if (prior) {
+        digestMemo.delete(id);
+        digestMemoBytes -= prior.bytes;
+    }
+    const bytes =
+        128 +
+        id.length * 2 +
+        fields.reduce<number>(
+            (sum, field) => sum + 16 + (typeof field === "string" ? field.length * 2 : 0),
+            0,
+        );
+    if (bytes <= DIGEST_MEMO_MAX_BYTES) {
+        while (digestMemoBytes + bytes > DIGEST_MEMO_MAX_BYTES || digestMemo.size >= 20_000) {
+            const oldest = digestMemo.entries().next().value;
+            if (!oldest) break;
+            digestMemo.delete(oldest[0]);
+            digestMemoBytes -= oldest[1].bytes;
+        }
+        digestMemo.set(id, { fields: [...fields], digest, bytes });
+        digestMemoBytes += bytes;
+    }
+    return digest;
+}
+
 function equalContentFields(
     left: readonly LkgContentField[],
     right: readonly LkgContentField[],
@@ -561,9 +604,12 @@ export function noteEntry(sessionId: string, messages: MessageLike[]): LkgEntryN
     });
     const anchorIndex = entryInputIds.indexOf(slot.lastInputMessageId);
     if (anchorIndex < 0) return null;
-    const entryContentDigests = messages
-        .slice(0, anchorIndex + 1)
-        .map((message) => lkgContentDigest(message));
+    const entryContentDigests = messages.slice(0, anchorIndex + 1).map((message, index) => {
+        const fields = lkgContentFields(message);
+        return fields
+            ? memoizedLkgContentDigestFromFields(entryInputIds[index] ?? "", fields)
+            : null;
+    });
     if (entryContentDigests.some((digest) => digest === null)) return null;
     const pristineTail = structuredClone(messages.slice(anchorIndex + 1)) as MessageLike[];
     return {
@@ -575,6 +621,8 @@ export function noteEntry(sessionId: string, messages: MessageLike[]): LkgEntryN
 }
 
 export function resetLkgSlotsForTest(): void {
+    digestMemo.clear();
+    digestMemoBytes = 0;
     lkgHeapHolder.entries.clear();
     totalBytes = 0;
     persistenceBackend = undefined;

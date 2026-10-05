@@ -31,13 +31,14 @@ import {
 import {
     countRawSessionMessageOrdinalsFromDb,
     countStoredRawSessionMessagesFromDb,
+    hasRawSessionMessageByIdFromDb,
     type RawMessage,
     type RawMessageOrdinalAnchor,
     type RawMessageOrdinalEntry,
     type RawMessageParts,
     readRawSeedTailFromDb,
     readRawSessionMessageByIdFromDb,
-    readRawSessionMessageIdOrdinalsFromDb,
+    readRawSessionMessageIdOrdinalsForRangeFromDb,
     readRawSessionMessageOrdinalByIdFromDb,
     readRawSessionMessageOrdinalPageFromDb,
     readRawSessionMessagePageFromDb,
@@ -397,10 +398,11 @@ export function readRawSessionMessagePage(
     afterOrdinal: number,
     limit: number,
     finalWatermark: number,
+    after?: RawMessageOrdinalAnchor,
 ): RawMessage[] {
     const provider = sessionProviders.get(sessionId)?.provider;
     if (provider?.readMessagePage) {
-        return provider.readMessagePage(afterOrdinal, limit, finalWatermark);
+        return provider.readMessagePage(afterOrdinal, limit, finalWatermark, after);
     }
     if (provider) {
         return provider
@@ -412,7 +414,7 @@ export function readRawSessionMessagePage(
     }
     if (!openCodeDbExists()) return [];
     return withReadOnlySessionDb((db) =>
-        readRawSessionMessagePageFromDb(db, sessionId, afterOrdinal, limit, finalWatermark),
+        readRawSessionMessagePageFromDb(db, sessionId, afterOrdinal, limit, finalWatermark, after),
     );
 }
 
@@ -757,13 +759,16 @@ export function readRawSessionMessageIdOrdinalsForRange(
     if (provider?.readMessageIdOrdinalsForRange) {
         return provider.readMessageIdOrdinalsForRange(from, to);
     }
+    if (!provider) {
+        return !openCodeDbExists()
+            ? new Map()
+            : withReadOnlySessionDb((db) =>
+                  readRawSessionMessageIdOrdinalsForRangeFromDb(db, sessionId, from, to),
+              );
+    }
     const all = provider?.readMessageIdOrdinals
         ? provider.readMessageIdOrdinals()
-        : provider
-          ? new Map(provider.readMessages().map((message) => [message.id, message.ordinal]))
-          : !openCodeDbExists()
-            ? new Map<string, number>()
-            : withReadOnlySessionDb((db) => readRawSessionMessageIdOrdinalsFromDb(db, sessionId));
+        : new Map(provider.readMessages().map((message) => [message.id, message.ordinal]));
     return new Map([...all].filter(([, ordinal]) => ordinal >= from && ordinal <= to));
 }
 
@@ -792,6 +797,11 @@ export function readRawSessionMessagePartsById(
 export function hasRawSessionMessageById(sessionId: string, messageId: string): boolean {
     const provider = sessionProviders.get(sessionId)?.provider;
     if (provider?.hasMessageById) return provider.hasMessageById(messageId);
+    if (!provider)
+        return (
+            openCodeDbExists() &&
+            withReadOnlySessionDb((db) => hasRawSessionMessageByIdFromDb(db, sessionId, messageId))
+        );
     return readRawSessionMessageById(sessionId, messageId) !== null;
 }
 
@@ -1001,12 +1011,14 @@ export async function getRawSessionTagKeysThrough(
         ? Math.max(1, Math.floor(options.fromMessageIndex ?? 1))
         : 1;
     let afterOrdinal = firstOrdinal - 1;
+    let after: RawMessageOrdinalAnchor | undefined;
     while (afterOrdinal < finalWatermark) {
         const messages = readRawSessionMessages.readPage(
             sessionId,
             afterOrdinal,
             pageSize,
             finalWatermark,
+            after,
         );
         if (messages.length === 0) break;
 
@@ -1055,6 +1067,8 @@ export async function getRawSessionTagKeysThrough(
 
         if (nextOrdinal <= afterOrdinal) break;
         afterOrdinal = nextOrdinal;
+        const last = messages.at(-1);
+        after = last ? { timeCreated: last.createdAt ?? 0, id: last.id } : undefined;
         if (afterOrdinal < finalWatermark) await yieldToEventLoop();
     }
 
