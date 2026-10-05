@@ -5,7 +5,7 @@
  * explicit transaction hold starts after BEGIN returns and includes COMMIT.
  * Commit scopes include no-op writes; WAL bytes distinguish dirty commits.
  */
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, readSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -50,6 +50,23 @@ function walBytes(path: string): number {
     } catch {
         return 0;
     }
+}
+
+const redundantIndexes = ['idx_tags_session_tag_number', 'idx_compartments_session', 'idx_pending_ops_session', 'idx_source_contents_session', 'idx_compression_depth_session', 'idx_transform_decisions_session_harness', 'idx_project_key_files_project'];
+function redundantIndexFrames(db: Database, path: string, start: number, end: number): number {
+    const pages = db.prepare(`SELECT pageno FROM dbstat WHERE name IN (${redundantIndexes.map(() => '?').join(',')})`).all(...redundantIndexes) as { pageno: number }[];
+    const pageIds = new Set(pages.map(row => row.pageno));
+    const [{ page_size: pageSize }] = db.prepare('PRAGMA page_size').all() as { page_size: number }[];
+    const fd = openSync(`${path}-wal`, 'r');
+    let count = 0;
+    try {
+        const header = Buffer.alloc(24);
+        for (let pos = Math.max(start, 32); pos < end; pos += pageSize + 24) {
+            readSync(fd, header, 0, 24, pos);
+            if (pageIds.has(header.readUInt32BE(0))) count++;
+        }
+    } finally { closeSync(fd); }
+    return count;
 }
 
 function instrumentation(db: Database) {
@@ -113,14 +130,18 @@ async function measure(
         const bytes = walBytes(path);
         const start = performance.now();
         await run();
+        const elapsed = performance.now() - start;
+        const afterBytes = walBytes(path);
+        const indexFrames = finding === 'DB-1/DB-4' ? redundantIndexFrames(db, path, bytes, afterBytes) : undefined;
         samples.push({
-            ms: performance.now() - start,
+            ms: elapsed,
             holdMs: counters.holdMs - startMetrics.holdMs,
             commits: counters.commits - startMetrics.commits,
             rollbacks: counters.rollbacks - startMetrics.rollbacks,
             writes: counters.writes - startMetrics.writes,
             prepares: counters.prepares - startMetrics.prepares,
-            walBytes: walBytes(path) - bytes,
+            walBytes: afterBytes - bytes,
+            redundantIndexFrames: indexFrames,
         });
     }
     samples.sort((a, b) => a.ms - b.ms);
@@ -160,8 +181,12 @@ function seed(db: Database, n: number) {
         const decision = db.prepare(`INSERT INTO transform_decisions(session_id, harness, message_id, ts_ms, decision)
             VALUES (?, 'opencode', ?, ?, 'defer')`);
         for (let i = 0; i < Math.min(n, 2000); i++) decision.run(session, `decision-${i}`, i);
+        const pluginMessage = db.prepare("INSERT INTO plugin_messages(direction, type, session_id, created_at) VALUES ('server', 'fixture', ?, 0)");
+        for (let i = 0; i < n; i++) pluginMessage.run(`other-${i % Math.ceil(n / 100)}`);
+        const candidate = db.prepare("INSERT INTO user_memory_candidates(session_id, content, created_at) VALUES (?, 'fixture memory', 0)");
+        for (let i = 0; i < n / 10; i++) candidate.run(`other-${i % Math.ceil(n / 100)}`);
         db.prepare(`UPDATE session_meta SET cached_m0_bytes = ?, cached_m1_bytes = ?, stripped_placeholder_ids = ? WHERE session_id = ?`)
-            .run("m".repeat(262144), "d".repeat(65536), JSON.stringify(Array.from({ length: 4096 }, (_, i) => `placeholder-${i}`)), session);
+            .run(Buffer.alloc(262144, "m"), Buffer.alloc(65536, "d"), JSON.stringify(Array.from({ length: 4096 }, (_, i) => `placeholder-${i}`)), session);
     });
 }
 
@@ -173,6 +198,7 @@ try {
         if (!db) throw new Error("fixture failed to open");
         db.exec("PRAGMA wal_autocheckpoint=0");
         seed(db, n);
+        if (getOrCreateSessionMeta(db, session).cachedM0Bytes?.length !== 262144) throw new Error('fixture m0 did not survive metadata validation');
         metrics.set(db, instrumentation(db));
 
         // 32 new tags approximates a tool-heavy turn; FULL/NORMAL is diagnostic only.
@@ -223,6 +249,13 @@ try {
         await measure(db, path, n, "DB-6/DB-7", "20 persisted setters in transform scope", () => withSqliteTransformPass(() => {
             for (let i = 0; i < 20; i++) setLastNudgeUndropped(db, session, i);
         }));
+        await measure(db, path, n, "DB-6", "20 busy_timeout read/set/restore cycles only", () => {
+            for (let i = 0; i < 20; i++) {
+                const row = db.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+                db.exec("PRAGMA busy_timeout=25");
+                db.exec(`PRAGMA busy_timeout=${row.timeout}`);
+            }
+        });
         await measure(db, path, n, "DB-8", "both placeholder getters (4096 ids)", () => {
             getStrippedPlaceholderIds(db, session);
             getHiddenSeamPlaceholderIds(db, session);
@@ -241,6 +274,11 @@ try {
         });
         await measure(db, path, n, "DB-11", "trigger bound floor=0 alone", () => getTriggerTagTokenUpperBound(db, session));
         const ids = Array.from({ length: 900 }, (_, i) => i + 1);
+        await measure(db, path, n, "DB-12", "prepare two 900-parameter IN reads only", () => {
+            const placeholders = ids.map(() => '?').join(',');
+            db.prepare(`SELECT tag_id, content FROM source_contents WHERE session_id = ? AND tag_id IN (${placeholders})`);
+            db.prepare(`SELECT tag_number FROM tags WHERE session_id = ? AND tag_number IN (${placeholders})`);
+        });
         await measure(db, path, n, "DB-12", "900 tag and source IN reads", () => { getTagsByNumbers(db, session, ids); getSourceContents(db, session, ids); });
         await measure(db, path, n, "DB-13", "decision open + write + prune + close (2000 retained)", () => {
             const handle = new Database(path);
@@ -261,7 +299,18 @@ try {
         console.log(JSON.stringify({ finding: "DB-17", n, beforeCleanup: heap.getHeapStats?.() }));
         for (let i = 0; i < Math.ceil(n / 100); i++) heap.cleanup(`heap-${i}`);
         console.log(JSON.stringify({ finding: "DB-17", n, afterCleanup: heap.getHeapStats?.() }));
-        for (const table of ["plugin_messages", "user_memory_candidates"]) plan(db, n, "DB-18", `DELETE FROM ${table} WHERE session_id = ?`, "absent");
+        // A separate cleanup host avoids reusing the search reader's snapshot
+        // after the decision-log writer has committed on another connection.
+        const cleanup = new Database(path);
+        metrics.set(cleanup, instrumentation(cleanup));
+        try {
+            for (const table of ["plugin_messages", "user_memory_candidates"]) {
+                plan(cleanup, n, "DB-18", `DELETE FROM ${table} WHERE session_id = ?`, "absent");
+                await measure(cleanup, path, n, "DB-18", `no-match cleanup scan of ${table} (${table === 'plugin_messages' ? n : n / 10} rows)`, () => {
+                    cleanup.prepare(`DELETE FROM ${table} WHERE session_id = ?`).run('absent');
+                });
+            }
+        } finally { cleanup.close(); }
         closeDatabase();
     }
     console.log(JSON.stringify({ completed: sizes.length, records: records.length, root, removed: true }));
