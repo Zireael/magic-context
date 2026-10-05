@@ -7,6 +7,7 @@
 
 import { log } from "../../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
+import { isKnownAutocommit } from "../../../shared/sqlite-helpers";
 import { cosineSimilarity } from "../memory/cosine-similarity";
 import { sanitizeFtsQuery } from "../memory/storage-memory-fts";
 import { loadProjectCommitEmbeddings } from "./storage-git-commit-embeddings";
@@ -32,6 +33,12 @@ function getSearchEmbeddings(
     projectPath: string,
     modelId: string,
 ): Map<string, Float32Array> {
+    if (!isKnownAutocommit(db)) {
+        // A rollback leaves every revision counter unchanged, so a vector read
+        // inside a transaction must never be cached or served from the cache.
+        embeddingCache.delete(db);
+        return loadProjectCommitEmbeddings(db, projectPath, modelId);
+    }
     let cache = embeddingCache.get(db);
     if (!cache) {
         cache = {

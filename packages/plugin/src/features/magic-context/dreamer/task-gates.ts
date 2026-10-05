@@ -1,5 +1,6 @@
 import { DREAM_TASK_PROMOTION_DEFAULTS } from "../../../config/schema/magic-context";
 import type { Database, Statement } from "../../../shared/sqlite";
+import { isKnownAutocommit } from "../../../shared/sqlite-helpers";
 import { hasMemoryClassifiedAtColumn } from "../memory/storage-memory";
 import { hasMuralCueColumns } from "../mural/storage-mural-cues";
 import {
@@ -488,6 +489,15 @@ export function getDreamTaskBacklogs(
     options: { lastRunAt?: number | null; retrospectiveWatermarkMs?: number | null } = {},
 ): DreamTaskBacklogMap {
     if (tasks.length === 0) return {};
+    if (!isKnownAutocommit(db)) {
+        // A rollback leaves every revision counter unchanged, so a backlog read
+        // inside a transaction must never be cached or served from the cache.
+        backlogCaches.delete(db);
+        const result: DreamTaskBacklogMap = {};
+        for (const task of tasks)
+            result[task] = getDreamTaskBacklog(db, projectPath, task, options);
+        return result;
+    }
     let cache = backlogCaches.get(db);
     if (!cache) {
         cache = {

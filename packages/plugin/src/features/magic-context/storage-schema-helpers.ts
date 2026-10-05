@@ -1,4 +1,5 @@
 import type { Database, Statement } from "../../shared/sqlite";
+import { isKnownAutocommit } from "../../shared/sqlite-helpers";
 
 interface ColumnCache {
     version: number;
@@ -13,15 +14,7 @@ function readColumnNames(db: Database, table: string): Set<string> {
 }
 
 function columnNames(db: Database, table: string): ReadonlySet<string> {
-    const transaction = db as unknown as { inTransaction?: boolean; isTransaction?: boolean };
-    let cacheable = false;
-    try {
-        cacheable = transaction.inTransaction === false || transaction.isTransaction === false;
-    } catch {
-        // Some instrumentation proxies cannot read SQLite's native transaction
-        // getter. Unknown transaction state must use fresh schema discovery.
-    }
-    if (!cacheable) {
+    if (!isKnownAutocommit(db)) {
         // Never retain an uncommitted schema. Rollback can reuse its schema_version
         // for a different subsequent ALTER, so a version alone cannot fence it.
         columnCaches.delete(db);
