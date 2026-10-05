@@ -51,6 +51,9 @@ cortexkit-role-tool-provider = "=0.5.0"
 # caller's composition hash exactly as the runner hashes them.
 serde_jcs = "0.2"
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", features = ["fs"] }
+
 [features]
 # Joint CC rig-drive fault injection. DEFAULT OFF.
 #

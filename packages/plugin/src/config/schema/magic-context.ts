@@ -1346,12 +1346,12 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "When true (default), Magic Context creates and re-tightens its storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages directory, database, WAL/SHM, cache, and RPC file permissions externally; Magic Context then never chmods or supplies restrictive creation modes. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.",
+                        "When true (default), Magic Context creates and re-tightens its TypeScript-mode storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages those files externally; in TypeScript mode Magic Context then skips its own creation modes and recursive tightening. In Rust transform mode, ck-mc's store library always keeps the shared data directory owner-only 0700, regardless of this setting. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.",
                     ),
             })
             .default({ enforce_private_permissions: true })
             .describe(
-                "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; every group member able to read the storage can read all stored session content and memories.",
+                "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; TypeScript mode follows that policy, but Rust transform mode always keeps its shared data directory owner-only because ck-mc's store library enforces it.",
             ),
         embedding: EmbeddingConfigSchema.default({
             provider: "local",

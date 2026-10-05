@@ -4,7 +4,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { chmodSync, createWriteStream, mkdirSync, rmSync } from "node:fs";
+import { closeSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { COMPACTION_ENABLED_PATH, isCompactionEnabled } from "../config/agent-disable";
@@ -125,7 +125,12 @@ import type {
 } from "../shared/rpc-types";
 import { getSqliteMemoryStats } from "../shared/sqlite";
 import { importPluginModule } from "../shared/stale-plugin-build";
-import { shouldEnforcePrivateStoragePermissions } from "../shared/storage-permissions";
+import {
+    createStorageWriteStream,
+    ensureStorageDirectorySync,
+    shouldEnforcePrivateStoragePermissions,
+    writeStorageFileWithBun,
+} from "../shared/storage-permissions";
 import {
     resolveTailHygieneStatus,
     type WireTailHygieneBaseline,
@@ -1288,7 +1293,7 @@ async function writeSnapshotJson(
     snapshot: Record<string, unknown>,
     enforcePrivatePermissions: boolean,
 ): Promise<void> {
-    const writer = createWriteStream(path, enforcePrivatePermissions ? { mode: 0o600 } : undefined);
+    const writer = createStorageWriteStream(path, enforcePrivatePermissions);
     const writeChunk = async (chunk: string): Promise<void> => {
         if (!writer.write(chunk)) await once(writer, "drain");
     };
@@ -1361,10 +1366,7 @@ async function generateDebugHeapSnapshot(
 
     const directory = join(storageDir, "heap-snapshots");
     const enforcePrivatePermissions = shouldEnforcePrivateStoragePermissions();
-    mkdirSync(
-        directory,
-        enforcePrivatePermissions ? { recursive: true, mode: 0o700 } : { recursive: true },
-    );
+    ensureStorageDirectorySync(directory);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const path = join(directory, `${timestamp}-${process.pid}.heapsnapshot`);
 
@@ -1386,7 +1388,7 @@ async function generateDebugHeapSnapshot(
     }
 
     if (typeof snapshot === "string") {
-        await Bun.write(path, snapshot);
+        await writeStorageFileWithBun(path, snapshot, enforcePrivatePermissions);
     } else {
         await writeSnapshotJson(
             path,
@@ -1399,13 +1401,6 @@ async function generateDebugHeapSnapshot(
             },
             enforcePrivatePermissions,
         );
-    }
-    if (enforcePrivatePermissions) {
-        try {
-            chmodSync(path, 0o600);
-        } catch {
-            // A tightening failure does not invalidate the completed diagnostic capture.
-        }
     }
     return { ...memory, path, format, snapshotVersion };
 }

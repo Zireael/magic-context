@@ -33,11 +33,16 @@ import { Database } from "bun:sqlite";
  * high-urgency registry peer message through prefrontal-core's agent.deliver op.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { type ManagedCallOptions, SubcClient } from "@cortexkit/subc-client";
 
+import { loadPluginConfig } from "../src/config";
 import { getDataDir, getMagicContextStorageDir } from "../src/shared/data-path";
+import {
+    setStoragePrivatePermissionEnforcement,
+    writeStorageFileAtomicSync,
+} from "../src/shared/storage-permissions";
 import { resolveOpenCodeDbPath } from "../src/shared/opencode-db-path";
 import { analyzeOpenCodeCacheBustSession } from "./analyze-cache-busts";
 import {
@@ -310,10 +315,7 @@ export function loadSentinelState(path: string): CacheBustSentinelState {
 }
 
 export function saveSentinelState(path: string, state: CacheBustSentinelState): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const temporary = `${path}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-    renameSync(temporary, path);
+    writeStorageFileAtomicSync(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 function parsePositiveInteger(value: string | undefined, flag: string): number {
@@ -1255,6 +1257,9 @@ export async function runSentinelOnce(
 }
 
 async function main(): Promise<void> {
+    setStoragePrivatePermissionEnforcement(
+        loadPluginConfig(process.cwd()).storage.enforce_private_permissions,
+    );
     const options = parseSentinelArgs(process.argv);
     await runSentinelOnce(options);
     while (!options.once) {

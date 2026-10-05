@@ -1,8 +1,8 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { resolveCortexKitProjectConfigPath } from "@magic-context/core/config/migrate-config-location";
 import {
     dropInheritedEmbeddingKeyOnRedirect,
@@ -1101,14 +1101,13 @@ async function runHealthChecks(options: {
 }
 
 function writeDefaultMagicContextConfig(path: string): void {
-    mkdirSync(dirname(path), { recursive: true });
     // Only the editor schema reference: writing every schema default explicitly
     // would pin those values, so later default changes would never take effect.
     const config = {
         $schema:
             "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
     };
-    writeFileAtomic(path, `${stringifyJsonc(config, null, 2)}\n`);
+    writeFileAtomic(path, `${stringifyJsonc(config, null, 2)}\n`, { ownerOnly: true });
 }
 
 function repair(plan: RepairPlan, prompts: PromptIO): number {
