@@ -1,4 +1,7 @@
-import { getCompartmentsByEndMessageId } from "@magic-context/core/features/magic-context/compartment-storage";
+import {
+	getCompartmentsByEndMessageId,
+	getUncoveredCompartmentEndThrough,
+} from "@magic-context/core/features/magic-context/compartment-storage";
 import type { PendingPiCompactionMarker } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -9,7 +12,11 @@ export type PiMarkerUpdateOutcome =
 	| { kind: "already-current"; firstKeptEntryId: string; compactionId: string }
 	| {
 			kind: "stale-skip";
-			reason: "compartment-removed" | "target-superseded" | "entry-removed";
+			reason:
+				| "compartment-removed"
+				| "target-superseded"
+				| "entry-removed"
+				| "partial-message-boundary";
 	  }
 	| { kind: "waiting-for-entry" }
 	| { kind: "retryable-failure"; error: Error };
@@ -48,6 +55,16 @@ export function applyDeferredPiCompactionMarker(
 		}
 		if (matches[0]?.endMessage !== pending.ordinal) {
 			return { kind: "stale-skip", reason: "target-superseded" };
+		}
+
+		// Pi keeps ordinal + 1, unlike OpenCode's user turn at/before the end.
+		// An uncovered indexed end would therefore be discarded, including blocks
+		// never summarized. Check even precomputed entry ids from older publishes;
+		// contiguous successors release older indexed ends by the shared rule.
+		if (
+			getUncoveredCompartmentEndThrough(deps.db, sessionId, pending.ordinal)
+		) {
+			return { kind: "stale-skip", reason: "partial-message-boundary" };
 		}
 
 		const branchEntries = deps.readBranchEntries();

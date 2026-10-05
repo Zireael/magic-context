@@ -327,6 +327,53 @@ export function compareOpenCodeMessagesByCanonicalOrder(
 }
 
 /**
+ * Prove a sparse successor gap contains no historian-present raw message.
+ * Rust skips ingress messages with ck.meta.synthetic; module-wire marks that
+ * only when every non-compaction part is synthetic/syntheticTodoMarker. Use the
+ * identical boolean policy, not text matching or a missing FTS/ordinal row.
+ * Both endpoints must still exist in canonical order. Empty/unknown/mixed-real
+ * rows remain present. This bounded key range never reads the whole raw history.
+ */
+export function isOpenCodeGapHistorianAbsent(
+    sessionId: string,
+    endId: string,
+    nextId: string,
+): boolean {
+    const end = getNonSummaryMessageSortKey(sessionId, endId);
+    const next = getNonSummaryMessageSortKey(sessionId, nextId);
+    if (
+        !end ||
+        !next ||
+        end.timeCreated > next.timeCreated ||
+        (end.timeCreated === next.timeCreated && end.id >= next.id)
+    )
+        return false;
+    const row = getWritableOpenCodeDb()
+        .prepare(`SELECT 1 FROM message m
+        WHERE m.session_id=?
+          AND (m.time_created>? OR (m.time_created=? AND m.id>?))
+          AND (m.time_created<? OR (m.time_created=? AND m.id<?))
+          AND NOT (COALESCE(json_type(m.data,'$.summary'),'')='true' AND COALESCE(json_extract(m.data,'$.finish'),'')='stop')
+          AND NOT (
+            EXISTS (SELECT 1 FROM part p WHERE p.message_id=m.id AND p.session_id=m.session_id AND COALESCE(json_extract(p.data,'$.type'),'')<>'compaction')
+            AND NOT EXISTS (SELECT 1 FROM part p WHERE p.message_id=m.id AND p.session_id=m.session_id
+                AND COALESCE(json_extract(p.data,'$.type'),'')<>'compaction'
+                AND COALESCE(json_type(p.data,'$.synthetic'),'')<>'true'
+                AND COALESCE(json_type(p.data,'$.syntheticTodoMarker'),'')<>'true')
+          ) LIMIT 1`)
+        .get(
+            sessionId,
+            end.timeCreated,
+            end.timeCreated,
+            end.id,
+            next.timeCreated,
+            next.timeCreated,
+            next.id,
+        );
+    return !row;
+}
+
+/**
  * Check whether an OpenCode message ID still exists for a given session.
  *
  * Used by plan v6's deferred marker drain to validate that a deferred
@@ -575,14 +622,23 @@ export function injectCompactionMarker(
  * write lock. Acquiring that lock before the first DELETE avoids SQLite's
  * read-to-write upgrade path, where SQLITE_BUSY does not honor busy_timeout.
  */
+export type CompactionMarkerReplacementOutcome =
+    | { kind: "committed"; marker: CompactionMarkerState }
+    | { kind: "definitely-no-cut" | "uncertain"; error: Error };
+
 export function replaceCompactionMarker(
     existing: CompactionMarkerState | null,
     args: InjectCompactionMarkerArgs,
-): CompactionMarkerState | null {
-    const db = getWritableOpenCodeDb();
+): CompactionMarkerReplacementOutcome {
+    let connection: Database | undefined;
+    let entered = false;
+    let readyToCommit = false;
     try {
-        return db
+        const db = getWritableOpenCodeDb();
+        connection = db;
+        const marker = db
             .transaction(() => {
+                entered = true;
                 if (existing) {
                     db.prepare("DELETE FROM part WHERE id = ?").run(existing.summaryPartId);
                     db.prepare("DELETE FROM message WHERE id = ?").run(existing.summaryMessageId);
@@ -594,14 +650,23 @@ export function replaceCompactionMarker(
                         `failed to inject replacement marker at ordinal ${args.endOrdinal}`,
                     );
                 }
+                readyToCommit = true;
                 return replacement;
             })
             .immediate();
+        return { kind: "committed", marker };
     } catch (error) {
         log(
             `[magic-context] compaction-marker: atomic replacement failed: ${error instanceof Error ? error.message : String(error)}`,
         );
-        return null;
+        // A failed BEGIN never wrote. A callback failure before COMMIT is also
+        // safe only when SQLite confirms the surrounding rollback completed.
+        // A failure during COMMIT is ambiguous, even if the connection is idle.
+        const definitelyNoCut = !entered || (!readyToCommit && connection?.inTransaction === false);
+        return {
+            kind: definitelyNoCut ? "definitely-no-cut" : "uncertain",
+            error: error instanceof Error ? error : new Error(String(error)),
+        };
     }
 }
 
