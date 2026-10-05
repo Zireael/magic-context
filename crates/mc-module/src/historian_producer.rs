@@ -655,7 +655,7 @@ impl fmt::Display for HistorianProducerError {
             }
             HistorianProducerError::RunnerSessionDeletionUnsupported { session_id } => write!(
                 f,
-                "runner cannot delete session {session_id}; Broca's append-only write-ahead log retains it until archival after 7 days"
+                "runner cannot delete session {session_id}; Broca never deletes sessions, so it stays in Broca's store indefinitely"
             ),
             HistorianProducerError::HostRunnerRequiresHostTransport => {
                 write!(f, "host historian runner does not use a subc module route")
@@ -983,7 +983,7 @@ impl HistorianProducer {
         self.close().await;
         static RETENTION_WARNING: std::sync::Once = std::sync::Once::new();
         RETENTION_WARNING.call_once(|| {
-            tracing::warn!("[mc-module] runner cannot delete sessions: Broca has no session.delete operation; its write-ahead log is append-only and archives after 7 days. Dreamer memory-pool snapshots sent to the runner stay in Broca's store until archived; closing routes does not delete them.");
+            tracing::warn!("[mc-module] runner cannot delete sessions: Broca has no session.delete operation and never deletes a session. Its write-ahead log is append-only, an idle session is moved into an archive byte for byte after 7 days and kept, and engram backs both up. Dreamer memory-pool snapshots sent to the runner therefore stay indefinitely; closing routes does not delete them.");
         });
         Err(HistorianProducerError::RunnerSessionDeletionUnsupported {
             session_id: session_id.to_string(),
@@ -2339,7 +2339,9 @@ mod tests {
             error,
             HistorianProducerError::RunnerSessionDeletionUnsupported { .. }
         ));
-        assert!(error.to_string().contains("until archival after 7 days"));
+        assert!(error
+            .to_string()
+            .contains("stays in Broca's store indefinitely"));
         assert!(client.command_route.is_none());
         assert!(client.subscribe_route.is_none());
         client.purge_session("another-snapshot").await.unwrap_err();
@@ -2351,7 +2353,7 @@ mod tests {
         let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
         assert_eq!(logs.matches("runner cannot delete sessions").count(), 1);
         assert!(logs.contains("memory-pool snapshots"));
-        assert!(logs.contains("archives after 7 days"));
+        assert!(logs.contains("never deletes a session"));
     }
 
     #[tokio::test]
