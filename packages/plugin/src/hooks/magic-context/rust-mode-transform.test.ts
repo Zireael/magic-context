@@ -6959,6 +6959,9 @@ describe("raw fallback refusal copy and early abort", () => {
                 }) as MessageLike,
         );
         const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        // A module-mocked logger can retain earlier transforms' calls when Bun
+        // reuses it for spyOn. Only this refusal pass belongs in the assertions.
+        logSpy.mockClear();
         try {
             const output = { messages: [] as unknown[] };
             await expect(

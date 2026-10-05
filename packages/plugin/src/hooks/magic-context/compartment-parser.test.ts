@@ -5,6 +5,9 @@ import { parseCompartmentOutput } from "./compartment-parser";
 describe("parseCompartmentOutput — v2 5-category facts", () => {
     it("logs every unknown category block and counts rejected facts", () => {
         const logged = spyOn(logger, "log").mockImplementation(() => {});
+        // Another file can module-mock the logger. Bun then reuses that mock
+        // for spyOn, including calls made before this test installed its spy.
+        logged.mockClear();
         try {
             const parsed = parseCompartmentOutput(`<output><facts>
 <PROJECT_RULES>\n* Keep valid fact.\n</PROJECT_RULES>
@@ -26,6 +29,7 @@ describe("parseCompartmentOutput — v2 5-category facts", () => {
     });
     it("logs only fallback tags containing facts", () => {
         const logged = spyOn(logger, "log").mockImplementation(() => {});
+        logged.mockClear();
         try {
             const parsed = parseCompartmentOutput(`<output>
 <PROJECT_RULS>\n* One\n* Two\n</PROJECT_RULS>
