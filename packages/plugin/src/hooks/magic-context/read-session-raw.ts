@@ -425,6 +425,34 @@ export function readRawSessionMessageIdOrdinalsFromDb(
     return ordinalById;
 }
 
+/** Hydrate only the requested range; malformed rows consume ordinals but have no id entry. */
+export function readRawSessionMessageIdOrdinalsForRangeFromDb(
+    db: Database,
+    sessionId: string,
+    fromOrdinal: number,
+    toOrdinal: number,
+): Map<string, number> {
+    const from = Math.max(1, Math.floor(fromOrdinal));
+    const to = Math.floor(toOrdinal);
+    if (to < from) return new Map();
+    const rows = db
+        .prepare(`
+        SELECT id, data FROM message WHERE session_id = ?
+          AND CASE WHEN json_valid(data) THEN NOT (
+            COALESCE(json_type(data, '$.summary'), '') = 'true'
+            AND COALESCE(json_extract(data, '$.finish'), '') = 'stop'
+          ) ELSE 1 END
+        ORDER BY time_created, id LIMIT ? OFFSET ?
+    `)
+        .all(sessionId, to - from + 1, from - 1)
+        .filter(isRawMessageRow);
+    const result = new Map<string, number>();
+    for (const [index, row] of rows.entries()) {
+        if (parseJsonRecord(row.data)) result.set(row.id, from + index);
+    }
+    return result;
+}
+
 /** Read a keyset page used to incrementally maintain shadow message ordinals. */
 export function readRawSessionMessageOrdinalPageFromDb(
     db: Database,
@@ -845,6 +873,25 @@ export function readRawSessionMessageByIdFromDb(
         createdAt: row.time_created,
         version: row.time_updated ?? null,
     };
+}
+
+/** Existence does not require a canonical ordinal or any part payloads. */
+export function hasRawSessionMessageByIdFromDb(
+    db: Database,
+    sessionId: string,
+    messageId: string,
+): boolean {
+    const row = db
+        .prepare("SELECT id, data, time_created FROM message WHERE session_id = ? AND id = ?")
+        .get(sessionId, messageId) as RawMessageRow | null;
+    if (!row || !isRawMessageRow(row) || typeof row.time_created !== "number") return false;
+    const info = parseJsonRecord(row.data);
+    if (!info || isRawCompactionSummaryInfo(info)) return false;
+    // The legacy ordinal SQL also excludes numeric summary=1. Preserve its
+    // unusual point-lookup behavior for those rows without taxing ordinary ids.
+    if (info.summary === 1 && info.finish === "stop")
+        return readRawSessionMessageByIdFromDb(db, sessionId, messageId) !== null;
+    return true;
 }
 
 /** Read the canonical servable tail and its parts in one query, including its boundary row. */
