@@ -7,7 +7,7 @@ import {
     estimateImageTokensFromDataUrl,
     estimateToolAttachmentImageTokens,
 } from "./image-token-estimate";
-import { estimateTokens } from "./read-session-formatting";
+import { createTokenCountMemo } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import { UNKNOWN_FIT_RATIO } from "./tokenizer-calibration";
 
@@ -55,9 +55,11 @@ function serializedText(value: unknown): string {
     return (typeof value === "string" ? value : JSON.stringify(value)) ?? "";
 }
 
+const wireTextTokens = createTokenCountMemo(100_000, 128 * 1024 * 1024);
+
 function serializedTokens(value: unknown): number {
     const serialized = serializedText(value);
-    return serialized ? estimateTokens(serialized) : 0;
+    return serialized ? wireTextTokens(serialized) : 0;
 }
 
 type WireBucket = keyof MessageTokenEstimate;
