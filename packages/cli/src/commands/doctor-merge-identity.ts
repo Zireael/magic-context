@@ -24,6 +24,7 @@ import {
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { resolveOpenCodeDbPath } from "@magic-context/core/shared/opencode-db-path";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { configureContextDatabasePragmas } from "@magic-context/core/shared/sqlite-context-pragmas";
 import {
     CLI_SCHEMA_FLOOR_VERSION,
     openExistingContextDatabase,
@@ -400,6 +401,7 @@ export function runMergeIdentityCli(args: string[], deps: Partial<MergeIdentityD
     try {
         // Rows may have moved since the read-only preview; check the pair again on the
         // handle that is about to write.
+        configureContextDatabasePragmas(db);
         assertMergePairSafe(db, observed, storageDir, from, to);
         printReport(mergeProjectIdentities(db, from, to));
     } finally {

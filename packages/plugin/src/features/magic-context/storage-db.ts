@@ -42,6 +42,7 @@ import {
     withoutSqliteTransformPass,
     withSqliteBackgroundWriter,
 } from "../../shared/sqlite";
+import { configureContextDatabasePragmas } from "../../shared/sqlite-context-pragmas";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { importPluginModule } from "../../shared/stale-plugin-build";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
@@ -328,6 +329,7 @@ function migrateLegacyStorageIfNeeded(targetDbPath: string, targetDbDir: string)
     try {
         const legacyDb = new Database(legacyDbPath);
         try {
+            configureContextDatabasePragmas(legacyDb, true);
             legacyDb.exec("PRAGMA wal_checkpoint(TRUNCATE)");
         } finally {
             closeQuietly(legacyDb);
@@ -1172,7 +1174,7 @@ export function initializeDatabase(
     // or writes: it defaults to OFF, which silently breaks every ON DELETE
     // CASCADE / SET NULL declared in the schema below and in migrations.
     db.exec("PRAGMA foreign_keys=ON");
-    db.exec("PRAGMA journal_mode=WAL");
+    configureContextDatabasePragmas(db);
     applySqliteTuningPragmas(db);
     db.exec(`
     CREATE TABLE IF NOT EXISTS tags (
@@ -2586,6 +2588,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
 }
 
 const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
+const channel2HealStatements = new WeakMap<
+    Database,
+    { stale: ReturnType<Database["prepare"]>; heal: ReturnType<Database["prepare"]> }
+>();
 
 /**
  * Boot heal for a wedged Channel-2 ceiling-nudge lease.
@@ -2600,9 +2606,23 @@ const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
 function healWedgedChannel2Claims(db: Database): void {
     try {
         const staleBefore = Date.now() - CHANNEL2_CLAIM_TTL_MS;
-        db.prepare(
-            "UPDATE session_meta SET channel2_nudge_state = '', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)",
-        ).run(staleBefore);
+        let statements = channel2HealStatements.get(db);
+        if (!statements) {
+            const predicate =
+                "channel2_nudge_state = 'claimed' AND (channel2_nudge_claimed_at IS NULL OR channel2_nudge_claimed_at = 0 OR channel2_nudge_claimed_at <= ?)";
+            statements = {
+                stale: db.prepare(`SELECT 1 FROM session_meta WHERE ${predicate} LIMIT 1`),
+                heal: db.prepare(
+                    `UPDATE session_meta SET channel2_nudge_state = '', channel2_nudge_claimed_at = 0, channel2_nudge_claim_token = '' WHERE ${predicate}`,
+                ),
+            };
+            channel2HealStatements.set(db, statements);
+        }
+        // An UPDATE with no matches still acquires the shared writer lock. Keep
+        // checking leases on every open, but admit a writer only for real work.
+        // The UPDATE repeats the predicate because another host may renew a
+        // claim between this read and writer admission.
+        if (statements.stale.get(staleBefore)) statements.heal.run(staleBefore);
     } catch {
         // Columns may be missing on a very fresh DB before ensureColumn/migration
         // adds them; fresh rows seed the state as '' so there is nothing to heal.

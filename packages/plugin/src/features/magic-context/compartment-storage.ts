@@ -8,6 +8,7 @@ import { getIncrementDepthStatement } from "./compression-depth-storage";
 import { isNoContentCompartment } from "./no-content-compartment";
 import { queueM0Mutation } from "./storage-m0-mutation-log";
 import { clearCachedM0M1 } from "./storage-meta-shared";
+import { getTableColumnNames } from "./storage-schema-helpers";
 
 const insertCompartmentStatements = new WeakMap<Database, PreparedStatement>();
 const insertFactStatements = new WeakMap<Database, PreparedStatement>();
@@ -268,10 +269,34 @@ function toSessionFact(row: SessionFactRow): SessionFact {
 }
 
 export function getCompartments(db: Database, sessionId: string): Compartment[] {
+    const presentColumns = getTableColumnNames(db, "compartments");
+    const columns = [
+        "id",
+        "session_id",
+        "sequence",
+        "start_message",
+        "end_message",
+        "start_message_id",
+        "end_message_id",
+        "start_block_index",
+        "end_block_index",
+        "title",
+        "content",
+        "p1",
+        "p2",
+        "p3",
+        "p4",
+        "importance",
+        "episode_type",
+        "legacy",
+        "created_at",
+        "rebase_status",
+    ].filter((column) => presentColumns.has(column));
     const rows = db
-        // Audit note: SELECT * is intentional — compartments table is owned by this plugin, columns are
-        // validated by isCompartmentRow(), and all columns are needed for rendering and validation.
-        .prepare("SELECT * FROM compartments WHERE session_id = ? ORDER BY sequence ASC")
+        // Retired embeddings can be several KiB per row. Only transfer the
+        // fields used by validation and rendering, preserving their order.
+        .prepare(`SELECT ${columns.length ? columns.join(", ") : "NULL AS id"}
+            FROM compartments WHERE session_id = ? ORDER BY sequence ASC`)
         .all(sessionId)
         .filter(isCompartmentRow);
     return rows.map(toCompartment);
