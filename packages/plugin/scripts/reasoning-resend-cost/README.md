@@ -48,7 +48,11 @@ timeout 120s rm -rf "${TMPDIR%/}/magic-context/reasoning-diff"
   missing usage as boundaries (never bridge them). Pi follows `parentId`, not
   adjacency in an append-only file; compaction/context-edit/custom-message/model
   changes between steps invalidate a pair.
-- Logical input is `input + cache.read + cache.write`. Default cache-prefix
+- Logical input is `input + cache.read + cache.write`. **OpenCode's stored output
+  excludes separately reported reasoning; Pi's output includes it** on these measured routes. Thus
+  subtract O in OpenCode, and O-R in Pi. The literal brief formula is included as
+  a diagnostic on the same reported-reasoning observations: it adds one to k in
+  OpenCode and is not a second measurement of replay. Default cache-prefix
   tolerance is 128 tokens; results also expose 0 and 512. This is a necessary
   screening proxy, not proof of complete byte identity.
 - OpenCode 1 tool results come from step N's tool parts. User text between steps

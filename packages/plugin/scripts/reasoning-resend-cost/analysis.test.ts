@@ -17,6 +17,11 @@ describe("reasoning resend offline accounting", () => {
         expect(e.y).toBe(160); // 200 growth less 40 visible tokens, no new content.
         expect(e.basis).toBe("reported");
     });
+    test("OpenCode visible-only output does not subtract reasoning twice", () => {
+        const e = estimatePair(usage(1000, 40, 600), usage(1700), oc1Content([], true), 1, false);
+        expect(e.x).toBe(600);
+        expect(e.y).toBe(660); // 700 growth minus 40 visible; R can exceed O.
+    });
     test("negative residuals survive instead of manufacturing positive replay", () => {
         const e = estimatePair(usage(1000), usage(900), oc1Content([], true), 1);
         expect(e.y).toBe(-140);

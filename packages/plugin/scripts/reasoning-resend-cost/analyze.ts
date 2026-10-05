@@ -117,7 +117,7 @@ function merge(a: Content, b: Content): Content {
         unsupported: a.unsupported || b.unsupported, replayChars: a.replayChars + b.replayChars,
     };
 }
-export function estimatePair(a: Usage, b: Usage, c: Content, ratio: number) {
+export function estimatePair(a: Usage, b: Usage, c: Content, ratio: number, outputIncludesReasoning = true) {
     const count = (parts: string[]) => parts.reduce((sum, s) => sum + estimateTokens(s) * ratio, 0);
     const body = count(c.bodies), reasoningLocal = count(c.reasoning), visibleLocal = count(c.visible);
     const wrappers = 12 * c.tools + 8 * c.users;
@@ -125,7 +125,9 @@ export function estimatePair(a: Usage, b: Usage, c: Content, ratio: number) {
     // Their output semantics cannot be inferred by subtracting a local text count:
     // use independently tokenized visible text/tool calls on those routes instead.
     const reported = a.reasoning !== null && (a.reasoning > 0 || reasoningLocal === 0);
-    const visible = reported ? a.output - (a.reasoning ?? 0) : visibleLocal;
+    // OpenCode stores non-reasoning output separately; Pi's output includes it.
+    // Subtracting R from OpenCode's O double-counts R in the estimated replay.
+    const visible = reported ? a.output - (outputIncludesReasoning ? (a.reasoning ?? 0) : 0) : visibleLocal;
     const x = reported ? (a.reasoning ?? 0) : reasoningLocal;
     return {
         x, y: total(b) - total(a) - visible - body - wrappers, body, wrappers,
@@ -140,7 +142,7 @@ function addPair(harness: string, a: Step, b: Step, content: () => Content, prio
     if (a.provider !== b.provider || a.model !== b.model) return exclude(g, "model-switch");
     if (a.bad || b.bad || !total(a.usage) || !total(b.usage) || a.usage.output <= 0 || b.usage.output <= 0)
         return exclude(g, "error-or-empty-usage");
-    if (a.usage.reasoning !== null && a.usage.reasoning > a.usage.output)
+    if (harness === "pi" && a.usage.reasoning !== null && a.usage.reasoning > a.usage.output)
         return exclude(g, "reasoning-exceeds-output");
     // Retain gaps up to 512 so exact/128/512-token cache tolerance can be compared
     // without making another pass over the private data. None of these gates proves
@@ -152,7 +154,7 @@ function addPair(harness: string, a: Step, b: Step, content: () => Content, prio
     if (c.bodies.reduce((sum, s) => sum + s.length, 0) > 100_000)
         return exclude(g, "new-content-over-100k-characters");
     const calibration = resolveModelCalibration(a.provider, a.model);
-    const e = estimatePair(a.usage, b.usage, c, calibration.proseRatio);
+    const e = estimatePair(a.usage, b.usage, c, calibration.proseRatio, harness === "pi");
     g.rows.push({ ...e, id: a.id, nextId: b.id, session: a.session,
         usage: a.usage, nextUsage: b.usage, gap, users: c.users, tools: c.tools,
         replayChars: c.replayChars, prior,
@@ -307,8 +309,10 @@ function summarize(key: string, g: Group) {
         candidates: g.candidates, exclusions: g.exclusions,
         cacheEligible512: g.rows.length, cacheEligible128: g.rows.filter((r) => r.gap <= 128).length,
         selected: main.length, basis: [...new Set(main.map((r) => r.basis))],
+        outputConvention: key.startsWith("oc1|") ? "visible-only-when-reasoning-reported; otherwise-text-fallback" : "includes-reasoning",
         calibration: resolveModelCalibration(key.split("|")[1].split("/")[0], key.split("|")[1].split("/").slice(1).join("/")),
         main: mainFit, lag: fitLag(lagged),
+        literalBriefFormula: fit(main.filter((r) => r.basis === "reported").map((r) => ({ ...r, y: r.y + (key.startsWith("oc1|") ? r.x : 0) }))),
         smallBody128: fit(select(128, 128)), widerBody2048: fit(select(128, 2048)),
         exactPrefix: fit(select(0, 512)), loosePrefix512: fit(select(512, 512)),
         noTool: fit(main.filter((r) => r.tools === 0)), newUser: fit(main.filter((r) => r.users > 0)),
@@ -326,7 +330,7 @@ function summarize(key: string, g: Group) {
 async function main() {
     const args = process.argv.slice(2);
     const rootArg = args[0];
-    if (!rootArg) throw new Error("Usage: timeout 1800s bun analyze.ts SNAPSHOT_ROOT [SINCE_ISO UNTIL_ISO]");
+    if (!rootArg) throw new Error("Usage: timeout 1800s bun analyze.ts SCRATCH_ROOT [SINCE_ISO UNTIL_ISO]");
     const root = realpathSync(resolve(rootArg));
     // Keep all scratch output within the prescribed root. Source OpenCode stores
     // are opened read-only and SELECTed narrowly, never copied in their entirety.
@@ -362,6 +366,7 @@ async function main() {
     }
     if (!getTokenEstimatorFingerprint().startsWith("tokenizer:")) throw new Error("Tokenizer fell back during measurement");
     const results = {
+        measuredAt: new Date().toISOString(),
         since: new Date(since).toISOString(), until: new Date(until).toISOString(),
         tokenizer: getTokenEstimatorFingerprint(), calibrationRevision: CALIBRATION_TABLE_REVISION,
         inventory, groups: [...groups].map(([k, g]) => summarize(k, g)).sort((a, b) => b.steps - a.steps),
