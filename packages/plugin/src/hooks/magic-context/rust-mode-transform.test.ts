@@ -67,10 +67,17 @@ import {
     withSqliteTransformPass,
 } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import {
+    type SqliteWriteLocker,
+    startSqliteWriteLocker,
+} from "../../shared/sqlite-write-locker-test-support";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
-import { applyDeferredCompactionMarker } from "./compaction-marker-manager";
+import {
+    applyDeferredCompactionMarker,
+    type MarkerUpdateOutcome,
+} from "./compaction-marker-manager";
 import { primeCtxReduceSpawnPermission } from "./ctx-reduce-availability";
 import { autoEmbedAttemptedBySession } from "./embed-session-state";
 import {
@@ -340,8 +347,9 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 
 describe("Rust mode authority adapter", () => {
     function markerFaultFixture(
-        fault: "fence" | "after-marker" | "capture" | "bookkeeping",
+        fault: "fence" | "after-marker" | "capture" | "bookkeeping" | "host-lock-capture",
         queueOldCapture = false,
+        noCutOutcome?: MarkerUpdateOutcome,
     ) {
         const sid = `marker-admission-${fault}-${Date.now()}`;
         sessions.push(sid);
@@ -353,6 +361,9 @@ describe("Rust mode authority adapter", () => {
         );
         oc.prepare("INSERT INTO message VALUES ('m1', ?, 1, 1, ?)").run(sid, '{"role":"user"}');
         oc.close();
+        // Prime the host's WAL connection before taking its writer lock, so the
+        // reverse-order probe fails at BEGIN, not during cold journal setup.
+        if (fault === "host-lock-capture") listSessionCompactionMarkers(sid);
         let db = makeFileDb();
         const path = (
             db.prepare("PRAGMA database_list").all() as Array<{ name: string; file: string }>
@@ -375,6 +386,8 @@ describe("Rust mode authority adapter", () => {
         let fail = true;
         let captureCompleted = false;
         let deferRebuild = false;
+        let hostLocker: SqliteWriteLocker | undefined;
+        const markerOutcomes: MarkerUpdateOutcome[] = [];
         const queuedCaptures: Array<() => void> = [];
         const calls: string[] = [];
         const transformRequests: Record<string, unknown>[] = [];
@@ -384,6 +397,12 @@ describe("Rust mode authority adapter", () => {
                 if (method !== "transform") return { ok: true };
                 transformRequests.push(body as Record<string, unknown>);
                 step++;
+                if (fault === "host-lock-capture" && fail && step === 2) {
+                    hostLocker = await startSqliteWriteLocker(
+                        join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"),
+                        7_000,
+                    );
+                }
                 captureCompleted = false;
                 const oldRepresentation = step === 1 || (queueOldCapture && step === 2);
                 return {
@@ -430,15 +449,18 @@ describe("Rust mode authority adapter", () => {
                     String(sql).startsWith(
                         "SELECT detected_context_limit, detected_context_limit_model_key",
                     )
-                )
+                ) {
+                    if (noCutOutcome) fail = false;
                     throw new Error("injected late overflow bookkeeping failure");
+                }
                 return originalPrepare(sql);
             });
             const deps = makeDeps(db, moduleClient);
             deps.tagger = createTagger();
             deps.compactionMarkerStrategy = {
                 applyDeferred: (...args) => {
-                    const outcome = applyDeferredCompactionMarker(...args);
+                    const outcome = noCutOutcome ?? applyDeferredCompactionMarker(...args);
+                    markerOutcomes.push(outcome);
                     if (fault === "after-marker" && fail && outcome.kind === "applied")
                         throw new Error("injected after irreversible marker write");
                     return outcome;
@@ -455,7 +477,7 @@ describe("Rust mode authority adapter", () => {
                       }
                     : {}),
                 onLkgCaptureForTests: () => {
-                    if (fault === "capture" && fail && step >= 2)
+                    if ((fault === "capture" || fault === "host-lock-capture") && fail && step >= 2)
                         throw new Error("injected priced LKG capture failure");
                     captureCompleted = true;
                 },
@@ -478,7 +500,17 @@ describe("Rust mode authority adapter", () => {
             },
             calls,
             transformRequests,
+            markerOutcomes,
             serve,
+            serveAliased: async () => {
+                const input = makeMessages(sid);
+                const output = { messages: input as unknown[] };
+                await transform.run(sid, input, output, makeMeta(db, sid));
+                return JSON.stringify(output.messages);
+            },
+            waitForHostLock: async () => {
+                if (hostLocker) expect(await hostLocker.exited).toBe(0);
+            },
             invoke,
             queuedCaptures,
             stopFault: () => {
@@ -503,6 +535,78 @@ describe("Rust mode authority adapter", () => {
             },
         };
     }
+
+    it("a busy host cut followed by priced capture failure retains still-safe LKG across restart", async () => {
+        const fixture = markerFaultFixture("host-lock-capture");
+        try {
+            const old = await fixture.serve();
+            expect(await fixture.serveAliased()).toBe(old);
+            expect(fixture.markerOutcomes.at(-1)).toMatchObject({
+                kind: "retryable-failure",
+                cut: "definitely-no-cut",
+            });
+            expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(0);
+            expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(old);
+            await fixture.waitForHostLock();
+            fixture.restart();
+            expect(getSlot(fixture.sid)?.jsonPrefix).toBe(old);
+            fixture.stopFault();
+            expect(await fixture.serve()).toContain("new admitted prefix");
+        } finally {
+            await fixture.waitForHostLock();
+            fixture.dispose();
+        }
+    });
+
+    for (const outcome of [
+        { kind: "already-current" },
+        { kind: "stale-skip", reason: "partial-message-boundary" },
+    ] as const) {
+        it(`a definitely unchanged ${outcome.kind} cut preserves old LKG after later capture failure`, async () => {
+            const fixture = markerFaultFixture("capture", false, outcome);
+            try {
+                const old = await fixture.serve();
+                expect(await fixture.serve()).toBe(old);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(old);
+            } finally {
+                fixture.dispose();
+            }
+        });
+    }
+
+    it("a proven no-cut bookkeeping fault restores the old durable slot after a newer capture persisted", async () => {
+        const fixture = markerFaultFixture("bookkeeping", false, { kind: "already-current" });
+        try {
+            const old = await fixture.serve();
+            expect(await fixture.serve()).toBe(old);
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(old);
+            fixture.restart();
+            expect(getSlot(fixture.sid)?.jsonPrefix).toBe(old);
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("an uncertain strategy failure never revives quarantined LKG even without a visible marker", async () => {
+        const fixture = markerFaultFixture("capture", false, {
+            kind: "retryable-failure",
+            error: new Error("strategy cannot prove its commit outcome"),
+        });
+        try {
+            await fixture.serve();
+            await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+            fixture.restart();
+            expect(getSlot(fixture.sid)).toBeUndefined();
+        } finally {
+            fixture.dispose();
+        }
+    });
 
     for (const fault of ["after-marker", "capture", "bookkeeping"] as const) {
         it(`post-cut ${fault} fault refuses instead of old replay, then recomposes successfully`, async () => {

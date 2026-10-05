@@ -82,6 +82,7 @@ export function createV2RustCompactionMarkerStrategy(
             } catch (error) {
                 return {
                     kind: "retryable-failure",
+                    cut: "definitely-no-cut",
                     error: error instanceof Error ? error : new Error(String(error)),
                 };
             }
@@ -90,6 +91,7 @@ export function createV2RustCompactionMarkerStrategy(
                 // previous boundary in place rather than dropping back to full history.
                 return {
                     kind: "retryable-failure",
+                    cut: "definitely-no-cut",
                     error: new Error(
                         `no user boundary found at or before endMessageId ${pending.endMessageId} (ordinal ${pending.ordinal}); preserving existing boundary`,
                     ),

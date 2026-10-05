@@ -622,14 +622,23 @@ export function injectCompactionMarker(
  * write lock. Acquiring that lock before the first DELETE avoids SQLite's
  * read-to-write upgrade path, where SQLITE_BUSY does not honor busy_timeout.
  */
+export type CompactionMarkerReplacementOutcome =
+    | { kind: "committed"; marker: CompactionMarkerState }
+    | { kind: "definitely-no-cut" | "uncertain"; error: Error };
+
 export function replaceCompactionMarker(
     existing: CompactionMarkerState | null,
     args: InjectCompactionMarkerArgs,
-): CompactionMarkerState | null {
-    const db = getWritableOpenCodeDb();
+): CompactionMarkerReplacementOutcome {
+    let connection: Database | undefined;
+    let entered = false;
+    let readyToCommit = false;
     try {
-        return db
+        const db = getWritableOpenCodeDb();
+        connection = db;
+        const marker = db
             .transaction(() => {
+                entered = true;
                 if (existing) {
                     db.prepare("DELETE FROM part WHERE id = ?").run(existing.summaryPartId);
                     db.prepare("DELETE FROM message WHERE id = ?").run(existing.summaryMessageId);
@@ -641,14 +650,23 @@ export function replaceCompactionMarker(
                         `failed to inject replacement marker at ordinal ${args.endOrdinal}`,
                     );
                 }
+                readyToCommit = true;
                 return replacement;
             })
             .immediate();
+        return { kind: "committed", marker };
     } catch (error) {
         log(
             `[magic-context] compaction-marker: atomic replacement failed: ${error instanceof Error ? error.message : String(error)}`,
         );
-        return null;
+        // A failed BEGIN never wrote. A callback failure before COMMIT is also
+        // safe only when SQLite confirms the surrounding rollback completed.
+        // A failure during COMMIT is ambiguous, even if the connection is idle.
+        const definitelyNoCut = !entered || (!readyToCommit && connection?.inTransaction === false);
+        return {
+            kind: definitelyNoCut ? "definitely-no-cut" : "uncertain",
+            error: error instanceof Error ? error : new Error(String(error)),
+        };
     }
 }
 

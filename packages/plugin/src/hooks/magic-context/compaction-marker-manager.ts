@@ -92,7 +92,20 @@ export type MarkerUpdateOutcome =
           kind: "stale-skip";
           reason: "compartment-removed" | "target-superseded" | "partial-message-boundary";
       }
-    | { kind: "retryable-failure"; error: Error };
+    | {
+          kind: "retryable-failure";
+          error: Error;
+          /** Omitted means uncertain; only verified non-commit authorizes old replay. */
+          cut?: "definitely-no-cut" | "uncertain";
+      };
+
+export function markerUpdateDefinitelyDidNotCut(outcome: MarkerUpdateOutcome): boolean {
+    return (
+        outcome.kind === "already-current" ||
+        outcome.kind === "stale-skip" ||
+        (outcome.kind === "retryable-failure" && outcome.cut === "definitely-no-cut")
+    );
+}
 
 /**
  * Validate that a deferred pending-marker target is still the right thing to
@@ -297,6 +310,7 @@ export function applyDeferredCompactionMarker(
     directory?: string,
     trustedBoundary?: TrustedMaterializedCompactionBoundary,
 ): MarkerUpdateOutcome {
+    let cut: "definitely-no-cut" | "uncertain" = "definitely-no-cut";
     try {
         // Rust may fence the target with the exact durable boundary returned by the
         // materializing response. Other callers validate against local compartment rows.
@@ -340,6 +354,7 @@ export function applyDeferredCompactionMarker(
         if (!boundary) {
             return {
                 kind: "retryable-failure",
+                cut: "definitely-no-cut",
                 error: new Error(
                     `no user boundary found at or before endMessageId ${pending.endMessageId} (ordinal ${pending.ordinal}); preserving existing marker`,
                 ),
@@ -361,7 +376,8 @@ export function applyDeferredCompactionMarker(
         // Replace both host-store row sets under one BEGIN IMMEDIATE. A busy
         // store fails before deletion; any later failure rolls the deletion back.
         const removedSummaryMessageId = existing?.summaryMessageId ?? null;
-        const result = replaceCompactionMarker(existing, {
+        cut = "uncertain";
+        const replacement = replaceCompactionMarker(existing, {
             sessionId,
             endOrdinal: pending.ordinal,
             endMessageId: pending.endMessageId,
@@ -369,14 +385,14 @@ export function applyDeferredCompactionMarker(
             directory: directory ?? process.cwd(),
             resolvedBoundary: boundary,
         });
-        if (!result) {
+        if (replacement.kind !== "committed") {
             return {
                 kind: "retryable-failure",
-                error: new Error(
-                    `atomic marker replacement failed for ordinal ${pending.ordinal}; will retry`,
-                ),
+                cut: replacement.kind,
+                error: replacement.error,
             };
         }
+        const result = replacement.marker;
 
         persistMarkerStateAndDropReplacedTag(
             db,
@@ -411,7 +427,7 @@ export function applyDeferredCompactionMarker(
             `compaction-marker drain: retryable failure for ordinal ${pending.ordinal}:`,
             error,
         );
-        return { kind: "retryable-failure", error };
+        return { kind: "retryable-failure", error, cut };
     }
 }
 
@@ -487,7 +503,7 @@ export function updateCompactionMarkerAfterPublication(
         return false;
     }
 
-    const result = replaceCompactionMarker(existing, {
+    const replacement = replaceCompactionMarker(existing, {
         sessionId,
         endOrdinal: lastCompartmentEnd,
         endMessageId: targetEndMessageId,
@@ -496,7 +512,8 @@ export function updateCompactionMarkerAfterPublication(
         resolvedBoundary: boundary,
     });
 
-    if (result) {
+    if (replacement.kind === "committed") {
+        const result = replacement.marker;
         persistMarkerStateAndDropReplacedTag(
             db,
             sessionId,

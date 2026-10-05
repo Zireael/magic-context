@@ -61,6 +61,7 @@ import {
 } from "../../shared/sqlite";
 import { renderUserFacingFailure } from "../../shared/user-facing-codes";
 import type { WindowGeometryResult } from "../../shared/window-geometry";
+import { markerUpdateDefinitelyDidNotCut } from "./compaction-marker-manager";
 import {
     cachedToolPermissionDenied,
     resolveCtxReduceAvailability,
@@ -106,6 +107,7 @@ import {
     contentSnapshotValue,
     dropSlot,
     exactReusablePrefix,
+    forgetInMemorySlot,
     getSlot,
     incrementalLkgContentDigests,
     LKG_SNAPSHOT_ARRAY,
@@ -2066,22 +2068,27 @@ export function createRustModeTransform(
         deps.liveModelBySession?.get(sessionId) ??
         hostModelFallback(sessionId);
 
-    const fenceMarkerAdmission = (sessionId: string, state: RustSessionState): void => {
+    const fenceMarkerAdmission = (
+        sessionId: string,
+        state: RustSessionState,
+        quarantine = false,
+    ): void => {
         state.markerAdmissionFenced = true;
         state.forceFullWire = true;
         // A queued defer capture from before the cut must not resurrect old
         // durable bytes after this pass fails before preparing its new capture.
         state.lkgCaptureSequence += 1;
         state.lkgLastServedCaptureSequence = null;
-        // This is strict, not best-effort dropSlot: a host cut must not be
-        // attempted if the old durable request could survive a process restart.
+        // Quarantine old bytes behind a durable write-ahead fence until the host
+        // reports whether it cut. Destruction is reserved for committed/uncertain
+        // outcomes, so a verified non-commit can retain its still-safe replay.
         deps.db
             .transaction(() => {
                 setRustMarkerAdmissionFence(deps.db, sessionId, true);
-                clearPersistedLkgSlotStrict(deps.db, sessionId);
+                if (!quarantine) clearPersistedLkgSlotStrict(deps.db, sessionId);
             })
             .immediate();
-        dropSlot(sessionId, "rust_marker_admission_fenced");
+        if (!quarantine) dropSlot(sessionId, "rust_marker_admission_fenced");
         state.lkgAcceptedCapture = undefined;
         state.lkgSyncCaptureRequired = true;
     };
@@ -2343,6 +2350,9 @@ export function createRustModeTransform(
         const passObservedAtMs = Date.now();
         const state = ensureState(states, sessionId);
         let markerApplyAttempted = false;
+        let markerDefinitelyNoCut = false;
+        let markerSafeSnapshot: LkgSlot | undefined;
+        let markerOriginalMessages: MessageLike[] | undefined;
         state.lastPassMarkerApplyAttempted = false;
         // Only the path that captures the array it serves sets this again, so every
         // other way out of this pass leaves the next pass unable to trust the slot.
@@ -4065,9 +4075,24 @@ export function createRustModeTransform(
                         sessionDirectory: directory,
                         materializedBoundary,
                         beforeMarkerApply: () => {
+                            if (!markerAdmissionRecovery) markerSafeSnapshot = getSlot(sessionId);
+                            markerOriginalMessages = messages.slice();
                             markerApplyAttempted = true;
                             state.lastPassMarkerApplyAttempted = true;
-                            fenceMarkerAdmission(sessionId, state);
+                            fenceMarkerAdmission(sessionId, state, true);
+                        },
+                        afterMarkerApply: (outcome) => {
+                            // A non-commit on this attempt cannot clear a fence
+                            // left by a previous, potentially committed attempt.
+                            markerDefinitelyNoCut =
+                                !markerAdmissionRecovery &&
+                                markerUpdateDefinitelyDidNotCut(outcome);
+                            if (markerDefinitelyNoCut) {
+                                state.lastPassMarkerApplyAttempted = false;
+                            } else {
+                                markerSafeSnapshot = undefined;
+                                fenceMarkerAdmission(sessionId, state);
+                            }
                         },
                         compactionMarkerStrategy: deps.compactionMarkerStrategy,
                         fullFeatureMode: !sessionMeta.isSubagent,
@@ -4155,7 +4180,7 @@ export function createRustModeTransform(
                 // A cache-busting replacement invalidates the previous snapshot only after the
                 // replacement is installed. If installation fails, the prior LKG remains available
                 // and its replay still applies durable binding-mismatch strips.
-                if (cacheBustingPass) {
+                if (cacheBustingPass && !markerDefinitelyNoCut) {
                     dropSlot(sessionId, "lkg_cache_bust_pending_capture");
                     state.lkgAcceptedCapture = undefined;
                 }
@@ -4180,7 +4205,7 @@ export function createRustModeTransform(
                     ) {
                         return;
                     }
-                    dropSlot(sessionId, `lkg_${mode}_capture_failed`);
+                    if (!markerDefinitelyNoCut) dropSlot(sessionId, `lkg_${mode}_capture_failed`);
                     state.lkgAcceptedCapture = undefined;
                     state.lkgSyncCaptureRequired = true;
                     sessionLog(
@@ -4399,7 +4424,52 @@ export function createRustModeTransform(
                 state.markerAdmissionFenced = false;
             }
         } catch (error) {
+            if (markerDefinitelyNoCut) {
+                try {
+                    // Later capture/bookkeeping can overwrite a slot even when
+                    // the host cut never moved. Restore the quarantined request
+                    // durably before making it replayable again.
+                    deps.db
+                        .transaction(() => {
+                            if (markerSafeSnapshot) {
+                                if (!saveLkgSlotToDb(deps.db, sessionId, markerSafeSnapshot))
+                                    throw new Error("could not restore the unchanged-boundary LKG");
+                            } else {
+                                clearPersistedLkgSlotStrict(deps.db, sessionId);
+                            }
+                            setRustMarkerAdmissionFence(deps.db, sessionId, false);
+                        })
+                        .immediate();
+                    // Discard this attempt's unadmitted in-memory capture before
+                    // reinstalling the older, proven-safe slot. Normal captures
+                    // keep their monotonic row-version rejection unchanged.
+                    forgetInMemorySlot(sessionId);
+                    if (markerSafeSnapshot && !captureSlot(sessionId, markerSafeSnapshot))
+                        throw new Error("could not restore the unchanged-boundary LKG in memory");
+                    if (!markerSafeSnapshot)
+                        dropSlot(sessionId, "unchanged_boundary_without_prior_lkg");
+                    state.markerAdmissionFenced = false;
+                    state.lkgAcceptedCapture = undefined;
+                    state.lkgSyncCaptureRequired = true;
+                    markerApplyAttempted = false;
+                    if (markerOriginalMessages)
+                        replaceMessagesInPlace(output, markerOriginalMessages);
+                } catch (restoreError) {
+                    sessionLog(
+                        sessionId,
+                        "unchanged-boundary LKG restoration failed; refusing:",
+                        restoreError,
+                    );
+                }
+            }
             if (markerApplyAttempted || markerAdmissionRecovery || state.markerAdmissionFenced) {
+                // A thrown strategy has no non-commit proof. Its quarantined old
+                // snapshot must never be revived, including across a restart.
+                try {
+                    fenceMarkerAdmission(sessionId, state);
+                } catch {
+                    /* the durable fence already hides quarantined bytes */
+                }
                 state.markerAdmissionFenced = true;
                 state.forceFullWire = true;
                 state.parked = false;

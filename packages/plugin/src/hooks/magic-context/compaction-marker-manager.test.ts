@@ -661,6 +661,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
         const first = applyDeferredCompactionMarker(db, "ses-retry", makePending(), dataHome);
         expect(first.kind).toBe("retryable-failure");
+        expect(first).toMatchObject({ cut: "uncertain" });
 
         const inspectAfterCrash = new Database(join(dataHome, "opencode", "opencode.db"));
         const firstSummaryIds = inspectAfterCrash
@@ -917,6 +918,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
             const startedAt = Date.now();
             const outcome = applyDeferredCompactionMarker(db, "ses-lock", makePending(), dataHome);
             expect(outcome.kind).toBe("retryable-failure");
+            expect(outcome).toMatchObject({ cut: "definitely-no-cut" });
             // This OpenCode-owned handle is not routed by the shared SQLite wrapper.
             // Its native timeout expires before the deferred marker is retried.
             expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4500);

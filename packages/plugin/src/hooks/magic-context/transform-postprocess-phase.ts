@@ -84,7 +84,11 @@ import {
     rearmChannel2AfterCoverageAdvancingHardFold,
     rearmChannel2AfterMeasuredCollapse,
 } from "./channel2-cycle";
-import { applyDeferredCompactionMarker, MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
+import {
+    applyDeferredCompactionMarker,
+    MARKER_SUMMARY_TEXT,
+    type MarkerUpdateOutcome,
+} from "./compaction-marker-manager";
 import { getActiveCompartmentRun } from "./compartment-runner";
 import type {
     CtxReduceAvailabilityVerdict,
@@ -763,6 +767,8 @@ export function applyRustModeDeferredCompactionMarker(args: {
     cacheBustingPass: boolean;
     /** Fence old replay before a host strategy may commit an irreversible cut. */
     beforeApply?: () => void;
+    /** Report the cut outcome before subsequent pending-state bookkeeping can fail. */
+    afterApply?: (outcome: MarkerUpdateOutcome) => void;
     db: ContextDatabase;
     sessionId: string;
     boundary?: RustMaterializedCompactionBoundary;
@@ -860,6 +866,7 @@ export function applyRustModeDeferredCompactionMarker(args: {
         args.sessionDirectory,
         trustedBoundary,
     );
+    args.afterApply?.(outcome);
     switch (outcome.kind) {
         case "applied":
         case "already-current":
@@ -1007,6 +1014,7 @@ export function runRustModePostprocess(args: {
     sessionDirectory?: string;
     materializedBoundary?: RustMaterializedCompactionBoundary;
     beforeMarkerApply?: () => void;
+    afterMarkerApply?: (outcome: MarkerUpdateOutcome) => void;
     compactionMarkerStrategy?: CompactionMarkerStrategy;
     fullFeatureMode: boolean;
     compactionOff?: boolean;
@@ -1083,6 +1091,7 @@ export function runRustModePostprocess(args: {
         applyRustModeDeferredCompactionMarker({
             cacheBustingPass: true,
             beforeApply: args.beforeMarkerApply,
+            afterApply: args.afterMarkerApply,
             ...(args.compactionMarkerStrategy
                 ? { applyDeferred: args.compactionMarkerStrategy.applyDeferred }
                 : {}),
