@@ -228,3 +228,126 @@ not rerun or repaired. This is not a full OpenCode 2 native-suite sign-off or a
 paused-in-flight historian race certification. It also does not promise recovery
 through real, pre-flag, mixed, empty-part or otherwise unknown gaps: those remain
 fail-closed, and may require repair/recompilation rather than a marker retry.
+
+## Round-four follow-up: dispatch and definitely unchanged cuts
+
+Merged master first, bringing in `marker-unfreeze-review-r3.md` and preserving
+its report unchanged. Implementation checkpoints are `23fe9ebc81` (wire dispatch)
+and `c6326155bb` (verified non-cut availability). The earlier sections describe
+round three; the quarantine/retention behavior below supersedes its destructive
+pre-attempt LKG invalidation.
+
+### Management dispatch is now constructed by the transport
+
+Recovery explicitly supplies `method:"session.flush"` in the JSON body.
+`SubcModuleTransport.call` also derives the dispatch field of flat JSON management
+requests from its authoritative `method` argument, including replacing a mismatched
+body discriminator. The change preserves reply paging and the intentional MCP
+facade protocol: `{name,arguments}` calls must stay method-free, because ck-mc
+routes them to a different handler. Pre-encoded byte bodies remain byte-preserving;
+the production caller audit found no such caller.
+
+The audit covered all 27 direct `.call(...)` matches in 17 production files and
+their dynamic wrapper/builders. Transform/state-sync builders, management RPC and
+command handlers, refusal status probes, todo/drop backends, and historian wrapper
+calls already carry their management discriminator. Dreamer/memory/tool calls using
+`name`/`arguments` are deliberate facade requests, not malformed flat management
+calls. Recovery was the missing flat discriminator. No compatibility shim or Rust
+dispatch change is introduced.
+
+The new socket regression uses the actual transport, SubcClient authentication,
+route opening, frame encoding, and bytes received by a TCP peer. It does not mock
+the module client's `.call`. Literal expectations verify missing flush method
+insertion, mismatched status-method replacement, and unchanged facade routing.
+On the old encoder, this is the sole failure beside the original flat-body identity
+control: **1 pass / 1 fail / 9 assertions**.
+
+The real-host reproduction recreates the exact durable version-2 fence and removes
+LKG rows/chunks on a valid summarized-history session. It then submits the next
+turn, re-arms the fence, restarts OpenCode on the same fixture, and submits another.
+Both next passes now report **SOFT / reason=explicit_flush / applied=true /
+served_from=transform**, send full input, reach the provider, clear the fence, and
+persist one new durable LKG. No manual flag clearing substitutes for admission.
+The fixture deliberately ends the harness's frozen zero-TTL setup and seeds a
+valid summary; otherwise TTL expiry can produce an unrelated HARD, or an
+unsummarized session can produce metadata-only SOFT+. The genuine rebuilding
+decision requirement was not weakened to accommodate either preliminary fixture.
+
+### Typed non-commit proof preserves still-safe replay
+
+Host replacement now returns `committed`, `definitely-no-cut`, or `uncertain`.
+A failed BEGIN or writer setup never wrote. A callback failure before COMMIT is
+definitely unchanged only after the connection confirms the surrounding rollback
+completed. A COMMIT failure remains uncertain even when SQLite is idle. Failure
+in context.db's marker mirror after the host commit is likewise uncertain.
+
+The strategy carries this distinction in retryable outcomes via
+`cut:"definitely-no-cut"`; an omitted annotation remains uncertain, so existing
+or alternate strategies cannot accidentally authorize old replay. Already-current
+and stale-skip are typed no-mutation results. V2's failed boundary lookup reports
+the same definite non-cut proof; its actual recorded-boundary write does not.
+
+The cross-database crash window still requires a durable write-ahead fence while
+the host outcome is unknown. Instead of destroying old bytes at this point, the
+adapter quarantines them behind that fence. Committed, uncertain, and thrown
+strategy outcomes permanently invalidate them. Verified non-cuts retain their
+snapshot through the remainder of admission. If later capture or bookkeeping
+fails, restoration and fence clearing commit together before old replay is made
+available. Failure to restore remains fail-closed. A non-cut on the current retry
+cannot clear a fence left by an earlier potentially committed attempt.
+
+Restoration also handles output arrays aliasing the raw input and a new capture
+already persisted before late bookkeeping fails. The unadmitted process copy is
+evicted before installing the older safe slot; ordinary monotonic row-version
+capture checks remain unchanged. Queued old capture cancellation and every
+post-commit refusal/restart guard remain in place.
+
+The reverse-order regression holds the real OpenCode writer in a separate process
+for seven seconds, with the WAL connection already primed. Host BEGIN cannot
+acquire the writer and returns a typed definite non-cut. A later priced capture
+fault now serves exactly the previous LKG, leaves no host marker/mirror, clears
+the provisional fence, and hydrates the same old snapshot on a new adapter/file
+connection. Once the lock/fault ends, a real marker application succeeds. No-op,
+stale-skip, persisted-new-capture/late-bookkeeping, and uncertain-result controls
+cover the adjacent branches. Existing real post-commit and mirror-failure tests
+retain their safe claims; no test was rewritten to invert its contract.
+
+### Round-four mutation proofs and final gates
+
+All mutations staged the live specific files first and captured an empty unstaged
+diff, carried `NON-VACUITY BREAK`, captured a non-empty diff, then restored with
+`git checkout -- <path> && touch <path>` and captured an empty diff again.
+Each named test was the sole failure in its selection:
+
+| Mutation | Sole red test | Green control | During / restored diff |
+| --- | --- | --- | --- |
+| Remove transport-derived method insertion/replacement | `serializes management dispatch from the call method over the real socket and preserves facade envelopes` | `omits an ambient supervised identity while preserving route identity and flat request bytes` | `module-transport.ts`: 1 file +2/-1 / empty |
+| Ignore typed failed-BEGIN non-cut proof | `a busy host cut followed by priced capture failure retains still-safe LKG across restart` | `an uncertain strategy failure never revives quarantined LKG even without a visible marker` | `compaction-marker-manager.ts`: 1 file +1/-1 / empty |
+| Trust every retryable failure, including uncertain results | `an uncertain strategy failure never revives quarantined LKG even without a visible marker` | `a busy host cut followed by priced capture failure retains still-safe LKG across restart` | `compaction-marker-manager.ts`: 1 file +1/-1 / empty |
+
+Final results (Bun **1.4.2**, TypeScript **5.9.3**, Biome **2.5.1**):
+
+- Plugin package typecheck: **three tsc invocations pass**.
+- Ten focused plugin files (the seven original suites plus low-level marker,
+  LKG-slot, and module-transport suites): **512 pass / 0 fail / 4,781 assertions**.
+- Restored fault/rejection selection: **15 pass / 0 fail / 112 assertions**.
+- Executable scoped Biome: **8 non-cut files pass**, plus **3 dispatch files pass**.
+- Plugin rebuild: pass, including **4 V2 loader tests / 19 assertions**.
+- Final complete real OpenCode 1 marker suite: **4 pass / 0 fail / 168 assertions**,
+  209.24 seconds. All original large-cut/byte-identity, sparse synthetic/real-gap,
+  and metadata-only SOFT+ claims pass alongside the new live/restarted SOFT recovery.
+- Pi's normal package typecheck now passes after the master merge, and its marker
+  suite passes **11 tests / 18 assertions**. No Pi config workaround was added.
+- The edited host fixture has **0 local TypeScript diagnostics**; its scoped
+  dependency graph still has the unchanged `rust-harness.ts` SDK `session.get`
+  diagnostic. E2E-wide typecheck and unrelated V2/native lanes were not rerun.
+- AFT inspection remains partial because its Biome/Tier-2 producers are unavailable;
+  it reports no TypeScript errors. Executable Biome and package tsc are the gates.
+
+Host commands use the same explicit module, daemon, and bundle paths shown above.
+The module is the existing worktree-built artifact from the preceding delivery;
+Rust sources are unchanged, and the existing hermetic daemon is **ck-subc 0.20.55**.
+Every lsof isolation assertion passes. No live database/configuration or backup
+store is accessed. No package install, manifest/lock edit, native rebuild, or new
+report file is part of round four. Production fixes were checkpointed separately
+before this evidence update.
