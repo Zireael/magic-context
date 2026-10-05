@@ -12,7 +12,9 @@ Read both earlier reviews and the protected `ARCHITECTURE.md:48–108` first.
 No live database, configuration, or backup store is accessed. Unit fixtures and
 host runs are confined to `$TMPDIR/magic-context/marker-unfreeze-review-r3-bg_c62afe4/`.
 Shell commands have outer timeouts; native builds are serialized with `-j 2`.
-Candidate source/test overlays are temporary and will be restored before delivery.
+Candidate source/test overlays and all throwaway proof tests were restored before
+delivery; no production fix, package/config workaround, or test weakening is
+included. The report was committed at its evidence checkpoints.
 
 **Do not sign off round three yet.** All three round-two reproductions now pass
 for their intended reasons, and the ordinary real OpenCode 1 byte-identity suite
@@ -274,3 +276,75 @@ with synthetic-only gaps; a real row at **85** keeps marker **50** and sends no
 new provider request. The real metadata-only committed execute remains SOFT+
 and preserves pending work/history bytes. None of these ordinary probes arms a
 failed-admission fence, so none contradicts the recovery blocker.
+
+## Verification, isolation, and limits
+
+Tools: **Bun 1.4.2 (744846f84)**, **TypeScript 5.9.3**, **cargo 1.99.0
+(5f94df478 2026-08-27)**, **SQLite 3.54.0**, real **OpenCode 1.18.30**.
+Rebuilt the worktree's module; used the explicitly selected existing hermetic
+daemon **ck-subc 0.20.55**, not a newly rebuilt daemon. Candidate and review-base
+Rust sources/manifests/lock compare equal. The lock does not match three available
+sibling versions, so `cargo build --release -p mc-module -j 2 --locked` fails
+before compiling. A single foreground offline build succeeds in **5m35s**, with
+temporary sibling lock resolutions `subc-core 0.20.55→0.20.56`, `subc-daemon
+0.31.1→0.32.0`, and `subc-os 0.1.5→0.1.6`; the lock was staged first, then
+restored/touched and its diff verified empty. No lock or manifest is delivered.
+
+All shell commands have outer timeouts. Builds and host runs use foreground
+waits, native compilation uses **`-j 2`**, and **only one OpenCode host runs at
+a time**. The prepared frozen Bun install is used; no package install or manifest
+edit was required. Full native/V2 lanes and unrelated baseline failures from the
+round-two review were not rerun: this is the deliberately narrow fence review.
+
+For all review tests, set these under the throwaway root (the harness further
+creates a separate `opencode-e2e-*` fixture for each host):
+
+```sh
+root="$TMPDIR/magic-context/marker-unfreeze-review-r3-bg_c62afe4"
+export TMPDIR="$root/tmp" XDG_DATA_HOME="$root/data" XDG_CONFIG_HOME="$root/config"
+export XDG_STATE_HOME="$root/state" XDG_RUNTIME_DIR="$root/runtime"
+export MAGIC_CONTEXT_STORAGE_DIR="$root/storage" OPENCODE_DB=opencode.db
+```
+
+`OPENCODE_DB` is deliberately relative so the helpers' separate per-test XDG
+fixtures own their respective databases; none resolves against HOME's live store.
+Every real-host sample used `timeout 20s lsof -p <host,daemon,module[,producer]>
+-Fn` and checked **every** `.db`, `.db-wal`, and `.db-shm` path against that host's
+throwaway data directory. The host byte-suite's first sample: PIDs
+**84831,84603,84674,84769**, holding only
+`…/tmp/opencode-e2e-N2gbam/data/opencode/opencode.db` and
+`…/data/cortexkit/magic-context/{context,store}.db`. The final failing fence proof:
+host **61684**, restarted host **76418**, daemon **61195**, module **61435**;
+every database is under `…/tmp/opencode-e2e-3kIpG4/data/`. The file inventories
+are printed verbatim in the retained logs. No live database/config or backup is
+opened, read, written, copied, or migrated; the host's legacy-config migration
+messages refer only to these isolated fixture configs.
+
+| Command / check | Independent result |
+| --- | --- |
+| From `packages/plugin`: `timeout 180s bun test src/hooks/magic-context/compaction-marker-manager.test.ts src/hooks/magic-context/rust-mode-transform.test.ts src/v2/fold/boundary.test.ts -t 'r2 proof:' --timeout 30000` | **3 pass / 0 fail / 10 assertions**; exact previous blockers, not filtered away. |
+| `timeout 180s bun run --cwd packages/plugin build` | Candidate rebuilt successfully, including **4 V2 loader tests / 19 assertions**. |
+| `timeout 120s bun run --cwd packages/plugin typecheck` | All **three tsc invocations pass**, silent-on-success, TypeScript 5.9.3. |
+| `timeout 900s cargo build --release -p mc-module -j 2 --offline` | **One package build target passes**, no Rust tests; temporary lock resolution restored as above. |
+| From `packages/e2e-tests`: `timeout 1200s bun test tests/rust-compaction-marker-byte-identity.test.ts --timeout 900000` | **3 pass / 0 fail / 140 assertions**, 85.34s; lsof guards pass. Explicit paths: `MC_E2E_CK_MC_PREBUILT_BIN=$PWD/../../target/release/ck-mc`, `MC_E2E_CK_SUBC_BIN=$PWD/../../target/pipe-only-subc/debug/ck-subc`, `MC_E2E_PLUGIN_ENTRY=$PWD/../plugin/dist/index.js`. |
+| Temporary adapter tests: `timeout 180s bun test src/hooks/magic-context/rust-mode-transform.test.ts -t 'r3 review' --timeout 30000` | **5 pass / 0 fail / 53 assertions**, 8.13s; before-host, mirror, final-clear, actual fence lock, and reverse-order actual host lock. |
+| Temporary unit blocker proof plus controls: `timeout 90s bun test src/hooks/magic-context/rust-mode-transform.test.ts -t 'r3 proof:\|post-cut.*refus\|r3 review' --timeout 30000` | **11 pass / 1 expected-safe failure / 119 assertions**; only the exact wire-method test fails. |
+| Temporary real-host blocker proof: `timeout 240s bun test tests/rust-marker-fence-review-r3.test.ts --timeout 120000` | **0 pass / 1 expected-safe failure / 10 assertions**, 25.52s; both pre/post-restart refuses collected, real dispatch/control replies and lsof guards verified. |
+| Original candidate seven-suite run after proof tests restored: `timeout 240s bun test src/features/magic-context/compartment-storage-v6.test.ts src/hooks/magic-context/compaction-marker-manager.test.ts src/hooks/magic-context/transform-postprocess-phase.test.ts src/hooks/magic-context/rust-mode-transform.test.ts src/hooks/magic-context/rust-mode-marker-lock-contention.test.ts src/hooks/magic-context/lkg-persist.test.ts src/v2/fold/boundary.test.ts --timeout 30000` | **459 pass / 0 fail / 4,578 assertions**, 70.01s. All existing fence, outer-wrapper, queued-capture, and LKG hydration controls stay green. |
+| From `packages/pi-plugin`: `timeout 90s bun test src/compaction-marker-manager-pi.test.ts --timeout 30000` | **11 pass / 0 fail / 18 assertions**, separate Pi process. |
+| `timeout 20s git diff --check` and final changed-file inventory | Pass; final review changes only this Markdown report. |
+
+The preliminary extra-host probe had two setup limitations, corrected without
+changing production: `h.contextDb()` is read-only, so the test's fence control
+uses an explicit writable **throwaway** connection; and diagnostic writes are
+queued, so the proof awaits `waitForRustPasses` instead of assuming log completion
+immediately after the SDK prompt. The final expected-safe failure is the real
+wire-dispatch blocker, not either setup error.
+
+Retained text evidence and temporary proof source under the throwaway root:
+`oc1-host.log`, `review-windows.log`, `flush-unit-proof.log`,
+`oc1-flush-wire-proof.log`, `candidate-units.log`, `pi-markers.log`,
+`adapter-review-proofs.ts`, and `real-fence-proof.ts`. Only the report is committed;
+no fixture database, source overlay, or generated bundle is delivered. No
+production-guard mutation proof is claimed: the blocker proofs assert literal
+safe wire/recovery outcomes and fail loudly against the unchanged candidate.
