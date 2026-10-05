@@ -25,9 +25,9 @@ import {
     ensureStorageDirectorySync,
     setStoragePrivatePermissionEnforcement,
     tightenStorageTreeSync,
+    writeStorageFileAsync,
     writeStorageFileAtomicSync,
     writeStorageFileSync,
-    writeStorageFileWithBun,
 } from "./storage-permissions";
 
 const roots: string[] = [];
@@ -68,9 +68,9 @@ describe("owner-only storage permissions", () => {
             forcePrivate: true,
         });
         writeStorageFileAtomicSync(join(storage, "last-update-check.json"), "{}\n", true);
-        const bunSnapshotPath = join(storage, "snapshot.heapsnapshot");
-        await writeStorageFileWithBun(bunSnapshotPath, "snapshot", true);
-        expect(statSync(bunSnapshotPath).mode & 0o077).toBe(0);
+        const snapshotPath = join(storage, "snapshot.heapsnapshot");
+        await writeStorageFileAsync(snapshotPath, "snapshot", true);
+        expect(statSync(snapshotPath).mode & 0o077).toBe(0);
         const legacy = join(storage, "project-identities");
         mkdirSync(legacy, { recursive: true });
         writeFileSync(join(legacy, "legacy.json"), "{}\n");
