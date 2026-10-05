@@ -43,6 +43,7 @@ pub mod config;
 mod content_language;
 pub mod decay_render;
 pub mod decision_calibration;
+mod digest;
 pub mod divergence;
 pub mod healing;
 pub mod historian;
