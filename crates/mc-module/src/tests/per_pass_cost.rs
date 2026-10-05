@@ -716,6 +716,10 @@ async fn copied_sessions_per_pass_cost() {
         let mut full = base.clone();
         full["messages"] = serde_json::to_value(&messages).unwrap();
         let full = serde_json::from_value::<TransformRequest>(full).unwrap();
+        crate::tail_hygiene::profile_part_hash_variants(
+            session,
+            &ck_wire::project_messages(&messages).unwrap(),
+        );
         transform::perf_audit_metadata::measure_fixture(
             &full,
             &state.core,
