@@ -13571,6 +13571,14 @@ impl McStore {
             },
         };
         let write = context_writes::PendingContextWrite::Fold(fold);
+        // Deflate needs no database state. Prepare the identical payload before taking
+        // store.db's writer lock, but report any preparation error only after the publish
+        // predicates pass, preserving refusal precedence for stale producers.
+        let prepared_transcripts = if request.compartments.is_empty() {
+            Ok(None)
+        } else {
+            prepare_chunk_transcripts(request.chunk_transcript, request.raw_chunk_messages)
+        };
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
@@ -13697,13 +13705,12 @@ impl McStore {
                 Err(e) => return Ok(PublishTxnOutcome::Serde(e)),
             };
             if request.chunk_transcript.is_some() || request.raw_chunk_messages.is_some() {
-                insert_chunk_transcripts_tx(
+                insert_prepared_chunk_transcripts_tx(
                     tx,
                     session_id,
                     first_appended_sequence,
                     request.compartments,
-                    request.chunk_transcript,
-                    request.raw_chunk_messages,
+                    prepared_transcripts?.as_ref(),
                 )?;
             }
             single_store_schema::write_compartment_dates(tx, session_id, &numbered)?;
@@ -16003,17 +16010,15 @@ fn next_compartment_sequence_tx(
     )
 }
 
-fn insert_chunk_transcripts_tx(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-    first_sequence: i64,
-    compartments: &[StoredCompartment],
+struct PreparedChunkTranscripts {
+    transcript: Vec<u8>,
+    raw_messages: Option<Vec<u8>>,
+}
+
+fn prepare_chunk_transcripts(
     transcript: Option<&str>,
     raw_messages: Option<&str>,
-) -> rusqlite::Result<()> {
-    if compartments.is_empty() {
-        return Ok(());
-    }
+) -> rusqlite::Result<Option<PreparedChunkTranscripts>> {
     let compressed = transcript.and_then(|transcript| {
         compress_transcript(transcript)
             .ok()
@@ -16024,12 +16029,31 @@ fn insert_chunk_transcripts_tx(
         .transpose()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     if compressed.is_none() && raw_messages_compressed.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     // The original schema keeps transcript_deflate NOT NULL. A raw-only row still needs a
     // harmless condensed payload so durable raw recovery is not discarded with an oversized
     // historian transcript.
     let compressed = compressed.unwrap_or_else(|| compress_transcript("").unwrap_or_default());
+    Ok(Some(PreparedChunkTranscripts {
+        transcript: compressed,
+        raw_messages: raw_messages_compressed,
+    }))
+}
+
+fn insert_prepared_chunk_transcripts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    first_sequence: i64,
+    compartments: &[StoredCompartment],
+    prepared: Option<&PreparedChunkTranscripts>,
+) -> rusqlite::Result<()> {
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    if compartments.is_empty() {
+        return Ok(());
+    }
     for (idx, compartment) in compartments.iter().enumerate() {
         tx.execute(
             "INSERT OR REPLACE INTO mc_chunk_transcripts
@@ -16041,8 +16065,8 @@ fn insert_chunk_transcripts_tx(
                 first_sequence + idx as i64,
                 compartment.start_message,
                 compartment.end_message,
-                &compressed,
-                raw_messages_compressed.as_deref(),
+                &prepared.transcript,
+                prepared.raw_messages.as_deref(),
                 compartment.created_at,
             ],
         )?;
@@ -16055,31 +16079,33 @@ fn evict_chunk_transcripts_tx(
     session_id: &str,
 ) -> rusqlite::Result<()> {
     let empty_transcript = compress_transcript("").unwrap_or_default();
-    loop {
-        let total: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(LENGTH(transcript_deflate)), 0)
+    let mut total: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(LENGTH(transcript_deflate)), 0)
                FROM mc_chunk_transcripts WHERE session_id = ?1",
-            params![session_id],
-            |r| r.get(0),
-        )?;
-        if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
-            return Ok(());
-        }
-        let victim: Option<(i64, bool)> = tx
-            .query_row(
-                "SELECT compartment_seq, raw_messages_deflate IS NOT NULL
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
+        return Ok(());
+    }
+    // Snapshot identities and lengths once, before changing the table. Subtract the
+    // exact reclaimed bytes in the same oldest-first order as the per-victim SUM loop.
+    let victims: Vec<(i64, bool, i64)> = tx
+        .prepare_cached(
+            "SELECT compartment_seq, raw_messages_deflate IS NOT NULL, LENGTH(transcript_deflate)
                    FROM mc_chunk_transcripts
                   WHERE session_id = ?1
                     AND (raw_messages_deflate IS NULL OR transcript_deflate <> ?2)
-                  ORDER BY created_at_ms ASC, compartment_seq ASC
-                  LIMIT 1",
-                params![session_id, &empty_transcript],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((victim, retains_raw_messages)) = victim else {
-            return Ok(());
-        };
+                   ORDER BY created_at_ms ASC, compartment_seq ASC",
+        )?
+        .query_map(params![session_id, &empty_transcript], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (victim, retains_raw_messages, length) in victims {
+        if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
+            break;
+        }
         if retains_raw_messages {
             // Full message recovery is durable by contract. Retain its raw payload and reclaim
             // only the optional condensed transcript when the legacy transcript budget fills.
@@ -16089,13 +16115,16 @@ fn evict_chunk_transcripts_tx(
                   WHERE session_id = ?1 AND compartment_seq = ?2",
                 params![session_id, victim, &empty_transcript],
             )?;
+            total -= length - empty_transcript.len() as i64;
         } else {
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq = ?2",
                 params![session_id, victim],
             )?;
+            total -= length;
         }
     }
+    Ok(())
 }
 
 fn compress_transcript(transcript: &str) -> std::io::Result<Vec<u8>> {

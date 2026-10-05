@@ -114,6 +114,78 @@ fn fold_upsert_and_replace_preserve_retained_row_ids_and_bytes() {
     assert_eq!(read(), after[9..]);
 }
 
+// Independent oracle: the previous oldest-first eviction algorithm, including the
+// raw-only placeholder exception and repeated total queries.
+fn legacy_evict(tx: &rusqlite::Transaction<'_>, session: &str) -> rusqlite::Result<()> {
+    let empty = compress_transcript("").unwrap();
+    loop {
+        let total: i64 = tx.query_row("SELECT COALESCE(SUM(LENGTH(transcript_deflate)),0) FROM mc_chunk_transcripts WHERE session_id=?1",params![session],|r|r.get(0))?;
+        if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
+            return Ok(());
+        }
+        let victim: Option<(i64,bool)> = tx.query_row("SELECT compartment_seq, raw_messages_deflate IS NOT NULL FROM mc_chunk_transcripts WHERE session_id=?1 AND (raw_messages_deflate IS NULL OR transcript_deflate<>?2) ORDER BY created_at_ms,compartment_seq LIMIT 1",params![session,&empty],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let Some((seq, raw)) = victim else {
+            return Ok(());
+        };
+        if raw {
+            tx.execute("UPDATE mc_chunk_transcripts SET transcript_deflate=?3 WHERE session_id=?1 AND compartment_seq=?2",params![session,seq,&empty])?;
+        } else {
+            tx.execute(
+                "DELETE FROM mc_chunk_transcripts WHERE session_id=?1 AND compartment_seq=?2",
+                params![session, seq],
+            )?;
+        }
+    }
+}
+
+#[test]
+fn prepared_transcripts_and_eviction_preserve_payloads_and_victim_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+    let transcript = "A summary with 雪 and §42§.\n";
+    let raw = r#"[{"role":"user","text":"raw 雪","unknown":{"keep":true}}]"#;
+    let prepared = prepare_chunk_transcripts(Some(transcript), Some(raw))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        prepared.transcript,
+        compress_transcript(transcript).unwrap()
+    );
+    assert_eq!(
+        prepared.raw_messages.as_ref().unwrap(),
+        &compress_raw_messages(raw).unwrap()
+    );
+    assert_eq!(
+        decompress_raw_messages(prepared.raw_messages.as_ref().unwrap()).unwrap(),
+        raw
+    );
+    let raw_only = prepare_chunk_transcripts(None, Some(raw)).unwrap().unwrap();
+    assert_eq!(raw_only.transcript, compress_transcript("").unwrap());
+    assert_eq!(raw_only.raw_messages, prepared.raw_messages);
+    store.inner.with_conn(|conn| {
+        let tx = rusqlite::Transaction::new_unchecked(conn,rusqlite::TransactionBehavior::Immediate)?;
+        // Length, ordering and retention are the eviction inputs. Oversized fixture
+        // blobs also exercise corrupt/legacy rows without requiring a new encoding.
+        for session in ["legacy","optimized"] {
+            for seq in 0..80 {
+                tx.execute("INSERT INTO mc_chunk_transcripts(session_id,compartment_seq,start_ordinal,end_ordinal,transcript_deflate,raw_messages_deflate,created_at_ms) VALUES (?1,?2,?2,?2,zeroblob(262144),?3,?4)",params![session,seq,if seq%3==0 {prepared.raw_messages.as_deref()}else{None},seq%5])?;
+            }
+            tx.execute("INSERT INTO mc_chunk_transcripts(session_id,compartment_seq,start_ordinal,end_ordinal,transcript_deflate,raw_messages_deflate,created_at_ms) VALUES (?1,999,999,999,?2,?3,-1)",params![session,&raw_only.transcript,raw_only.raw_messages.as_deref()])?;
+        }
+        legacy_evict(&tx,"legacy")?;
+        evict_chunk_transcripts_tx(&tx,"optimized")?;
+        type TranscriptRows = Vec<(i64, Vec<u8>, Option<Vec<u8>>)>;
+        let read = |session| -> rusqlite::Result<TranscriptRows> {
+            tx.prepare("SELECT compartment_seq,transcript_deflate,raw_messages_deflate FROM mc_chunk_transcripts WHERE session_id=?1 ORDER BY compartment_seq")?
+                .query_map(params![session],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect()
+        };
+        assert_eq!(read("optimized")?,read("legacy")?);
+        let raw_count: i64 = tx.query_row("SELECT COUNT(*) FROM mc_chunk_transcripts WHERE session_id='optimized' AND raw_messages_deflate IS NOT NULL",[],|r|r.get(0))?;
+        assert_eq!(raw_count,28);
+        tx.rollback()
+    }).unwrap();
+}
+
 #[test]
 #[ignore = "performance instrument; uses throwaway databases"]
 fn measure_store_findings() {
@@ -170,34 +242,37 @@ fn measure_store_findings() {
                 .collect(),
             ..Default::default()
         };
-        let mut meta = ModuleMeta::default();
-        meta.resolved_compartment_boundaries = compartments
-            .iter()
-            .map(|row| {
-                let (start_id, start_block) =
-                    context_boundaries::canonical_boundary_parts(&row.start_message_id).unwrap();
-                let (end_id, end_block) =
-                    context_boundaries::canonical_boundary_parts(&row.end_message_id).unwrap();
-                let mut boundary = ResolvedContextBoundary {
-                    sequence: row.sequence,
-                    source_start_message: row.start_message,
-                    source_end_message: row.end_message,
-                    source_start_message_id: start_id.to_string(),
-                    source_end_message_id: end_id.to_string(),
-                    source_start_block_index: start_block,
-                    source_end_block_index: end_block,
-                    source_row_identity: String::new(),
-                    start_message: row.start_message,
-                    end_message: row.end_message,
-                    start_message_id: row.start_message_id.clone(),
-                    end_message_id: row.end_message_id.clone(),
-                    start_date: None,
-                    end_date: None,
-                };
-                boundary.bind_to_row(row).unwrap();
-                boundary
-            })
-            .collect();
+        let meta = ModuleMeta {
+            resolved_compartment_boundaries: compartments
+                .iter()
+                .map(|row| {
+                    let (start_id, start_block) =
+                        context_boundaries::canonical_boundary_parts(&row.start_message_id)
+                            .unwrap();
+                    let (end_id, end_block) =
+                        context_boundaries::canonical_boundary_parts(&row.end_message_id).unwrap();
+                    let mut boundary = ResolvedContextBoundary {
+                        sequence: row.sequence,
+                        source_start_message: row.start_message,
+                        source_end_message: row.end_message,
+                        source_start_message_id: start_id.to_string(),
+                        source_end_message_id: end_id.to_string(),
+                        source_start_block_index: start_block,
+                        source_end_block_index: end_block,
+                        source_row_identity: String::new(),
+                        start_message: row.start_message,
+                        end_message: row.end_message,
+                        start_message_id: row.start_message_id.clone(),
+                        end_message_id: row.end_message_id.clone(),
+                        start_date: None,
+                        end_date: None,
+                    };
+                    boundary.bind_to_row(row).unwrap();
+                    boundary
+                })
+                .collect(),
+            ..Default::default()
+        };
         let mut version = store.commit("s", None, &core, &meta).unwrap();
         let encode_ms = timed(
             || {
@@ -237,6 +312,25 @@ fn measure_store_findings() {
                         Ok(())
                     })
                     .unwrap();
+            },
+            20,
+        );
+        let mut serialization_fold = fold.clone();
+        if let context_writes::PendingContextWrite::Fold(write) = &mut serialization_fold {
+            write.compartments = vec![write.compartments[0].clone(); 8];
+        }
+        let pending_serialize_ms = timed(
+            || {
+                black_box(serde_json::to_string(&serialization_fold).unwrap());
+                black_box(serde_json::to_string(&serialization_fold).unwrap());
+            },
+            20,
+        );
+        let memory_reads_ms = timed(
+            || {
+                for id in 1..=50 {
+                    black_box(store.get_memory_full(id).unwrap().expect("seeded memory"));
+                }
             },
             20,
         );
@@ -343,8 +437,21 @@ fn measure_store_findings() {
             },
             20,
         );
+        let transcript = (0..messages)
+            .map(|i| {
+                format!(
+                    "user m{i}: read src/module_{}.rs and fix issue {}\n",
+                    i % 97,
+                    i % 173
+                )
+            })
+            .collect::<String>();
+        let raw = serde_json::to_string(&(0..messages).map(|i| serde_json::json!({"id":format!("m{i}"),"role":"user","text":format!("Read module {} and investigate issue {}",i%97,i%173)})).collect::<Vec<_>>()).unwrap();
+        let prepare_start = Instant::now();
+        let prepared = prepare_chunk_transcripts(Some(&transcript), Some(&raw)).unwrap();
+        let prepare_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
         let (codec_ms, schema_ms, transcript_ms, transcript_bytes) = store.inner.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
             let codec_ms = timed(|| { black_box(cache_codec::read_decoded(&transaction, "s").unwrap()); }, 20);
             let schema_ms = timed(|| {
                 let names: Vec<String> = transaction.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
@@ -352,13 +459,24 @@ fn measure_store_findings() {
                     black_box(transaction.prepare(&format!("PRAGMA table_info(\"{}\")", name.replace('"', "\"\""))).unwrap().query_map([], |r| r.get::<_,String>(1)).unwrap().map(Result::unwrap).collect::<Vec<_>>());
                 }
             }, 10);
-            let transcript = (0..messages).map(|i| format!("user m{i}: read src/module_{}.rs and fix issue {}\n", i % 97, i % 173)).collect::<String>();
-            let raw = serde_json::to_string(&(0..messages).map(|i| serde_json::json!({"id":format!("m{i}"),"role":"user","text":format!("Read module {} and investigate issue {}",i%97,i%173)})).collect::<Vec<_>>()).unwrap();
-            let transcript_ms = timed(|| { insert_chunk_transcripts_tx(&transaction, "s", 1, &compartments[..compartments.len().min(8)], Some(&transcript), Some(&raw)).unwrap(); }, 5);
+            let transcript_ms = timed(|| { insert_prepared_chunk_transcripts_tx(&transaction, "s", 1, &compartments[..compartments.len().min(8)], prepared.as_ref()).unwrap(); }, 5);
             let bytes: i64 = transaction.query_row("SELECT SUM(LENGTH(transcript_deflate)+COALESCE(LENGTH(raw_messages_deflate),0)) FROM mc_chunk_transcripts WHERE session_id='s'", [], |r| r.get(0))?;
+            let tiny_raw = compress_raw_messages("[0]").unwrap();
+            for session in ["legacy_perf","optimized_perf"] {
+                let mut insert = transaction.prepare("INSERT INTO mc_chunk_transcripts(session_id,compartment_seq,start_ordinal,end_ordinal,transcript_deflate,raw_messages_deflate,created_at_ms) VALUES (?1,?2,?2,?2,zeroblob(4096),?3,?2)")?;
+                for seq in 0..compartments.len() {
+                    insert.execute(params![session,seq as i64, if seq%3==0 {Some(tiny_raw.as_slice())}else{None}])?;
+                }
+            }
+            let started = Instant::now(); legacy_evict(&transaction,"legacy_perf")?;
+            let legacy_ms = started.elapsed().as_secs_f64()*1000.0;
+            let started = Instant::now(); evict_chunk_transcripts_tx(&transaction,"optimized_perf")?;
+            let optimized_ms = started.elapsed().as_secs_f64()*1000.0;
+            println!("RS3 eviction rows={} 4096_bytes_per_row legacy_ms={legacy_ms:.3} single_scan_ms={optimized_ms:.3}",compartments.len());
             transaction.rollback()?;
+            println!("RS3 messages={messages} prepare_outside_lock_ms={prepare_ms:.3}");
             Ok((codec_ms, schema_ms, transcript_ms, bytes))
         }).unwrap();
-        println!("RS fixture messages={messages} compartments={} memories={} fold_context_tx_ms={fold_ms:.3} facts_context_tx_ms={facts_ms:.3} RS13_search_ms={search_ms:.3} RS8_commit_8_mints_ms={tag_commit_ms:.3} RS10_snapshot_ms={assembly_ms:.3} RS15_canonicalize_4_roots_ms={canonical_ms:.3} RS4_codec_ms={codec_ms:.3} RS4_commit_ms={encode_ms:.3} RS5_cold_ms={boundary_cold_ms:.3} RS5_warm_ms={boundary_warm_ms:.3} RS15_schema_ms={schema_ms:.3} RS3_compress_write_8_store_tx_ms={transcript_ms:.3} RS3_persisted_bytes={transcript_bytes}", compartments.len(), messages/10);
+        println!("RS fixture messages={messages} compartments={} memories={} fold_context_tx_ms={fold_ms:.3} facts_context_tx_ms={facts_ms:.3} RS13_search_ms={search_ms:.3} RS8_commit_8_mints_ms={tag_commit_ms:.3} RS10_snapshot_ms={assembly_ms:.3} RS15_canonicalize_4_roots_ms={canonical_ms:.3} RS15_memory_reads_50_ms={memory_reads_ms:.3} RS15_serialize_twice_8_compartments_ms={pending_serialize_ms:.3} RS4_codec_ms={codec_ms:.3} RS4_commit_ms={encode_ms:.3} RS5_cold_ms={boundary_cold_ms:.3} RS5_warm_ms={boundary_warm_ms:.3} RS15_schema_ms={schema_ms:.3} RS3_write_8_store_tx_ms={transcript_ms:.3} RS3_persisted_bytes={transcript_bytes}", compartments.len(), messages/10);
     }
 }
