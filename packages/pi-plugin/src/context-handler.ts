@@ -57,7 +57,6 @@ import { isPrefixBoundThinkingModel } from "@magic-context/core/features/magic-c
 import {
 	encodePiContentDecision,
 	freezePiContentDecision,
-	getPiContentDecisions,
 } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import {
 	computeProtectionWindow,
@@ -98,8 +97,6 @@ import {
 	getTagsByNumbers,
 	getTagsBySession,
 	getTagsForPendingOperations,
-	hasPiFallbackMessageTags,
-	hasPiFallbackToolOwnerTags,
 	isWrapupInProgress,
 	setSessionWorkMetrics,
 	updateSessionMeta,
@@ -242,8 +239,13 @@ import {
 	getPiChannel1Baseline,
 	setPiChannel1Baseline,
 } from "./ctx-reduce-nudge-pi";
+import { runPiDebugAssertion } from "./debug-assertions-pi";
 import { detectRecentCommit } from "./detect-recent-commit";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
+import {
+	hasPiFallbackMessageTags,
+	hasPiFallbackToolOwnerTags,
+} from "./fallback-tag-probes-pi";
 import {
 	applyPiHeuristicCleanup,
 	type PiHeuristicCleanupResult,
@@ -252,6 +254,7 @@ import { readPiHistorianTail } from "./historian-tail-pi";
 import {
 	clearM0M1PiCache,
 	clearPiInjectionTokenCountCache,
+	clearPiMuralProcessCache,
 	createPiM0M1PassSnapshot,
 	injectM0M1Pi,
 	mustMaterializePi,
@@ -282,6 +285,7 @@ import {
 	createPiLkgCoordinator,
 	isTransientPiStorageError,
 	type PiLkgPassSnapshot,
+	type PiLkgSerializedOutput,
 	piStorageErrorReason,
 	reconcilePiLkgEntryIds,
 	resolvePiLkgOutputEntryIds,
@@ -325,7 +329,11 @@ import {
 	replayStrippedInlineThinkingPi,
 	stripInlineThinkingPi,
 } from "./reasoning-replay-pi";
-import { capturePiServedArray } from "./served-array-ledger";
+import { replayPiReminderStrips } from "./reminder-strip-pi";
+import {
+	capturePiServedArray,
+	clearPiServedArraySession,
+} from "./served-array-ledger";
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
 import {
@@ -339,6 +347,7 @@ import { clearPiSystemPromptSession } from "./system-prompt";
 import { getPiTagSnapshot } from "./tag-snapshot-pi";
 import {
 	assertPiTailHygieneContentUnchanged,
+	clearPiTailHygieneContentMemo,
 	countRealPiUserMessages,
 	effectivePiTailHygiene,
 	refreshPiTailHygieneBaseline,
@@ -3991,12 +4000,8 @@ export function registerPiContextHandler(
 				sessionId,
 				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
 			);
-			if (
-				assertTailHygieneLastWriter &&
-				process.env.NODE_ENV !== "production"
-			) {
-				assertTailHygieneLastWriter();
-			}
+			runPiDebugAssertion(assertTailHygieneLastWriter);
+			let serializedOutput: PiLkgSerializedOutput | undefined;
 			if (!lkgCompactionOff && lkgPassSnapshot) {
 				let hostEnvelopeSignature: string | undefined;
 				try {
@@ -4009,7 +4014,7 @@ export function registerPiContextHandler(
 				} catch {
 					/* Missing optional attribution must not prevent capturing the good prefix. */
 				}
-				lkgCoordinator.captureAppliedPass({
+				serializedOutput = lkgCoordinator.captureAppliedPass({
 					hostEnvelopeSignature,
 					snapshot: lkgPassSnapshot,
 					outputMessages,
@@ -4025,7 +4030,7 @@ export function registerPiContextHandler(
 					cacheBusting: result.bustedThisPass,
 				});
 			}
-			capturePiServedArray(sessionId, outputMessages);
+			capturePiServedArray(sessionId, outputMessages, { serializedOutput });
 			if (thinkingBindingRecoveryApplied) {
 				try {
 					clearThinkingBindingRecoveryIf(
@@ -6727,64 +6732,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 
 	// Caveman renders from pristine source, so frozen reminder cleanup must run
 	// after both its discovery and replay paths, including when cleanup is disabled.
-	const contentDecisions = getPiContentDecisions(args.db, args.sessionId);
-	const undecidedTagNumbers = activeTags
-		.filter(
-			(tag) =>
-				!contentDecisions.has(
-					encodePiContentDecision("reminder-strip", tag.messageId),
-				),
-		)
-		.map((tag) => tag.tagNumber);
-	const legacySources = new Map<number, string>();
-	for (let offset = 0; offset < undecidedTagNumbers.length; offset += 500) {
-		const loaded = getSourceContents(
-			args.db,
-			args.sessionId,
-			undecidedTagNumbers.slice(offset, offset + 500),
-		);
-		for (const [tagNumber, source] of loaded) {
-			legacySources.set(tagNumber, source);
-		}
-	}
-	for (const tag of activeTags) {
-		const target = targets.get(tag.tagNumber);
-		const content = target?.getContent?.();
-		if (!content) continue;
-		const encodedDecision = encodePiContentDecision(
-			"reminder-strip",
-			tag.messageId,
-		);
-		let frozen = contentDecisions.has(encodedDecision);
-		const legacySource = legacySources.get(tag.tagNumber) ?? "";
-		const isLegacyReminderProjection =
-			textIdentityPlan.legacyReminderTagNumbers.has(tag.tagNumber) ||
-			(legacySource.trimStart().startsWith("<!-- +") &&
-				withoutPiLeadingTemporalMarker(`${legacySource}\n`).trim().length ===
-					0);
-		if (
-			!frozen &&
-			isCacheBustingPass &&
-			isLegacyReminderProjection &&
-			freezePiContentDecision(
-				args.db,
-				args.sessionId,
-				"reminder-strip",
-				tag.messageId,
-			)
-		) {
-			contentDecisions.add(encodedDecision);
-			frozen = true;
-		}
-		const stripped = stripSystemInjection(content);
-		if (stripped === null) continue;
-		// Older releases could overwrite source_contents with the stripped body.
-		// Replaying that exact legacy source on defer prevents one unpriced
-		// resurrection; the next reclaim ride freezes the normal decision.
-		const legacyStripped =
-			!frozen && stripTagPrefix(legacySource) === stripTagPrefix(stripped);
-		if (frozen || legacyStripped) target?.setContent(stripped);
-	}
+	const contentDecisions = replayPiReminderStrips({
+		db: args.db,
+		sessionId: args.sessionId,
+		activeTags,
+		targets,
+		legacyReminderTagNumbers: textIdentityPlan.legacyReminderTagNumbers,
+		cacheBusting: isCacheBustingPass,
+	});
 
 	// 5. Commit tagging mutations back to Pi messages BEFORE injecting
 	// the history block. Otherwise the injection write target is the
@@ -7961,6 +7916,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	invalidateTrueRawTokenCache({ sessionId, reason: "pi.branch.changed" });
 	clearPiLiveUsageClassification(sessionId);
 	clearPiLkgSessionState(sessionId);
+	clearPiServedArraySession(sessionId);
 	activeContextHandlerSessions.delete(sessionId);
 	clearAutoSearchForPiSession(sessionId);
 	lastEmergencyNotificationAtMs.delete(sessionId);
@@ -7985,6 +7941,10 @@ export function clearContextHandlerSession(sessionId: string): void {
 	piTextIdentitySourceCacheBySession.delete(sessionId);
 	piBranchProjectionBySession.delete(sessionId);
 	clearPiInjectionTokenCountCache(sessionId);
+	clearPiMuralProcessCache(sessionId);
+	// The content memo is shared across sessions, not owned by one session id.
+	// Dropping it at teardown releases old bodies; deterministic counts rebuild.
+	clearPiTailHygieneContentMemo();
 	clearPiChannel1State(sessionId);
 	lastHeuristicsTurnIdBySession.delete(sessionId);
 	routinePressureAppliedBySession.delete(sessionId);

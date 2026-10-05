@@ -5,10 +5,19 @@ import {
 import { replayLkg } from "@magic-context/core/hooks/magic-context/lkg-replay";
 import {
 	captureSlot,
+	contentSnapshotValue,
 	dropSlot,
 	exactReusablePrefix,
 	getSlot,
 	incrementalLkgContentDigests,
+	LKG_SNAPSHOT_ARRAY,
+	LKG_SNAPSHOT_BOOLEAN,
+	LKG_SNAPSHOT_KEY,
+	LKG_SNAPSHOT_NULL,
+	LKG_SNAPSHOT_NUMBER,
+	LKG_SNAPSHOT_OBJECT,
+	LKG_SNAPSHOT_STRING,
+	LKG_SNAPSHOT_UNDEFINED,
 	type LkgContentField,
 	type LkgEntryNote,
 	type LkgSlot,
@@ -51,6 +60,12 @@ export interface PiLkgCaptureTiming {
 	sessionId: string;
 	elapsedMs: number;
 	reusedPrefix: number;
+}
+
+/** Detached serialization of this pass's exact output, for same-pass observers. */
+export interface PiLkgSerializedOutput {
+	jsonMessages: readonly string[];
+	json: string;
 }
 
 interface PiLkgSessionState {
@@ -203,7 +218,7 @@ export interface PiLkgCoordinator {
 		outputEntryIds?: readonly (string | null | undefined)[];
 		cacheBusting: boolean;
 		hostEnvelopeSignature?: string;
-	}): void;
+	}): PiLkgSerializedOutput | undefined;
 }
 
 export function isTransientPiStorageError(error: unknown): boolean {
@@ -313,39 +328,79 @@ export function piStorageErrorReason(error: unknown): string {
 
 // JSON serializers on non-plain values (for example Date) are not represented
 // by field tokens. Keep the original array serialization path for those values.
-function isPlainJsonValue(
-	value: unknown,
-	seen = new WeakSet<object>(),
-): boolean {
-	if (!value || typeof value !== "object") return true;
-	if (seen.has(value)) return false;
-	const prototype = Object.getPrototypeOf(value);
-	if (
-		!Array.isArray(value) &&
-		prototype !== Object.prototype &&
-		prototype !== null
-	)
-		return false;
-	if (
-		prototype === Object.prototype &&
-		Object.getOwnPropertyDescriptor(prototype, "toJSON")
-	)
-		return false;
-	seen.add(value);
-	const keys = Object.keys(value);
-	if (Array.isArray(value) && keys.length !== value.length) return false;
-	for (const key of keys) {
-		const descriptor = Object.getOwnPropertyDescriptor(value, key);
-		if (
-			descriptor?.get ||
-			descriptor?.set ||
-			(key === "toJSON" && typeof descriptor?.value === "function") ||
-			!isPlainJsonValue(descriptor?.value, seen)
-		)
-			return false;
+/** Validate JSON-visible data and detach exact field tokens in the same walk. */
+function plainJsonFields(value: unknown): LkgContentField[] | null {
+	const fields: LkgContentField[] = [];
+	const seen = new WeakSet<object>();
+	const visit = (child: unknown): boolean => {
+		if (child === null) fields.push(LKG_SNAPSHOT_NULL);
+		else if (typeof child === "string") fields.push(LKG_SNAPSHOT_STRING, child);
+		else if (typeof child === "number") fields.push(LKG_SNAPSHOT_NUMBER, child);
+		else if (typeof child === "boolean")
+			fields.push(LKG_SNAPSHOT_BOOLEAN, child);
+		else if (typeof child !== "object") fields.push(LKG_SNAPSHOT_UNDEFINED);
+		else {
+			if (seen.has(child)) return false;
+			const array = Array.isArray(child);
+			const prototype = Object.getPrototypeOf(child);
+			if (
+				(!array && prototype !== Object.prototype && prototype !== null) ||
+				"toJSON" in child
+			)
+				return false;
+			const keys = Object.keys(child);
+			if (array && keys.length !== child.length) return false;
+			seen.add(child);
+			fields.push(array ? LKG_SNAPSHOT_ARRAY : LKG_SNAPSHOT_OBJECT);
+			const countIndex = fields.length;
+			fields.push(array ? child.length : 0);
+			let count = 0;
+			for (const key of keys) {
+				const descriptor = Object.getOwnPropertyDescriptor(child, key);
+				if (
+					!descriptor ||
+					!("value" in descriptor) ||
+					(array && key !== String(count))
+				)
+					return false;
+				const entry: unknown = descriptor.value;
+				if (
+					!array &&
+					(entry === undefined ||
+						typeof entry === "function" ||
+						typeof entry === "symbol")
+				)
+					continue;
+				count++;
+				if (!array) fields.push(LKG_SNAPSHOT_KEY, key);
+				if (!visit(entry)) return false;
+			}
+			if (!array) fields[countIndex] = count;
+			seen.delete(child);
+		}
+		return true;
+	};
+	if (!visit(value)) return null;
+	// The shared snapshot ignores an empty OpenCode diff summary. Native Pi
+	// messages never carry that shape, but preserve compatibility for adapters.
+	const normalized = contentSnapshotValue(value);
+	return normalized === value ? fields : lkgContentFields(normalized);
+}
+
+function plainOutputFields(
+	messages: readonly unknown[],
+): { id: string; fields: readonly LkgContentField[] }[] | null {
+	if ("toJSON" in messages || Object.keys(messages).length !== messages.length)
+		return null;
+	const outputs: { id: string; fields: readonly LkgContentField[] }[] = [];
+	for (let index = 0; index < messages.length; index++) {
+		const descriptor = Object.getOwnPropertyDescriptor(messages, String(index));
+		if (!descriptor || !("value" in descriptor)) return null;
+		const fields = plainJsonFields(descriptor.value);
+		if (!fields) return null;
+		outputs.push({ id: String(index), fields });
 	}
-	seen.delete(value);
-	return true;
+	return outputs;
 }
 
 function snapshotInputs(
@@ -623,14 +678,9 @@ export function createPiLkgCoordinator(
 		try {
 			// Pi clones the host array between hooks, so reference identity cannot prove
 			// an unchanged output. Detached field tokens also detect in-place rewrites.
-			const plainOutput = isPlainJsonValue(args.outputMessages);
-			const outputs = !plainOutput
-				? []
-				: args.outputMessages.map((message, index) => {
-						const fields = lkgContentFields(message);
-						if (!fields) throw new Error("LKG output snapshot failed");
-						return { id: String(index), fields };
-					});
+			const detachedOutputs = plainOutputFields(args.outputMessages);
+			const plainOutput = detachedOutputs !== null;
+			const outputs = detachedOutputs ?? [];
 			const priorOutput = plainOutput ? state.outputSnapshot : null;
 			const prefix = exactReusablePrefix(outputs, priorOutput?.inputs ?? null);
 			const jsonMessages = [
@@ -840,20 +890,21 @@ export function createPiLkgCoordinator(
 		};
 		if (state.syncCaptureRequired) {
 			commit();
-			return;
+		} else {
+			try {
+				scheduleCapture(commit);
+			} catch (error) {
+				dropSlot(plan.sessionId, "lkg_capture_schedule_failed");
+				state.syncCaptureRequired = true;
+				state.acceptedInputs = null;
+				sessionLog(
+					plan.sessionId,
+					"LKG CAPTURE SCHEDULE FAILED; forcing synchronous capture on the next applied pass:",
+					error,
+				);
+			}
 		}
-		try {
-			scheduleCapture(commit);
-		} catch (error) {
-			dropSlot(plan.sessionId, "lkg_capture_schedule_failed");
-			state.syncCaptureRequired = true;
-			state.acceptedInputs = null;
-			sessionLog(
-				plan.sessionId,
-				"LKG CAPTURE SCHEDULE FAILED; forcing synchronous capture on the next applied pass:",
-				error,
-			);
-		}
+		return state.outputSnapshot ?? undefined;
 	};
 
 	return {

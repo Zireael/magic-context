@@ -34,6 +34,13 @@ export function clearPiTailHygieneContentMemo(): void {
 	contentMemoBytes = 0;
 }
 
+export const __test = {
+	contentMemoStats: () => ({
+		entries: contentMemo.size,
+		bytes: contentMemoBytes,
+	}),
+};
+
 const FNV1A_32_OFFSET = 0x811c9dc5;
 const FNV1A_32_PRIME = 0x01000193;
 

@@ -331,6 +331,8 @@ export const __test = {
 	trimPiMessagesToBoundary,
 	renderFreshM0PiNonPersisted,
 	clearPiMuralProcessCache,
+	hasMuralProcessCache: (sessionId: string) =>
+		cachedMuralBySession.has(sessionId),
 	setProjectDocsReadObserverForTests(
 		observer: (() => void) | undefined,
 	): () => void {
@@ -636,7 +638,7 @@ interface CachedPiMural {
 
 const cachedMuralBySession = new Map<string, CachedPiMural>();
 
-function clearPiMuralProcessCache(sessionId?: string): void {
+export function clearPiMuralProcessCache(sessionId?: string): void {
 	if (sessionId) cachedMuralBySession.delete(sessionId);
 	else cachedMuralBySession.clear();
 }

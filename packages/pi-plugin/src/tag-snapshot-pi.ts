@@ -36,6 +36,17 @@ export function createPiTagSnapshotReader(db: Database) {
 	`);
 	const revision = db.prepare("SELECT revision FROM pi_tag_revision");
 	const dataVersion = db.prepare("PRAGMA main.data_version");
+	revisionReaders.set(db, () => {
+		const transaction = db as unknown as {
+			inTransaction?: boolean;
+			isTransaction?: boolean;
+		};
+		if (transaction.inTransaction || transaction.isTransaction) return null;
+		return [
+			(revision.get() as { revision: number }).revision,
+			(dataVersion.get() as { data_version: number }).data_version,
+		] as const;
+	});
 	const changed = db.prepare(
 		"SELECT tag_number FROM pi_tag_changes WHERE session_id = ? ORDER BY tag_number",
 	);
@@ -129,6 +140,19 @@ const readers = new WeakMap<
 	Database,
 	(sessionId: string) => ReturnType<typeof getTagsBySession>
 >();
+
+const revisionReaders = new WeakMap<
+	Database,
+	() => readonly [number, number] | null
+>();
+
+/** Revision for tag-only observations; transactions must use uncached reads. */
+export function readPiTagSnapshotRevision(
+	db: Database,
+): readonly [number, number] | null {
+	if (!readers.has(db)) createPiTagSnapshotReader(db);
+	return revisionReaders.get(db)?.() ?? null;
+}
 
 export function getPiTagSnapshot(db: Database, sessionId: string) {
 	let reader = readers.get(db);

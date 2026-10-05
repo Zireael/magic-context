@@ -151,7 +151,7 @@ import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transa
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
 import {
-	convertEntriesToRawMessages,
+	iterateEntriesToRawMessageRange,
 	SYNTH_USER_ID_PREFIX,
 } from "./read-session-pi";
 import { isPiSystemEntry } from "./system-entry-pi";
@@ -1891,7 +1891,15 @@ export function findFirstKeptEntryId(
 	lastCompactedOrdinal: number,
 ): string | null {
 	const target = lastCompactedOrdinal + 1;
-	for (const message of convertEntriesToRawMessages(entries)) {
+	const afterOrdinal = Number.isNaN(lastCompactedOrdinal)
+		? 0
+		: Math.max(0, lastCompactedOrdinal);
+	for (const message of iterateEntriesToRawMessageRange(
+		entries,
+		afterOrdinal,
+		Number.MAX_SAFE_INTEGER,
+		Number.MAX_SAFE_INTEGER,
+	)) {
 		if (message.ordinal < target || isPiSystemEntry(message)) continue;
 		if (message.id.startsWith(SYNTH_USER_ID_PREFIX)) return null;
 		if (message.id.length === 0) continue;

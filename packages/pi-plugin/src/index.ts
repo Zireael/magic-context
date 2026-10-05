@@ -222,7 +222,6 @@ import {
 } from "./pi-proven-floor";
 import { abortInFlightRecomps, awaitInFlightRecomps } from "./pi-recomp-runner";
 import { handlePiProviderFailure } from "./provider-error-recovery-pi";
-import { readPiSessionMessages } from "./read-session-pi";
 import { bindStaleBuildNotice } from "./stale-build-notice";
 import { registerStatusLine, updateStatusLine } from "./status-line";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
@@ -2775,7 +2774,6 @@ async function startPiMagicContextRuntime(
 					)?.getBranch?.();
 					return Array.isArray(branch) ? branch : undefined;
 				},
-				readMessages: () => readPiSessionMessages(ctx),
 			});
 			persistPiMessageEndModelMeta({
 				db,
