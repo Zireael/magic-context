@@ -1,9 +1,10 @@
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
-import type { PendingOp } from "./types";
+import type { PendingOp, TagEntry } from "./types";
 
 const queuePendingOpStatements = new WeakMap<Database, PreparedStatement>();
+const queueUnchangedDropStatements = new WeakMap<Database, PreparedStatement>();
 const getPendingOpsStatements = new WeakMap<Database, PreparedStatement>();
 const getPendingOpsCountStatements = new WeakMap<Database, PreparedStatement>();
 const hasPendingDropOpsStatements = new WeakMap<Database, PreparedStatement>();
@@ -93,6 +94,38 @@ export function queuePendingOp(
     queuedAt: number = Date.now(),
 ): void {
     getQueuePendingOpStatement(db).run(sessionId, tagId, operation, queuedAt, getHarness());
+}
+
+/** Revalidate a preselected row by primary key, never by scanning the session.
+ * A consumed, retargeted, owner-adopted, or deleted/reinserted tag must not inherit
+ * a stale selection. Size/depth changes do not change its source identity.
+ */
+export function queuePendingDropForUnchangedTag(
+    db: Database,
+    sessionId: string,
+    tag: TagEntry,
+): boolean {
+    let statement = queueUnchangedDropStatements.get(db);
+    if (!statement) {
+        statement =
+            db.prepare(`INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness)
+            SELECT session_id, tag_number, 'drop', ?, ? FROM tags
+            WHERE id = ? AND session_id = ? AND tag_number = ? AND message_id = ?
+                AND type = ? AND tool_owner_message_id IS ? AND status = 'active'`);
+        queueUnchangedDropStatements.set(db, statement);
+    }
+    return (
+        statement.run(
+            Date.now(),
+            getHarness(),
+            tag.id ?? null,
+            sessionId,
+            tag.tagNumber,
+            tag.messageId,
+            tag.type,
+            tag.toolOwnerMessageId,
+        ).changes > 0
+    );
 }
 
 export function getPendingOps(db: Database, sessionId: string): PendingOp[] {
