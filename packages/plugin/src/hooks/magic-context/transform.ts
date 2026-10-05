@@ -75,7 +75,11 @@ import type { CavemanWordRules } from "./caveman";
 import { replayCavemanCompression } from "./caveman-cleanup";
 import { commitCompactionModeRecord, reconcileCompactionMode } from "./compaction-off-transition";
 import { getActiveCompartmentRun, startCompartmentAgent } from "./compartment-runner";
-import { buildTriggerInMemoryTail, checkCompartmentTrigger } from "./compartment-trigger";
+import {
+    buildTriggerInMemoryTail,
+    checkCompartmentTrigger,
+    getProactiveCompartmentTriggerPercentage,
+} from "./compartment-trigger";
 import {
     type CtxReduceAvailabilityVerdict,
     primeCtxReduceSpawnPermission,
@@ -98,6 +102,7 @@ import {
     historyBudgetPolicyIdentity,
     resolveContextWindowGeometry,
     resolveExecuteThreshold,
+    resolveExecuteThresholdDetail,
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
@@ -1561,7 +1566,7 @@ export function createTransform(deps: TransformDeps) {
                 : contextUsageEarly.percentage > 0
                   ? contextUsageEarly.inputTokens / (contextUsageEarly.percentage / 100)
                   : undefined;
-        const effectiveExecuteThresholdPercentage = resolveExecuteThreshold(
+        const executeThresholdDetail = resolveExecuteThresholdDetail(
             deps.executeThresholdPercentage ?? 65,
             currentModelKeyForBoundary,
             65,
@@ -1570,6 +1575,11 @@ export function createTransform(deps: TransformDeps) {
                 contextLimit: thresholdContextLimit,
                 sessionId,
             },
+        );
+        const effectiveExecuteThresholdPercentage = executeThresholdDetail.percentage;
+        sessionLog(
+            sessionId,
+            `transform threshold: model=${currentModelKeyForBoundary ?? "unknown"} matchedModel=${executeThresholdDetail.matchedKey ?? "scalar"} mode=${executeThresholdDetail.mode} threshold=${effectiveExecuteThresholdPercentage}% proactiveFloor=${getProactiveCompartmentTriggerPercentage(effectiveExecuteThresholdPercentage)}%`,
         );
         const { forceMaterializationPercentage } = escalationBands(
             effectiveExecuteThresholdPercentage,

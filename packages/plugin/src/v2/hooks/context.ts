@@ -54,7 +54,7 @@ import {
     recordToolParameters,
 } from "../../hooks/magic-context/dropped-input-guard";
 import { EmergencyFailClosedError } from "../../hooks/magic-context/emergency-fail-closed";
-import { resolveContextLimit } from "../../hooks/magic-context/event-resolvers";
+import { resolveContextLimit, resolveModelKey } from "../../hooks/magic-context/event-resolvers";
 import {
     type HistoryBoundaryRepair,
     repairMissingHistoryBoundary,
@@ -273,6 +273,7 @@ export function createHostSeams(
         | "hostMessageReconciliationSource"
         | "hostProtectedTailBoundary"
         | "hostModelFallback"
+        | "getModelKey"
         | "hostRefusalNotice"
         | "hostRefuse"
     >
@@ -287,6 +288,13 @@ export function createHostSeams(
             }),
         // Draft-backed: v2 never reconstructs the live model from message.updated.
         hostModelFallback: (sessionID) => liveModels.get(sessionID) ?? null,
+        // The shared scheduler and historian pressure bands read this callback,
+        // not liveModelBySession directly. Resolve on each pass so the draft's
+        // model is authoritative before any usage arrives and after a switch.
+        getModelKey: (sessionID) => {
+            const model = liveModels.get(sessionID);
+            return resolveModelKey(model?.providerID, model?.modelID);
+        },
         hostRefusalNotice: async (_client, sessionID, message) => {
             pushNotification("toast", { message, variant: "error" }, sessionID);
             await deliverSynthetic(context, sessionID, message);
