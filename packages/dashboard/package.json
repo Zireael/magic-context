@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "bunx tauri dev",
-    "dev:frontend": "vite",
-    "build": "vite build",
+    "dev:frontend": "bun run generate:config && vite",
+    "build": "bun run generate:config && vite build",
+    "generate:config": "bun scripts/generate-config-manifests.ts",
     "build:tauri": "bunx tauri build",
     "preview": "vite preview",
     "tauri": "bunx tauri",

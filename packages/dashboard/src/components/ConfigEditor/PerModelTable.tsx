@@ -1,5 +1,6 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { configDefault } from "./config-schema";
+import HelpPopover from "./HelpPopover";
 import ModelSelect from "./ModelSelect";
 import {
   addModelRow,
@@ -88,9 +89,14 @@ export default function PerModelTable(props: {
       <div class="config-defaults">
         <For each={keys()}>
           {(key) => (
-            <div>
-              <span class="config-field-label">{COLUMNS[key].label}</span>
-              <code class="config-field-key">{key}.default</code>
+            <div class="config-field">
+              <div class="config-field-header">
+                <span class="config-field-label">{COLUMNS[key].label}</span>
+                <Show when={key === "cache_ttl"}>
+                  <HelpPopover topic="cache_ttl" label="Cache TTL" />
+                </Show>
+                <code class="config-field-key">{key}.default</code>
+              </div>
               <span class="config-field-desc">{COLUMNS[key].description}</span>
               {input(key, "default")}
               <Show
@@ -104,15 +110,6 @@ export default function PerModelTable(props: {
                   Output Reserve overrides require a numeric default in the config schema. Set a
                   default above before saving; a derived fallback cannot be stored in a model map.
                 </p>
-              </Show>
-              <Show when={key === "cache_ttl"}>
-                <details class="config-help">
-                  <summary>How it works</summary>
-                  <p>
-                    This is Magic Context's deferral gate; it does not change the provider's cache
-                    lifetime. Enter a duration such as 5m, or “never” to keep the prefix warm.
-                  </p>
-                </details>
               </Show>
             </div>
           )}

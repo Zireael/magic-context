@@ -550,6 +550,8 @@ export type OpencodeInstallState = "cli" | "desktop" | "none";
 
 /** Harness-scoped model catalogs returned together by the Tauri backend. */
 export interface ModelCatalogs {
+  /** Exact variant keys from verbose OpenCode metadata; absence means unknown, [] means none. */
+  opencodeVariants?: Record<string, string[]>;
   opencode: string[];
   pi: string[];
   omp: string[];
