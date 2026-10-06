@@ -100,4 +100,78 @@ Marker test `lsof -p` inventories include only that root's `opencode.db`,
 `context.db`, and `store.db`, before and after restarts. Package unit suites
 use a throwaway `HOME` without exporting `OPENCODE_DB`.
 
-Additional gate results are recorded in the delivery declaration.
+## Additional verification
+
+All four full manifest Rust hermetic shards ran through the CI wrapper with
+the real release module/daemon pair and the separate `drive-fault` binary:
+
+| Shard | Files | Passing tests | Manifest/fixture skips | Result |
+| --- | ---: | ---: | ---: | --- |
+| 0/4 | 15 | 39 | 60 | pass, including all four marker tests |
+| 1/4 | 14 | 23 | 17 | pass |
+| 2/4 | 14 | 28 | 65 | pass |
+| 3/4 | 14 | 25 | 12 | pass after the wrapper's bounded retry |
+
+Shard 3's first `rust-adapter-perf` run observed five passes instead of four;
+its fresh-process retry passed. This retry is reported rather than hidden.
+External `lsof -p` observations captured 82, 32, 45, and 51 database-owning
+host/module processes respectively, with no database paths outside the
+throwaway task root.
+
+`cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings`
+pass (four workspace crates). The requested `cargo test -p mc-module -p mc-store`
+was attempted in full twice. The first run passed all 1,603 module library tests
+and preceding integration targets, but hit an asynchronous `store_opening`
+response in `hostless_store_init_first_transform_through_real_daemon`; that
+test passed immediately in isolation. All remaining integration targets were
+then run and passed separately, as did all 229 store library tests. A second
+full run hit the pre-existing caveman wall-clock assertion under shared-machine
+load: `long_whitespace_runs_and_many_paths_compress_in_linear_time` measured
+5.68 seconds. It also passed in isolation. Neither failure is in changed code;
+there is no claim that a single full Cargo invocation was clean. Module
+documentation tests collect zero tests.
+
+Issue 624's focused, separate-process checks pass: five saved/model-policy
+tests, four OpenCode v1/v2 transform tests, two Rust authority-adapter tests,
+three Pi context tests, and three Rust module TTL tests. They include live
+user edits on the next pass, frozen built-in defaults, and unchanged prompt
+bytes. Running broad Pi and OpenCode unit files in one Bun process initially
+produced cross-harness state/mock failures; these are not substituted for the
+isolated runtime contract checks.
+
+The repository `bun run typecheck` passes (TypeScript 5.9.3, four packages).
+The e2e-only `tsc --noEmit` command reports 19 existing errors in unchanged
+files and transitive product imports. Fresh authoritative diagnostics cover
+all seven changed TypeScript files with zero errors or warnings. Shell syntax
+checking passes for the changed Docker setup script; the Docker install/smoke
+image itself was not run.
+
+The actual OpenCode 1/OpenCode 2 store-conversion suite passes all 14 tests;
+its three observed database-owning processes also stay below the throwaway
+root. Pi host version is 0.87.1.
+
+The complete Pi host manifest ran: 49 passed, 246 host-gating skips, and one
+failure in the long-session test's `"notes ready"` expectation. That same
+expectation fails in isolation and in the archived, unmodified `ef536a3c07`
+tree with a freshly built Pi plugin, so it is not caused by this correction.
+
+The real issue 624 OpenCode host test also fails its final `ttl_idle` assertion
+both here and in the unmodified `ef536a3c07` archive. Its policy assertions
+pass (`13h`, then `1h`), but an asynchronous completion event overwrites the
+fixture's artificially backdated response time before the lowering pass.
+The retained log directly shows `cacheTtl=13h` with the old timestamp, then
+`cacheTtl=1h` with a fresh timestamp and a correct `defer`. This separate fixture
+race was not changed or folded into the marker fix.
+
+The complete OpenCode manifest invocation reached its 30-minute command cap
+after 71 passing tests and that one known failure, with 34 of 40 files reached.
+The six unreached files were then run separately (12 passes), along with the
+two final idle-restart cases (both pass, one repeats an already completed case).
+This covers all 40 manifest files with 84 distinct passing tests and the
+baseline issue 624 fixture failure; it is not a claim of a clean, single full
+invocation. The independent cache-analysis oracle passes all ten tests.
+
+The daemon release binary used for the hermetic runs was built from sibling
+subconscious revision `d2a2fd7c018aea7faf5914dc3e95ad5781f6b7b2`.
+Additional baseline failures and exact commands are recorded in the delivery
+declaration.
