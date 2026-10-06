@@ -4670,9 +4670,21 @@ pub struct FrozenDecisionCalibration {
     pub source: String,
 }
 
+/// Scheduling provenance and the built-in fallback frozen for one session/model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheTtlPolicy {
+    pub value: String,
+    pub source: String,
+    pub model_key: Option<String>,
+    pub built_in_default: String,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
+    /// Scheduling policy only: never part of the render identity or cached prompt bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_policy: Option<SessionCacheTtlPolicy>,
     /// Host ordinals and module block IDs used for rendering, only while the shared
     /// row's original IDs, block indices, and ordinals still match.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

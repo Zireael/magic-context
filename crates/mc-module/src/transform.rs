@@ -602,6 +602,8 @@ pub struct ProducerContext<'a> {
     pub cache_ttl: String,
     /// Whether the model-resolution walk selected a per-model entry or fell through to the default.
     pub cache_ttl_provenance: CacheTtlProvenance,
+    /// Hostless scheduling provenance, committed only with a successful transform.
+    pub cache_ttl_policy: Option<mc_store::SessionCacheTtlPolicy>,
     /// Provider/model key for threshold lookup. Per-model overrides are deferred, so
     /// production currently supplies None.
     pub model_key: Option<String>,
@@ -3191,6 +3193,9 @@ fn apply_additive_only(
 
     let mut core = loaded.core.clone();
     let mut meta = loaded.meta.clone();
+    if let Some(policy) = &ctx.cache_ttl_policy {
+        meta.cache_ttl_policy = Some(policy.clone());
+    }
     // Persist an equivalent revision written by an older digest format. This changes only
     // stored metadata; the served bytes are decided by the plan above.
     meta.m1_revision = applied_m1_revision;
@@ -5054,6 +5059,9 @@ fn apply_once(
     let mut core = loaded.core.clone();
     log_reasoning_drop_seed_skips(&core, &live, &req.session_id);
     let mut meta = loaded.meta.clone();
+    if let Some(policy) = &ctx.cache_ttl_policy {
+        meta.cache_ttl_policy = Some(policy.clone());
+    }
     // Persist an equivalent revision written by an older digest format. This changes only
     // stored metadata; the served bytes are decided by the plan above.
     meta.m1_revision = applied_m1_revision;
@@ -18631,6 +18639,7 @@ pub(crate) mod tests {
             smart_drops: false,
             cache_ttl: "5m".to_string(),
             cache_ttl_provenance: CacheTtlProvenance::Default,
+            cache_ttl_policy: None,
             model_key: None,
             observed_last_response_at_ms: None,
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),

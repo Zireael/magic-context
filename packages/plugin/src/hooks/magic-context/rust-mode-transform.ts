@@ -1447,7 +1447,12 @@ function shouldRefreshMuralCandidate(args: {
     cacheTtl: string;
     explicitMaterialization: boolean;
 }): boolean {
-    const ttlMs = args.cacheTtl === "1h" ? 3_600_000 : 300_000;
+    let ttlMs = 300_000;
+    try {
+        ttlMs = parseCacheTtl(args.cacheTtl);
+    } catch {
+        // Invalid policy follows the scheduler's five-minute fallback.
+    }
     return (
         !args.initialized ||
         args.pressure >= args.threshold ||
@@ -2456,11 +2461,13 @@ export function createRustModeTransform(
             ? canonicalModelIdentity(resolveModelKey(model.providerID, model.modelID) ?? "")
             : null;
         try {
+            const ttlConfig = deps.sampleCacheTtlConfig?.();
             sessionMeta.cacheTtl = resolveSessionCacheTtl(
                 deps.db,
                 sessionId,
-                deps.cacheTtlConfig,
+                ttlConfig?.cache_ttl ?? deps.cacheTtlConfig,
                 modelKey ?? undefined,
+                ttlConfig?.cacheTtlConfigured ?? deps.cacheTtlConfigured,
             ).value;
         } catch (error) {
             preflightError ??= error;

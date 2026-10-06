@@ -165,6 +165,95 @@ describe("Pi context project identity cache", () => {
 	});
 });
 
+for (const configured of [true, false]) {
+	it(`Pi context pass ${configured ? "applies live user TTL edits without a prompt or model change" : "keeps built-in TTL changes frozen"}`, async () => {
+		const db = createTestDb();
+		const sessionId = `pi-ttl-${configured}`;
+		const fake = createFakePi();
+		let ttl = configured ? "1h" : "5m";
+		const logger = await import("@magic-context/core/shared/logger");
+		const logCalls = spyOn(logger, "sessionLog");
+		const decision = () =>
+			logCalls.mock.calls
+				.filter(
+					([id, message]) =>
+						id === sessionId &&
+						typeof message === "string" &&
+						message.startsWith("transform:") &&
+						message.includes("decision="),
+				)
+				.at(-1)?.[1];
+		try {
+			registerPiContextHandler(fake.pi as never, {
+				db,
+				protectedTokens: 0,
+				protectedTags: 0,
+				cacheTtlConfig: ttl,
+				cacheTtlConfigured: configured,
+				resolveForProject: () => ({
+					db,
+					protectedTokens: 0,
+					protectedTags: 0,
+					cacheTtlConfig: ttl,
+					cacheTtlConfigured: configured,
+				}),
+			});
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: unknown[] }>;
+			const raw = [
+				userMessage("hello", 1),
+				assistantMessage("keep this cached reply", 2),
+				userMessage("next", 3),
+			];
+			const pass = () => {
+				const messages = structuredClone(raw);
+				const ctx = {
+					...fakeContext(
+						sessionId,
+						process.cwd(),
+						["u1", "a2", "u3"],
+						messages,
+					),
+					model: { provider: "anthropic", id: "opus" },
+				};
+				return handler({ messages: messages as never[] }, ctx as never);
+			};
+			await pass();
+			queuePendingOp(db, sessionId, 2, "drop");
+			updateSessionMeta(db, sessionId, {
+				lastResponseTime: Date.now() - 2 * 60 * 60 * 1000,
+			});
+			ttl = configured ? "13h" : "10m";
+			const served = await pass();
+			expect(decision()).toContain(
+				configured ? "decision=defer" : "decision=execute",
+			);
+			expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe(
+				configured ? "13h" : "5m",
+			);
+			if (configured) {
+				updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() });
+				ttl = "1m";
+				expect((await pass()).messages).toEqual(served.messages);
+				expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe("1m");
+				expect(getPendingOps(db, sessionId)).toHaveLength(1);
+				expect(decision()).toContain("decision=defer");
+				updateSessionMeta(db, sessionId, {
+					lastResponseTime: Date.now() - 120_000,
+				});
+				await pass();
+				expect(decision()).toContain("decision=execute");
+			}
+		} finally {
+			logCalls.mockRestore();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+}
+
 describe("Pi project binding retry", () => {
 	it("retries a failed first write without adding steady-state writes", () => {
 		const db = createTestDb();

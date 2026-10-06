@@ -3,6 +3,14 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and the Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh. The tag release workflow also runs the Rust invocation; both Rust lanes require public sibling path dependencies (../commons and ../subconscious).",
     "entries": [
         {
+            "path": "tests/cache-ttl-live-config.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 624: real OpenCode 1 reloads edited user TTL before the next idle decision, preserves provider prefix bytes on a raise, and lowers only through ttl_idle; PID lsof proves throwaway-store containment",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/subagent-write-tools.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

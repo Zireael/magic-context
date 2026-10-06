@@ -393,6 +393,11 @@ export async function sendEmergencyRefusalNotice(
 
 export interface TransformDeps {
     cacheTtlConfig?: import("../../shared/model-cache-ttl").CacheTtlConfig;
+    cacheTtlConfigured?: boolean;
+    sampleCacheTtlConfig?: () => {
+        cache_ttl: import("../../shared/model-cache-ttl").CacheTtlConfig;
+        cacheTtlConfigured?: boolean;
+    };
     hiddenCompletionExecutor?: import("./compartment-runner-types").HiddenCompletionExecutor;
     /** Host marker lifecycle; omission preserves OpenCode 1 marker writes and replay. */
     compactionMarkerStrategy?: CompactionMarkerStrategy & {
@@ -819,11 +824,13 @@ export function createTransform(deps: TransformDeps) {
                 findNewestUserModel(messages) ??
                 deps.liveModelBySession?.get(sessionId) ??
                 findLastAssistantModel(messages);
+            const ttlConfig = deps.sampleCacheTtlConfig?.();
             sessionMeta.cacheTtl = resolveSessionCacheTtl(
                 db,
                 sessionId,
-                deps.cacheTtlConfig,
+                ttlConfig?.cache_ttl ?? deps.cacheTtlConfig,
                 ttlModel ? `${ttlModel.providerID}/${ttlModel.modelID}` : undefined,
+                ttlConfig?.cacheTtlConfigured ?? deps.cacheTtlConfigured,
             ).value;
         } catch (error) {
             sessionLog(sessionId, "transform failed reading session meta:", error);

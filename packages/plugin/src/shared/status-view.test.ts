@@ -264,7 +264,7 @@ describe("status view model", () => {
      * gap fit; otherwise the caller draws one column.
      */
     test("draws two columns only when both columns' values fit", () => {
-        const sections = view().sections;
+        const sections = view({ cacheTtlSource: "default" }).sections;
         for (const section of sections) {
             const longest = Math.max(...section.rows.map((row) => row.value.length));
             expect(statusSectionWidth(section)).toBe(section.labelWidth + 1 + longest);
@@ -297,7 +297,7 @@ describe("status view model", () => {
         expect(statusColumnsFor(narrowValues, needed).twoColumn).toBe(true);
         expect(statusColumnsFor(narrowValues, needed - 1).twoColumn).toBe(false);
 
-        // A long value — the model key on the Configured row — pushes the left
+        // A long value — the frozen-default source on the Configured row — pushes the left
         // column past what the dialog has, so the same sections go one column
         // rather than wrapping that value mid-word.
         expect(statusColumnsFor(sections, 84).twoColumn).toBe(false);

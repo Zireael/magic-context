@@ -1426,6 +1426,8 @@ export async function registerContext(context: V2Context) {
                 );
             transform ??= createTransform({
                 cacheTtlConfig: config.cache_ttl,
+                cacheTtlConfigured: config.cacheTtlConfigured,
+                sampleCacheTtlConfig: () => liveConfigReader.poll().effective,
                 db,
                 tagger,
                 ...createV2ThresholdDeps(config),

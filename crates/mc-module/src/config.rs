@@ -140,7 +140,7 @@ pub struct McModuleConfig {
     pub prompt_surface_guidance_override: Option<String>,
     pub smart_drops: bool,
     pub cache_ttl: String,
-    /// Per-model TTL overrides from the object config shape. Resolution uses the
+    /// Configured TTL entries (including an explicit `default`). Resolution uses the
     /// shared exact, bare, dash-stripped, provider-wildcard, then default walk.
     pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
     /// Settings only `tool.catalog` reads (`src/tool_catalog.rs`).
@@ -204,6 +204,8 @@ impl Default for McModuleConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTtlProvenance {
     Explicit,
+    /// User/project default controls scheduling, but does not author provider cache markers.
+    ConfiguredDefault,
     Default,
 }
 
@@ -309,7 +311,11 @@ impl McModuleConfig {
         };
         let default = || ResolvedCacheTtl {
             value: self.cache_ttl.clone(),
-            provenance: CacheTtlProvenance::Default,
+            provenance: if self.cache_ttl_by_model.contains_key("default") {
+                CacheTtlProvenance::ConfiguredDefault
+            } else {
+                CacheTtlProvenance::Default
+            },
         };
 
         // Check an exact key before splitting into provider and model parts, so a bare key cannot
@@ -642,6 +648,31 @@ fn guidance_marker_count(content: &str) -> usize {
         .count()
 }
 
+fn apply_cache_ttl_config(cfg: &mut McModuleConfig, value: Option<&Value>) {
+    match value {
+        Some(Value::String(ttl)) if !ttl.trim().is_empty() => {
+            cfg.cache_ttl = ttl.trim().to_string();
+            // A global project policy replaces the user map, just as in the TS loader.
+            cfg.cache_ttl_by_model.clear();
+            cfg.cache_ttl_by_model
+                .insert("default".to_string(), cfg.cache_ttl.clone());
+        }
+        Some(Value::Object(map)) => {
+            for (key, value) in map {
+                let Some(ttl) = value.as_str().map(str::trim).filter(|ttl| !ttl.is_empty()) else {
+                    continue;
+                };
+                if key == "default" {
+                    cfg.cache_ttl = ttl.to_string();
+                }
+                // Keeping the default entry records that it was configured, even for 5m.
+                cfg.cache_ttl_by_model.insert(key.clone(), ttl.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
 fn merge_tiers_with_warnings(
     user: Option<&Value>,
     project: Option<&Value>,
@@ -741,35 +772,13 @@ fn merge_tiers_with_warnings(
         {
             cfg.prompt_surface_guidance_override = Some(guidance.to_string());
         }
-        match user.pointer("/cache_ttl") {
-            Some(Value::String(cache_ttl)) => {
-                if !cache_ttl.trim().is_empty() {
-                    cfg.cache_ttl = cache_ttl.trim().to_string();
-                }
-            }
-            // Per-model map: { "default": "5m", "anthropic/claude-opus-4-8": "300m", ... }.
-            // Silently ignoring this shape left the module on the 5m default while the
-            // user had configured 300m for Anthropic models (a spurious idle-TTL HARD on
-            // a still-warm provider cache).
-            Some(Value::Object(map)) => {
-                for (key, value) in map {
-                    let Some(ttl) = value.as_str() else { continue };
-                    if ttl.trim().is_empty() {
-                        continue;
-                    }
-                    if key == "default" {
-                        cfg.cache_ttl = ttl.trim().to_string();
-                    } else {
-                        cfg.cache_ttl_by_model
-                            .insert(key.clone(), ttl.trim().to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
+        apply_cache_ttl_config(&mut cfg, user.get("cache_ttl"));
     }
 
     if let Some(project) = project {
+        // TTL is scheduling policy, not trusted model-facing text. Project policy follows
+        // the same per-key override merge as the TypeScript loaders.
+        apply_cache_ttl_config(&mut cfg, project.get("cache_ttl"));
         cfg.execute_threshold_project_config = execute_threshold_at(project);
         cfg.protected_tokens_project = protected_tokens_at(project, "project", &mut warnings);
         warn_deprecated_protected_tags(project, "project", &mut warnings);
@@ -1207,11 +1216,24 @@ mod cache_ttl_tests {
     }
 
     #[test]
-    fn project_tier_cannot_set_cache_ttl() {
+    fn project_tier_cache_ttl_overrides_user_policy_per_key() {
         let project = json!({ "cache_ttl": { "default": "600m" } });
-        let cfg = merge_tiers(None, Some(&project));
-        assert_eq!(cfg.cache_ttl, "5m");
-        assert!(cfg.cache_ttl_by_model.is_empty());
+        let user = json!({ "cache_ttl": { "default": "1h", "anthropic/opus": "13h" } });
+        let cfg = merge_tiers(Some(&user), Some(&project));
+        assert_eq!(cfg.resolve_cache_ttl(Some("other/model")), "600m");
+        assert_eq!(cfg.resolve_cache_ttl(Some("anthropic/opus")), "13h");
+        assert_eq!(
+            cfg.resolve_cache_ttl_with_provenance(None).provenance,
+            CacheTtlProvenance::ConfiguredDefault
+        );
+        let global = merge_tiers(Some(&user), Some(&json!({ "cache_ttl": "5m" })));
+        assert_eq!(global.resolve_cache_ttl(Some("anthropic/opus")), "5m");
+        assert_eq!(
+            global
+                .resolve_cache_ttl_with_provenance(Some("anthropic/opus"))
+                .provenance,
+            CacheTtlProvenance::ConfiguredDefault
+        );
     }
 }
 

@@ -810,6 +810,7 @@ export function buildStatusDetail(
               }
             : undefined;
     const liveConfig = currentPluginConfigReader(directory);
+    const liveTtlConfig = liveConfig?.poll().effective;
     const liveFailure = liveConfig?.lastFailure();
     const detail: StatusDetail = {
         ...base,
@@ -1013,8 +1014,11 @@ export function buildStatusDetail(
 
             const ttlDisplay = resolveCacheTtlDisplay({
                 frozen: readSessionCacheTtl(db, sessionId),
-                configured: (config.cache_ttl ?? "5m") as MagicContextConfig["cache_ttl"],
-                configuredExplicitly: config.cacheTtlConfigured === true,
+                configured: (liveTtlConfig?.cache_ttl ??
+                    config.cache_ttl ??
+                    "5m") as MagicContextConfig["cache_ttl"],
+                configuredExplicitly:
+                    (liveTtlConfig?.cacheTtlConfigured ?? config.cacheTtlConfigured) === true,
                 modelKey,
                 sessionValue: persistedCacheTtl,
                 sessionModelKey: persistedModelKey,

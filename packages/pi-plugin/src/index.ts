@@ -388,6 +388,7 @@ export function persistPiMessageEndModelMeta(args: {
 	sessionId: string;
 	message: unknown;
 	cacheTtlConfig: MagicContextConfig["cache_ttl"];
+	cacheTtlConfigured?: boolean;
 }): void {
 	if (!args.message || typeof args.message !== "object") return;
 	const msg = args.message as {
@@ -412,6 +413,7 @@ export function persistPiMessageEndModelMeta(args: {
 		args.sessionId,
 		args.cacheTtlConfig,
 		modelKey,
+		args.cacheTtlConfigured,
 	).value;
 	const currentMeta = getOrCreateSessionMeta(args.db, args.sessionId);
 	updateSessionMeta(args.db, args.sessionId, {
@@ -1531,6 +1533,7 @@ async function startPiMagicContextRuntime(
 	): PiContextHandlerOptions => ({
 		db: database,
 		cacheTtlConfig: cfg.cache_ttl,
+		cacheTtlConfigured: cfg.cacheTtlConfigured,
 		smartDrops: cfg.smart_drops === true,
 		protectedTokens: cfg.protected_tokens,
 		protectedTokenTierOverrides: getProtectedTokensTierOverrides(cfg) ?? {},
@@ -1731,7 +1734,12 @@ async function startPiMagicContextRuntime(
 			PI_HARNESS_KIND,
 			activeModelRegistry,
 		);
-		return { ...project.contextOptions, historian };
+		return {
+			...project.contextOptions,
+			historian,
+			cacheTtlConfig: sampled.cache_ttl,
+			cacheTtlConfigured: sampled.cacheTtlConfigured,
+		};
 	}
 
 	const bootProjectDeps = buildProjectDeps(
@@ -1976,6 +1984,7 @@ async function startPiMagicContextRuntime(
 		resolveStatusDeps: (ctx) => {
 			const current = resolveCurrentProjectDeps(ctx);
 			const live = liveReaderFor(current.projectDir, current.config);
+			const fresh = live.poll().effective;
 			const failure = live.lastFailure();
 			return {
 				configGeneration: live.current().generation,
@@ -2018,8 +2027,8 @@ async function startPiMagicContextRuntime(
 					return `Pi model chain empty (no model found): ${parts.join("; ")}`;
 				})(),
 				activeProfile: current.config.profile,
-				cacheTtlConfig: current.config.cache_ttl,
-				cacheTtlConfigured: current.cacheTtlConfigured,
+				cacheTtlConfig: fresh.cache_ttl,
+				cacheTtlConfigured: fresh.cacheTtlConfigured,
 				configParseFailures: current.configParseFailures,
 				hasDeprecatedProtectedTags: current.hasDeprecatedProtectedTags,
 				compactionEnabled: isCompactionEnabled(current.config),
@@ -2779,7 +2788,15 @@ async function startPiMagicContextRuntime(
 				db,
 				sessionId,
 				message: event.message,
-				cacheTtlConfig: resolveCurrentProjectDeps(ctx).config.cache_ttl,
+				...(() => {
+					const project = resolveCurrentProjectDeps(ctx);
+					const fresh = liveReaderFor(project.projectDir, project.config).poll()
+						.effective;
+					return {
+						cacheTtlConfig: fresh.cache_ttl,
+						cacheTtlConfigured: fresh.cacheTtlConfigured,
+					};
+				})(),
 			});
 			// Compute pressure with OpenCode-equivalent semantics: pull
 			// the assistant's `usage` field, normalize inclusive OpenAI
