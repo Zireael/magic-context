@@ -333,7 +333,7 @@ describe("Pi status dialog", () => {
 			const summary = formatPiStatusSummary(statusFixture);
 			expect(summary).toBe(`Magic Context Status
 Context: 1.0% of usable context (1,000 / 100,000 tokens)
-Cache lifetime: 1h (config for anthropic/claude-opus-5)
+Cache lifetime: 1h (your config)
 Automatic compression: at 65.0% of usable context
 History compression: Waiting for enough conversation history
 Reclaimable: 3 spent tool outputs (~14k tokens)
@@ -341,11 +341,7 @@ Memory: 0 memories · 0 notes
 Search indexing: Off
 Warning: The last context update did not finish. Send another message to retry. (MC-S02)
 Warning: History compression could not finish this turn. It will retry automatically. (MC-H01)`);
-			for (const value of [
-				"1.0%",
-				"65.0%",
-				"1h (config for anthropic/claude-opus-5)",
-			]) {
+			for (const value of ["1.0%", "65.0%", "1h (your config)"]) {
 				expect(summary).toContain(value);
 			}
 			for (const forbidden of [

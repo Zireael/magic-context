@@ -216,6 +216,52 @@ fn apply_claude_code_config_controls(
     }
 }
 
+fn resolve_session_cache_ttl(
+    store: &McStore,
+    session_id: &str,
+    model_key: Option<&str>,
+    frozen: &McModuleConfig,
+    live: &McModuleConfig,
+) -> Result<(config::ResolvedCacheTtl, mc_store::SessionCacheTtlPolicy), McStoreError> {
+    let resolved = live.resolve_cache_ttl_with_provenance(model_key);
+    let configured = resolved.provenance != config::CacheTtlProvenance::Default;
+    let loaded = store.load_meta(session_id)?;
+    let built_in_default = loaded
+        .meta
+        .cache_ttl_policy
+        .as_ref()
+        .filter(|policy| policy.model_key.as_deref() == model_key)
+        .map(|policy| policy.built_in_default.clone())
+        .unwrap_or_else(|| {
+            let bound = frozen.resolve_cache_ttl_with_provenance(model_key);
+            if bound.provenance == config::CacheTtlProvenance::Default {
+                bound.value
+            } else {
+                McModuleConfig::default().resolve_cache_ttl(model_key)
+            }
+        });
+    let effective = config::ResolvedCacheTtl {
+        value: if configured {
+            resolved.value.clone()
+        } else {
+            built_in_default.clone()
+        },
+        provenance: resolved.provenance,
+    };
+    let policy = mc_store::SessionCacheTtlPolicy {
+        value: effective.value.clone(),
+        source: if configured {
+            "your config"
+        } else {
+            "built-in default, frozen for this session"
+        }
+        .to_string(),
+        model_key: model_key.map(str::to_string),
+        built_in_default,
+    };
+    Ok((effective, policy))
+}
+
 /// Normalize the OC host's already-rendered mural to the exact m0 input contract.
 fn host_mural_artifact(input: Option<&m0_compose::M0MuralInput>) -> Option<(String, String)> {
     let input = input?;
@@ -10327,19 +10373,28 @@ impl McHandler {
         let handler_entry_state = OnceLock::new();
         let run_transform = || {
             profile_start!(perf_context, "transform_context");
-            let resolved_cache_ttl = parsed.cache_ttl.clone().map_or_else(
-                || {
-                    binding
-                        .config
-                        .resolve_cache_ttl_with_provenance(parsed.model_key.as_deref())
-                },
-                |value| config::ResolvedCacheTtl {
-                    value,
-                    // Host-resolved TTLs remain host-side; only a per-model config match may
-                    // instruct the Claude Code marker owner.
-                    provenance: config::CacheTtlProvenance::Default,
-                },
-            );
+            let (resolved_cache_ttl, cache_ttl_policy) =
+                if let Some(value) = parsed.cache_ttl.clone() {
+                    (
+                        config::ResolvedCacheTtl {
+                            value,
+                            // Host-resolved TTLs remain host-side; only a per-model config match may
+                            // instruct the Claude Code marker owner.
+                            provenance: config::CacheTtlProvenance::Default,
+                        },
+                        None,
+                    )
+                } else {
+                    resolve_session_cache_ttl(
+                        &store,
+                        &parsed.session_id,
+                        parsed.model_key.as_deref(),
+                        &binding.config,
+                        &self.effective_config(&binding.project_root),
+                    )
+                    .map(|(resolved, policy)| (resolved, Some(policy)))
+                    .map_err(transform::TransformError::Store)?
+                };
             let producer_ctx = transform::ProducerContext {
                 project_path: &project_path,
                 note_project_path: &note_project_path,
@@ -10379,6 +10434,7 @@ impl McHandler {
                 // request's model while retaining whether the walk actually matched an entry.
                 cache_ttl: resolved_cache_ttl.value,
                 cache_ttl_provenance: resolved_cache_ttl.provenance,
+                cache_ttl_policy,
                 model_key: binding.model_key.clone(),
                 // Only the host knows whether the provider actually completed a reply.
                 // A local transform response merely prepares the next provider request.
@@ -21709,6 +21765,79 @@ mod tests {
         assert_eq!(served["scheduler_decision"], "defer");
     }
 
+    #[tokio::test]
+    async fn session_cache_ttl_reload_only_rebuilds_through_normal_idle_expiry() {
+        let mut config = default_test_config();
+        config.cache_ttl = "1h".to_string();
+        config
+            .cache_ttl_by_model
+            .insert("default".to_string(), "1h".to_string());
+        let (mut handler, store, _dir, _) =
+            handler_with_store(Arc::new(ProducerState::default()), config.clone());
+        let mut wire = request_with_usage(vec![ck("tail", 1, "unchanged raw tail")], 1_000, 50_000);
+        wire["model_key"] = json!("anthropic/opus");
+        wire["prev_response_completed_at_ms"] = json!(now_ms());
+        let original = call_transform_request(&handler, wire.clone()).await;
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.expiry_cutoff_ms = now_ms() - 3 * 3_600_000;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        config.cache_ttl = "13h".to_string();
+        handler.fixed_config = Some(config.clone());
+        wire["prev_response_completed_at_ms"] = json!(now_ms() - 2 * 3_600_000);
+        let raised = call_transform_request(&handler, wire.clone()).await;
+        assert_eq!(raised["scheduler_decision"], "defer");
+        assert_ne!(raised["action"], "HARD");
+        assert_eq!(raised["ck_messages"], original["ck_messages"]);
+        config.cache_ttl = "1m".to_string();
+        handler.fixed_config = Some(config);
+        wire["prev_response_completed_at_ms"] = json!(now_ms());
+        let lowered_warm = call_transform_request(&handler, wire.clone()).await;
+        assert_eq!(lowered_warm["scheduler_decision"], "defer");
+        assert_eq!(lowered_warm["ck_messages"], raised["ck_messages"]);
+        wire["prev_response_completed_at_ms"] = json!(now_ms() - 120_000);
+        let lowered_idle = call_transform_request(&handler, wire).await;
+        assert_eq!(lowered_idle["scheduler_decision"], "execute");
+        assert_eq!(lowered_idle["action"], "HARD");
+        assert_eq!(lowered_idle["materialize_reason"], "ttl_expiry");
+        assert_eq!(
+            store
+                .load_meta("ses")
+                .unwrap()
+                .meta
+                .cache_ttl_policy
+                .unwrap()
+                .source,
+            "your config"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cache_ttl_builtin_reload_keeps_the_original_idle_decision() {
+        let config = default_test_config();
+        let (mut handler, store, _dir, _) =
+            handler_with_store(Arc::new(ProducerState::default()), config.clone());
+        let mut wire = request_with_usage(vec![ck("tail", 1, "raw tail")], 1_000, 50_000);
+        wire["prev_response_completed_at_ms"] = json!(now_ms());
+        call_transform_request(&handler, wire.clone()).await;
+        handler.fixed_config = Some(McModuleConfig {
+            cache_ttl: "10m".to_string(),
+            ..config
+        });
+        wire["prev_response_completed_at_ms"] = json!(now_ms() - 7 * 60_000);
+        let response = call_transform_request(&handler, wire).await;
+        assert_eq!(response["scheduler_decision"], "execute");
+        let policy = store
+            .load_meta("ses")
+            .unwrap()
+            .meta
+            .cache_ttl_policy
+            .unwrap();
+        assert_eq!(policy.value, "5m");
+        assert_eq!(policy.source, "built-in default, frozen for this session");
+    }
+
     #[test]
     fn wire_execute_threshold_overrides_config_and_absence_preserves_fallback_both_directions() {
         fn decision(wire_threshold: Option<f64>, config_threshold: f64) -> scheduler::BaseDecision {
@@ -28337,6 +28466,44 @@ mod tests {
         )
         .await;
         assert_eq!(guidance_full_repeat, guidance_full);
+    }
+
+    #[test]
+    fn session_cache_ttl_user_edits_are_live_and_default_changes_are_frozen() {
+        let (_, store, _dir, _) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let frozen = McModuleConfig::default();
+        let mut live = frozen.clone();
+        let model_key = "anthropic/claude-opus-5-5";
+        let model = Some(model_key);
+        let resolve_and_save = |session: &str, bound: &McModuleConfig, live: &McModuleConfig| {
+            let (resolved, policy) =
+                resolve_session_cache_ttl(&store, session, model, bound, live).unwrap();
+            let mut loaded = store.load_meta(session).unwrap();
+            loaded.meta.cache_ttl_policy = Some(policy);
+            store
+                .commit_meta(session, loaded.row_version, &loaded.meta)
+                .unwrap();
+            resolved
+        };
+        live.cache_ttl_by_model
+            .insert(model_key.to_string(), "1h".to_string());
+        assert_eq!(resolve_and_save("user-ttl", &frozen, &live).value, "1h");
+        live.cache_ttl_by_model
+            .insert(model_key.to_string(), "13h".to_string());
+        assert_eq!(resolve_and_save("user-ttl", &frozen, &live).value, "13h");
+        assert_eq!(
+            resolve_and_save("builtin-ttl", &frozen, &frozen).value,
+            "5m"
+        );
+        let changed_default = McModuleConfig {
+            cache_ttl: "10m".to_string(),
+            ..McModuleConfig::default()
+        };
+        assert_eq!(
+            resolve_and_save("builtin-ttl", &changed_default, &changed_default).value,
+            "5m"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -36680,6 +36847,7 @@ mod tests {
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
+                cache_ttl_policy: None,
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
@@ -37663,6 +37831,7 @@ mod tests {
                 smart_drops: false,
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
+                cache_ttl_policy: None,
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),

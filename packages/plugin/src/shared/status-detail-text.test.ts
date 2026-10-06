@@ -100,7 +100,7 @@ describe("status detail text", () => {
         expect(formatStatusDetailMarkdown(STATUS_FIXTURE)).toBe(`## Magic Context Status
 
 - **Context:** 75.0% of usable context (96,000 / 128,000 tokens)
-- **Cache lifetime:** 1h (config for anthropic/claude-opus-5)
+- **Cache lifetime:** 1h (your config)
 - **Automatic compression:** at 65.0% of usable context
 - **History compression:** Compressing history · 12 history blocks
 - **Reclaimable:** 3 spent tool outputs (~14k tokens)

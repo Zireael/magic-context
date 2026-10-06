@@ -88,6 +88,7 @@ fn context(dir: &str) -> ProducerContext<'_> {
         smart_drops: false,
         cache_ttl: "5m".to_string(),
         cache_ttl_provenance: CacheTtlProvenance::Default,
+        cache_ttl_policy: None,
         model_key: None,
         observed_last_response_at_ms: None,
         guidance_date: None,

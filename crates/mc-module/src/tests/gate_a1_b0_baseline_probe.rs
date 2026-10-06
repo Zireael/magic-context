@@ -124,9 +124,10 @@ async fn gate_probe_default_runner_request_and_meta_digests() {
         "the default runner's completion request must match its pinned prompt bytes"
     );
 
-    // The durable blob is the one stream that does move, and it moves by exactly
-    // the width of the new attempt field. Anything else touching the blob shows up
-    // here as a length that is neither the base's nor the base's plus that field.
+    // Scheduling provenance is durable metadata, never a prompt input. Pin its exact
+    // addition along with the producer attempt so unrelated blob changes still fail.
+    const TTL_POLICY_FIELD: &str = ",\"cache_ttl_policy\":{\"value\":\"5m\",\"source\":\"built-in default, frozen for this session\",\"model_key\":null,\"built_in_default\":\"5m\"}";
+    assert!(meta_blob.contains(&TTL_POLICY_FIELD[1..]));
     assert_ne!(
         meta_digest, BASELINE_META_DIGEST,
         "the attempt is stored unconditionally, so the blob cannot match the base's"
@@ -137,8 +138,8 @@ async fn gate_probe_default_runner_request_and_meta_digests() {
     );
     assert_eq!(
         meta_blob.len(),
-        BASELINE_META_BYTES + ATTEMPT_FIELD.len(),
-        "the blob must grow by exactly the new field and nothing else"
+        BASELINE_META_BYTES + ATTEMPT_FIELD.len() + TTL_POLICY_FIELD.len(),
+        "the blob must grow by exactly the attempt and TTL policy fields and nothing else"
     );
 }
 

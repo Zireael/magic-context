@@ -126,8 +126,10 @@ export interface EventHandlerDeps {
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
         cache_ttl: CacheTtlConfig;
+        cacheTtlConfigured?: boolean;
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
     };
+    sampleCacheTtlConfig?: () => { cache_ttl: CacheTtlConfig; cacheTtlConfigured?: boolean };
     tagger: Tagger;
     // openDatabase() returns Database | null, but the hook only constructs these
     // deps after it has already null-checked and disabled MC on storage failure,
@@ -328,13 +330,15 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     );
                 }
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
+                const ttlConfig = deps.sampleCacheTtlConfig?.() ?? deps.config;
                 updateSessionMeta(deps.db, info.id, {
                     isSubagent: info.parentID.length > 0,
                     cacheTtl: resolveSessionCacheTtl(
                         deps.db,
                         info.id,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value,
                 });
             } catch (error) {
@@ -782,19 +786,22 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     updates.lastResponseTime = responseTime;
                 }
 
-                if (typeof deps.config.cache_ttl === "string") {
+                const ttlConfig = deps.sampleCacheTtlConfig?.() ?? deps.config;
+                if (typeof ttlConfig.cache_ttl === "string") {
                     updates.cacheTtl = resolveSessionCacheTtl(
                         deps.db,
                         info.sessionID,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value;
                 } else if (modelKey) {
                     updates.cacheTtl = resolveSessionCacheTtl(
                         deps.db,
                         info.sessionID,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value;
                 }
 

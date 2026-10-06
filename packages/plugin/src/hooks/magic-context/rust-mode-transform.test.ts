@@ -1356,7 +1356,7 @@ describe("Rust mode authority adapter", () => {
         });
     });
 
-    it("sends the frozen known-model TTL to the Rust module", async () => {
+    it("sends the frozen built-in known-model TTL to the Rust module", async () => {
         const sessionId = "rust-known-model-ttl";
         sessions.push(sessionId);
         const db = makeDb();
@@ -1377,6 +1377,7 @@ describe("Rust mode authority adapter", () => {
         };
         const deps = makeDeps(db, moduleClient);
         deps.cacheTtlConfig = "5m";
+        deps.cacheTtlConfigured = false;
         const transform = createRustModeTransform(deps, { moduleClient });
         const messages = makeMessages(sessionId);
         messages[0].info.model = { providerID: "openai", modelID: "gpt-6" };
@@ -1398,6 +1399,46 @@ describe("Rust mode authority adapter", () => {
             ["30m", "30m"],
         ]);
         expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe("30m");
+    });
+
+    it("sends the live user TTL to both Rust module scheduling inputs on the next pass", async () => {
+        const sessionId = "rust-live-user-ttl";
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const ttls: unknown[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method === "transform")
+                    ttls.push([
+                        body?.cache_ttl,
+                        (body?.pass_inputs as Record<string, unknown>)?.cache_ttl,
+                    ]);
+                return method === "transform"
+                    ? { decision: "SOFT+", native_messages: makeMessages(sessionId) }
+                    : { ok: true };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        let ttl = "1h";
+        deps.sampleCacheTtlConfig = () => ({ cache_ttl: ttl, cacheTtlConfigured: true });
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const messages = makeMessages(sessionId);
+        messages[0].info.model = { providerID: "anthropic", modelID: "opus" };
+        for (const next of ["1h", "13h"]) {
+            ttl = next;
+            await transform.run(
+                sessionId,
+                messages,
+                { messages: [...messages] },
+                makeMeta(db, sessionId),
+            );
+        }
+        expect(ttls).toEqual([
+            ["1h", "1h"],
+            ["13h", "13h"],
+        ]);
+        expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe("13h");
     });
 
     it("serves 2048-message SOFT+, SOFT and HARD native wires with the original SHA256", async () => {

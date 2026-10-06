@@ -715,6 +715,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
 
     const transform = createTransform({
         cacheTtlConfig: deps.config.cache_ttl,
+        cacheTtlConfigured: deps.config.cacheTtlConfigured,
+        sampleCacheTtlConfig: () => deps.sampleHistorianConfig?.() ?? deps.config,
         tagger: deps.tagger,
         scheduler: deps.scheduler,
         contextUsageMap,
@@ -834,6 +836,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         onRustEngineReconnectRefusal: (args) => rustRefusalRecovery?.arm(args),
     });
     const eventHandler = createEventHandler({
+        sampleCacheTtlConfig: () => deps.sampleHistorianConfig?.() ?? deps.config,
         contextUsageMap,
         compactionHandler: deps.compactionHandler,
         config: deps.config,

@@ -672,6 +672,10 @@ export function loadPiConfigDetailed(
 	const recoveredTopLevelKeys: string[] = [];
 	const cacheTtlConfigured = Object.hasOwn(rawConfig, "cache_ttl");
 	const parsed = parsePiConfig(rawConfig, recoveredTopLevelKeys);
+	// Runtime provenance must not become a user setting when config is serialized.
+	Object.defineProperty(parsed.config, "cacheTtlConfigured", {
+		value: cacheTtlConfigured,
+	});
 	// An ignored invalid project value is still a config the user must fix, so
 	// keep reporting it as schema recovery (parity with the OpenCode loader).
 	for (const key of projectRestoredTopLevelKeys) {
