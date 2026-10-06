@@ -4558,11 +4558,14 @@ describe("Rust mode authority adapter", () => {
         await expect(
             transform.run(sessionId, secondInput, secondOutput, makeMeta(db, sessionId)),
         ).rejects.toBeInstanceOf(EmergencyFailClosedError);
-        expect(performance.now() - startedAt).toBeLessThan(1000);
+        const elapsedMs = performance.now() - startedAt;
+        console.log(`oversized priced snapshot refusal: ${elapsedMs.toFixed(1)}ms`);
+        expect(elapsedMs).toBeLessThan(1000);
 
         // Refusal can follow an in-place managed edit, but no sendable result is returned.
         expect(getSlot(sessionId)).toBeUndefined();
-        expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
+        // A byte-proven context refusal is not an engine transport/capture failure.
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
     });
 
     it("reuses only the exact accepted prefix after an older stable-id mutation", async () => {

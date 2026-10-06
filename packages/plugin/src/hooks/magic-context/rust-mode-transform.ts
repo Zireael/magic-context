@@ -4183,14 +4183,18 @@ export function createRustModeTransform(
                     cacheBustingPass ||
                     response.scheduler_decision === "execute"
                 ) {
-                    servedFinalWireEstimate = finalWireUsage.estimate(sessionId, {
-                        messages: appliedMessages as MessageLike[],
-                        systemPromptTokens: sessionMeta.systemPromptTokens,
-                        providerID: model?.providerID,
-                        modelID: model?.modelID,
-                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
-                        systemPromptHash: sessionMeta.systemPromptHash,
-                    });
+                    servedFinalWireEstimate = finalWireUsage.estimate(
+                        sessionId,
+                        {
+                            messages: appliedMessages as MessageLike[],
+                            systemPromptTokens: sessionMeta.systemPromptTokens,
+                            providerID: model?.providerID,
+                            modelID: model?.modelID,
+                            agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                            systemPromptHash: sessionMeta.systemPromptHash,
+                        },
+                        resolvedWindowGeometry?.usableHard ?? resolvedContextLimit,
+                    );
                     const refusal = outgoingContextRefusal(
                         servedFinalWireEstimate,
                         resolvedWindowGeometry?.usableHard ?? resolvedContextLimit,
@@ -4200,7 +4204,15 @@ export function createRustModeTransform(
                             resolveDecisionCalibration(model?.providerID, model?.modelID),
                         ),
                     );
-                    if (refusal) throw contextRefusalError(refusal);
+                    if (refusal) {
+                        // A priced module replacement invalidates its prior durable
+                        // snapshot even when final admission refuses before installation.
+                        if (cacheBustingPass) {
+                            dropSlot(sessionId, "lkg_over_limit_replacement");
+                            state.lkgAcceptedCapture = undefined;
+                        }
+                        throw contextRefusalError(refusal);
+                    }
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
                 // output.messages commonly aliases the raw input array, so preserve the entry ids

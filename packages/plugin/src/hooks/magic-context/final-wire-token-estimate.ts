@@ -12,7 +12,11 @@ import {
     estimateImageTokensFromDataUrl,
     estimateToolAttachmentImageTokens,
 } from "./image-token-estimate";
-import { createTokenCountMemo, hasTokenizerForFit } from "./read-session-formatting";
+import {
+    createTokenCountMemo,
+    hasTokenizerForFit,
+    tokenCountUsesByteBound,
+} from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import { UNKNOWN_FIT_RATIO } from "./tokenizer-calibration";
 
@@ -257,7 +261,11 @@ export function createFinalWireUsageTracker() {
         ]);
     };
     return {
-        estimate(sessionId: string, input: FinalWireTokenEstimateInput): FinalWireTokenEstimate {
+        estimate(
+            sessionId: string,
+            input: FinalWireTokenEstimateInput,
+            limit?: number,
+        ): FinalWireTokenEstimate {
             let measuredPrefix: FinalWireTokenEstimateInput["measuredPrefix"];
             try {
                 const previous = served.get(sessionId);
@@ -298,7 +306,7 @@ export function createFinalWireUsageTracker() {
             } catch {
                 /* Missing or uncorrelated evidence falls back to current calibration. */
             }
-            return estimateFinalWireInputTokens({ ...input, measuredPrefix });
+            return estimateOutgoingWireForRefusal({ ...input, measuredPrefix }, limit);
         },
         capture(sessionId: string, input: FinalWireTokenEstimateInput): void {
             served.delete(sessionId);
@@ -326,7 +334,7 @@ export interface FinalWireTokenEstimate {
     /** Unlike trusted, this excludes unknown/family fit and borrowed tool envelopes. */
     refusalGrade?: boolean;
     refusalTokens?: number;
-    refusalBasis?: "calibrated" | "provider-prefix";
+    refusalBasis?: "calibrated" | "provider-prefix" | "byte-bound";
     messageTokens: MessageTokenEstimate;
     systemTokens: number;
     toolDefinitionTokens: number | undefined;
@@ -348,6 +356,66 @@ export interface FinalWireTokenEstimate {
  * This is not exact provider tokenization: provider framing remains unmeasured.
  * Fit callers must require trusted, not merely compare a numeric partial estimate.
  */
+/** Healthy-send checks settle cheap byte bounds before invoking BPE. Admission
+ * continues to use its existing separate fit policy and complete envelope. */
+export function estimateOutgoingWireForRefusal(
+    input: FinalWireTokenEstimateInput,
+    limit?: number,
+): FinalWireTokenEstimate {
+    if (typeof limit === "number" && Number.isFinite(limit) && limit > 0) {
+        const measured = input.measuredPrefix;
+        const baseline = measured?.inputTokens ?? 0;
+        const pricedMessages = measured?.appendedMessages ?? input.messages;
+        const bytes = wireContentBytes(pricedMessages, Math.max(0, limit - baseline) * 4, 4);
+        if (bytes) {
+            const lower = baseline + Math.ceil(bytes.bytes / 4);
+            const calibration = resolveDecisionCalibration(input.providerID, input.modelID);
+            const tools =
+                input.providerID && input.modelID
+                    ? getMeasuredToolDefinitionTokens(
+                          input.providerID,
+                          input.modelID,
+                          input.agentName,
+                      )
+                    : undefined;
+            const envelope = measured
+                ? baseline
+                : tools !== undefined &&
+                    Number.isFinite(input.systemPromptTokens) &&
+                    input.systemPromptTokens > 0
+                  ? providerMass({ system: input.systemPromptTokens, tools }, calibration, true)
+                  : undefined;
+            const upper =
+                envelope === undefined
+                    ? undefined
+                    : envelope +
+                      Math.ceil(
+                          bytes.bytes *
+                              Math.max(
+                                  UNKNOWN_FIT_RATIO,
+                                  calibration.toolsRatio,
+                                  calibration.proseRatio,
+                              ),
+                      );
+            if (bytes.aborted || lower > limit || (upper !== undefined && upper <= limit)) {
+                const over = bytes.aborted || lower > limit;
+                return {
+                    tokens: over ? lower : upper!,
+                    trusted: !over,
+                    refusalGrade: over,
+                    refusalTokens: over ? lower : undefined,
+                    refusalBasis: "byte-bound",
+                    messageTokens: { conversation: 0, toolCall: 0 },
+                    systemTokens: input.systemPromptTokens,
+                    toolDefinitionTokens: tools,
+                    toolDefinitionsMeasured: tools !== undefined,
+                };
+            }
+        }
+    }
+    return estimateFinalWireInputTokens(input);
+}
+
 export function estimateFinalWireInputTokens(
     input: FinalWireTokenEstimateInput,
 ): FinalWireTokenEstimate {
@@ -397,7 +465,8 @@ export function estimateFinalWireInputTokens(
         complete &&
         hasTokenizerForFit() &&
         measuredToolDefinitions !== undefined &&
-        hasMeasuredDecisionCalibration(calibration);
+        hasMeasuredDecisionCalibration(calibration) &&
+        input.messages.every(hasRefusalCountableParts);
     const measured = input.measuredPrefix;
     const useMeasured =
         refusalGrade &&
@@ -449,6 +518,17 @@ export function estimateFinalWireInputTokens(
         toolDefinitionTokens,
         toolDefinitionsMeasured: measuredToolDefinitions !== undefined,
     };
+}
+
+function hasRefusalCountableParts(message: MessageLike): boolean {
+    let exact = true;
+    visitWireContent(message, {
+        text: (_bucket, value) => {
+            if (tokenCountUsesByteBound(serializedText(value))) exact = false;
+        },
+        image: () => {},
+    });
+    return exact;
 }
 
 /** A measured request already paid for its envelope; estimate only new messages. */

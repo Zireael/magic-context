@@ -4,8 +4,11 @@ import {
 	hasMeasuredDecisionCalibration,
 	providerMass,
 } from "@magic-context/core/hooks/magic-context/decision-calibration";
-import { hasTokenizerForFit } from "@magic-context/core/hooks/magic-context/read-session-formatting";
-
+import {
+	hasTokenizerForFit,
+	tokenCountUsesByteBound,
+} from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import { UNKNOWN_FIT_RATIO } from "@magic-context/core/hooks/magic-context/tokenizer-calibration";
 import { tokenizePiMessages } from "./tokenize-pi-messages";
 
 export class PiStorageBusyError extends Error {
@@ -86,12 +89,13 @@ export function estimatePiOutgoingInputTokens(
 	messages: readonly unknown[],
 	observed?: PiFitEnvelope,
 	measuredPrefix?: PiMeasuredPrefixFit,
+	contextLimit?: number,
 ): {
 	tokens: number;
 	trusted: boolean;
 	refusalGrade?: boolean;
 	refusalTokens?: number;
-	refusalBasis?: "calibrated" | "provider-prefix";
+	refusalBasis?: "calibrated" | "provider-prefix" | "byte-bound";
 } {
 	if (
 		!observed ||
@@ -118,6 +122,83 @@ export function estimatePiOutgoingInputTokens(
 		);
 	});
 	if (!complete) return { tokens: 0, trusted: false };
+	const measuredForBounds =
+		measuredPrefix &&
+		measuredPrefix.modelKey === observed.modelKey &&
+		observed.envelopeSignature &&
+		measuredPrefix.envelopeSignature === observed.envelopeSignature &&
+		Number.isSafeInteger(measuredPrefix.inputTokens) &&
+		measuredPrefix.inputTokens > 0
+			? measuredPrefix
+			: undefined;
+	if (contextLimit && Number.isFinite(contextLimit) && contextLimit > 0) {
+		const priced = measuredForBounds?.appendedMessages ?? messages;
+		const baseline = measuredForBounds?.inputTokens ?? 0;
+		let contentBytes = 0;
+		for (const rawMessage of priced) {
+			const message = rawMessage as {
+				content:
+					| string
+					| Array<{
+							text?: string;
+							thinking?: string;
+							thinkingSignature?: string;
+							textSignature?: string;
+							name?: string;
+							arguments?: unknown;
+					  }>;
+			};
+			if (typeof message.content === "string")
+				contentBytes += Buffer.byteLength(message.content);
+			else
+				for (const part of message.content) {
+					for (const value of [
+						part.text,
+						part.thinking,
+						part.thinkingSignature,
+						part.textSignature,
+						part.name,
+					])
+						if (typeof value === "string")
+							contentBytes += Buffer.byteLength(value);
+					if (part.arguments !== undefined)
+						contentBytes += Buffer.byteLength(JSON.stringify(part.arguments));
+				}
+			if (baseline + Math.ceil(contentBytes / 4) > contextLimit) break;
+		}
+		const lower = baseline + Math.ceil(contentBytes / 4);
+		if (lower > contextLimit)
+			return {
+				tokens: lower,
+				trusted: false,
+				refusalGrade: true,
+				refusalTokens: lower,
+				refusalBasis: "byte-bound",
+			};
+		const envelope = measuredForBounds
+			? baseline
+			: providerMass(
+					{
+						system: observed.systemTokens,
+						tools: observed.toolDefinitionTokens,
+					},
+					observed.calibration ?? calibrationForModelKey(observed.modelKey),
+					true,
+				);
+		const fit =
+			observed.calibration ?? calibrationForModelKey(observed.modelKey);
+		const upper =
+			envelope +
+			Math.max(UNKNOWN_FIT_RATIO, fit.toolsRatio, fit.proseRatio) *
+				Buffer.byteLength(JSON.stringify(priced));
+		if (upper <= contextLimit)
+			return {
+				tokens: upper,
+				trusted: true,
+				refusalGrade: false,
+				refusalBasis: "byte-bound",
+			};
+	}
 	const raw = tokenizePiMessages([...messages]);
 	const calibration =
 		observed.calibration ?? calibrationForModelKey(observed.modelKey);
@@ -135,6 +216,25 @@ export function estimatePiOutgoingInputTokens(
 	);
 	const refusalGrade =
 		Number.isFinite(tokens) &&
+		messages.every((rawMessage) => {
+			const content = (rawMessage as { content: unknown }).content;
+			if (typeof content === "string") return !tokenCountUsesByteBound(content);
+			return (content as Array<Record<string, unknown>>).every((part) =>
+				[
+					part.text,
+					part.thinking,
+					part.thinkingSignature,
+					part.textSignature,
+					part.name,
+					part.arguments === undefined
+						? undefined
+						: JSON.stringify(part.arguments),
+				].every(
+					(value) =>
+						typeof value !== "string" || !tokenCountUsesByteBound(value),
+				),
+			);
+		}) &&
 		hasMeasuredDecisionCalibration(refusalCalibration) &&
 		observed.toolDefinitionsMeasured === true &&
 		Number.isFinite(observed.refusalToolDefinitionTokens) &&

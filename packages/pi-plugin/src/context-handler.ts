@@ -4040,6 +4040,7 @@ export function registerPiContextHandler(
 								(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
 							)
 						: undefined,
+					rawFallbackLimit,
 				);
 				const refusal = outgoingContextRefusal(
 					estimate,

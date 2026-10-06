@@ -13,6 +13,32 @@ import {
 } from "./pi-raw-fallback";
 import { tokenizePiMessages } from "./tokenize-pi-messages";
 
+it("Pi healthy refusal settles huge and small byte bounds without BPE", () => {
+	const envelope = {
+		modelKey: "unknown/unknown",
+		systemTokens: 100,
+		toolDefinitionTokens: 0,
+	};
+	const startedAt = performance.now();
+	const huge = estimatePiOutgoingInputTokens(
+		[{ role: "toolResult", content: "x".repeat(12 * 1024 * 1024) }],
+		envelope,
+		undefined,
+		16000,
+	);
+	expect(huge.refusalBasis).toBe("byte-bound");
+	expect(huge.refusalGrade).toBe(true);
+	expect(performance.now() - startedAt).toBeLessThan(1000);
+	const small = estimatePiOutgoingInputTokens(
+		[{ role: "user", content: "x".repeat(4000) }],
+		envelope,
+		undefined,
+		16000,
+	);
+	expect(small.refusalBasis).toBe("byte-bound");
+	expect(small.refusalGrade).toBe(false);
+});
+
 it("re-review: Pi must not refuse a fitting uncalibrated request on the unknown-model upper envelope", () => {
 	const messages = [
 		{

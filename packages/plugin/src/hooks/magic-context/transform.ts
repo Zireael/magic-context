@@ -2717,14 +2717,18 @@ export function createTransform(deps: TransformDeps) {
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (postTransformResult.bustedThisPass) {
             try {
-                finalWireEstimate = finalWireUsage.estimate(sessionId, {
-                    messages,
-                    systemPromptTokens: sessionMeta.systemPromptTokens,
-                    providerID: modelForBudget?.providerID,
-                    modelID: modelForBudget?.modelID,
-                    agentName: notificationParams.agent,
-                    systemPromptHash: sessionMeta.systemPromptHash,
-                });
+                finalWireEstimate = finalWireUsage.estimate(
+                    sessionId,
+                    {
+                        messages,
+                        systemPromptTokens: sessionMeta.systemPromptTokens,
+                        providerID: modelForBudget?.providerID,
+                        modelID: modelForBudget?.modelID,
+                        agentName: notificationParams.agent,
+                        systemPromptHash: sessionMeta.systemPromptHash,
+                    },
+                    boundaryContextLimit,
+                );
             } catch {
                 sessionLog(
                     sessionId,
@@ -2743,14 +2747,18 @@ export function createTransform(deps: TransformDeps) {
             finalWireEstimate =
                 finalWireEstimate ??
                 (emergencyUsagePercentage >= 95 || schedulerDecision === "execute"
-                    ? finalWireUsage.estimate(sessionId, {
-                          messages,
-                          systemPromptTokens: sessionMeta.systemPromptTokens,
-                          providerID: modelForBudget?.providerID,
-                          modelID: modelForBudget?.modelID,
-                          agentName: notificationParams.agent,
-                          systemPromptHash: sessionMeta.systemPromptHash,
-                      })
+                    ? finalWireUsage.estimate(
+                          sessionId,
+                          {
+                              messages,
+                              systemPromptTokens: sessionMeta.systemPromptTokens,
+                              providerID: modelForBudget?.providerID,
+                              modelID: modelForBudget?.modelID,
+                              agentName: notificationParams.agent,
+                              systemPromptHash: sessionMeta.systemPromptHash,
+                          },
+                          boundaryContextLimit,
+                      )
                     : undefined);
             if (finalWireEstimate) {
                 sessionLog(

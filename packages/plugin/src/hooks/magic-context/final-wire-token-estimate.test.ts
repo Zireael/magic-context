@@ -9,6 +9,7 @@ import {
     createFinalWireUsageTracker,
     describeFinalWireTail,
     estimateFinalWireInputTokens,
+    estimateOutgoingWireForRefusal,
     type FinalWireTokenEstimate,
 } from "./final-wire-token-estimate";
 import { estimateTokens } from "./read-session-formatting";
@@ -17,6 +18,37 @@ import type { MessageLike } from "./tag-messages";
 const MODEL = { providerID: "test-provider", modelID: "test-model", agentName: "build" };
 
 afterEach(() => __resetToolDefinitionMeasurements());
+
+it("healthy refusal settles over and under byte bounds without token counts", () => {
+    recordToolDefinition(MODEL.providerID, MODEL.modelID, MODEL.agentName, "read", "Read", {});
+    const huge = estimateOutgoingWireForRefusal(
+        {
+            messages: [toolMessage("x".repeat(12 * 1024 * 1024 + 1000))],
+            systemPromptTokens: 100,
+            ...MODEL,
+        },
+        16000,
+    );
+    expect(huge.refusalBasis).toBe("byte-bound");
+    expect(huge.refusalGrade).toBe(true);
+    expect(huge.messageTokens).toEqual({ conversation: 0, toolCall: 0 });
+    const small = estimateOutgoingWireForRefusal(
+        { messages: [toolMessage("x".repeat(4000))], systemPromptTokens: 100, ...MODEL },
+        16000,
+    );
+    expect(small.refusalBasis).toBe("byte-bound");
+    expect(small.refusalGrade).toBe(false);
+    expect(small.messageTokens).toEqual({ conversation: 0, toolCall: 0 });
+});
+
+it("pathological text uses a bounded byte count without disabling ordinary tokenization", () => {
+    const ordinary = estimateTokens("ordinary words");
+    const text = "x".repeat(12 * 1024 * 1024);
+    const startedAt = performance.now();
+    expect(estimateTokens(text)).toBe(Buffer.byteLength(text));
+    expect(performance.now() - startedAt).toBeLessThan(1000);
+    expect(estimateTokens("ordinary words")).toBe(ordinary);
+});
 
 it("borrowed tool definitions and family fallback are admission-only even on complete over-limit envelopes", () => {
     recordToolDefinition("other", "route", "build", "probe", "word ".repeat(20000), {});
