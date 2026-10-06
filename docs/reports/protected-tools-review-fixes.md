@@ -357,3 +357,67 @@ of the package's Solid configuration; its correct package-local retry passed.
 All storage was in-memory or preload/fixture-owned temporary roots; no live host
 or provider was started. Full-plugin completion remains an explicit verification
 gap, not a claimed pass.
+
+## Synchronous tokenizer hang correction
+
+The earlier full-plugin gap is now closed. Master was merged at `47234a3745`.
+The isolated oversized-priced-snapshot regression hit a hard 10-second timeout
+before the fix. A temporary diagnostic confirmed the stack: the Rust-mode healthy
+refusal path called `estimateFinalWireInputTokens` → `estimateMessageTokens` →
+`serializedTokens` with **12,583,912 characters**, before replay admission's cheap
+byte proxy could run. The diagnostic was removed; this was synchronous BPE work,
+not merely machine contention or an asynchronous test timeout.
+
+Healthy refusal checks now settle over/under byte bounds before BPE and tokenize
+only uncertain envelopes. Provider-measured prefix usage remains the baseline;
+only the new tail is bounded. Missing envelope evidence still cannot originate
+a healthy refusal. Byte-derived evidence is named separately from calibrated
+counts. Priced refusals invalidate an obsolete durable snapshot before returning.
+
+`estimateTokens` previously had no input-cost guard. Its memo's byte ceiling only
+bounded retention **after** encoding. It now bounds individual BPE calls to 4096 UTF-16 code units
+chunks, splits ordinary prose before whitespace to preserve measured mass, and
+uses a byte upper bound for pathological unbroken runs or parts beyond the total
+work ceiling. Fallback does not disable ordinary tokenization. Bound-only message
+counts do not become calibrated refusal evidence. Shared hygiene differential
+corpora and the 250k-token memoization control pass without changing their goldens.
+
+Admission already rejected byte-over arrays before tokenization. It still had
+the same exposure in uncertain-band text and in other direct tokenizer callers,
+including tool/schema counting; the shared cost guard now bounds those routes too.
+
+The fail-first real-pass regression requires the 12 MB second pass to complete
+under one second. It now completes in **3.1 ms** in the full suite (4.3 ms in the
+initial isolated restored run), still returns `EmergencyFailClosedError`, and
+retains its stale-LKG invalidation assertions. Its failure counter is now zero:
+the cheap refusal is a healthy context decision, not an engine capture failure.
+The originally failing 12 MB fixture and normal force-latch/incomplete-system
+fixtures all pass; no unrelated timeout or hygiene expectation was weakened.
+
+### Final gates
+
+| Command/check | Result |
+| --- | --- |
+| Full plugin `bun run test` | **7016 passed, 4 skipped, 0 failed**; 7020 tests across 678 files in 185.22s |
+| Full Pi `bun run test` | **1562 passed, 3 skipped, 0 failed**; 1565 tests across 145 files in 41.31s |
+| Root `bun run lint` | **Passed with zero errors**; 1603 files checked (13 warnings and 3 infos) |
+| Plugin and Pi repository typechecks | Passed, TypeScript 5.9.3 |
+| Root package build | Passed; 4 OpenCode 2 loader tests, 19 assertions |
+| Refusal/estimation and replay-fit targeted suites | 43 passed, 123 assertions |
+| Pi refusal/provider-usage targeted suites | 16 passed, 73 assertions |
+| Hygiene differential/performance controls | 5 passed, 209 assertions |
+
+The complete plugin script includes the required frozen installation and
+`bun test --parallel=4 --timeout 30000`. Its first completed runs exposed unrelated
+fixture Git-commit timeouts: inherited command-line `core.hooksPath` pointed at
+external AFT hooks. The final run removed only inherited `GIT_CONFIG_*` hook
+environment from test subprocesses; fixture-local Git configuration and all tests
+remain enabled. No test timeout was increased or assertion removed to obtain the
+successful full-suite result. Package import organization was checked, including
+the Pi context-handler imports already moved to the top on merged master.
+
+Logs: ignored `target/self-stamp-verification/plugin-complete.*`,
+`pi-complete.*` and `root-lint-final.*`. Bun 1.4.2 and Biome 2.5.1 were used.
+All stores remained in-memory or preload/fixture-owned temporary roots; no live
+host/provider/store was opened. Native Rust and package manifests/lockfiles were
+not changed in this correction.
