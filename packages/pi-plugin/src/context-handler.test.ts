@@ -49,6 +49,7 @@ import {
 	getOverflowState,
 	recordDetectedContextLimit,
 	recordOverflowDetected,
+	setPersistedNoteNudgeTriggerMessageId,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
@@ -2413,7 +2414,6 @@ describe("registerPiContextHandler", () => {
 				sessionId: "ses-context",
 				content: "Remember to update docs.",
 			});
-			onNoteTrigger(db, "ses-context", "historian_complete");
 
 			const triggerMsg = userMessage("trigger turn", 1);
 			const newMsg = userMessage("new turn", 2);
@@ -2426,6 +2426,8 @@ describe("registerPiContextHandler", () => {
 					[triggerMsg],
 				) as never,
 			);
+			// Arm after the prior user was served; initial rebuilds may deliver immediately.
+			onNoteTrigger(db, "ses-context", "historian_complete");
 			const result = await handler(
 				{ messages: [newMsg] as never[] },
 				fakeContext(
@@ -2447,6 +2449,86 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("delivers a pending note on a Pi rebuild and replays identical bytes on defer", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-note-rebuild";
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const pass = async () => {
+				const messages = [userMessage("latest real user", 1)];
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				return (
+					await handler(
+						{ messages: messages as never[] },
+						fakeContext(
+							sessionId,
+							process.cwd(),
+							["entry-latest"],
+							messages,
+						) as never,
+					)
+				).messages;
+			};
+			addNote(db, "session", { sessionId, content: "Rebuild reminder" });
+			onNoteTrigger(db, sessionId, "historian_complete");
+			setPersistedNoteNudgeTriggerMessageId(db, sessionId, "entry-latest");
+			signalPiPendingMaterialization(sessionId);
+			const rebuilt = await pass();
+			expect(textOf(rebuilt[0] as never)).toContain("deferred_notes");
+			expect(await pass()).toEqual(rebuilt);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("does not append a late note trigger to a served Pi user, including after restart", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-late-note";
+		try {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const pass = async (fresh = false) => {
+				const messages = [userMessage("already on the wire", 1)];
+				const ids = ["entry-served"];
+				if (fresh) {
+					messages.push(userMessage("new work", 2));
+					ids.push("entry-new");
+				}
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				return (
+					await handler(
+						{ messages: messages as never[] },
+						fakeContext(sessionId, process.cwd(), ids, messages) as never,
+					)
+				).messages;
+			};
+			const served = await pass();
+			addNote(db, "session", { sessionId, content: "Late reminder" });
+			onNoteTrigger(db, sessionId, "historian_complete");
+			setPersistedNoteNudgeTriggerMessageId(db, sessionId, "entry-old-trigger");
+			expect(await pass()).toEqual(served);
+			clearContextHandlerSession(sessionId);
+			registerPiContextHandler(fake.pi as never, { db });
+			expect(await pass()).toEqual(served);
+			expect(getNoteNudgeAnchors(db, sessionId)).toEqual([]);
+			const delivered = await pass(true);
+			expect(delivered[0]).toEqual(served[0]);
+			expect(textOf(delivered[1] as never)).toContain("deferred_notes");
+			expect(await pass(true)).toEqual(delivered);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("replays sticky note nudges idempotently across passes", async () => {
 		const db = createTestDb();
 		try {
@@ -2463,7 +2545,6 @@ describe("registerPiContextHandler", () => {
 				sessionId,
 				content: "Sticky reminder.",
 			});
-			onNoteTrigger(db, sessionId, "historian_complete");
 			const triggerMsg = userMessage("trigger turn", 1);
 			const newMsg = userMessage("new turn", 2);
 			await handler(
@@ -2475,6 +2556,7 @@ describe("registerPiContextHandler", () => {
 					[triggerMsg],
 				) as never,
 			);
+			onNoteTrigger(db, sessionId, "historian_complete");
 			await handler(
 				{ messages: [newMsg] as never[] },
 				fakeContext(sessionId, process.cwd(), ["entry-new"], [newMsg]) as never,
@@ -2620,7 +2702,6 @@ describe("registerPiContextHandler", () => {
 				event: { messages: never[] },
 				ctx: never,
 			) => Promise<{ messages: never[] }>;
-			onNoteTrigger(db, sessionId, "historian_complete");
 			const turn = async (id: string) => {
 				const msg = userMessage("next turn", 1);
 				return handler(
@@ -2629,6 +2710,7 @@ describe("registerPiContextHandler", () => {
 				);
 			};
 			await turn("entry-1");
+			onNoteTrigger(db, sessionId, "historian_complete");
 			const delivered = await turn("entry-2");
 			expect(delivered.messages.map(textOf).join("\n")).toContain(
 				"Smart note check unavailable",
