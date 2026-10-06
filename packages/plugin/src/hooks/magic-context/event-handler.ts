@@ -73,6 +73,7 @@ import {
     resolveModelKey,
     resolveSessionId,
 } from "./event-resolvers";
+import { lkgProviderInputTotal, noteLkgProviderResponse } from "./lkg-measured-request";
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
 import { readRawSessionMessages } from "./read-session-chunk";
@@ -523,6 +524,19 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
                 return;
             }
+
+            noteLkgProviderResponse({
+                sessionId: info.sessionID,
+                responseId: info.messageID,
+                modelKey:
+                    info.providerID && info.modelID
+                        ? `${info.providerID}/${info.modelID}`
+                        : undefined,
+                inputTokens: lkgProviderInputTotal(info.tokens),
+                completedAt: info.completedAt,
+                finish: info.finish,
+                error: info.error,
+            });
 
             // Invalidate this message's cached token contribution. The message
             // content is finalized at this event — if a prior transform pass

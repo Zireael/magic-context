@@ -64,6 +64,11 @@ import {
     createToolExecuteAfterHook,
 } from "../../hooks/magic-context/hook-handlers";
 import { materializeM0 } from "../../hooks/magic-context/inject-compartments";
+import {
+    beginV2LkgRequest,
+    lkgProviderInputTotal,
+    noteLkgProviderResponse,
+} from "../../hooks/magic-context/lkg-measured-request";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
@@ -82,6 +87,7 @@ import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { registerRpcHandlers } from "../../plugin/rpc-handlers";
 import { hideSubagentTools } from "../../plugin/subagent-tool-policy";
+import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { detectConflicts } from "../../shared/conflict-detector";
 import { getDataDir, getMagicContextStorageDir } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
@@ -985,6 +991,7 @@ export async function registerContext(context: V2Context) {
      * when that could not be done safely (the context database is not durable, or a
      * store could not be read); the usage figure itself never makes a turn unsafe.
      */
+    const latestLkgResponseIds = new BoundedSessionMap<string | undefined>(1000);
     const recordUsage = async (
         draft: Pick<SessionContext, "sessionID" | "model">,
     ): Promise<boolean> => {
@@ -998,6 +1005,22 @@ export async function registerContext(context: V2Context) {
             const reader = openStoreReader();
             try {
                 const latest = reader.latestAssistant(draft.sessionID);
+                latestLkgResponseIds.set(draft.sessionID, latest?.id);
+                if (latest)
+                    noteLkgProviderResponse({
+                        sessionId: draft.sessionID,
+                        responseId: latest.id,
+                        modelKey:
+                            latest.data.model?.providerID && latest.data.model?.id
+                                ? `${latest.data.model.providerID}/${latest.data.model.id}`
+                                : undefined,
+                        inputTokens: lkgProviderInputTotal(latest.data.tokens),
+                        completedAt: latest.data.time?.completed,
+                        createdAt: latest.data.time?.created ?? latest.time_created,
+                        finish: latest.data.finish,
+                        error: latest.data.error,
+                        v2: true,
+                    });
                 const draftModelKey = `${draft.model.providerID}/${draft.model.id}`;
                 if (!queriedModels.has(draftModelKey)) {
                     const catalog = await Promise.resolve(context.model.list());
@@ -1648,6 +1671,11 @@ export async function registerContext(context: V2Context) {
                     );
             }
             const mapped = adaptPayload(draft, admitted);
+            beginV2LkgRequest(
+                draft.sessionID,
+                `${draft.model.providerID}/${draft.model.id}`,
+                latestLkgResponseIds.get(draft.sessionID),
+            );
             await createMessagesTransformHandler({
                 magicContext: { "experimental.chat.messages.transform": transform },
                 compactionOff,

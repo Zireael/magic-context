@@ -85,6 +85,11 @@ import {
     ENGINE_RECONNECTING_USER_MESSAGE,
 } from "./emergency-fail-closed";
 import { getVisibleMemoryIds } from "./inject-compartments";
+import {
+    beginV2LkgRequest,
+    clearLkgMeasuredRequest,
+    noteLkgProviderResponse,
+} from "./lkg-measured-request";
 import { createDbLkgPersistence, loadPersistedLkgSlot } from "./lkg-persist";
 import * as lkgSlot from "./lkg-slot";
 import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
@@ -7690,6 +7695,81 @@ describe("rust-mode wire transport (protected_tokens_effective)", () => {
         expect(transformBodies[0]?.protected_tokens_effective).toBe(10_240);
     });
 });
+
+for (const host of ["v1", "v2"] as const) {
+    it(`${host} Rust failure serves measured 633258 LKG plus a small tail instead of inflated 912733`, async () => {
+        const sessionId = `measured-rust-replay-${host}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        const modelKey = "test-provider/test-model";
+        if (host === "v1")
+            noteLkgProviderResponse({ sessionId, modelKey, responseId: "reply", inputTokens: 0 });
+        else beginV2LkgRequest(sessionId, modelKey, "previous-reply");
+        let failing = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (failing) throw new Error("rust module request timed out");
+                return {
+                    decision: "HARD",
+                    row_version: 1,
+                    native_messages: structuredClone(input),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            rawFallbackEstimatorForTests: () => ({
+                tokens: 912_733,
+                trusted: true,
+                messageTokens: { conversation: 900_000, toolCall: 0 },
+                systemTokens: 100,
+                toolDefinitionTokens: 12_633,
+            }),
+        });
+        const meta = makeMeta(db, sessionId);
+        recordDetectedContextLimit(db, sessionId, 872_000, modelKey);
+        await transform.run(sessionId, input, { messages: [...input] }, meta);
+        const saved = getSlot(sessionId)!;
+        expect(saved).toBeDefined();
+        noteLkgProviderResponse({
+            sessionId,
+            modelKey,
+            responseId: "reply",
+            inputTokens: 633_258,
+            finish: "stop",
+            completedAt: Date.now() + 1,
+            ...(host === "v2" ? { v2: true, createdAt: Date.now() + 1 } : {}),
+        });
+        const next: MessageLike[] = [
+            ...input,
+            {
+                info: { id: "reply", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "small reply" }],
+            } as MessageLike,
+            {
+                info: {
+                    id: "next",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "continue" }],
+            } as MessageLike,
+        ];
+        failing = true;
+        const output = { messages: structuredClone(next) as unknown[] };
+        await transform.run(sessionId, next, output, meta);
+        expect(output.messages).toEqual([
+            ...JSON.parse(saved.jsonPrefix),
+            ...next.slice(input.length),
+        ]);
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        clearLkgMeasuredRequest(sessionId);
+    });
+}
 
 it("refuses a tiny untrusted fallback estimate instead of treating the byte proxy as fit proof", async () => {
     const sessionId = "fit-incomplete-fallback";

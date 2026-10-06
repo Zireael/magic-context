@@ -1,4 +1,5 @@
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
+import { claimLkgRequestIdentity, noteCapturedLkgRequest } from "./lkg-measured-request";
 import {
     captureSlot,
     dropSlot,
@@ -219,6 +220,8 @@ export interface LkgCaptureInput {
     modelKey: string | null;
     providerKey: string | null;
     capturedAt?: number;
+    systemPromptTokens?: number;
+    agentName?: string;
 }
 
 export type LkgValidationFailure =
@@ -405,7 +408,7 @@ export function captureLkgSlot(args: LkgCaptureInput): boolean {
     const built = buildLkgPrefix(args.input, args.output);
     if (!built) return false;
     const modelKeys = canonicalLkgModelKeys(args.modelKey, args.providerKey);
-    return captureSlot(args.sessionId, {
+    const slot: LkgSlot = {
         jsonPrefix: built.jsonPrefix,
         inputIdSeq: built.inputIdSeq,
         inputContentDigests: built.inputContentDigests,
@@ -413,7 +416,22 @@ export function captureLkgSlot(args: LkgCaptureInput): boolean {
         modelKey: modelKeys.modelKey,
         providerKey: modelKeys.providerKey,
         capturedAt: args.capturedAt ?? Date.now(),
-    });
+    };
+    const captured = captureSlot(args.sessionId, slot);
+    if (captured)
+        noteCapturedLkgRequest({
+            sessionId: args.sessionId,
+            slot,
+            // A TS slot can end before the request's active tool tail. Such a partial
+            // snapshot is not the request the provider measured.
+            request:
+                built.anchorIndex === args.input.length - 1
+                    ? claimLkgRequestIdentity(args.sessionId)
+                    : undefined,
+            systemPromptTokens: args.systemPromptTokens ?? 0,
+            agentName: args.agentName,
+        });
+    return captured;
 }
 
 function entryIdsAreValid(slot: LkgSlot, entryIds: string[]): boolean {
