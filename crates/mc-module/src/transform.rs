@@ -1643,6 +1643,11 @@ pub struct TransformResponse {
     /// need to interpret the legacy action field.
     #[serde(default)]
     pub decision: String,
+    /// Response-local permission for host prefix mutations, from the final served plan.
+    /// A marker-only HARD may preserve the prefix; a reclaim opportunity is not permission.
+    /// Always serialized, including false. Older responses deserialize conservatively.
+    #[serde(default)]
+    pub prefix_bust_permitted: bool,
     /// Canonical execute/defer class shared with TypeScript transform telemetry.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub scheduler_decision: Option<String>,
@@ -1744,6 +1749,7 @@ impl TransformResponse {
             full_array_fingerprint,
             action: "NEED_FULL_SYNC".to_string(),
             decision: "NEED_FULL_SYNC".to_string(),
+            prefix_bust_permitted: false,
             scheduler_decision: None,
             scheduler_defer_reason: None,
             materialize_reason: None,
@@ -1784,6 +1790,7 @@ impl TransformResponse {
             full_array_fingerprint,
             action: "PASSTHROUGH".to_string(),
             decision: "PASSTHROUGH".to_string(),
+            prefix_bust_permitted: false,
             scheduler_decision: None,
             scheduler_defer_reason: None,
             materialize_reason: None,
@@ -3534,6 +3541,10 @@ fn apply_additive_only(
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: action.clone(),
             decision: action,
+            prefix_bust_permitted: matches!(
+                plan,
+                PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
+            ),
             scheduler_decision: Some(scheduler_outcome.pass.canonical_decision().to_string()),
             scheduler_defer_reason: scheduler_outcome
                 .defer_reason
@@ -6966,6 +6977,7 @@ fn apply_once(
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: result_action.clone(),
             decision: result_action,
+            prefix_bust_permitted: is_provider_prefix_mutation_pass,
             scheduler_decision: Some(scheduler_outcome.pass.canonical_decision().to_string()),
             scheduler_defer_reason: scheduler_outcome
                 .defer_reason
@@ -21372,6 +21384,11 @@ pub(crate) mod tests {
             .unwrap();
         let hard = transform(&s, &request, &ctx).unwrap();
         assert_eq!(hard.action, "HARD");
+        assert!(!hard.prefix_bust_permitted);
+        assert_eq!(
+            serde_json::to_value(&hard).unwrap()["prefix_bust_permitted"],
+            false
+        );
         assert_eq!(m0_bytes(&hard), m0_bytes(&baseline));
         assert_eq!(m1_bytes(&hard), m1_bytes(&baseline));
         assert!(!s.load("ses").unwrap().meta.project_memory_epoch_pending);
@@ -21469,11 +21486,64 @@ pub(crate) mod tests {
             .unwrap();
         let hard = transform(&s, &request, &ctx).unwrap();
         assert_eq!(hard.action, "HARD");
+        assert!(hard.prefix_bust_permitted);
+        assert_eq!(
+            serde_json::to_value(&hard).unwrap()["prefix_bust_permitted"],
+            true
+        );
         assert_ne!(m0_bytes(&hard), m0_bytes(&baseline));
         assert!(s.load_pending_agent_drops("ses").unwrap().is_empty());
         assert!(frozen_red_payload(&s.load("ses").unwrap().core, "tail#0").is_some());
         let replay = transform(&s, &request, &ctx).unwrap();
         assert_eq!(replay.messages(), hard.messages());
+    }
+
+    #[test]
+    fn force_opportunity_without_eligible_work_does_not_certify_a_served_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![item("a", 1, "raw"), item("tail", 2, "protected tail")],
+            ),
+            10,
+            100,
+        );
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        transform(&s, &request, &ctx).unwrap();
+        let baseline = transform(&s, &request, &ctx).unwrap();
+        let force = with_usage(request.clone(), 90, 100);
+        let response = transform(&s, &force, &ctx).unwrap();
+        assert_eq!(response.action, "SOFT+");
+        assert_eq!(response.messages(), baseline.messages());
+        assert!(
+            !response.prefix_bust_permitted,
+            "a force opportunity is not a served rebuild"
+        );
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["prefix_bust_permitted"],
+            false
+        );
+    }
+
+    #[test]
+    fn prefix_permission_is_explicit_on_compatibility_and_full_sync_responses() {
+        for response in [
+            TransformResponse::need_full_sync(None),
+            TransformResponse::passthrough(vec![], None),
+        ] {
+            let mut wire = serde_json::to_value(&response).unwrap();
+            assert_eq!(wire["prefix_bust_permitted"], false);
+            wire.as_object_mut()
+                .unwrap()
+                .remove("prefix_bust_permitted");
+            let old: TransformResponse = serde_json::from_value(wire).unwrap();
+            assert!(!old.prefix_bust_permitted);
+        }
     }
 
     fn regate_mark_epoch_pending(s: &McStore, session: &str) {
