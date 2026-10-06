@@ -2,7 +2,7 @@ import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
-import { newestCtxReduceTagNumbers } from "./reclaim-protection";
+import { removePendingOp } from "./storage-ops";
 import type { TagEntry } from "./types";
 
 declare module "./types" {
@@ -356,7 +356,7 @@ const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedS
 
 /**
  * Return age-reclaim candidates with the same persisted token estimate used by reclaim hints.
- * The newest ctx_reduce exemplars are omitted before the watermark/value checks in the caller.
+ * Protection is applied by the caller using its shared per-selection snapshot.
  * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
  */
 export function getActiveToolTagsForAgeReclaim(
@@ -394,8 +394,7 @@ export function getActiveToolTagsForAgeReclaim(
                         : (outputTokens ?? 0) + (inputTokens ?? 0),
             };
         });
-    const protectedCtxReduceTags = newestCtxReduceTagNumbers(tags);
-    return tags.filter((tag) => !protectedCtxReduceTags.has(tag.tagNumber));
+    return tags;
 }
 
 /**
@@ -1926,7 +1925,7 @@ export function markTagsCompactedByMessageIds(
          WHERE id = ? AND session_id = ?
             AND status IN ('active', 'dropped')
             AND message_id IS ? AND tool_owner_message_id IS ?
-          RETURNING id`,
+          RETURNING tag_number`,
     );
     let cursor = 0;
     let changed = 0;
@@ -1935,7 +1934,18 @@ export function markTagsCompactedByMessageIds(
         let processed = 0;
         do {
             const row = candidates[cursor++];
-            if (update.get(row.id, sessionId, row.message_id, row.tool_owner_message_id)) changed++;
+            const retired = update.get(
+                row.id,
+                sessionId,
+                row.message_id,
+                row.tool_owner_message_id,
+            ) as { tag_number: number } | null;
+            if (retired) {
+                // The raw source is off-wire. Its held work must leave the queue
+                // in the same transaction, not await another priced drain.
+                removePendingOp(db, sessionId, retired.tag_number);
+                changed++;
+            }
             processed++;
         } while (cursor < candidates.length && processed < 128 && performance.now() - start < 8);
     });

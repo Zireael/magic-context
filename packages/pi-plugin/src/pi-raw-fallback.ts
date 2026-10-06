@@ -1,5 +1,6 @@
 import {
 	calibrationForModelKey,
+	hasMeasuredDecisionCalibration,
 	type DecisionCalibration,
 	providerMass,
 } from "@magic-context/core/hooks/magic-context/decision-calibration";
@@ -69,12 +70,111 @@ export interface PiFitEnvelope {
 	modelKey: string;
 	systemTokens: number;
 	toolDefinitionTokens: number;
+	/** Current route's active definitions, not the all-registered-tools fit envelope. */
+	refusalToolDefinitionTokens?: number;
+	toolDefinitionsMeasured?: boolean;
 	/** Serialized complete envelope with an empty messages array. */
 	envelopeBytes?: number;
 	/** Fingerprint of the complete host system/tools snapshot. */
 	envelopeSignature?: string;
 	/** The session's frozen policy; an absent freeze uses the unknown-model fit rule. */
 	calibration?: DecisionCalibration;
+}
+
+/** A complete final envelope is required; missing metadata must not reject a healthy pass. */
+export function estimatePiOutgoingInputTokens(
+	messages: readonly unknown[],
+	observed?: PiFitEnvelope,
+	measuredPrefix?: PiMeasuredPrefixFit,
+): {
+	tokens: number;
+	trusted: boolean;
+	refusalGrade?: boolean;
+	refusalTokens?: number;
+	refusalBasis?: "calibrated" | "provider-prefix";
+} {
+	if (
+		!observed ||
+		!Number.isFinite(observed.systemTokens) ||
+		observed.systemTokens <= 0 ||
+		!Number.isFinite(observed.toolDefinitionTokens) ||
+		observed.toolDefinitionTokens < 0 ||
+		!hasTokenizerForFit()
+	)
+		return { tokens: 0, trusted: false };
+	const complete = messages.every((message) => {
+		if (!message || typeof message !== "object") return false;
+		const m = message as { role?: string; content?: unknown };
+		return (
+			["user", "assistant", "toolResult"].includes(m.role ?? "") &&
+			(typeof m.content === "string" ||
+				(Array.isArray(m.content) &&
+					m.content.every(
+						(p) =>
+							p &&
+							typeof p === "object" &&
+							["text", "thinking", "toolCall"].includes(String(p.type)),
+					)))
+		);
+	});
+	if (!complete) return { tokens: 0, trusted: false };
+	const raw = tokenizePiMessages([...messages]);
+	const calibration =
+		observed.calibration ?? calibrationForModelKey(observed.modelKey);
+	// Admission keeps its frozen policy. Refusal independently requires this
+	// route's measured model seed, never that policy's unknown fit multiplier.
+	const refusalCalibration = calibrationForModelKey(observed.modelKey);
+	const tokens = providerMass(
+		{
+			system: observed.systemTokens,
+			tools: observed.toolDefinitionTokens + raw.toolCall,
+			prose: raw.conversation,
+		},
+		calibration,
+		true,
+	);
+	const refusalGrade =
+		Number.isFinite(tokens) &&
+		hasMeasuredDecisionCalibration(refusalCalibration) &&
+		observed.toolDefinitionsMeasured === true &&
+		Number.isFinite(observed.refusalToolDefinitionTokens) &&
+		observed.refusalToolDefinitionTokens! >= 0;
+	const measured =
+		measuredPrefix &&
+		measuredPrefix.modelKey === observed.modelKey &&
+		observed.envelopeSignature &&
+		measuredPrefix.envelopeSignature === observed.envelopeSignature &&
+		Number.isSafeInteger(measuredPrefix.inputTokens) &&
+		measuredPrefix.inputTokens > 0
+			? measuredPrefix
+			: undefined;
+	const tail = measured
+		? tokenizePiMessages([...measured.appendedMessages])
+		: raw;
+	const refusalTokens = refusalGrade
+		? (measured?.inputTokens ?? 0) +
+			providerMass(
+				{
+					system: measured ? 0 : observed.systemTokens,
+					tools:
+						(measured ? 0 : observed.refusalToolDefinitionTokens!) +
+						tail.toolCall,
+					prose: tail.conversation,
+				},
+				refusalCalibration,
+			)
+		: undefined;
+	return {
+		tokens,
+		trusted: Number.isFinite(tokens),
+		refusalGrade,
+		refusalTokens,
+		refusalBasis: refusalGrade
+			? measured
+				? "provider-prefix"
+				: "calibrated"
+			: undefined,
+	};
 }
 
 export interface PiMeasuredPrefixFit {

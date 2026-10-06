@@ -10,7 +10,11 @@ import {
 	notePiLkgProviderUsage,
 } from "./pi-lkg";
 import { readPiLkgFitEnvelope } from "./pi-lkg-fit-envelope";
-import { assertPiRawFallbackFits } from "./pi-raw-fallback";
+import {
+	assertPiRawFallbackFits,
+	estimatePiOutgoingInputTokens,
+} from "./pi-raw-fallback";
+import { outgoingContextRefusal } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 
 const key = "openai-codex/gpt-5.6-sol";
 const databases: Database[] = [];
@@ -20,7 +24,8 @@ afterEach(() => {
 	resetLkgSlotsForTest();
 	for (const db of databases.splice(0)) db.close();
 });
-function harness() {
+function harness(modelKey = key, prefixOverride?: unknown[]) {
+	const provider = modelKey.slice(0, modelKey.indexOf("/"));
 	const db = new Database(":memory:");
 	databases.push(db);
 	initializeDatabase(db);
@@ -34,12 +39,12 @@ function harness() {
 	const envelope = readPiLkgFitEnvelope(
 		{ getSystemPrompt: () => "Complete host prompt." },
 		{ getAllTools: () => [] },
-		key,
-		calibrationForModelKey(key),
+		modelKey,
+		calibrationForModelKey(modelKey),
 	);
 	if (!envelope?.envelopeSignature)
 		throw new Error("complete envelope required");
-	const prefix = [
+	const prefix = prefixOverride ?? [
 		{
 			role: "user",
 			timestamp: 1,
@@ -56,8 +61,8 @@ function harness() {
 		sessionId,
 		messages: prefix,
 		entryIds: ["input"],
-		modelKey: key,
-		providerKey: "openai-codex",
+		modelKey,
+		providerKey: provider,
 	});
 	const recapture = (flush = true) => {
 		coordinator.captureAppliedPass({
@@ -77,8 +82,8 @@ function harness() {
 	const assistant = {
 		role: "assistant",
 		content: [{ type: "text", text: "Accepted reply" }],
-		model: "gpt-5.6-sol",
-		provider: "openai-codex",
+		model: modelKey.slice(modelKey.indexOf("/") + 1),
+		provider,
 		timestamp: Date.now() + 1,
 		stopReason: "stop",
 		usage: {
@@ -99,8 +104,8 @@ function harness() {
 				sessionId,
 				messages: [...prefix, ...tail],
 				entryIds: ["input", "answer", "new-input"],
-				modelKey: key,
-				providerKey: "openai-codex",
+				modelKey,
+				providerKey: provider,
 			}),
 			(id) => (id === "answer" ? parent : undefined),
 		);
@@ -108,6 +113,19 @@ function harness() {
 		db,
 		sessionId,
 		coordinator,
+		prefix,
+		outgoing(messages: readonly unknown[], parent = "input") {
+			const snapshot = coordinator.beginPass({
+				sessionId,
+				messages: [...prefix, ...tail],
+				entryIds: ["input", "answer", "new-input"],
+				modelKey,
+				providerKey: provider,
+			});
+			return coordinator.measureOutgoingPrefix(snapshot, messages, (id) =>
+				id === "answer" ? parent : undefined,
+			);
+		},
 		envelope,
 		assistant,
 		tail,
@@ -115,6 +133,58 @@ function harness() {
 		recapture,
 	};
 }
+
+test("Pi healthy refusal prefers correlated provider usage and prices only the new tail", () => {
+	const h = harness("anthropic/claude-fable-5-1", [
+		{ role: "user", content: "word ".repeat(20000) },
+	]);
+	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
+	const messages = [
+		...h.prefix,
+		{
+			...h.assistant,
+			content: [{ type: "text", text: "§2§ Accepted reply" }],
+		},
+		h.tail[1],
+	];
+	const basis = h.outgoing(messages);
+	expect(basis?.inputTokens).toBe(130);
+	const estimate = estimatePiOutgoingInputTokens(messages, h.envelope, basis);
+	expect(estimate.tokens).toBeGreaterThan(16000);
+	expect(estimate.refusalGrade).toBe(true);
+	expect(estimate.refusalBasis).toBe("provider-prefix");
+	expect(estimate.refusalTokens).toBeLessThan(200);
+	expect(outgoingContextRefusal(estimate, 16000)).toBeUndefined();
+	expect(
+		h.outgoing([{ role: "user", content: "changed prefix" }, ...h.tail]),
+	).toBeUndefined();
+	expect(h.outgoing(messages, "wrong-parent")).toBeUndefined();
+	const mismatched = estimatePiOutgoingInputTokens(
+		messages,
+		{ ...h.envelope!, envelopeSignature: "different" },
+		basis,
+	);
+	expect(mismatched.refusalBasis).toBe("calibrated");
+});
+
+test("Pi measured preceding usage can prove generic overflow without blaming a fitting protected subset", () => {
+	const h = harness("anthropic/claude-fable-5-1", [
+		{ role: "user", content: "hello" },
+	]);
+	h.assistant.usage.input = 17000;
+	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
+	const messages = [...h.prefix, ...h.tail];
+	const estimate = estimatePiOutgoingInputTokens(
+		messages,
+		h.envelope,
+		h.outgoing(messages),
+	);
+	expect(estimate.tokens).toBeLessThan(1000);
+	expect(estimate.refusalTokens).toBeGreaterThan(16000);
+	expect(outgoingContextRefusal(estimate, 16000, 10)).toContain(
+		"after reclaim",
+	);
+});
 
 test("correlated provider input includes cached tokens and prices only the appended reply and new tail", () => {
 	const h = harness();

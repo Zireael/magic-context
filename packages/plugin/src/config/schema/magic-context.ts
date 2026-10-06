@@ -8,6 +8,7 @@ import type {
 } from "../../features/magic-context/dreamer/task-registry";
 import { toolTemplateError } from "../../shared/historian-tool-template";
 import { isValidPromptSurfaceModelKey } from "../../shared/prompt-surface";
+import { DEFAULT_PROTECTED_TOOLS, mergeProtectedTools } from "../../shared/protected-tools-policy";
 import { AgentOverrideConfigSchema } from "./agent-overrides";
 
 export const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
@@ -955,6 +956,7 @@ export interface MagicContextConfig {
     execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
     protected_tokens?: number;
     protected_tags?: number;
+    protected_tools: Record<string, number>;
     clear_reasoning_age: number;
     history_budget_percentage: number;
     historian_timeout_ms: number;
@@ -1038,7 +1040,8 @@ export interface MagicContextConfig {
      *  on its own; when off, the messages sent to the model are byte-identical to
      *  the age-based-only behavior. Experimental, opt-in, default off until cache
      *  stability is proven. */
-    smart_drops: boolean;
+    /** Deprecated and ignored: supersession reclaim is always on. */
+    smart_drops?: unknown;
     /**
      * Age-tier caveman compression for long user/assistant text parts.
      * Graduated from `experimental.caveman_text_compression`; opt-in, default off.
@@ -1438,10 +1441,18 @@ export const MagicContextConfigSchema = z
             "Pi-only child-process extension controls. This setting is user-level only; project configuration cannot choose which extensions a user's subagent children load.",
         ),
         smart_drops: z
-            .boolean()
-            .default(false)
+            .unknown()
+            .optional()
             .describe(
-                "Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 3), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart.",
+                "Deprecated: ignored. Content-aware supersession reclaim is always on, only on passes already rebuilding the cache. Remove this key; it no longer does anything.",
+            )
+            .meta({ deprecated: true }),
+        protected_tools: z
+            .record(z.string(), z.number().int().nonnegative())
+            .default({ ...DEFAULT_PROTECTED_TOOLS })
+            .transform((map) => mergeProtectedTools(map))
+            .describe(
+                "Keep each tool's newest N still-active results in every automatic drop lane (issue 621). User and project maps merge over defaults {todowrite: 1, ctx_reduce: 3}; 0 turns protection off. Names are case-insensitive and ignore leading mcp_. Holds even at 95% pressure, with no byte cap: large protected outputs can reach refusal sooner. Queued drops, from the agent or historian publication, are held until newer calls displace the result and a later cache-rebuilding pass applies them. The historian's summary is unaffected; the raw result leaves at the next fold. Frozen strips are unaffected. Changes and rotation never originate a bust; dropped results are never restored.",
             ),
         caveman_text_compression: z
             .object({

@@ -102,6 +102,21 @@ export function getCurrentToolSetHash(
     return createHash("sha256").update(Array.from(toolIds.keys()).sort().join("\0")).digest("hex");
 }
 
+/** Exact observed schemas, not just names, for correlating a provider usage sample. */
+export function getToolDefinitionMeasurementSignature(
+    providerID: string,
+    modelID: string,
+    agentName: string | undefined,
+): string | undefined {
+    const key = keyFor(providerID, modelID, agentName);
+    const measured = measurements.get(key);
+    const observed = fingerprints.get(key);
+    if (!measured || !observed || [...measured.keys()].some((id) => !observed.has(id))) return;
+    return createHash("sha256")
+        .update(JSON.stringify([...measured.keys()].sort().map((id) => [id, observed.get(id)])))
+        .digest("hex");
+}
+
 /**
  * Register the database used to persist measurements. Called by
  * openDatabase() after runMigrations() has ensured the
