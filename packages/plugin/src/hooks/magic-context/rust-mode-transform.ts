@@ -4211,7 +4211,11 @@ export function createRustModeTransform(
                             dropSlot(sessionId, "lkg_over_limit_replacement");
                             state.lkgAcceptedCapture = undefined;
                         }
-                        throw contextRefusalError(refusal);
+                        const error = contextRefusalError(refusal);
+                        // The module returned an unservable array, not a typed
+                        // native refusal. Repeated invalid outputs must park it.
+                        markFailure(sessionId, state, error);
+                        throw error;
                     }
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);

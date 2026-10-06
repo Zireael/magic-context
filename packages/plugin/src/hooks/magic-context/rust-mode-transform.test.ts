@@ -4564,8 +4564,30 @@ describe("Rust mode authority adapter", () => {
 
         // Refusal can follow an in-place managed edit, but no sendable result is returned.
         expect(getSlot(sessionId)).toBeUndefined();
-        // A byte-proven context refusal is not an engine transport/capture failure.
-        expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(1);
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const input = makeMessages(sessionId);
+            await expect(
+                transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId)),
+            ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        }
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(3);
+        expect(transform.getState(sessionId).parked).toBe(true);
+        expect(pass).toBe(4);
+        const parkedInput = makeMessages(sessionId);
+        await expect(
+            transform.run(
+                sessionId,
+                parkedInput,
+                { messages: [...parkedInput] },
+                makeMeta(db, sessionId),
+            ),
+        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        // The fifth live pass is the existing parked retry opportunity. Invalid
+        // output still refuses and retains failure history instead of resetting it.
+        expect(pass).toBe(5);
+        expect(transform.getState(sessionId).consecutiveFailures).toBe(4);
+        expect(transform.getState(sessionId).parkCount).toBe(1);
     });
 
     it("reuses only the exact accepted prefix after an older stable-id mutation", async () => {
