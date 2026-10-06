@@ -5,7 +5,7 @@ import {
 	COMPILER_OUTPUT,
 	timeoutTestDatabase,
 	withLocalHttpServer,
-} from "@magic-context/core/features/magic-context/smart-notes/__tests__/http-timeout-fixture";
+} from "@magic-context/core/features/magic-context/smart-notes/__tests__/http-timeout-fixture.test";
 import { __wakePlaneTest } from "@magic-context/core/features/magic-context/smart-notes/wake-plane";
 import {
 	addNote,

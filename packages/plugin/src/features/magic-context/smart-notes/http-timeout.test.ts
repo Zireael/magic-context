@@ -9,7 +9,7 @@ import {
     TIMEOUT_URL,
     timeoutTestDatabase,
     withLocalHttpServer,
-} from "./__tests__/http-timeout-fixture";
+} from "./__tests__/http-timeout-fixture.test";
 import { createSmartNoteCapabilities } from "./capabilities";
 import { compileSmartNoteCheck } from "./compiler";
 import { runDueCompiledSmartNoteChecks } from "./runner";

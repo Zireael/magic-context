@@ -93,6 +93,7 @@ export function timeoutTestDatabase(): { db: Database; dispose: () => void } {
         const output = execFileSync("lsof", ["-p", String(process.pid)], {
             encoding: "utf8",
             timeout: 10_000,
+            windowsHide: true,
         });
         const dbLines = output.split("\n").filter((line) => /\.db(?:[-\s]|$)/.test(line));
         expect(dbLines.some((line) => line.includes(path))).toBe(true);
