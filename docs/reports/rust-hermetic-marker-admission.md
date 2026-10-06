@@ -80,3 +80,96 @@ produce the same MC-dependent result. The reused daemon and narrow marker-only
 host selection were not equivalent to running CI's four drift shards. The
 sparse-gap negative control's intended refusal was not explicitly awaited as a
 rejection, so real host error-envelope behavior also escaped that coverage.
+
+## Fix and fixture scope
+
+The adapter measures the candidate once. If fit is over/unproven or capture
+inputs cannot be proven coherent, it logs `rust compaction-marker admission
+deferred` with reason, fit, estimate, trust, proxy tokens/bytes and limit. Host
+postprocess still records the newest pending boundary, but returns before
+strategy application, retry accounting, quarantine or fencing. The newly
+transformed request is postprocessed and served normally. SOFT+ leaves the
+pending target alone; a later rebuilding pass with proven fit can drain it.
+The post-cut final-fit and durable-fence paths are unchanged, including recovery
+when a previous pass already may have moved the cut.
+
+Only **OpenCode 2 fold cadence** changes its mock window (24k → 40k). After the
+production fix, its 24k run served every turn without refusals, but its fixed
+prompt **plus protected 3k-turn tail** still measured 30,664–31,066 against a
+usable limit of 22,976 on every rebuilding pass. This is the minimum retained
+fixture content after each fold, not merely transient pre-fold pressure; that
+fixture cannot admit a moving boundary under its old window. The window change
+keeps the execute trigger near 9.3k usable tokens (40% → 24%) and keeps the second
+scenario above the host trigger (reported usage 20k → 36k). No fold, shrink, drop,
+three-boundary, actual-trim, checkpoint-source, or failed-turn assertion is removed
+or relaxed. The final run records final input 15 versus untrimmed equivalent 29,
+increasing trim drops 2/6/10/14, and seven answered module-backed checkpoints in
+the forced-pressure scenario. V1 pressure-fold, ctx-reduce and maintenance retain
+their original small windows and pass through pre-cut deferral.
+
+## Verification and mutation proof
+
+Tools: Bun 1.4.2 (`744846f84`), TypeScript 5.9.3, Biome 2.5.1, Cargo 1.99.0
+(`5f94df478`), OpenCode 1.18.32 and workspace-pinned OpenCode 2.0.22.
+All host commands had outer timeouts and the same retained-fixture/lsof driver.
+All native builds were serialized with `-j 2`.
+
+- `bun run typecheck` in `packages/plugin`: pass (all three compiler invocations).
+- Targeted Biome check: pass, 3 edited plugin files.
+- Regular adapter, postprocess, marker-lock, LKG persistence and V2 boundary
+  suites: **437 pass / 0 fail / 4,539 assertions**, 5 files. This includes the
+  existing post-cut faults, restart fence, uncertain cut, no-cut recovery,
+  queued-capture invalidation and rejected native-head controls, plus the new
+  real-estimator fixed-floor, untrusted-estimator and throwing-estimator cases.
+- Plugin build: pass, including 4 V2 loader tests / 19 assertions.
+- E2E project `tsc --noEmit`: pre-existing errors in untouched probe, harness,
+  adapter/RPC/conversion/todo/timeout and imported plugin files; no diagnostics
+  in either edited E2E file. A TypeScript compiler-API program rooted at those
+  two files verifies **2 roots / 0 edited-file diagnostics**, with 2 unchanged
+  dependency diagnostics. No unrelated source fixes are included.
+
+The non-vacuity mutation bypassed `admissionProven === false` in
+`transform-postprocess-phase.ts`, marked `NON-VACUITY BREAK`. The staged live
+baseline had an empty working diff; mutation produced **1 file, +1/-1**. The named
+fixed-floor regression alone went red with post-cut final-admission refusal;
+`post-cut capture fault refuses instead of old replay, then recomposes
+successfully` stayed green. Restoring from the staged index and touching the
+file produced an empty working diff. No mutant was committed.
+
+### Four drift shards, sequentially
+
+Each uses `MC_E2E_SHARD=N/4 scripts/run-rust-hermetic-e2e.sh`, the current-tree
+plain/fault module pair, and exact CI daemon b5aba1a1. Counts include the runner's
+existing manifest/host skips; the actual Rust regression tests are not skipped.
+
+| Shard | Final result | Files | Pass / fail / skip | Assertions | lsof snapshots |
+| --- | --- | --- | --- | --- | --- |
+| 0/4 | PASS | 15 | 39 / 0 / 60 | 383 | retained log verified |
+| 1/4 | PASS | 14 | 23 / 0 / 17 | 149 | 66 |
+| 2/4 | PASS | 14 | 28 / 0 / 65 | 405 | 92 |
+| 3/4 | PASS | 14 | 25 / 0 / 12 | 279 | 119 |
+
+The shard-0 tool reply was lost during a tool-daemon/Broca restart; the command
+had completed. Its retained log contains all 15 passing file summaries and the
+final `hermetic:end status=pass`; no runner process remained. That result was
+recovered rather than silently rerunning it. All four final logs were independently
+checked for nonzero passes, zero failures and the final group pass marker.
+
+Initial shard 1 still failed the impossible 24k OC2 fixture; its unrelated large
+tail-delta host startup lost a race and recovered on the runner's standard retry.
+The final shard-1 rerun passes every file without retries. Initial shard 2 spent
+two ten-minute test budgets building the slow health-probe example under shared
+compile-slot contention and then hit its outer timeout. Prebuilding that same
+current-tree example with `cargo build --release -j 2 -p mc-module --example
+slow_transform_probe`, selecting it through the existing prebuilt-probe option,
+and rerunning shard 2 made both health tests pass (the slow test in 3.38 seconds).
+No timeout or test expectation was weakened. No product Rust source changed.
+
+After all four shards, a separate `bun test --timeout 600000 --max-concurrency=1
+tests/opencode2/rust-mode-fold-cadence.test.ts` passed **2 tests / 15 assertions**
+with 2 host lsof snapshots. Across the matrix, reproductions and verification,
+**16 lsof logs / 6,293 database-path observations** resolve only below the task's
+throwaway root. Detailed raw evidence remains there as `shard-0.log`,
+`shard-1-room.log`, `shard-2-prebuilt-probe.log`, `shard-3.log`,
+`final-oc2-fold.log`, their `*-lsof.log` companions, and the kept host/module/plugin
+fixture logs.
