@@ -87,3 +87,27 @@ policy persistence and legacy decoding in mc-store. Neutralizing policy freezing
 reddened the TS/Pi map-edit and upgrade tests and the native policy test;
 neutralizing the no-op lease guard separately reddened TS/Pi lease assertions.
 The TS rotation control stayed green in those runs.
+
+## Actual delivery-fold retirement
+
+OpenCode postprocess now records the source rows removed by `injectM0M1`'s
+successful delivery trim, not just the earlier preparation trim. Those tags
+become compacted, and their held pending rows are deleted in the same bounded
+writer transaction as retirement. Retained owners sharing a call ID are untouched.
+
+The regression `review regression: executed fold must retire the held historian
+row it actually trims` runs a real model-change HARD fold with a historian hold;
+it never invokes the retirement helper. It proves the covered raw copy disappears,
+the retained raw copy survives, the covered tag is compacted and its pending row
+is gone before any subsequent drain. A retained protected row remains pending.
+
+Two separate mutations disabled the delivery-retirement call and the pending-row
+delete. Each reddened only that regression; `keeps OpenCode final bytes identical
+to a one-shot executed fold` remained green. Staged working bytes were restored
+after each break. The restored regression/control passed. Storage retirement and
+v86 migration tests passed (seven tests), including the unchanged 100k-tag/two-
+second bound (117.7 ms). Their small storage fixture now supplies the tag-number
+and pending-queue columns required by atomic retirement; assertions are unchanged.
+Plugin typecheck passed with TypeScript 5.9.3. Scoped formatting passed with Biome
+2.5.1 from the plugin directory; invoking Biome at workspace root hit the existing
+nested-root configuration error. Bun test version: 1.4.2.

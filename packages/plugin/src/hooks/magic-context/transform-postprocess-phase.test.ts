@@ -63,6 +63,7 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import * as autoSearchRunner from "./auto-search-runner";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { registerActiveCompartmentRun } from "./compartment-runner";
+import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
 import type { Channel1State } from "./ctx-reduce-nudge";
 import * as staleReduce from "./drop-stale-reduce-calls";
@@ -3966,6 +3967,78 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             hardSignals: BASE_HARD,
         });
     }
+
+    it("review regression: executed fold must retire the held historian row it actually trims", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        createOpenCodeDbWithoutMessages("postprocess-held-fold-");
+        const sessionId = "ses-hardfold-held-retirement";
+        materializeBaseline(sessionId);
+        const covered = makeToolMessage("covered-owner");
+        const live = makeToolMessage("live-owner");
+        const messages = [covered, live];
+        for (const [index, message] of messages.entries()) {
+            const part = message.parts[0] as { tool: string; callID: string };
+            part.tool = "todowrite";
+            // Reused call IDs must not retire a different, retained owner.
+            part.callID = "shared-call";
+            insertTag(
+                db,
+                sessionId,
+                "shared-call",
+                "tool",
+                4000,
+                index + 1,
+                0,
+                "todowrite",
+                0,
+                message.info.id,
+            );
+        }
+        queueDropsForCompartmentalizedMessages(db, sessionId, 1, {
+            messageFileKeys: new Set(),
+            toolObservations: new Map([["shared-call", new Set(["covered-owner"])]]),
+        });
+        queuePendingOp(db, sessionId, 2, "drop");
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 1,
+                startMessageId: "covered-owner",
+                endMessageId: "covered-owner",
+                title: "covered todo",
+                content: "The covered todo was recorded.",
+            },
+        ]);
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: new Map([
+                    [1, makeDropTarget(covered)],
+                    [2, makeDropTarget(live)],
+                ]),
+                protectedTools: { todowrite: 2 },
+                prefixTrimSourceOrder: capturePrefixTrimSourceOrder(messages),
+                m0M1: {
+                    projectPath: FOLD_PROJECT,
+                    projectDirectory: FOLD_PROJECT,
+                    historyBudgetTokens: 98_000,
+                    hardSignals: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
+                },
+            }),
+        );
+        expect(result.materialized).toBe(true);
+        expect(result.prefixTrimStatus).toBe("applied");
+        expect(messages.some((message) => message.info.id === "covered-owner")).toBe(false);
+        expect(messages.find((message) => message.info.id === "live-owner")).toBe(live);
+        expect((live.parts[0] as { state: { output: string } }).state.output).toContain("word ");
+        expect(getTagsBySession(db, sessionId).map((tag) => tag.status)).toEqual([
+            "compacted",
+            "active",
+        ]);
+        expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([2]);
+    });
 
     it("keeps OpenCode final bytes identical to a one-shot executed fold", async () => {
         db = new Database(":memory:");

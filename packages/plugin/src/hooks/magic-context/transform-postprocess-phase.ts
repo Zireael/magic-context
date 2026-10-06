@@ -2841,6 +2841,7 @@ export async function runPostTransformPhase(
         }
         const tInjectM0M1 = performance.now();
         try {
+            const messagesBeforeInjection = args.messages.slice();
             const result = injectM0M1({
                 db: args.db,
                 sessionId: args.sessionId,
@@ -2866,6 +2867,17 @@ export async function runPostTransformPhase(
                 compactionOff,
             });
             deliveredPrefix = result;
+            if (result.prefixTrimStatus === "applied") {
+                // Preparation can fold off-wire without trimming. Retire only
+                // source rows the delivered prefix actually removed, including
+                // held drops that ran before this later delivery trim.
+                const retainedMessages = new Set(args.messages);
+                const trimmedMessageIds = messagesBeforeInjection
+                    .filter((message) => !retainedMessages.has(message))
+                    .map((message) => message.info.id)
+                    .filter((id): id is string => typeof id === "string");
+                markTagsCompactedByMessageIds(args.db, args.sessionId, trimmedMessageIds);
+            }
             if (result.injected) {
                 m0M1InjectedThisPass = true;
                 prependedMessageCount += result.prependedMessageCount;
