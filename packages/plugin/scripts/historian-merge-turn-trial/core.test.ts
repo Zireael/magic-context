@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { bm25, cosine, eligible, mergePrompt, parseDecisions, removeMemory, retrieve, trialRoot, type Memory } from "./core";
+import { bm25, cosine, eligible, mergePrompt, parseDecisions, recordedMemoryFacts, removeMemory, retrieve, trialRoot, type Memory } from "./core";
 
 const memory = (id: number, content: string, created_at = 1, status = "active"): Memory => ({ id, content, category: "ARCHITECTURE", created_at, updated_at: created_at, status, source_type: "historian" });
 describe("merge-turn trial controls", () => {
@@ -11,6 +11,11 @@ describe("merge-turn trial controls", () => {
     });
     test("time fence excludes equal-time, future and archived memories", () => {
         expect(eligible([memory(1, "old"), memory(2, "equal", 10), memory(3, "future", 11), memory(4, "archived", 1, "archived")], 10).map(m => m.id)).toEqual([1]);
+    });
+    test("recorded memory pool parses dash bullets and XML escapes", () => {
+        expect(recordedMemoryFacts("<project-memory>\n<ARCHITECTURE>\n- ck-mc &lt; 2 &amp; store\n</ARCHITECTURE>\n<CONSTANTS>\n- default: 3\n</CONSTANTS>\n</project-memory>")).toEqual([
+            { category: "ARCHITECTURE", content: "ck-mc < 2 & store" }, { category: "CONSTANTS", content: "default: 3" },
+        ]);
     });
     test("BM25 ranks independent known passages", () => {
         expect(bm25("sqlite lock", [memory(1, "unrelated rendering"), memory(2, "sqlite busy lock timeout"), memory(3, "sqlite")])[0]!.id).toBe(2);

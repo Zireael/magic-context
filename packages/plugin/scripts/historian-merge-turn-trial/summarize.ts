@@ -17,14 +17,16 @@ for (const item of manifest.cases) {
     cases.push({ ...item, originalEstimatedSystemTokens: estimateTokens(system), first: { runId: first.runId, usage: first.usage, durationMs: first.durationMs, facts: lexical.facts.length, compartments: lexical.compartments },
         second: second ? { runId: second.runId, usage: second.usage, durationMs: second.durationMs } : undefined });
 }
-const usageKeys = ["input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens"];
+const usageKeys = ["input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens"];
 const total = (key: string) => cases.reduce((n, c) => n + c[key], 0);
 const usage = (turn: "first" | "second") => Object.fromEntries(usageKeys.map(k => [k, cases.reduce((n, c) => n + (c[turn]?.usage[k] ?? 0), 0)]));
+const reported = (turn: "first" | "second") => Object.fromEntries(usageKeys.map(k => [k, cases.filter(c => c[turn]?.usage[k] !== undefined).length]));
 const summary = { caseCount: cases.length, turn2Completed: cases.filter(c => c.second).length, model: "google/antigravity-gemini-3.8-flash", systemHash: hash(system),
     originalFacts: total("originalFactCount"), firstFacts: cases.reduce((n, c) => n + c.first.facts, 0), originalCompartments: total("originalCompartments"), firstCompartments: cases.reduce((n, c) => n + c.first.compartments, 0),
     coverage: manifest.coverage, embeddings: manifest.embeddings,
     originalEstimatedUserTokens: total("originalEstimatedTokens"), strippedEstimatedUserTokens: total("strippedEstimatedTokens"), estimatedSystemTokens: total("originalEstimatedSystemTokens"), memoryEstimatedTokens: total("memoryEstimatedTokens"),
     firstUsage: usage("first"), secondUsage: usage("second"),
+    firstUsageReportedCases: reported("first"), secondUsageReportedCases: reported("second"),
     memoryUserShareRange: [Math.min(...cases.map(c => c.memoryEstimatedTokens / c.originalEstimatedTokens)), Math.max(...cases.map(c => c.memoryEstimatedTokens / c.originalEstimatedTokens))],
     firstMoreFacts: cases.filter(c => c.first.facts > c.originalFactCount).length, firstFewerFacts: cases.filter(c => c.first.facts < c.originalFactCount).length,
     cases };

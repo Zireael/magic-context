@@ -6,6 +6,8 @@ import { eligible, embeddingCredential, EMBEDDING_MODEL, isolate, normalize, ret
 const root = trialRoot(process.argv[2]);
 const phase = process.argv[3] ?? "second";
 if (!["first", "second"].includes(phase)) throw new Error("Review phase must be first or second");
+const limit = Number(process.argv[4] ?? 40);
+if (!Number.isInteger(limit) || limit < 1 || limit > 40) throw new Error("Review limit must be 1..40");
 const credential = phase === "second" ? await embeddingCredential().catch(() => undefined) : undefined;
 isolate(root);
 const { OpenAICompatibleEmbeddingProvider } = await import("../../src/features/magic-context/memory/embedding-openai");
@@ -16,7 +18,7 @@ const rows = db.query("SELECT memory_id,embedding FROM memory_embeddings").all()
 const vectors = new Map(rows.map(r => [r.memory_id, new Float32Array(r.embedding.buffer.slice(r.embedding.byteOffset, r.embedding.byteOffset + r.embedding.byteLength))]));
 const manifest = await Bun.file(join(root, "manifest.json")).json();
 const reviews = [];
-for (const c of manifest.cases) {
+for (const c of manifest.cases.slice(0, limit)) {
     const input = await Bun.file(join(root, "inputs", `${c.index}.json`)).json();
     const candidate = await Bun.file(join(root, "results", `${c.index}-${phase === "first" ? "lexical" : "candidates"}.json`)).json();
     const decisions = phase === "second" ? await Bun.file(join(root, "results", `${c.index}-decisions.json`)).json() : {};

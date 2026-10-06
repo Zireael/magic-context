@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { normalizeMemoryContent } from "../../src/features/magic-context/memory/normalize-hash";
+import { unescapeXml } from "../../src/shared/xml-unescape";
 
 export const MODEL = "google/antigravity-gemini-3.8-flash";
 export const EMBEDDING_MODEL = "qwen/qwen3-embedding-8b";
@@ -37,6 +38,12 @@ export function removeMemory(prompt: string): { prompt: string; block: string } 
     const end = ends[0]!.index! + "</project-memory>".length;
     if (end <= start) throw new Error("Reversed memory block");
     return { prompt: prompt.slice(0, start) + prompt.slice(end), block: prompt.slice(start, end) };
+}
+export function recordedMemoryFacts(block: string): Fact[] {
+    // Rendered memory uses '-' bullets; historian output uses '*'. These are
+    // different wire formats, so the output parser cannot recover this pool.
+    return [...block.matchAll(/<([A-Z][A-Z_]*)>([\s\S]*?)<\/\1>/g)].flatMap(m =>
+        [...m[2]!.matchAll(/^-\s+(.+)$/gm)].map(line => ({ category: m[1]!, content: unescapeXml(line[1]!.trim()) })));
 }
 export function eligible(memories: Memory[], before: number): Memory[] {
     return memories.filter(m => m.status === "active" && m.created_at < before);
