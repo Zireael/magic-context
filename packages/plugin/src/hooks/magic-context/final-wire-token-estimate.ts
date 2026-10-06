@@ -402,7 +402,7 @@ export function estimateOutgoingWireForRefusal(
                 return {
                     tokens: over ? lower : upper!,
                     trusted: !over,
-                    refusalGrade: over,
+                    refusalGrade: over && envelope !== undefined,
                     refusalTokens: over ? lower : undefined,
                     refusalBasis: "byte-bound",
                     messageTokens: { conversation: 0, toolCall: 0 },

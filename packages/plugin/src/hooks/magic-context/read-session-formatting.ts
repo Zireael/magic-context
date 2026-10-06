@@ -396,7 +396,7 @@ export function hasTokenizerForFit(): boolean {
 
 /** BPE can be quadratic on a long unbroken word. Keep individual encodes bounded. */
 export function tokenCountUsesByteBound(text: string): boolean {
-    return text.length > 1024 * 1024 || /[\p{L}\p{N}]{1025}/u.test(text);
+    return text.length > 1024 * 1024 || /[\p{L}\p{N}]{16385}/u.test(text);
 }
 
 export function estimateTokens(text: string): number {
