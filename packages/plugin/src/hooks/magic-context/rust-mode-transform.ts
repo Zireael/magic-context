@@ -2588,7 +2588,7 @@ export function createRustModeTransform(
         };
         // The measurement every last-known-good replay is admitted with (see
         // `measureLkgReplay`), here with this pass's model and estimator.
-        const measureAgainstLimit = (candidate: readonly unknown[], limit: number): FrozenFit =>
+        const measureOutputAgainstLimit = (candidate: readonly unknown[], limit: number) =>
             measureLkgReplayRequest({
                 sessionId,
                 messages: candidate as MessageLike[],
@@ -2597,7 +2597,9 @@ export function createRustModeTransform(
                 systemPromptTokens: sessionMeta.systemPromptTokens,
                 agentName: deps.getNotificationParams?.(sessionId)?.agent,
                 estimator: rawFallbackEstimator,
-            }).fit;
+            });
+        const measureAgainstLimit = (candidate: readonly unknown[], limit: number): FrozenFit =>
+            measureOutputAgainstLimit(candidate, limit).fit;
         /**
          * Admission for a healthy pass that would serve the frozen replay `candidate`
          * instead of `moduleOutput`. Returns a release reason when the frozen bytes no
@@ -3926,21 +3928,26 @@ export function createRustModeTransform(
                     !sessionMeta.isSubagent &&
                     (materializedBoundary !== undefined ||
                         getPendingCompactionMarkerState(deps.db, sessionId) !== null);
+                let markerAdmissionProven = true;
                 if (markerCandidate) {
                     const ids = messages.map((message) => message.info.id);
-                    if (
-                        ids.length === 0 ||
-                        ids.some((id) => typeof id !== "string") ||
-                        new Set(ids).size !== ids.length ||
-                        pendingWireCache.rawContentSnapshots.length !== ids.length
-                    ) {
-                        throw new RustTransformProtocolError(
-                            "rust transform wire invariant failed: cannot prepare coherent priced capture inputs before marker application",
-                        );
-                    }
-                    if (measureAgainstLimit(moduleMessages, contextLimit) !== "under") {
-                        throw new RustTransformProtocolError(
-                            "rust transform wire invariant failed: native output admission was not proven before marker application",
+                    const coherentInputs =
+                        ids.length > 0 &&
+                        ids.every((id) => typeof id === "string") &&
+                        new Set(ids).size === ids.length &&
+                        pendingWireCache.rawContentSnapshots.length === ids.length;
+                    const measure = measureOutputAgainstLimit(moduleMessages, contextLimit);
+                    markerAdmissionProven = coherentInputs && measure.fit === "under";
+                    if (!markerAdmissionProven) {
+                        // A host cut is optional. Retain its pending target and serve the
+                        // fresh engine output when local fit/capture proof is unavailable.
+                        // Only a fault after a possible cut may fence this representation.
+                        sessionLog(
+                            sessionId,
+                            `rust compaction-marker admission deferred: reason=${coherentInputs ? "output_fit" : "capture_inputs"} fit=${measure.fit} ` +
+                                `estimated=${measure.tokens ?? "unavailable"} trusted=${measure.trusted} ` +
+                                `proxy_tokens=${measure.proxy ? Math.ceil(measure.proxy.bytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN) : "unavailable"} ` +
+                                `proxy_bytes=${measure.proxy?.bytes ?? "unavailable"} limit=${contextLimit}`,
                         );
                     }
                 }
@@ -4092,6 +4099,7 @@ export function createRustModeTransform(
                         projectPath: memoryProjectPath,
                         sessionDirectory: directory,
                         materializedBoundary,
+                        markerAdmissionProven,
                         beforeMarkerApply: () => {
                             if (!markerAdmissionRecovery) markerSafeSnapshot = getSlot(sessionId);
                             markerOriginalMessages = messages.slice();

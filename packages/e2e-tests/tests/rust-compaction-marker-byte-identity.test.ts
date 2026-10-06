@@ -377,7 +377,14 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             assertHermeticStores(h);
             const before = h.readRustPasses().length;
             const providerRequestsBefore = h.mainRequests().length;
-            await h.sendPrompt(sessionId, "recover this sparse history on a genuine bust");
+            const recoveringTurn = h.sendPrompt(sessionId, "recover this sparse history on a genuine bust");
+            if (realGap) {
+                // The host returns an error envelope when the module refuses the lossy
+                // projection. Await that rejection before checking its exact cause below.
+                await expect(recoveringTurn).rejects.toThrow("sendPrompt returned without session data");
+            } else {
+                await recoveringTurn;
+            }
             const pass = (await h.waitForRustPasses(before+1)).at(-1)!;
             if (realGap) {
                 // The real module independently refuses a PRESENT uncovered item

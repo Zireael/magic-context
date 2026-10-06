@@ -355,6 +355,9 @@ describe("Rust mode authority adapter", () => {
         fault: "fence" | "after-marker" | "capture" | "bookkeeping" | "host-lock-capture",
         queueOldCapture = false,
         noCutOutcome?: MarkerUpdateOutcome,
+        admissionEstimator?: Parameters<
+            typeof createRustModeTransform
+        >[1]["rawFallbackEstimatorForTests"],
     ) {
         const sid = `marker-admission-${fault}-${Date.now()}`;
         sessions.push(sid);
@@ -474,6 +477,7 @@ describe("Rust mode authority adapter", () => {
             };
             return createRustModeTransform(deps, {
                 moduleClient,
+                rawFallbackEstimatorForTests: admissionEstimator,
                 ...(queueOldCapture
                     ? {
                           scheduleLkgCapture: (capture: () => void) => {
@@ -823,6 +827,91 @@ describe("Rust mode authority adapter", () => {
         expect(listSessionCompactionMarkers(sid)).toHaveLength(0);
         expect(isRustMarkerAdmissionFenced(db, sid)).toBe(false);
     });
+
+    it("serves a rebuilding output above the fixed prompt floor without cutting, then cuts when room returns", async () => {
+        const fixture = markerFaultFixture("capture");
+        const log = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            fixture.stopFault();
+            await fixture.serve();
+            updateSessionMeta(fixture.db, fixture.sid, { systemPromptTokens: 1_000 });
+            recordDetectedContextLimit(fixture.db, fixture.sid, 1_000, "test-provider/test-model");
+            recordToolDefinition(
+                "test-provider",
+                "test-model",
+                undefined,
+                "large-tool",
+                "schema ".repeat(1_000),
+                {
+                    type: "object",
+                },
+            );
+
+            // The fixed system/tool floor exceeds this window even after the engine folds.
+            // Failure to admit an optional host cut must not reject the fresh engine output.
+            const served = await fixture.serve();
+            expect(served).toContain("new admitted prefix");
+            expect(fixture.markerOutcomes).toHaveLength(0);
+            expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(0);
+            expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(served);
+            const pending = getPendingCompactionMarkerState(fixture.db, fixture.sid);
+            expect(pending).toMatchObject({ ordinal: 1, endMessageId: "m1" });
+            const deferrals = log.mock.calls.filter((call) =>
+                String(call[1]).startsWith("rust compaction-marker admission deferred:"),
+            );
+            expect(deferrals).toHaveLength(1);
+            expect(deferrals[0]?.[1]).toContain("fit=over");
+            expect(deferrals[0]?.[1]).toContain("limit=1000");
+            expect(deferrals[0]?.[1]).toMatch(/estimated=\d+ trusted=true proxy_tokens=\d+/);
+
+            fixture.setDeferredRebuild(true);
+            expect(await fixture.serve()).toContain("new admitted prefix");
+            expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)).toEqual(pending);
+            expect(fixture.markerOutcomes).toHaveLength(0);
+
+            recordDetectedContextLimit(
+                fixture.db,
+                fixture.sid,
+                200_000,
+                "test-provider/test-model",
+            );
+            fixture.setDeferredRebuild(false);
+            expect(await fixture.serve()).toContain("new admitted prefix");
+            expect(fixture.markerOutcomes.at(-1)?.kind).toBe("applied");
+            expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(1);
+            expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+        } finally {
+            log.mockRestore();
+            fixture.dispose();
+        }
+    });
+    for (const unavailable of ["untrusted", "throwing"] as const) {
+        it(`serves fresh output and retains the pending cut with an ${unavailable} admission estimate`, async () => {
+            const fixture = markerFaultFixture("capture", false, undefined, () => {
+                if (unavailable === "throwing") throw new Error("tokenizer unavailable");
+                return {
+                    tokens: 1,
+                    trusted: false,
+                    messageTokens: { conversation: 1, toolCall: 0 },
+                    systemTokens: 0,
+                };
+            });
+            try {
+                fixture.stopFault();
+                await fixture.serve();
+                expect(await fixture.serve()).toContain("new admitted prefix");
+                expect(fixture.markerOutcomes).toHaveLength(0);
+                expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)?.ordinal).toBe(1);
+                expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(0);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            } finally {
+                fixture.dispose();
+            }
+        });
+    }
     it("retains pending indexed markers while a healthy SOFT+ serves the frozen representation", async () => {
         const sessionId = `rust-frozen-marker-${Date.now()}`;
         sessions.push(sessionId);
