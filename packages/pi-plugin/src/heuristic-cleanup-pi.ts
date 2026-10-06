@@ -33,10 +33,6 @@
  */
 
 import { freezePiContentDecision } from "@magic-context/core/features/magic-context/pi-content-decisions";
-import {
-	CTX_REDUCE_KEEP,
-	protectedToolTagNumbers,
-} from "@magic-context/core/features/magic-context/reclaim-protection";
 import { sessionDecisionCalibration } from "@magic-context/core/features/magic-context/session-decision-calibration";
 import {
 	type ContextDatabase,
@@ -75,7 +71,7 @@ import { sessionLog } from "@magic-context/core/shared/logger";
  * Pi names its built-in tools bare (`read`, `grep`), so the bare names
  * are what match; the `mcp_` forms cover MCP servers using that prefix.
  */
-export const PI_CTX_REDUCE_KEEP = CTX_REDUCE_KEEP;
+export const PI_CTX_REDUCE_KEEP = 3;
 
 const DEDUP_SAFE_TOOLS = new Set([
 	"grep",
@@ -99,8 +95,6 @@ const DEDUP_SAFE_TOOLS = new Set([
 ]);
 
 export interface PiHeuristicCleanupConfig {
-	protectedTools?: Readonly<Record<string, number>>;
-	protectedToolTags?: ReadonlySet<number>;
 	protectedTags: number;
 	/** Token-window cutoff; null means no tool-backed protection window exists. */
 	protectedCutoff?: number | null;
@@ -288,10 +282,14 @@ function collectStaleReduceCallIds(
 		if (left.composite === right.composite) return 0;
 		return left.composite < right.composite ? 1 : -1;
 	});
+	const protectedComposite = new Set(
+		newestFirst.slice(0, PI_CTX_REDUCE_KEEP).map((call) => call.composite),
+	);
 	const composite = new Set<string>();
 	const bareCallIds = new Set<string>();
 	for (const call of newestFirst) {
-		if (call.maxTag > toolAgeCutoff) continue;
+		if (call.maxTag > toolAgeCutoff || protectedComposite.has(call.composite))
+			continue;
 		composite.add(call.composite);
 		bareCallIds.add(call.callId);
 	}
@@ -341,9 +339,6 @@ export function applyPiHeuristicCleanup(
 	// All work in this function short-circuits on `tag.status !== "active"`.
 	// See OpenCode `applyHeuristicCleanup` for the full P0 perf rationale.
 	const tags = preloadedTags ?? getActiveTagsBySession(db, sessionId);
-	const protectedTools =
-		config.protectedToolTags ??
-		protectedToolTagNumbers(tags, config.protectedTools);
 	// `maxTag` must reflect the true session max (including dropped/compacted)
 	// so the protected-cutoff window is anchored to the most recent tag
 	// regardless of status. `getMaxTagNumberBySession` resolves with a
@@ -354,7 +349,8 @@ export function applyPiHeuristicCleanup(
 			? maxTag + 1
 			: (config.protectedCutoff ?? maxTag - config.protectedTags);
 	const routine = config.routine !== false;
-	// Stale-result detection uses the same protected-tool cutoff as the other result-handling paths.
+	// Stale ctx_reduce removal uses the protected-tail window after first retaining
+	// the newest housekeeping exemplars; only older calls can become stale.
 	const toolAgeCutoff = protectedCutoff;
 
 	let droppedTools = 0;
@@ -427,7 +423,6 @@ export function applyPiHeuristicCleanup(
 			priorInputSample,
 			hasPriorDrop: priorInputSample > 0,
 			passAlreadyPriced: emergency.passAlreadyPriced === true,
-			protectedToolTags: protectedTools,
 		});
 		if (plan.shouldDrop) {
 			const toDrop = new Set(plan.tagNumbers);
@@ -487,7 +482,6 @@ export function applyPiHeuristicCleanup(
 			for (const tag of tags) {
 				if (tag.status !== "active") continue;
 				if (tag.type !== "tool") continue;
-				if (protectedTools.has(tag.tagNumber)) continue;
 				if (!tag.messageId) continue;
 				// Composite match for tags carrying an owner — prevents a reused
 				// callId in a fresh turn from being dropped by a stale call in an
@@ -609,7 +603,6 @@ export function applyPiHeuristicCleanup(
 					const tag = group[i];
 					if (tag.tagNumber > protectedCutoff) continue;
 					const target = targets.get(tag.tagNumber);
-					if (protectedTools.has(tag.tagNumber)) continue;
 					if (target?.canDrop?.() === false) continue;
 					// Deduplication stays full-drop; only emergency recent arcs keep
 					// skeletons. A call that cannot be removed keeps real arguments.

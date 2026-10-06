@@ -1,30 +1,51 @@
-//! Verify that adding durable session fields leaves the historian request and
-//! folded response unchanged. The request digest covers the system prompt, user
-//! prompt, and model sent to the completion provider; the served digest covers
-//! the response array. The metadata checks allow only the expected new fields.
+//! Probes that are deliberately written against the pre-A1 API surface so the
+//! SAME file compiles and runs on the base commit `991046ca` as well as here.
+//!
+//! The acceptance bar for the host-runner slice was "with the default runner,
+//! nothing changed". The historian's calibration examples now intentionally use
+//! three seeds plus diverse older and recent session references, so its request
+//! digest is pinned to the current prompt while the served-byte digest remains
+//! the base-tree comparison.
+//!
+//! - The historian request digest covers exactly what leaves the module for the
+//!   completion provider: the system prompt, the user prompt, and the model.
+//! - The served digest covers what the harness receives back from a fold pass.
+//! - The meta digest covers the durable session blob, which is the one stream
+//!   the slice DOES change (it gains an attempt field) and therefore has to be
+//!   measured rather than assumed.
+//!
+//! Only the first two are asserted against pinned values. The meta digest is
+//! reported, because its whole point is that it differs between the two trees.
 
 use super::*;
 use sha2::{Digest, Sha256};
 
-/// Digest of the system prompt, user prompt, and model sent to the provider.
+/// The historian request bytes pinned after calibration switched to three seeds
+/// plus diverse older and recent session examples. Main-session bytes stay pinned
+/// separately by BASELINE_SERVED_DIGEST.
 const EXPECTED_REQUEST_DIGEST: &str =
     "a2e70c1e70fd85b1b442c69a6e312a3595b2f97953f2de01ab64b892dd914320";
 
-/// Digest of the message array returned by a fold pass.
+/// The array a fold pass serves, recorded the same way.
 const BASELINE_SERVED_DIGEST: &str =
     "34e55f759e321821f452bf6e028cfe94eef25c5087afac4345480b419863b680";
 
-/// Digest of the earlier session metadata format, before the attempt and
-/// protected-tool policy fields were added.
+/// The durable session blob on the base tree. This one is NOT expected to match
+/// here: the slice adds an attempt field to every blob. It is pinned so the
+/// difference stays exactly that one known field instead of becoming a licence
+/// to reshape the blob.
+///
+/// Re-recorded against master at `981c746b` when the slice was integrated there:
+/// master's own later work had already grown the blob from the 22,027 bytes
+/// recorded at `991046ca`. The request digest above tracks the current shared
+/// historian prompt; the served digest below remains the base-tree comparison.
 const BASELINE_META_DIGEST: &str =
     "6d9f28bd0253565e8175ad3d26a4f7e490b01d577f188c8299b0321ee502caeb";
-// Expected earlier-format metadata length before the two fields checked below.
+// One byte more than the base tree's 22_403: the single-store move folds two more
+// inputs into `m1_external_revision`, and the hash it stores here is one decimal digit
+// longer. Nothing about the attempt field changed.
 const BASELINE_META_BYTES: usize = 22_404;
 const ATTEMPT_FIELD: &str = ",\"producer_attempt\":0";
-// The saved nudge baseline includes the default keep counts for ctx_reduce and
-// todowrite. This fragment includes the comma that follows the first field.
-const PROTECTED_POLICY_FIELD: &str =
-    "\"protected_tools_policy\":{\"ctx_reduce\":3,\"todowrite\":1},";
 
 fn digest(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
@@ -103,8 +124,9 @@ async fn gate_probe_default_runner_request_and_meta_digests() {
         "the default runner's completion request must match its pinned prompt bytes"
     );
 
-    // The metadata may grow only by the serialized attempt and policy fields.
-    // Any other change to the persisted blob changes this exact-length check.
+    // The durable blob is the one stream that does move, and it moves by exactly
+    // the width of the new attempt field. Anything else touching the blob shows up
+    // here as a length that is neither the base's nor the base's plus that field.
     assert_ne!(
         meta_digest, BASELINE_META_DIGEST,
         "the attempt is stored unconditionally, so the blob cannot match the base's"
@@ -113,14 +135,10 @@ async fn gate_probe_default_runner_request_and_meta_digests() {
         meta_blob.contains(ATTEMPT_FIELD),
         "the attempt rides the blob as a plain field: {meta_blob:.200}"
     );
-    assert!(
-        meta_blob.contains(PROTECTED_POLICY_FIELD),
-        "the frozen protected-tool policy rides the blob as a plain field"
-    );
     assert_eq!(
         meta_blob.len(),
-        BASELINE_META_BYTES + ATTEMPT_FIELD.len() + PROTECTED_POLICY_FIELD.len(),
-        "the blob must grow by exactly the attempt and policy fields and nothing else"
+        BASELINE_META_BYTES + ATTEMPT_FIELD.len(),
+        "the blob must grow by exactly the new field and nothing else"
     );
 }
 

@@ -15,10 +15,7 @@ function getQueuePendingOpStatement(db: Database): PreparedStatement {
     let stmt = queuePendingOpStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            `INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness)
-             SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (
-                 SELECT 1 FROM pending_ops WHERE session_id = ? AND tag_id = ? AND operation = ?
-             )`,
+            "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness) VALUES (?, ?, ?, ?, ?)",
         );
         queuePendingOpStatements.set(db, stmt);
     }
@@ -96,18 +93,7 @@ export function queuePendingOp(
     operation: PendingOp["operation"],
     queuedAt: number = Date.now(),
 ): void {
-    // One statement makes retry/overlap idempotent even across SQLite writers,
-    // preserving the first row's identity, timestamp and queue order.
-    getQueuePendingOpStatement(db).run(
-        sessionId,
-        tagId,
-        operation,
-        queuedAt,
-        getHarness(),
-        sessionId,
-        tagId,
-        operation,
-    );
+    getQueuePendingOpStatement(db).run(sessionId, tagId, operation, queuedAt, getHarness());
 }
 
 /** Revalidate a preselected row by primary key, never by scanning the session.
@@ -125,11 +111,7 @@ export function queuePendingDropForUnchangedTag(
             db.prepare(`INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness)
             SELECT session_id, tag_number, 'drop', ?, ? FROM tags
             WHERE id = ? AND session_id = ? AND tag_number = ? AND message_id = ?
-                AND type = ? AND tool_owner_message_id IS ? AND status = 'active'
-                AND NOT EXISTS (
-                    SELECT 1 FROM pending_ops WHERE session_id = tags.session_id
-                        AND tag_id = tags.tag_number AND operation = 'drop'
-                )`);
+                AND type = ? AND tool_owner_message_id IS ? AND status = 'active'`);
         queueUnchangedDropStatements.set(db, statement);
     }
     return (

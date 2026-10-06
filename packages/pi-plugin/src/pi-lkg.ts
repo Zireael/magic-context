@@ -212,12 +212,6 @@ export interface PiLkgCoordinator {
 		snapshot: PiLkgPassSnapshot,
 		parentOf?: (id: string) => string | null | undefined,
 	): PiLkgReplayResult;
-	/** Provider evidence for a healthy output, without performing a replay. */
-	measureOutgoingPrefix(
-		snapshot: PiLkgPassSnapshot,
-		messages: readonly unknown[],
-		parentOf?: (id: string) => string | null | undefined,
-	): PiMeasuredPrefixFit | undefined;
 	captureAppliedPass(args: {
 		snapshot: PiLkgPassSnapshot;
 		outputMessages: readonly unknown[];
@@ -938,33 +932,6 @@ export function createPiLkgCoordinator(
 			return result;
 		},
 		captureAppliedPass,
-		measureOutgoingPrefix(snapshot, messages, parentOf) {
-			try {
-				const slot = getSlot(snapshot.sessionId);
-				const measured = measuredPrefixFor(snapshot, slot, parentOf);
-				if (!slot || !measured) return;
-				const prefix = JSON.parse(slot.jsonPrefix) as unknown[];
-				// A healthy reclaim may have removed or rewritten the old prefix.
-				// Usage belongs to those exact served bytes, never to their replacement.
-				if (
-					!Array.isArray(prefix) ||
-					messages.length < prefix.length ||
-					JSON.stringify(messages.slice(0, prefix.length)) !== slot.jsonPrefix
-				)
-					return;
-				const appendedMessages = messages.slice(prefix.length);
-				// Tagging/stripping can rewrite the new reply's content. Its usage
-				// identity must still match; price the actual returned tail separately.
-				if (
-					completedProviderUsage(appendedMessages[0])?.signature !==
-					completedProviderUsage(snapshot.pristineTail?.[0])?.signature
-				)
-					return;
-				return { ...measured, appendedMessages };
-			} catch {
-				return;
-			}
-		},
 	};
 }
 

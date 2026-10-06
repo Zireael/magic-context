@@ -16,7 +16,6 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import {
     closeDatabase,
     getPendingOps,
@@ -26,7 +25,6 @@ import {
 } from "../../features/magic-context/storage";
 import { queuePendingOp } from "../../features/magic-context/storage-ops";
 import { getActiveTagsBySession } from "../../features/magic-context/storage-tags";
-import { applyPendingOperations } from "./apply-operations";
 import {
     prepareCompartmentDrops,
     queueDropsForCompartmentalizedMessages,
@@ -69,33 +67,6 @@ function makeRawMessages(messages: RawMessage[]) {
 }
 
 describe("queueDropsForCompartmentalizedMessages composite identity", () => {
-    it("review regression: repeated historian publication of a held result must have bounded pending depth", () => {
-        useTempDataHome("drop-queue-held-bound-");
-        const db = openDatabase();
-        insertTag(db, "ses-1", "held-call", "tool", 100, 1, 0, "todowrite", 0, "held-owner");
-        const observed = {
-            messageFileKeys: new Set<string>(),
-            toolObservations: new Map([["held-call", new Set(["held-owner"])]]),
-        };
-        queueDropsForCompartmentalizedMessages(db, "ses-1", 1, observed);
-        const first = getPendingOps(db, "ses-1");
-        for (let n = 0; n < 99; n++)
-            queueDropsForCompartmentalizedMessages(db, "ses-1", 1, observed);
-        expect(getPendingOps(db, "ses-1")).toHaveLength(1);
-        expect(getPendingOps(db, "ses-1")).toEqual(first);
-        const active = getActiveTagsBySession(db, "ses-1");
-        expect(
-            applyPendingOperations(
-                "ses-1",
-                db,
-                new Map(),
-                protectedToolTagNumbers(active, { todowrite: 1 }),
-            ),
-        ).toBe(false);
-        expect(getActiveTagsBySession(db, "ses-1")).toEqual(active);
-        expect(getPendingOps(db, "ses-1")).toEqual(first);
-    });
-
     it("prepared drops are byte-identical to the previous queue with a frozen clock", () => {
         useTempDataHome("drop-queue-byte-parity-");
         const db = openDatabase();
@@ -107,7 +78,7 @@ describe("queueDropsForCompartmentalizedMessages composite identity", () => {
         insertTag(db, "ses-1", "m1:p1", "message", 10, 6);
         updateTagStatus(db, "ses-1", 6, "dropped");
         insertTag(db, "ses-1", "tail:p0", "message", 10, 7);
-        // Preserve an existing row's identity when publication selects it again.
+        // Preserve existing rows and the old queue's duplicate behavior.
         queuePendingOp(db, "ses-1", 3, "drop", 900);
         const keys = {
             messageFileKeys: new Set(["m1:p0", "m1:file1", "m1:p1"]),
@@ -132,7 +103,7 @@ describe("queueDropsForCompartmentalizedMessages composite identity", () => {
                 if (matches) queuePendingOp(db, "ses-1", tag.tagNumber, "drop");
             }
             const previousBytes = queueBytes();
-            expect(getPendingOps(db, "ses-1").map((op) => op.tagId)).toEqual([3, 1, 4, 5]);
+            expect(getPendingOps(db, "ses-1").map((op) => op.tagId)).toEqual([3, 1, 3, 4, 5]);
             db.exec("ROLLBACK");
             const prepared = prepareCompartmentDrops(db, "ses-1", 2, keys);
             db.exec("BEGIN IMMEDIATE");

@@ -118,22 +118,11 @@ export function readPiLkgFitEnvelope(
 		}
 		const systemTokens = estimateTokens(systemJson);
 		const toolDefinitionTokens = estimateTokens(toolsJson);
-		const refusalToolDefinitionTokens = activeNames
-			? estimateTokens(
-					JSON.stringify({
-						tools: serializedTools.tools.filter((tool) =>
-							activeNames.includes(String(tool.name)),
-						),
-					}),
-				)
-			: undefined;
 		if (!hasTokenizerForFit()) return;
 		return {
 			modelKey: canonical,
 			systemTokens,
 			toolDefinitionTokens,
-			refusalToolDefinitionTokens,
-			toolDefinitionsMeasured: refusalToolDefinitionTokens !== undefined,
 			envelopeBytes: Buffer.byteLength(envelopeJson),
 			envelopeSignature: activeNames
 				? createHash("sha256")

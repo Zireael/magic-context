@@ -860,24 +860,22 @@ Tier boundaries are hardcoded to keep behavior predictable and prevent cache-bus
 
 | Key | Type | Default |
 |-----|------|---------|
-| `smart_drops` | deprecated, ignored | — |
+| `smart_drops` | `boolean` | `false` |
 
-**Always on.** Content-aware reclaim of tool output that a later call has made obsolete is layered on top of the normal age-based auto-drop. Old configs containing `smart_drops` keep loading, but its value has no effect and doctor reports it as ignored. Supersession reclaims spent results regardless of age:
+**Experimental, opt-in.** Content-aware reclaim of tool output that a later call has made obsolete, layered on top of the normal age-based auto-drop. The age-based drop reclaims the *oldest* tool outputs first; smart-drops additionally reclaims outputs that are dead by *supersession*, regardless of age:
 
 | Class | Behavior |
 |---|---|
 | `todowrite` | Keep the newest snapshot, drop older ones (the live plan is re-injected every pass; older snapshots are stale). |
-| `ctx_reduce` | Keep the newest 3 active results by default, drop older ones (preserves the visible reduce rhythm). |
+| `ctx_reduce` | Keep the newest 5 calls, drop older ones (preserves the visible reduce rhythm). |
 | Zero-value meta (`bash_status`, `bash_kill`, `ctx_note` read/dismiss) | Drop all (worthless once the call ran; `ctx_note` write/update carry intent and are never dropped). |
 | Superseded edits | When a file is edited more than once, the newest edit stays in full and each older edit is compressed to a marker that keeps its `filePath` and a short region hint of the diff, so the agent still sees which file and region it edited. This is the largest source of reclaimable bytes. |
 
-**Cache safety.** Selection is age-independent, but supersession only acts on passes already rebuilding the cache. Sessions that previously set `smart_drops: false` drain their backlog on the first such pass, never on an ordinary defer pass. Drops replay byte-identically afterward.
+**Cache safety.** Selection is age-independent, but smart-drops only *acts* during a transform pass that is already rewriting the message array (the same execute-threshold gate the age-based drop uses), so it never causes a prompt-cache miss on its own. Every drop resolves to the same deterministic placeholder as the normal drops, so defer passes replay byte-for-byte identically. **When `smart_drops` is off, the messages sent to the model are byte-identical to the age-based-only behavior** — the entire feature is inert.
 
-### `protected_tools`
+**Cross-version note.** Once you enable `smart_drops`, all binaries that share your Magic Context database (e.g. multiple OpenCode instances, or OpenCode + Pi) should be on the release that introduced it. If a stale older binary co-runs with the feature on, the worst case is a one-time cache bust (the older binary fully drops what the newer one compressed); it never corrupts data.
 
-User and project JSON-object maps merge over `{ "todowrite": 1, "ctx_reduce": 3 }`. Each nonnegative whole number keeps that many newest still-active results, ordered by tag number; dropped or historian-summarised results do not count. Project entries override matching user entries. Names ignore case and a leading `mcp_`; 0 disables a default.
-
-Emergency, age, supersession (including edit-marker compression), and duplicate removal honour the map even at ≥95%. There is no byte cap, so large protected outputs can reach refusal sooner. Queued drops, from the agent or historian publication, are held like the protected tail until newer calls displace the result and a later cache-rebuilding pass applies them. The historian's summary is unaffected; the raw result leaves at the next fold. Frozen strips are unaffected. Map changes and N+1 rotation never originate a bust or restore dropped results.
+**When to enable.** Turn it on if you run very long, edit-heavy sessions and want to reclaim more context without losing the agent's record of what it did. The default stays off while cache stability is being validated in the wild. Requires a restart to take effect.
 
 ## Commands
 

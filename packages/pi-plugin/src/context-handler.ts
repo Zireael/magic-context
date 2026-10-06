@@ -62,10 +62,7 @@ import {
 	computeProtectionWindow,
 	getProtectionWindowForSession,
 } from "@magic-context/core/features/magic-context/protection-window";
-import {
-	protectedToolTagNumbers,
-	protectedToolTokenCount,
-} from "@magic-context/core/features/magic-context/reclaim-protection";
+import { newestCtxReduceTagNumbers } from "@magic-context/core/features/magic-context/reclaim-protection";
 import {
 	createScheduler,
 	parseCacheTtl,
@@ -98,7 +95,7 @@ import {
 	getPendingPiCompactionMarkerState,
 	getPersistedToolTagAccounting,
 	getTagsByNumbers,
-	type getTagsBySession,
+	getTagsBySession,
 	getTagsForPendingOperations,
 	isWrapupInProgress,
 	setSessionWorkMetrics,
@@ -161,17 +158,12 @@ import {
 } from "@magic-context/core/hooks/magic-context/channel2-cycle";
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { evaluateChannel2 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
-import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import {
 	type DroppedTokenReduction,
 	estimateDroppedTokensFromTagReductions,
 } from "@magic-context/core/hooks/magic-context/dropped-token-estimate";
-import {
-	contextRefusalError,
-	EmergencyFailClosedError,
-	outgoingContextRefusal,
-} from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
+import { EmergencyFailClosedError } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import {
 	DEFAULT_CONTEXT_LIMIT,
 	historyBudgetPolicyIdentity,
@@ -309,7 +301,6 @@ import {
 import { resolvePiProvenInputFloor } from "./pi-proven-floor";
 import {
 	assertPiRawFallbackFits,
-	estimatePiOutgoingInputTokens,
 	PiDegradedPassError,
 	PiStorageBusyError,
 } from "./pi-raw-fallback";
@@ -1244,9 +1235,10 @@ export interface PiSchedulerOptions {
 export interface PiContextHandlerOptions {
 	cacheTtlConfig?: import("@magic-context/core/shared/model-cache-ttl").CacheTtlConfig;
 	db: ContextDatabase;
-	/** Deprecated caller input, ignored. Supersession always rides an existing rebuild. */
+	/** Smart-drops (experimental, default off): also reclaim tool output that a
+	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
+	 *  sent to the model are byte-identical to the age-based-only behavior. */
 	smartDrops?: boolean;
-	protectedTools?: Readonly<Record<string, number>>;
 	/**
 	 * Heuristic-cleanup config (tiered emergency drop + caveman). When
 	 * omitted, heuristic cleanup is disabled — tagging and queued-drop
@@ -3405,7 +3397,6 @@ export function registerPiContextHandler(
 					lkgInputIdByRef.get(message),
 				),
 				smartDrops: options.smartDrops === true,
-				protectedTools: options.protectedTools,
 				protectedTags: options.protectedTags ?? 20,
 				protectedTokens: options.protectedTokens,
 				protectedTokenTierOverrides: options.protectedTokenTierOverrides,
@@ -3816,21 +3807,15 @@ export function registerPiContextHandler(
 						result.bustedThisPass,
 						hygieneCalibration,
 					);
-					const previousBaseline = getPiChannel1Baseline(sessionId);
 					const baseline = refreshPiTailHygieneBaseline({
 						messages: outputMessages,
 						tags,
 						protectedTagNumbers,
-						protectedTools: options.protectedTools,
 						pendingDropTagNumbers,
 						stableId,
-						protectedToolTags: protectedToolTagNumbers(
-							tags,
-							options.protectedTools,
-						),
 						syntheticLeadingCount: result.syntheticLeadingCount,
 						cacheBusting: result.bustedThisPass,
-						previous: previousBaseline,
+						previous: getPiChannel1Baseline(sessionId),
 						calibration:
 							hygieneUnitsVersion >= HYGIENE_PROVIDER_UNITS_VERSION
 								? hygieneCalibration
@@ -3896,8 +3881,6 @@ export function registerPiContextHandler(
 								db: options.db,
 								sessionId,
 								baseline: channelState,
-								rebuilding: result.bustedThisPass,
-								previous: previousBaseline,
 							});
 						} catch (error) {
 							sessionLog(
@@ -4018,41 +4001,6 @@ export function registerPiContextHandler(
 				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
 			);
 			runPiDebugAssertion(assertTailHygieneLastWriter);
-			if (
-				!options.compactionOff &&
-				(result.executedWorkThisPass ||
-					isCacheBusting ||
-					schedulerDecision === "execute")
-			) {
-				const envelope = readPiLkgFitEnvelope(
-					ctx,
-					pi,
-					resolvePiContextModelKey(ctx),
-					sessionDecisionCalibration(options.db, sessionId),
-				);
-				const estimate = estimatePiOutgoingInputTokens(
-					outputMessages,
-					envelope,
-					lkgPassSnapshot
-						? lkgCoordinator.measureOutgoingPrefix(
-								lkgPassSnapshot,
-								outputMessages,
-								(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
-							)
-						: undefined,
-					rawFallbackLimit,
-				);
-				const refusal = outgoingContextRefusal(
-					estimate,
-					rawFallbackLimit,
-					protectedToolTokenCount(
-						getActiveTagsBySession(options.db, sessionId),
-						options.protectedTools,
-						envelope ? calibrationForModelKey(envelope.modelKey) : undefined,
-					),
-				);
-				if (refusal) throw contextRefusalError(refusal);
-			}
 			let serializedOutput: PiLkgSerializedOutput | undefined;
 			if (!lkgCompactionOff && lkgPassSnapshot) {
 				let hostEnvelopeSignature: string | undefined;
@@ -5115,7 +5063,6 @@ interface RunPipelineArgs {
 	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
 	 *  sent to the model are byte-identical to the age-based-only behavior. */
 	smartDrops?: boolean;
-	protectedTools?: Readonly<Record<string, number>>;
 	protectedTags: number;
 	protectedTokens?: number;
 	protectedTokenTierOverrides?: ProtectedTokensTierOverrides;
@@ -6099,10 +6046,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const pendingOps = shouldReadPendingOps
 		? getPendingOps(args.db, args.sessionId)
 		: [];
-	const protectedToolTags = protectedToolTagNumbers(
-		getActiveTagsBySession(args.db, args.sessionId),
-		args.protectedTools,
-	);
 	const protectionWindowForPass = getProtectionWindowForSession(
 		args.db,
 		args.sessionId,
@@ -6159,12 +6102,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.sessionId,
 				args.db,
 				targets,
-				new Set([
-					...(args.contextUsage.percentage >= 95
-						? []
-						: protectedTagNumbersForPass),
-					...protectedToolTags,
-				]),
+				args.contextUsage.percentage >= 95
+					? newestCtxReduceTagNumbers(getTagsBySession(args.db, args.sessionId))
+					: protectedTagNumbersForPass,
 				pendingOperationTags,
 				pendingOps,
 				[],
@@ -6418,7 +6358,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.messages,
 				{
 					protectedTags: args.protectedTags,
-					protectedToolTags,
 					protectedCutoff: usesTokenProtection
 						? protectionWindowForPass.cutoff
 						: undefined,
@@ -6455,7 +6394,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					args.messages,
 					{
 						protectedTags: args.protectedTags,
-						protectedToolTags,
 						protectedCutoff: usesTokenProtection
 							? protectionWindowForPass.cutoff
 							: undefined,
@@ -6695,7 +6633,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			sessionId: args.sessionId,
 			targets,
 			watermark: reclaimMeta.toolReclaimWatermark ?? 0,
-			protectedToolTags,
 			pendingOps,
 		});
 		// Smart-drops: also reclaim older todowrite/ctx_reduce/meta outputs that
@@ -6704,7 +6641,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// already-gated drop apply as the age-based sweep above. Dedupe (a tag
 		// can qualify under more than one rule).
 		const editMarkerTagIds = new Set<number>();
-		{
+		if (args.smartDrops) {
 			const recentMessageIds = recentSupersessionOwnerMessageIds(
 				args.db,
 				args.sessionId,
@@ -6716,7 +6653,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				targets,
 				pendingOps,
 				recentMessageIds,
-				protectedToolTags,
 			});
 			for (const op of supersessionOps) {
 				if (!selectedIds.has(op.tagId)) {
@@ -6730,7 +6666,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				targets,
 				pendingOps,
 				recentMessageIds,
-				protectedToolTags,
 			});
 			for (const op of editReclaim.ops) {
 				// Drop wins over compress: only compress an edit no earlier rule

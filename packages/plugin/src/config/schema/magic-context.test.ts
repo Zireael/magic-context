@@ -185,7 +185,7 @@ describe("MagicContextConfigSchema", () => {
 
             const result = MagicContextConfigSchema.parse(input);
 
-            expect(result).toEqual({ ...input, protected_tools: { todowrite: 1, ctx_reduce: 3 } });
+            expect(result).toEqual(input);
         });
 
         it("accepts a boolean storage permission policy and rejects non-booleans", () => {

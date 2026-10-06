@@ -1,4 +1,3 @@
-import { protectedToolTagNumbers } from "@magic-context/core/features/magic-context/reclaim-protection";
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
 import { estimateImageTokensFromDataUrl } from "@magic-context/core/hooks/magic-context/image-token-estimate";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
@@ -12,6 +11,7 @@ import {
 	type TailHygienePartMeasurement,
 	type TailHygienePrefixMismatch,
 } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
+import { PI_CTX_REDUCE_KEEP } from "./heuristic-cleanup-pi";
 import { isPiSystemEntry } from "./system-entry-pi";
 
 const TAG_PREFIX = /^§(\d+)§\s*/;
@@ -52,7 +52,6 @@ export interface PiTailHygieneWalkInput {
 	 * snapshotted floor. Coordinate space: tag-number. An empty set is an empty window.
 	 */
 	protectedTagNumbers: ReadonlySet<number>;
-	protectedToolTags?: ReadonlySet<number>;
 	/** Active tags whose drop is queued but has not yet changed the rendered Pi entries. */
 	pendingDropTagNumbers?: ReadonlySet<number>;
 	stableId?: (message: unknown, index: number) => string | undefined;
@@ -469,7 +468,6 @@ function finalizeParts(
 	pendingDropTagNumbers: ReadonlySet<number>,
 	protectedTagNumbers: ReadonlySet<number>,
 	newestMessagePartStart: number,
-	protectedToolTags?: ReadonlySet<number>,
 ): TailHygieneMeasurement {
 	const visibleTags = new Map<number, TagEntry>();
 	for (const part of drafts) {
@@ -477,8 +475,11 @@ function finalizeParts(
 			visibleTags.set(part.tag.tagNumber, part.tag);
 	}
 	const protectedNumbers = new Set(protectedTagNumbers);
-	const exemplarNumbers =
-		protectedToolTags ?? protectedToolTagNumbers([...visibleTags.values()]);
+	const exemplarNumbers = [...visibleTags.values()]
+		.filter((tag) => tag.type === "tool" && tag.toolName === "ctx_reduce")
+		.sort((left, right) => right.tagNumber - left.tagNumber)
+		.slice(0, PI_CTX_REDUCE_KEEP)
+		.map((tag) => tag.tagNumber);
 	for (const tagNumber of exemplarNumbers) protectedNumbers.add(tagNumber);
 
 	let u = 0;
@@ -687,33 +688,18 @@ export function measurePiTailHygiene(
 		input.pendingDropTagNumbers ?? new Set<number>(),
 		input.protectedTagNumbers,
 		newestMessagePartStart,
-		input.protectedToolTags,
 	);
 }
 
 export function refreshPiTailHygieneBaseline(
 	input: PiTailHygieneWalkInput & {
 		cacheBusting: boolean;
-		protectedTools?: Readonly<Record<string, number>>;
 		previous?: TailHygieneBaseline;
 		calibration?: { toolsRatio: number; proseRatio: number };
 		hygieneUnitsVersion?: number;
 		now?: number;
 	},
 ): TailHygieneBaseline {
-	const protectedToolsPolicy = adoptedProtectedToolsPolicy(
-		input.protectedTools,
-		input.previous?.protectedToolsPolicy,
-		input.cacheBusting,
-		!!input.previous,
-	);
-	input = {
-		...input,
-		protectedToolTags: protectedToolTagNumbers(
-			input.tags,
-			protectedToolsPolicy,
-		),
-	};
 	const rawMeasured = measurePiTailHygiene(input);
 	const frozenCalibration =
 		!input.cacheBusting && input.previous
@@ -748,7 +734,6 @@ export function refreshPiTailHygieneBaseline(
 		mismatch?: TailHygienePrefixMismatch,
 	): TailHygieneBaseline => ({
 		...freezeTailHygieneMeasurement(measured),
-		protectedToolsPolicy,
 		hygieneUnitsVersion: frozenCalibration.hygieneUnitsVersion,
 		toolsRatio: frozenCalibration.toolsRatio,
 		proseRatio: frozenCalibration.proseRatio,
@@ -789,7 +774,6 @@ export function refreshPiTailHygieneBaseline(
 	}
 	return {
 		...input.previous,
-		protectedToolsPolicy,
 		turnDeltaU,
 		turnDeltaT,
 		evaluable: true,
@@ -838,5 +822,3 @@ export function assertPiTailHygieneContentUnchanged(
 		);
 	}
 }
-
-import { adoptedProtectedToolsPolicy } from "@magic-context/core/features/magic-context/reclaim-protection";

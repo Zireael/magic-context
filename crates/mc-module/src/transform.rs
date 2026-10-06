@@ -45,7 +45,7 @@ use crate::scheduler::{
 use crate::selection::{
     dropped_input_payload, filter_reasoning_ineligible_decisions, is_reclaim_hint_excluded_tool,
     resolve_tool_tier, select_reductions_with_outcome, PassClass, SelItem, SelKind, SelMessageRole,
-    SelectionConfig, SelectionContext, AGE_RECLAIM_MIN_TOKENS,
+    SelectionConfig, SelectionContext, SelectionOutcome, AGE_RECLAIM_MIN_TOKENS,
 };
 use crate::tail_hygiene::{
     channel1_refire_tokens, effective_tail_hygiene, hygiene_band,
@@ -596,9 +596,8 @@ pub struct ProducerContext<'a> {
     /// Whether the full compaction pipeline is enabled. When false, the module emits only
     /// additive m0/m1 memory and project-doc blocks ahead of the unchanged live array.
     pub compaction_enabled: bool,
-    /// Deprecated caller input, ignored by selection.
+    /// Smart-drop selector gate frozen at route bind.
     pub smart_drops: bool,
-    pub protected_tools: std::collections::BTreeMap<String, usize>,
     /// Effective cache TTL used by the host-side idle predicate.
     pub cache_ttl: String,
     /// Whether the model-resolution walk selected a per-model entry or fell through to the default.
@@ -2054,7 +2053,6 @@ struct Channel1Target {
 /// handler maps these to a clean Error frame rather than a partial/raw array.
 #[derive(Debug)]
 pub enum TransformError {
-    ProtectedToolResultsOverLimit,
     Store(McStoreError),
     /// Anthropic cannot accept an assistant-terminal retry, and moving completed output
     /// below its own prompt would rewrite conversational causality.
@@ -2101,14 +2099,9 @@ pub enum TransformError {
     LineageProtocol(String),
 }
 
-pub const PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE: &str = "protected_tool_results_over_limit";
-pub const PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE: &str = "The tool results kept by protected_tools are larger than this model's context window, so this turn was not sent. Lower the protected_tools counts.";
-
 impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransformError::ProtectedToolResultsOverLimit => write!(f,
-                "{PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE}"),
             TransformError::Store(e) => write!(f, "store: {e}"),
             TransformError::AssistantTerminalRetry => write!(
                 f,
@@ -4812,7 +4805,7 @@ fn apply_once(
                 .map(|block| block.id.clone())
         })
         .collect::<HashSet<_>>();
-    let mut protected_block_ids = tag_window_protected_block_ids
+    let protected_block_ids = tag_window_protected_block_ids
         .union(&exempt_message_protected_block_ids)
         .cloned()
         .collect::<HashSet<_>>();
@@ -4825,9 +4818,7 @@ fn apply_once(
             timings.emergency_reasoning_exclusions = excluded_arcs;
         }
     }
-    // The same pure selection pass computes protection for acknowledgements on
-    // defer too. Its Defer class emits no reductions and never prices a rewrite.
-    let selection_outcome = {
+    let selection_outcome = if producer_gate {
         let frozen = frozen_red_targets(&loaded.core);
         // No per-request gate here: producer_gate already requires
         // tail_reclaim_enabled, which is the profile default. Gating again on the
@@ -4881,13 +4872,12 @@ fn apply_once(
             },
             &SelectionConfig {
                 smart_drops: ctx.smart_drops,
-                protected_tools: ctx.protected_tools.clone(),
             },
         )
+    } else {
+        SelectionOutcome::default()
     };
     timings.selection = elapsed_ms(selection_started_at);
-    let nudge_base_protected_block_ids = protected_block_ids.clone();
-    protected_block_ids.extend(selection_outcome.protected_tool_block_ids.iter().cloned());
     let count_to_u64 =
         |count: Option<usize>| count.map(|value| u64::try_from(value).unwrap_or(u64::MAX));
     let eligible_supersession_count = count_to_u64(selection_outcome.eligible_supersession_count);
@@ -4961,7 +4951,6 @@ fn apply_once(
         planned_reasoning_cutoff,
         non_tool_bust_opportunity,
         lineage_anchor_mid,
-        &selection_outcome.protected_tool_block_ids,
     );
     let reclaim_pending_now = reductions_pending_now
         || !planned_caveman_units.is_empty()
@@ -5065,11 +5054,6 @@ fn apply_once(
     let mut core = loaded.core.clone();
     log_reasoning_drop_seed_skips(&core, &live, &req.session_id);
     let mut meta = loaded.meta.clone();
-    meta.protected_tool_block_ids = selection_outcome
-        .protected_tool_block_ids
-        .iter()
-        .cloned()
-        .collect();
     // Persist an equivalent revision written by an older digest format. This changes only
     // stored metadata; the served bytes are decided by the plan above.
     meta.m1_revision = applied_m1_revision;
@@ -6220,36 +6204,13 @@ fn apply_once(
         tag_rows_for_hygiene(&projection, &tag_rows, &tag_overlay, !tagging_active);
     profile_end!(perf_hygiene_tags);
     profile_start!(perf_hygiene_measure, "hygiene_measure");
-    let adopted_tools_policy = if is_bust_pass || loaded.meta.tail_hygiene_baseline.is_none() {
-        ctx.protected_tools.clone()
-    } else {
-        loaded
-            .meta
-            .tail_hygiene_baseline
-            .as_ref()
-            .and_then(|baseline| baseline.protected_tools_policy.clone())
-            .unwrap_or_else(|| [("todowrite".into(), 0), ("ctx_reduce".into(), 3)].into())
-    };
-    let nudge_tool_blocks = if adopted_tools_policy == ctx.protected_tools {
-        selection_outcome.protected_tool_block_ids.clone()
-    } else {
-        crate::selection::protected_blocks_for_policy(
-            &tail_for_selection,
-            &frozen_red_targets(&core),
-            &adopted_tools_policy,
-        )
-    };
-    let nudge_protected_block_ids = nudge_base_protected_block_ids
-        .union(&nudge_tool_blocks)
-        .cloned()
-        .collect();
     let hygiene_measurement = measure_tail_hygiene_with_pending_drops(
         &projection,
         &core,
         meta.coverage_ordinal,
         &hygiene_tag_rows,
         &protection_window.tag_numbers,
-        &nudge_protected_block_ids,
+        &protected_block_ids,
         &pending_drop_target_ids,
     );
     profile_end!(perf_hygiene_measure);
@@ -6318,12 +6279,6 @@ fn apply_once(
             })
     };
     profile_end!(perf_hygiene_refresh);
-    if let Some(baseline) = current_hygiene_baseline.as_mut() {
-        baseline.protected_tools_policy = Some(adopted_tools_policy.clone());
-    }
-    if let Some(baseline) = meta.tail_hygiene_baseline.as_mut() {
-        baseline.protected_tools_policy = Some(adopted_tools_policy);
-    }
     profile_end!(perf_hygiene);
     let refreshed_coverage = meta.coverage_ordinal;
     rearm_channel2_after_hard_fold(
@@ -6818,36 +6773,6 @@ fn apply_once(
         &projection,
         meta.coverage_ordinal,
     );
-    // Only current trusted ingress evidence can authorize a native refusal. This
-    // counts the protected results still live after this plan's actual fold;
-    // protected results cannot be reduced by reclaim, so they are a lower bound
-    // on the final request even when other content was successfully reclaimed.
-    if req
-        .usage
-        .as_ref()
-        .is_some_and(|usage| usage.final_wire_trusted)
-        && hard_context_limit_tokens > 0.0
-    {
-        let frozen_units = FrozenUnitLookup::Scan(&core.frozen_units);
-        let protected_result_tokens = tail_for_selection
-            .iter()
-            .filter(|item| {
-                matches!(item.kind, crate::selection::SelKind::ToolResult { .. })
-                    && selection_outcome
-                        .protected_tool_block_ids
-                        .contains(&item.id)
-                    && is_tail(item.ordinal, meta.coverage_ordinal)
-                    && item.id.rsplit_once('#').is_some_and(|(mid, _)| {
-                        output_message_strip_unit(&frozen_units, "stale_reduce", mid).is_none()
-                    })
-            })
-            .map(|item| item.served_token_count.or(item.token_count).unwrap_or(0) as f64)
-            .sum::<f64>()
-            * active_calibration.tools_ratio;
-        if protected_result_tokens > hard_context_limit_tokens {
-            return Err(TransformError::ProtectedToolResultsOverLimit);
-        }
-    }
     let first_applied_command_ids =
         first_applied_pending_command_ids(&pending_agent_drops, &loaded.core, &core);
     let frozen_reductions_before = frozen_red_targets(&loaded.core);
@@ -13136,7 +13061,6 @@ fn new_frozen_strip_units(
     reasoning_clear_cutoff: Option<u64>,
     is_bust_pass: bool,
     lineage_anchor_mid: Option<&str>,
-    protected_tools: &HashSet<String>,
 ) -> Vec<FrozenUnit> {
     if !is_bust_pass {
         return Vec::new();
@@ -13187,9 +13111,6 @@ fn new_frozen_strip_units(
             continue;
         }
         let blocks = message.ck.content.as_slice();
-        let protected_reduce = blocks.iter().enumerate().any(|(index, block)| {
-            is_reduce_block(block) && protected_tools.contains(&format!("{}#{index}", message.mid))
-        });
         if message.ck.role == "assistant" {
             // The reverse image scan in TS treats any assistant message as evidence
             // that older user content has already reached the model.
@@ -13245,7 +13166,6 @@ fn new_frozen_strip_units(
             if request_accepts_empty_content(req)
                 && index < protected_start
                 && blocks.iter().any(is_reduce_block)
-                && !protected_reduce
             {
                 let unit = strip_unit("stale_reduce", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
@@ -13262,8 +13182,7 @@ fn new_frozen_strip_units(
         }
         let is_stale_reduce = request_accepts_empty_content(req)
             && index < protected_start
-            && blocks.iter().any(is_reduce_block)
-            && !protected_reduce;
+            && blocks.iter().any(is_reduce_block);
         if is_stale_reduce {
             let unit = strip_unit("stale_reduce", &message.mid, &sentinel);
             if !existing_keys.contains(unit.key.as_str()) {
@@ -18710,7 +18629,6 @@ pub(crate) mod tests {
             protected_tokens_provenance: "derived",
             compaction_enabled: true,
             smart_drops: false,
-            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
             cache_ttl_provenance: CacheTtlProvenance::Default,
             model_key: None,
@@ -18727,294 +18645,6 @@ pub(crate) mod tests {
         let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
         ctx.smart_drops = true;
         ctx
-    }
-
-    #[test]
-    fn protected_tool_snapshot_is_the_selection_set_and_rotation_does_not_bust() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        ctx.protected_tools.insert("probe".to_string(), 1);
-        let mut request = req(
-            "protected-snapshot",
-            "cfg0",
-            vec![
-                wire_tool_call("owner", 1, "call_result"),
-                wire_tool_result(
-                    "result",
-                    2,
-                    json!({"kind":{"type":"text", "text":"protected output"}}),
-                ),
-            ],
-        );
-        request.tool_present = true;
-        transform(&s, &request, &ctx).unwrap();
-        let before = transform(&s, &request, &ctx).unwrap();
-        assert!(s
-            .load("protected-snapshot")
-            .unwrap()
-            .meta
-            .protected_tool_block_ids
-            .contains("result#0"));
-        request
-            .messages
-            .push(wire_tool_call("new-owner", 3, "call_new-result"));
-        request.messages.push(wire_tool_result(
-            "new-result",
-            4,
-            json!({"kind":{"type":"text", "text":"new output"}}),
-        ));
-        let after = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(after.action, "SOFT+");
-        let before_messages = before.ck_messages.as_ref().unwrap();
-        let after_messages = after.ck_messages.as_ref().unwrap();
-        assert_eq!(after_messages[..before_messages.len()], before_messages[..]);
-        let held = &s
-            .load("protected-snapshot")
-            .unwrap()
-            .meta
-            .protected_tool_block_ids;
-        assert!(held.contains("new-result#0"));
-        assert!(!held.contains("result#0"));
-    }
-
-    #[test]
-    fn protected_nudge_policy_waits_for_rebuilding_and_legacy_defaults_stay_frozen() {
-        for legacy in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let s = store(dir.path());
-            bootstrap_covering_a(&s);
-            let mut ctx = smart_pctx();
-            let tool = if legacy { "todowrite" } else { "probe" };
-            ctx.protected_tools.insert(tool.into(), 1);
-            let mut messages = vec![item("a", 1, "raw")];
-            for n in 0..4 {
-                let name = if n == 0 { tool } else { "ctx_reduce" };
-                let mut call = wire_tool_call(
-                    &format!("owner-{n}"),
-                    n * 2 + 2,
-                    &format!("call_result-{n}"),
-                );
-                if let ck_wire::CkKind::ToolCall { name: value, .. } = &mut call.ck.content[0].kind
-                {
-                    *value = name.into();
-                }
-                let text = "word ".repeat(if n == 0 { 12000 } else { 20000 });
-                let mut result = wire_tool_result(
-                    &format!("result-{n}"),
-                    n * 2 + 3,
-                    json!({"kind":{"type":"text","text":text}}),
-                );
-                if let ck_wire::CkKind::ToolResult { tool_name, .. } =
-                    &mut result.ck.content[0].kind
-                {
-                    *tool_name = name.into();
-                }
-                messages.extend([call, result]);
-            }
-            messages.push(item("tail", 12, "continue"));
-            let mut request = with_usage(active_cc_req("ses", "cfg0", messages), 10000, 100000);
-            request.protected_tokens_effective = Some(4000);
-            request.tool_present = true;
-            transform(&s, &request, &ctx).unwrap();
-            transform(&s, &request, &ctx).unwrap();
-            let mut loaded = s.load("ses").unwrap();
-            // Initialize the cached state, then measure the baseline with the same
-            // messages that were served. This isolates policy adoption from age-based
-            // cleanup, which could otherwise remove the tool result under test.
-            let rows = s.load_tags_for_session("ses").unwrap();
-            let projection = project_messages(&request.messages).unwrap();
-            let token_map = rows
-                .iter()
-                .map(|row| (row.block_id.as_str(), row.token_count as usize))
-                .collect();
-            let items = projection
-                .blocks
-                .iter()
-                .map(|block| sel_item_from_flat(block, &token_map))
-                .collect::<Vec<_>>();
-            let mut old_policy = crate::selection::default_protected_tools();
-            old_policy.insert(tool.into(), 0);
-            let old_protected =
-                crate::selection::protected_blocks_for_policy(&items, &HashSet::new(), &old_policy);
-            let window = ProtectionWindow::from_persisted_rows(&rows, 4000);
-            let measured = measure_tail_hygiene_with_pending_drops(
-                &projection,
-                &loaded.core,
-                loaded.meta.coverage_ordinal,
-                &rows,
-                &window.tag_numbers,
-                &old_protected,
-                &HashSet::new(),
-            );
-            let mut old_baseline = refresh_tail_hygiene_baseline_calibrated(
-                measured,
-                true,
-                None,
-                ctx.now_ms,
-                HygieneCalibration {
-                    units_version: 1,
-                    tools_ratio: 1.0,
-                    prose_ratio: 1.0,
-                },
-            )
-            .baseline;
-            old_baseline.protected_tools_policy = (!legacy).then_some(old_policy);
-            loaded.meta.tail_hygiene_baseline = Some(old_baseline);
-            let before_u = crate::tail_hygiene::effective_tail_hygiene(
-                loaded.meta.tail_hygiene_baseline.as_ref().unwrap(),
-            )
-            .0;
-            assert!(before_u > 6000);
-            loaded.meta.channel2_pressure_latched = true;
-            if legacy {
-                loaded
-                    .meta
-                    .tail_hygiene_baseline
-                    .as_mut()
-                    .unwrap()
-                    .protected_tools_policy = None;
-            }
-            s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
-                .unwrap();
-            ctx.protected_tools.insert(tool.into(), 1);
-            let deferred = transform(&s, &request, &ctx).unwrap();
-            assert_eq!(deferred.action, "SOFT+");
-            let after = s.load("ses").unwrap();
-            let after_u = crate::tail_hygiene::effective_tail_hygiene(
-                after.meta.tail_hygiene_baseline.as_ref().unwrap(),
-            )
-            .0;
-            assert_eq!(after_u, before_u);
-            assert!(after.meta.channel2_pressure_latched);
-            request.render_config = "cfg1".into();
-            transform(&s, &request, &ctx).unwrap();
-            let rebuilt = s.load("ses").unwrap();
-            assert!(
-                crate::tail_hygiene::effective_tail_hygiene(
-                    rebuilt.meta.tail_hygiene_baseline.as_ref().unwrap()
-                )
-                .0 < before_u
-            );
-            assert_eq!(
-                rebuilt
-                    .meta
-                    .tail_hygiene_baseline
-                    .as_ref()
-                    .unwrap()
-                    .protected_tools_policy
-                    .as_ref()
-                    .unwrap()
-                    .get(tool),
-                Some(&1)
-            );
-        }
-    }
-
-    #[test]
-    fn protected_ctx_reduce_stale_detection_and_frozen_replay() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        let mut ctx = smart_pctx();
-        ctx.protected_tools.insert("ctx_reduce".into(), 6);
-        let mut messages = Vec::new();
-        for n in 0..6 {
-            let mut call = wire_tool_call(
-                &format!("owner-{n}"),
-                n * 2 + 1,
-                &format!("call_result-{n}"),
-            );
-            if let ck_wire::CkKind::ToolCall { name, .. } = &mut call.ck.content[0].kind {
-                *name = "ctx_reduce".into();
-            }
-            let mut result = wire_tool_result(
-                &format!("result-{n}"),
-                n * 2 + 2,
-                json!({"kind":{"type":"text","text":"reduce result"}}),
-            );
-            if let ck_wire::CkKind::ToolResult { tool_name, .. } = &mut result.ck.content[0].kind {
-                *tool_name = "ctx_reduce".into();
-            }
-            messages.extend([call, result]);
-        }
-        messages.extend((0..45).map(|n| item(&format!("later-{n}"), n + 20, "later work")));
-        let mut request = req("ses", "cfg0", messages);
-        request.provider_id = Some("anthropic".into());
-        transform(&s, &request, &ctx).unwrap();
-        assert!(s
-            .load("ses")
-            .unwrap()
-            .core
-            .frozen_units
-            .iter()
-            .all(|unit| !unit.key.starts_with("strip:stale_reduce:")));
-        ctx.protected_tools.insert("ctx_reduce".into(), 0);
-        request.render_config = "cfg1".into();
-        let stripped = transform(&s, &request, &ctx).unwrap();
-        assert!(s
-            .load("ses")
-            .unwrap()
-            .core
-            .frozen_units
-            .iter()
-            .any(|unit| unit.key.starts_with("strip:stale_reduce:")));
-        ctx.protected_tools.insert("ctx_reduce".into(), 6);
-        let replay = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(stripped.ck_messages, replay.ck_messages);
-    }
-
-    #[test]
-    fn protected_tool_queued_drop_persists_until_rotation_and_a_priced_pass() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = store(dir.path());
-        bootstrap_covering_a(&s);
-        let context = smart_pctx();
-        let mut messages = vec![item("a", 1, "raw")];
-        messages.extend(todowrite_arc("held", 2));
-        // Large unrelated results exercise the token-window hold separately from
-        // the per-tool protection on the todowrite result.
-        for n in 0..3 {
-            messages.push(assistant_tool_call(
-                &format!("bash-{n}"),
-                4 + n * 2,
-                &format!("bash-call-{n}"),
-            ));
-            messages.push(tool_result(
-                &format!("bash-result-{n}"),
-                5 + n * 2,
-                &format!("bash-call-{n}"),
-                &"payload ".repeat(8000),
-            ));
-        }
-        let mut request = with_usage(active_cc_req("ses", "cfg0", messages), 10_000, 100_000);
-        request.protected_tokens_effective = Some(4000);
-        transform(&s, &request, &context).unwrap();
-        // Agent and historian requests share one durable pending-drop queue; rows do not
-        // record which publisher added them.
-        s.append_pending_agent_drops("ses", &["held_result#0".to_string()], 1)
-            .unwrap();
-        for config in ["cfg1", "cfg2"] {
-            request.render_config = config.to_string();
-            let response = transform(&s, &request, &context).unwrap();
-            assert_eq!(s.load_pending_agent_drops("ses").unwrap().len(), 1);
-            assert!(serde_json::to_string(&response.ck_messages)
-                .unwrap()
-                .contains("todo output"));
-            assert!(!frozen_red_targets(&s.load("ses").unwrap().core).contains("held_result#0"));
-        }
-        // A newer todowrite result changes which call is protected, but this deferred
-        // pass must not rewrite cached output or apply the queued drop.
-        request.messages.extend(todowrite_arc("newest", 10));
-        let defer = transform(&s, &request, &context).unwrap();
-        assert_eq!(defer.action, "SOFT+");
-        assert_eq!(s.load_pending_agent_drops("ses").unwrap().len(), 1);
-        assert!(!frozen_red_targets(&s.load("ses").unwrap().core).contains("held_result#0"));
-        request.render_config = "cfg3".to_string();
-        transform(&s, &request, &context).unwrap();
-        assert!(s.load_pending_agent_drops("ses").unwrap().is_empty());
-        assert!(frozen_red_targets(&s.load("ses").unwrap().core).contains("held_result#0"));
-        transform(&s, &request, &context).unwrap();
-        assert!(frozen_red_targets(&s.load("ses").unwrap().core).contains("held_result#0"));
     }
 
     fn seed_unrelated_hint_candidates(store: &McStore) {
@@ -21253,10 +20883,7 @@ pub(crate) mod tests {
             &items,
             &HashSet::new(),
             &ctx,
-            &SelectionConfig {
-                smart_drops: false,
-                ..SelectionConfig::default()
-            },
+            &SelectionConfig { smart_drops: false },
         );
         let mut applied = first
             .decisions
@@ -21301,10 +20928,7 @@ pub(crate) mod tests {
             &items,
             &applied,
             &ctx,
-            &SelectionConfig {
-                smart_drops: false,
-                ..SelectionConfig::default()
-            },
+            &SelectionConfig { smart_drops: false },
         );
         assert!(still_protected.decisions.is_empty());
 
@@ -21333,10 +20957,7 @@ pub(crate) mod tests {
             &items,
             &applied,
             &ctx,
-            &SelectionConfig {
-                smart_drops: false,
-                ..SelectionConfig::default()
-            },
+            &SelectionConfig { smart_drops: false },
         );
         // The later bust may also reclaim unprotected call blocks automatically;
         // count the explicit queue targets separately from those arc decisions.

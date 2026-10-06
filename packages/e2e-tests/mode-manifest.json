@@ -3,14 +3,6 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and the Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh. The tag release workflow also runs the Rust invocation; both Rust lanes require public sibling path dependencies (../commons and ../subconscious).",
     "entries": [
         {
-            "path": "tests/protected-tools.test.ts",
-            "tier": "ts-only",
-            "invocation": { "ts": true, "rust": false },
-            "rationale": "OpenCode 1.18.30 mock provider custom tool newest-two protection through emergency; PID lsof proves throwaway-store containment. Pi and Rust share the selection golden.",
-            "contract_refs": ["FOLD-UNDER-PRESSURE"],
-            "hosts": ["opencode"]
-        },
-        {
             "path": "tests/subagent-write-tools.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

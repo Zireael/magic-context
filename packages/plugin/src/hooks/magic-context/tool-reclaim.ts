@@ -1,4 +1,3 @@
-import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import {
     AGE_RECLAIM_MIN_TOKENS,
     advanceToolReclaimWatermark,
@@ -15,16 +14,21 @@ export function buildSyntheticToolReclaimOps(input: {
     targets: Map<number, TagTarget>;
     watermark: number;
     pendingOps?: readonly PendingOp[];
-    protectedTools?: Readonly<Record<string, number>>;
-    protectedToolTags?: ReadonlySet<number>;
 }): PendingOp[] {
     const watermark = Math.max(0, input.watermark);
     if (watermark <= 0) return [];
 
     const realPendingTagIds = new Set((input.pendingOps ?? []).map((op) => op.tagId));
+    // Storage-level candidate selection removes the newest ctx_reduce exemplars
+    // before this lane applies its watermark and value-floor checks.
     const tags = getActiveToolTagsForAgeReclaim(input.db, input.sessionId);
-    const protectedTags =
-        input.protectedToolTags ?? protectedToolTagNumbers(tags, input.protectedTools);
+    const newestTodowriteTag = tags.reduce<number | null>(
+        (newest, tag) =>
+            tag.toolName === "todowrite" && (newest === null || tag.tagNumber > newest)
+                ? tag.tagNumber
+                : newest,
+        null,
+    );
     const synthetic: PendingOp[] = [];
 
     for (const tag of tags) {
@@ -32,7 +36,7 @@ export function buildSyntheticToolReclaimOps(input: {
         if (tag.reclaimableTokens !== null && tag.reclaimableTokens < AGE_RECLAIM_MIN_TOKENS) {
             continue;
         }
-        if (protectedTags.has(tag.tagNumber)) continue;
+        if (tag.tagNumber === newestTodowriteTag) continue;
         if (realPendingTagIds.has(tag.tagNumber)) continue;
         if (input.targets.get(tag.tagNumber)?.canDrop?.() !== true) continue;
         synthetic.push({

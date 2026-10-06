@@ -31,7 +31,6 @@ export const RENDERED_PREFIXES: readonly string[] = [
   "output_reserve",
   "execute_threshold_percentage",
   "execute_threshold_tokens",
-  "protected_tools",
   // Tags & cleanup
   "protected_tokens",
   "clear_reasoning_age",
@@ -76,6 +75,7 @@ export const RENDERED_PREFIXES: readonly string[] = [
   "keep_subagents",
   "todowrite",
   "prompt_surface",
+  "smart_drops",
   "sqlite",
   "storage.enforce_private_permissions",
   "compaction.enabled",
@@ -151,7 +151,6 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
     "user-only Fusiform overlay path; raw JSONC because it is a filesystem location with a computed default (<dataDir>/fusiform/window-overlay.json), not a value worth a form widget",
   protected_tags:
     "deprecated and ignored by every runtime; retained only so existing files receive a migration warning",
-  smart_drops: "deprecated and ignored; supersession is always on and old configs remain loadable",
   debug_rpc:
     "developer-only diagnostics toggle (memory/heap endpoints on the local RPC); never a dashboard knob",
 };

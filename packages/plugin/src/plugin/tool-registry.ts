@@ -144,7 +144,6 @@ export function createToolRegistry(args: {
             ? {}
             : createCtxReduceTools({
                   db,
-                  protectedTools: pluginConfig.protected_tools,
                   getProtectionWindow: (sessionId) =>
                       getProtectionWindowForSession(
                           db,

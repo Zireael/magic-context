@@ -96,7 +96,7 @@ import {
 } from "./ctx-reduce-nudge";
 import { DegradedPassRefusalError, degradedPassError } from "./degraded-pass-refusal";
 import { deriveTriggerBudget } from "./derive-budgets";
-import { contextRefusalError, EmergencyFailClosedError } from "./emergency-fail-closed";
+import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
     historyBudgetPolicyIdentity,
@@ -107,7 +107,6 @@ import {
     resolveTrustedContextLimit,
 } from "./event-resolvers";
 import {
-    createFinalWireUsageTracker,
     describeFinalWireTail,
     estimateFinalWireInputTokens,
     estimateMessageTokens,
@@ -440,7 +439,6 @@ export interface TransformDeps {
      *  later call supersedes, on top of the age-based auto-drop. Off → messages
      *  sent to the model are byte-identical to the age-based-only behavior. */
     smartDrops?: boolean;
-    protectedTools?: Readonly<Record<string, number>>;
     clearReasoningAge: number;
     /** Commit-cluster historian trigger config (`commit_cluster_trigger`). */
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
@@ -658,7 +656,6 @@ export function resolveTransformHostSeams(
 }
 
 export function createTransform(deps: TransformDeps) {
-    const finalWireUsage = createFinalWireUsageTracker();
     const host = resolveTransformHostSeams(deps);
     const loadedSessions = new Set<string>();
     // Sessions whose history was clearly over the model's window, with no
@@ -2676,7 +2673,6 @@ export function createTransform(deps: TransformDeps) {
             // the primary agent that spawned them.
             cavemanTextCompression: !reducedMode ? deps.cavemanTextCompression : undefined,
             smartDrops: deps.smartDrops === true,
-            protectedTools: deps.protectedTools,
             // Pass the single resolved provider through to postprocess so every
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
@@ -2717,18 +2713,13 @@ export function createTransform(deps: TransformDeps) {
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (postTransformResult.bustedThisPass) {
             try {
-                finalWireEstimate = finalWireUsage.estimate(
-                    sessionId,
-                    {
-                        messages,
-                        systemPromptTokens: sessionMeta.systemPromptTokens,
-                        providerID: modelForBudget?.providerID,
-                        modelID: modelForBudget?.modelID,
-                        agentName: notificationParams.agent,
-                        systemPromptHash: sessionMeta.systemPromptHash,
-                    },
-                    boundaryContextLimit,
-                );
+                finalWireEstimate = estimateFinalWireInputTokens({
+                    messages,
+                    systemPromptTokens: sessionMeta.systemPromptTokens,
+                    providerID: modelForBudget?.providerID,
+                    modelID: modelForBudget?.modelID,
+                    agentName: notificationParams.agent,
+                });
             } catch {
                 sessionLog(
                     sessionId,
@@ -2746,19 +2737,14 @@ export function createTransform(deps: TransformDeps) {
                   : contextUsage.percentage;
             finalWireEstimate =
                 finalWireEstimate ??
-                (emergencyUsagePercentage >= 95 || schedulerDecision === "execute"
-                    ? finalWireUsage.estimate(
-                          sessionId,
-                          {
-                              messages,
-                              systemPromptTokens: sessionMeta.systemPromptTokens,
-                              providerID: modelForBudget?.providerID,
-                              modelID: modelForBudget?.modelID,
-                              agentName: notificationParams.agent,
-                              systemPromptHash: sessionMeta.systemPromptHash,
-                          },
-                          boundaryContextLimit,
-                      )
+                (emergencyUsagePercentage >= 95
+                    ? estimateFinalWireInputTokens({
+                          messages,
+                          systemPromptTokens: sessionMeta.systemPromptTokens,
+                          providerID: modelForBudget?.providerID,
+                          modelID: modelForBudget?.modelID,
+                          agentName: notificationParams.agent,
+                      })
                     : undefined);
             if (finalWireEstimate) {
                 sessionLog(
@@ -2881,12 +2867,6 @@ export function createTransform(deps: TransformDeps) {
                 foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
                 finalWireEstimate,
                 providerProvenLimitTokens,
-                contextLimitTokens: boundaryContextLimit,
-                protectedToolTokens: protectedToolTokenCount(
-                    getActiveTagsBySession(db, sessionId),
-                    deps.protectedTools,
-                    resolveDecisionCalibration(modelForBudget?.providerID, modelForBudget?.modelID),
-                ),
             });
             if (emergencyFailClosed.disarm) {
                 clearEmergencyRecovery(db, sessionId);
@@ -2896,9 +2876,6 @@ export function createTransform(deps: TransformDeps) {
                 );
             }
             if (emergencyFailClosed.shouldAbort) {
-                if (emergencyFailClosed.refusalMessage) {
-                    throw contextRefusalError(emergencyFailClosed.refusalMessage);
-                }
                 // The notice must finish before host refusal so recovery instructions survive interruption.
                 try {
                     await host.hostRefusalNotice(
@@ -3236,15 +3213,6 @@ export function createTransform(deps: TransformDeps) {
                 `thinking binding recovery: stripped bound reasoning from ${bindingRecovery.messageIds.length} assistant(s) [${bindingRecovery.messageIds.join(",")}]; flag=${cleared ? "cleared" : "rearmed"}`,
             );
         }
-        if (passOutcome.captureEligible)
-            finalWireUsage.capture(sessionId, {
-                messages,
-                systemPromptTokens: sessionMeta.systemPromptTokens,
-                providerID: modelForBudget?.providerID,
-                modelID: modelForBudget?.modelID,
-                agentName: notificationParams.agent,
-                systemPromptHash: sessionMeta.systemPromptHash,
-            });
     };
 
     return Object.assign(transform, {
@@ -3323,6 +3291,3 @@ export function resolveHistoryBudgetTokens(
             historyBudgetPercentage,
     );
 }
-
-import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
-import { resolveDecisionCalibration } from "./decision-calibration";

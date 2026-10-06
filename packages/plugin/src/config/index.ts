@@ -284,22 +284,10 @@ function deepMergeRawConfig(
             typeof overrideVal === "object" &&
             !Array.isArray(overrideVal)
         ) {
-            mergedValue =
-                key === "protected_tools"
-                    ? Object.fromEntries(
-                          [baseVal, overrideVal].flatMap((value) =>
-                              Object.entries(value as Record<string, unknown>).map(
-                                  ([name, count]) => [
-                                      name.toLowerCase().replace(/^mcp_/, ""),
-                                      count,
-                                  ],
-                              ),
-                          ),
-                      )
-                    : deepMergeRawConfig(
-                          baseVal as Record<string, unknown>,
-                          overrideVal as Record<string, unknown>,
-                      );
+            mergedValue = deepMergeRawConfig(
+                baseVal as Record<string, unknown>,
+                overrideVal as Record<string, unknown>,
+            );
         } else if (
             key === "disabled_hooks" &&
             Array.isArray(baseVal) &&
@@ -419,11 +407,6 @@ export function parsePluginConfig(
         warnProtectedTagsDeprecationOnce();
         preMigrationWarnings.push(
             "protected_tags is deprecated and ignored; use protected_tokens instead.",
-        );
-    }
-    if (Object.hasOwn(rawConfig, "smart_drops")) {
-        preMigrationWarnings.push(
-            "smart_drops is deprecated and ignored; supersession reclaim is always on. This key no longer does anything; remove it.",
         );
     }
     preMigrationWarnings.push(...misplacedAgentModelWarnings(rawConfig));
