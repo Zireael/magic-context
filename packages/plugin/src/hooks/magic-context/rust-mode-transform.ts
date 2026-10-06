@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
-
 import {
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
@@ -89,6 +88,11 @@ import {
 } from "./event-resolvers";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
 import { createHistorianHostRunner } from "./historian-host-runner";
+import {
+    claimLkgRequestIdentity,
+    type LkgRequestIdentity,
+    noteCapturedLkgRequest,
+} from "./lkg-measured-request";
 import { clearPersistedLkgSlotStrict, saveLkgSlotToDb } from "./lkg-persist";
 import {
     coldStartRawServedIndex,
@@ -100,6 +104,7 @@ import {
     lkgReplayFits,
     lkgReplayLimit,
     measureLkgReplay,
+    measureLkgReplayRequest,
     RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN,
 } from "./lkg-replay-fit";
 import {
@@ -288,6 +293,9 @@ interface RustLkgCapturePlan {
     capturedAt: number;
     rowVersion: number;
     captureSequence: number;
+    requestIdentity?: LkgRequestIdentity;
+    systemPromptTokens: number;
+    agentName?: string;
 }
 
 interface RustWireCache {
@@ -2243,6 +2251,7 @@ export function createRustModeTransform(
         inputSnapshots: readonly Pick<MessageContentSnapshot, "fields">[],
         nativeMessages: readonly unknown[],
         responseRowVersion: number,
+        systemPromptTokens: number,
     ): RustLkgCapturePlan | null => {
         state.lkgCaptureSequence += 1;
         if (
@@ -2265,6 +2274,9 @@ export function createRustModeTransform(
             capturedAt: Date.now(),
             rowVersion: responseRowVersion,
             captureSequence: state.lkgCaptureSequence,
+            requestIdentity: claimLkgRequestIdentity(sessionId),
+            systemPromptTokens,
+            agentName: deps.getNotificationParams?.(sessionId)?.agent,
         };
     };
 
@@ -2329,6 +2341,13 @@ export function createRustModeTransform(
             captureSequence: plan.captureSequence,
             rowVersion: plan.rowVersion,
         };
+        noteCapturedLkgRequest({
+            sessionId: plan.sessionId,
+            slot,
+            request: plan.requestIdentity,
+            systemPromptTokens: plan.systemPromptTokens,
+            agentName: plan.agentName,
+        });
         options.onLkgCaptureForTests?.(reusedPrefix);
         // Durability across restarts: store the exact accepted snapshot (the
         // jsonPrefix string is reused as-is, never re-serialized). Best-effort —
@@ -2570,17 +2589,14 @@ export function createRustModeTransform(
         // The measurement every last-known-good replay is admitted with (see
         // `measureLkgReplay`), here with this pass's model and estimator.
         const measureAgainstLimit = (candidate: readonly unknown[], limit: number): FrozenFit =>
-            measureLkgReplay({
+            measureLkgReplayRequest({
+                sessionId,
                 messages: candidate as MessageLike[],
                 limit,
-                estimate: () =>
-                    rawFallbackEstimator({
-                        messages: candidate as MessageLike[],
-                        systemPromptTokens: sessionMeta.systemPromptTokens,
-                        providerID: model?.providerID,
-                        modelID: model?.modelID,
-                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
-                    }),
+                model,
+                systemPromptTokens: sessionMeta.systemPromptTokens,
+                agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                estimator: rawFallbackEstimator,
             }).fit;
         /**
          * Admission for a healthy pass that would serve the frozen replay `candidate`
@@ -4197,6 +4213,7 @@ export function createRustModeTransform(
                     pendingWireCache.rawContentSnapshots,
                     output.messages,
                     rowVersion,
+                    sessionMeta.systemPromptTokens,
                 );
                 let captureMode = "async";
                 if (capturePlan) state.lkgLastServedCaptureSequence = capturePlan.captureSequence;

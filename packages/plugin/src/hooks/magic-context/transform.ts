@@ -2987,6 +2987,8 @@ export function createTransform(deps: TransformDeps) {
                 output: messages,
                 modelKey,
                 providerKey,
+                systemPromptTokens: sessionMeta.systemPromptTokens,
+                agentName: notificationParams?.agent,
             });
             if (captured) {
                 // Keep the durable snapshot in step with the TS-mode capture too:

@@ -7,7 +7,7 @@ import {
     estimateImageTokensFromDataUrl,
     estimateToolAttachmentImageTokens,
 } from "./image-token-estimate";
-import { createTokenCountMemo } from "./read-session-formatting";
+import { createTokenCountMemo, hasTokenizerForFit } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import { UNKNOWN_FIT_RATIO } from "./tokenizer-calibration";
 
@@ -300,6 +300,37 @@ export function estimateFinalWireInputTokens(
         systemTokens,
         toolDefinitionTokens,
         toolDefinitionsMeasured: measuredToolDefinitions !== undefined,
+    };
+}
+
+/** A measured request already paid for its envelope; estimate only new messages. */
+export function estimateAppendedWireTokens(
+    input: Pick<FinalWireTokenEstimateInput, "messages" | "providerID" | "modelID">,
+): FinalWireTokenEstimate {
+    const messageTokens = input.messages.reduce<MessageTokenEstimate>(
+        (total, message) => {
+            const next = estimateMessageTokens(message);
+            total.conversation += next.conversation;
+            total.toolCall += next.toolCall;
+            return total;
+        },
+        { conversation: 0, toolCall: 0 },
+    );
+    const tokens = providerMass(
+        { prose: messageTokens.conversation, tools: messageTokens.toolCall },
+        resolveDecisionCalibration(input.providerID, input.modelID),
+        true,
+    );
+    return {
+        tokens,
+        trusted:
+            hasTokenizerForFit() &&
+            Number.isFinite(tokens) &&
+            tokens >= 0 &&
+            input.messages.every(hasCountableParts),
+        messageTokens,
+        systemTokens: 0,
+        toolDefinitionTokens: 0,
     };
 }
 

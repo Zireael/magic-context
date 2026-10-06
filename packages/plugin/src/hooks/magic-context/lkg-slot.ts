@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { sessionLog } from "../../shared/logger";
+import { clearCapturedLkgMeasurement } from "./lkg-measured-request";
 import type { MessageLike } from "./transform-operations";
 
 export interface LkgSlot {
@@ -585,6 +586,7 @@ export function forgetInMemorySlot(sessionId: string): void {
 }
 
 export function dropSlot(sessionId: string, _reason?: string): void {
+    clearCapturedLkgMeasurement(sessionId);
     forgetInMemorySlot(sessionId);
     // The durable row must follow the drop: a slot invalidated in memory
     // (model change, reshape, recovery arm, deletion) is equally invalid after
