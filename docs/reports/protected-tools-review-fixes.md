@@ -421,3 +421,65 @@ Logs: ignored `target/self-stamp-verification/plugin-complete.*`,
 All stores remained in-memory or preload/fixture-owned temporary roots; no live
 host/provider/store was opened. Native Rust and package manifests/lockfiles were
 not changed in this correction.
+
+## Exact master estimator parity and failure-accounting correction
+
+The 451e79ad chunking and its 8 MiB threshold are removed. A fail-first parity test
+loads six real repository texts over 4 KiB and compares `estimateTokens` directly
+with the tokenizer's whole-text `encode(..., "all").length`. It failed on the
+chunked implementation: current schema text counted 21,180 instead of 21,173.
+After restoration all six texts match exactly (24 assertions).
+
+**`consecutiveFailures` drives the three-failure module parking/warning and retry cadence; early refusals of invalid returned arrays now increment it, and repeated over-limit output cannot bypass that accounting.**
+
+The 12 MB real-pass test again requires failure count 1, then exercises two more
+invalid outputs and asserts count 3 with parking enabled. Its existing fifth-pass
+retry still fails closed, retains count 4, and does not create a second parking
+transition. Native typed refusals that return no invalid array remain distinct.
+The first oversized refusal is still below one second (1.6 ms in the final suite).
+
+### Classification of the three Pi failures against master
+
+Reference checked with `git show master:<path>` at `9de884724d`:
+
+- `nudge hygiene three-leg differential corpus > keeps TypeScript and Pi aligned
+  with the Rust-consumed golden`: **unchanged from master**; its entire test file
+  is byte-identical to master.
+- `TS/Pi/module differential hygiene corpus > keeps Pi as the third leg across
+  the full shared corpus`: **test body unchanged from master**. The file's branch
+  changes are separate lease/policy tests, not this corpus assertion.
+- `Pi hygiene walk performance > memoized 250k-token rendered tail walks are cheap
+  relative to the cold walk`: **test body unchanged from master**.
+
+No expected corpus count, tolerance, performance ratio or synthetic input was
+changed. The other branch bug was a72572751a's global byte fallback in the shared
+estimator, which inflated these larger-prose inputs. Comparing the actual master
+source showed that `estimateTokens` uses whole-text encoding directly. That
+function now matches the reference exactly; the only added helper is a cost-fence
+predicate used by refusal-only counting. The 1 MiB/16,385-letter-or-digit limits
+remain in the new refusal path, not in shared threshold/protection/nudge counting.
+Obvious byte decisions still precede all refusal tokenization, and uncertain
+pathological refusal parts use byte bounds without altering the shared estimator.
+
+### Final isolated verification
+
+| Gate | Result |
+| --- | --- |
+| Full plugin `bun run test` | **7017 passed, 4 skipped, 0 failed**; 7021 tests across 679 files, 139.46s |
+| Full Pi `bun run test` | **1562 passed, 3 skipped, 0 failed**; 1565 tests across 145 files, 31.23s |
+| Root `bun run lint` | Passed with zero errors |
+| Plugin and Pi repository typechecks | Passed, TypeScript 5.9.3 |
+| Real-file parity, refusal-only bound and unchanged hygiene controls | 7 passed, 237 assertions |
+| Real oversized-output/parking regression | Passed, 14 assertions |
+
+Both full-suite invocations explicitly unset `OPENCODE_DB`, set HOME to the same
+canonical throwaway directory outside every Git repository, and rely on the
+repository test preload for stores/configuration. Inherited external AFT Git-hook
+environment was removed as in the previous gate. An initial HOME inside this Git
+worktree caused the existing home-directory identity tests to select Git identity
+instead of directory fallback; the corrected external throwaway HOME passes.
+No fixture expectation was weakened to work around that invocation error.
+
+Logs: ignored `target/self-stamp-verification/plugin-reference-final.*`,
+`pi-reference-final.*`, `root-lint-parity.*` and `parity-home.txt`. No native Rust,
+manifest, lockfile, live host, provider or production store was changed/opened.
