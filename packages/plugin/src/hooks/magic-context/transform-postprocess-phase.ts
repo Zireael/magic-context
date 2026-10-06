@@ -132,7 +132,7 @@ import {
     prepareCachedM0M1Replay,
     renderCompartmentInjection,
 } from "./inject-compartments";
-import { markNoteNudgeDelivered, peekNoteNudgeText } from "./note-nudger";
+import { markNoteNudgeDelivered, observeNoteNudgeServe, peekNoteNudgeText } from "./note-nudger";
 import { hasVisibleNoteReadCall } from "./note-visibility";
 import type { PassDegradationKind, PassDegradationSite, PassOutcome } from "./pass-outcome";
 import {
@@ -194,7 +194,7 @@ import {
 } from "./tool-reclaim";
 import {
     appendReminderToUserMessageById,
-    findLastUserMessageId,
+    findNoteNudgeUserMessageId,
     injectToolPartIntoAssistantById,
     injectToolPartIntoLatestAssistant,
 } from "./transform-message-helpers";
@@ -1190,7 +1190,17 @@ export function runRustModePostprocess(args: {
     applyFrozenTrailingBlankDecisions(args.messages, absorbingStripDecisions);
 
     let noteNudgeAppended = false;
-    const currentUserMessageId = findLastUserMessageId(args.messages);
+    const currentUserMessageId = findNoteNudgeUserMessageId(args.messages);
+    const eligibility = observeNoteNudgeServe({
+        db: args.db,
+        sessionId: args.sessionId,
+        userMessageIds: args.messages
+            .filter((m) => m.info.role === "user" && typeof m.info.id === "string")
+            .map((m) => m.info.id as string),
+        anchorMessageId: currentUserMessageId,
+        isLiveTail: args.messages.at(-1)?.info.id === currentUserMessageId,
+        isCacheBustingPass: args.cacheBustingPass === true,
+    });
     const noteReadStillVisible = hasVisibleNoteReadCall(args.messages);
     const deferredNoteText = peekNoteNudgeText(
         args.db,
@@ -1198,10 +1208,11 @@ export function runRustModePostprocess(args: {
         currentUserMessageId,
         args.projectPath,
         noteReadStillVisible,
+        eligibility,
     );
     if (deferredNoteText) {
         const instruction = `\n\n<instruction name="deferred_notes">${deferredNoteText}</instruction>`;
-        const anchoredMessageId = findLastUserMessageId(args.messages);
+        const anchoredMessageId = currentUserMessageId;
         const outcome = markNoteNudgeDelivered(
             args.db,
             args.sessionId,
@@ -3264,18 +3275,32 @@ export async function runPostTransformPhase(
         ? hasVisibleNoteReadCall(args.messages)
         : false;
     let noteNudgeAppendedThisPass = false;
+    const noteNudgeUserMessageId = findNoteNudgeUserMessageId(args.messages);
+    const noteNudgeEligibility = args.fullFeatureMode
+        ? observeNoteNudgeServe({
+              db: args.db,
+              sessionId: args.sessionId,
+              userMessageIds: args.messages
+                  .filter((m) => m.info.role === "user" && typeof m.info.id === "string")
+                  .map((m) => m.info.id as string),
+              anchorMessageId: noteNudgeUserMessageId,
+              isLiveTail: args.messages.at(-1)?.info.id === noteNudgeUserMessageId,
+              isCacheBustingPass,
+          })
+        : undefined;
     const deferredNoteText = args.fullFeatureMode
         ? peekNoteNudgeText(
               args.db,
               args.sessionId,
-              args.currentTurnId,
+              noteNudgeUserMessageId,
               args.projectPath,
               noteReadStillVisible,
+              noteNudgeEligibility,
           )
         : null;
     if (deferredNoteText) {
         const noteInstruction = `\n\n<instruction name="deferred_notes">${deferredNoteText}</instruction>`;
-        const anchoredMessageId = findLastUserMessageId(args.messages);
+        const anchoredMessageId = noteNudgeUserMessageId;
         const outcome = markNoteNudgeDelivered(
             args.db,
             args.sessionId,

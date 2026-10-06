@@ -178,6 +178,7 @@ import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fo
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import {
 	markNoteNudgeDelivered,
+	observeNoteNudgeServe,
 	onNoteTrigger,
 	peekNoteNudgeText,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
@@ -7605,8 +7606,8 @@ function applyNoteNudges(args: {
 	}
 	logTransformTiming(sessionId, "stickyReplayDecisions", tStickyReplay);
 
-	// Path 2: fresh delivery. Use the latest user message id (or null if
-	// no user messages yet) as the trigger-message hint to peekNoteNudgeText.
+	// Path 2: fresh delivery. Observe even when no trigger is pending, so a
+	// later trigger cannot change a user already served without the reminder.
 	//
 	// Visibility-aware suppression: peekNoteNudgeText suppresses the
 	// nudge when the agent already ran ctx_note(read) since the latest
@@ -7617,6 +7618,16 @@ function applyNoteNudges(args: {
 	// OpenCode's transform-postprocess-phase.ts:647 wiring.
 	const latestUser = findLatestUserMessageIdPi(messages, messageIdByIndex);
 	const latestUserId = latestUser?.messageId ?? null;
+	const eligibility = observeNoteNudgeServe({
+		db,
+		sessionId,
+		userMessageIds: [...messageIdByIndex]
+			.filter(([index]) => messages[index]?.role === "user")
+			.map(([, id]) => id),
+		anchorMessageId: latestUserId,
+		isLiveTail: latestUser?.index === messages.length - 1,
+		isCacheBustingPass: args.isCacheBusting,
+	});
 	const noteReadStillVisible = hasVisibleNoteReadCallPi(messages);
 	// The row snapshot is the change signal for expensive note/smart-note reads.
 	// A false trigger cannot produce a nudge, so avoid entering the shared helper
@@ -7630,6 +7641,7 @@ function applyNoteNudges(args: {
 					latestUserId,
 					projectIdentity,
 					noteReadStillVisible,
+					eligibility,
 				);
 	if (deferredNoteText) {
 		if (entryIds === null) {

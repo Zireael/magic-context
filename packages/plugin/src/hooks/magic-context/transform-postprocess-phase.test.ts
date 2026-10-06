@@ -7,15 +7,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import todoRideGolden from "../../../../../crates/mc-module/testdata/todo-ride-only.json";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
+import { runMigrations } from "../../features/magic-context/migrations";
 import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
 import {
+    addNote,
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
     advanceToolReclaimWatermark,
     applyStrippedPlaceholderDelta,
     getActiveTagsBySession,
     getChannel2NudgeState,
+    getNoteNudgeAnchors,
     getOrCreateSessionMeta,
     getPendingCompactionMarkerState,
     getPendingOps,
@@ -91,6 +94,7 @@ import {
     type ToolCallIndex,
     ToolMutationBatch,
 } from "./tool-drop-target";
+import { findLastUserMessageId } from "./transform-message-helpers";
 import * as operations from "./transform-operations";
 import { applyFlushedStatuses } from "./transform-operations";
 import {
@@ -562,6 +566,153 @@ describe("postprocess replay-or-refuse", () => {
             }
         });
     }
+});
+
+describe("note nudge first-serve fence", () => {
+    const makeNoteDb = (path = ":memory:") => {
+        db = new Database(path);
+        initializeDatabase(db);
+        runMigrations(db);
+    };
+    const oldId = "msg_0fde60284001HWrjLLMr7NA6U3";
+    const newestId = "msg_1132b8f570015eW5juiKW3okXV";
+    const source = () =>
+        [
+            {
+                info: { id: oldId, role: "user" },
+                parts: [{ type: "text", text: "old real user prompt" }],
+            },
+            {
+                info: { id: "answer", role: "assistant" },
+                parts: [{ type: "text", text: "working" }],
+            },
+            {
+                info: { id: newestId, role: "user" },
+                parts: [
+                    {
+                        type: "text",
+                        text: '§25124§ <system-reminder><channel-notice room="fleet">Hold launches.</channel-notice></system-reminder>',
+                    },
+                ],
+            },
+        ] as MessageLike[];
+
+    it("delivers on the SYNAPSE rebuild to the resolved wire user and replays identically on defer", async () => {
+        makeNoteDb();
+        const sessionId = "synapse-rebuild-note";
+        getOrCreateSessionMeta(db, sessionId);
+        addNote(db, "session", { sessionId, content: "Check deferred work" });
+        noteNudger.onNoteTrigger(db, sessionId, "historian_complete");
+        // The raw meaningful-user resolver skipped the newest channel notice.
+        replayStorage.setPersistedNoteNudgeTriggerMessageId(db, sessionId, oldId);
+        const raw = source();
+        (raw[2].parts[0] as { text: string }).text =
+            '<system-reminder><channel-notice room="fleet">Hold launches.</channel-notice></system-reminder>';
+        expect(findLastUserMessageId(raw)).toBe(oldId);
+        expect(findLastUserMessageId(source())).toBe(newestId);
+        const pass = async (bust: boolean) => {
+            const messages = source();
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    currentTurnId: bust ? oldId : newestId,
+                    pendingMaterializationSessions: new Set(bust ? [sessionId] : []),
+                }),
+            );
+            return messages;
+        };
+        const rebuild = await pass(true);
+        expect(getNoteNudgeAnchors(db, sessionId).map((a) => a.messageId)).toEqual([newestId]);
+        expect(JSON.stringify(rebuild[0])).not.toContain("deferred_notes");
+        expect(JSON.stringify(rebuild[2])).toContain("deferred_notes");
+        expect(await pass(false)).toEqual(rebuild);
+        expect(await pass(false)).toEqual(rebuild);
+    });
+
+    it("never delivers a late trigger to an already-served user, even when trigger identity differs", async () => {
+        makeNoteDb();
+        const sessionId = "synapse-late-note";
+        const pass = async (next = false) => {
+            const messages = source();
+            if (next)
+                messages.push({
+                    info: { id: "next-user", role: "user" },
+                    parts: [{ type: "text", text: "New work" }],
+                });
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, { currentTurnId: newestId }),
+            );
+            return messages;
+        };
+        const served = await pass();
+        addNote(db, "session", { sessionId, content: "Late condition check" });
+        noteNudger.onNoteTrigger(db, sessionId, "historian_complete");
+        replayStorage.setPersistedNoteNudgeTriggerMessageId(db, sessionId, oldId);
+        expect(await pass()).toEqual(served);
+        expect(getNoteNudgeAnchors(db, sessionId)).toEqual([]);
+        const delivered = await pass(true);
+        expect(delivered.slice(0, 3)).toEqual(served);
+        expect(getNoteNudgeAnchors(db, sessionId).map((a) => a.messageId)).toEqual(["next-user"]);
+        expect(await pass(true)).toEqual(delivered);
+    });
+
+    it("a restart with a stale trigger cannot append to the previously served newest user", async () => {
+        const root = createTestTempDirFromPath(join(tmpdir(), "note-restart-"));
+        const path = join(root, "context.db");
+        makeNoteDb(path);
+        const sessionId = "note-restart";
+        const pass = async (bust = false) => {
+            const messages = source();
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    currentTurnId: newestId,
+                    pendingMaterializationSessions: new Set(bust ? [sessionId] : []),
+                }),
+            );
+            return messages;
+        };
+        try {
+            const served = await pass();
+            addNote(db, "session", { sessionId, content: "Survives restart" });
+            noteNudger.onNoteTrigger(db, sessionId, "historian_complete");
+            replayStorage.setPersistedNoteNudgeTriggerMessageId(db, sessionId, oldId);
+            db.close();
+            makeNoteDb(path);
+            expect(await pass()).toEqual(served);
+            expect(await pass()).toEqual(served);
+            expect(getNoteNudgeAnchors(db, sessionId)).toEqual([]);
+            const hard = await pass(true);
+            expect(JSON.stringify(hard[2])).toContain("deferred_notes");
+            expect(await pass()).toEqual(hard);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it("the Rust host postprocessor uses the same first-serve and bust fence", () => {
+        makeNoteDb();
+        const sessionId = "rust-note-first-serve";
+        getOrCreateSessionMeta(db, sessionId);
+        const pass = (cacheBustingPass = false) => {
+            const messages = source();
+            runRustModePostprocess({
+                db,
+                sessionId,
+                messages,
+                fullFeatureMode: true,
+                cacheBustingPass,
+            });
+            return messages;
+        };
+        const served = pass();
+        addNote(db, "session", { sessionId, content: "Rust boundary note" });
+        noteNudger.onNoteTrigger(db, sessionId, "historian_complete");
+        replayStorage.setPersistedNoteNudgeTriggerMessageId(db, sessionId, oldId);
+        expect(pass()).toEqual(served);
+        expect(getNoteNudgeAnchors(db, sessionId)).toEqual([]);
+        const hard = pass(true);
+        expect(JSON.stringify(hard[2])).toContain("deferred_notes");
+        expect(pass()).toEqual(hard);
+    });
 });
 
 describe("optional fresh-tail additions", () => {
