@@ -273,3 +273,17 @@ Scoped `aft_inspect` had incomplete Biome/Pi server diagnostics; explicit packag
 typechecks/builds are authoritative. Full workspace tests/lint and real-host/
 gateway/provider probes were not run. This does not claim a live-vendor acceptance
 or repeat the earlier report's host handoff proof.
+
+### Post-checkpoint TypeScript verification
+
+The coherent implementation was committed as `bf43c94a1e` before the short,
+lane-by-lane verification runs. The TypeScript refusal/estimation suites then
+passed 21 tests and 68 assertions with Bun 1.4.2 under a 120-second bound.
+
+The calibrated positive control now deliberately crosses the boundary: its local
+protected count is below 16,000, while measured Fable pricing puts that subset
+above 16,000. Neutralizing protected-subset calibration reddened only
+`calibrated measured protected results still refuse with the protected-results code`;
+the unknown-model reviewer regression remained green. Restoring the staged bytes
+and rerunning the two suites passed. This defends calibration itself, not just a
+specimen whose unscaled mass was already over the limit.
