@@ -4886,6 +4886,7 @@ fn apply_once(
         )
     };
     timings.selection = elapsed_ms(selection_started_at);
+    let nudge_base_protected_block_ids = protected_block_ids.clone();
     protected_block_ids.extend(selection_outcome.protected_tool_block_ids.iter().cloned());
     let count_to_u64 =
         |count: Option<usize>| count.map(|value| u64::try_from(value).unwrap_or(u64::MAX));
@@ -6219,13 +6220,36 @@ fn apply_once(
         tag_rows_for_hygiene(&projection, &tag_rows, &tag_overlay, !tagging_active);
     profile_end!(perf_hygiene_tags);
     profile_start!(perf_hygiene_measure, "hygiene_measure");
+    let adopted_tools_policy = if is_bust_pass || loaded.meta.tail_hygiene_baseline.is_none() {
+        ctx.protected_tools.clone()
+    } else {
+        loaded
+            .meta
+            .tail_hygiene_baseline
+            .as_ref()
+            .and_then(|baseline| baseline.protected_tools_policy.clone())
+            .unwrap_or_else(|| [("todowrite".into(), 0), ("ctx_reduce".into(), 3)].into())
+    };
+    let nudge_tool_blocks = if adopted_tools_policy == ctx.protected_tools {
+        selection_outcome.protected_tool_block_ids.clone()
+    } else {
+        crate::selection::protected_blocks_for_policy(
+            &tail_for_selection,
+            &frozen_red_targets(&core),
+            &adopted_tools_policy,
+        )
+    };
+    let nudge_protected_block_ids = nudge_base_protected_block_ids
+        .union(&nudge_tool_blocks)
+        .cloned()
+        .collect();
     let hygiene_measurement = measure_tail_hygiene_with_pending_drops(
         &projection,
         &core,
         meta.coverage_ordinal,
         &hygiene_tag_rows,
         &protection_window.tag_numbers,
-        &protected_block_ids,
+        &nudge_protected_block_ids,
         &pending_drop_target_ids,
     );
     profile_end!(perf_hygiene_measure);
@@ -6294,6 +6318,12 @@ fn apply_once(
             })
     };
     profile_end!(perf_hygiene_refresh);
+    if let Some(baseline) = current_hygiene_baseline.as_mut() {
+        baseline.protected_tools_policy = Some(adopted_tools_policy.clone());
+    }
+    if let Some(baseline) = meta.tail_hygiene_baseline.as_mut() {
+        baseline.protected_tools_policy = Some(adopted_tools_policy);
+    }
     profile_end!(perf_hygiene);
     let refreshed_coverage = meta.coverage_ordinal;
     rearm_channel2_after_hard_fold(
@@ -18746,6 +18776,139 @@ pub(crate) mod tests {
             .protected_tool_block_ids;
         assert!(held.contains("new-result#0"));
         assert!(!held.contains("result#0"));
+    }
+
+    #[test]
+    fn protected_nudge_policy_waits_for_rebuilding_and_legacy_defaults_stay_frozen() {
+        for legacy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            bootstrap_covering_a(&s);
+            let mut ctx = smart_pctx();
+            let tool = if legacy { "todowrite" } else { "probe" };
+            ctx.protected_tools.insert(tool.into(), 1);
+            let mut messages = vec![item("a", 1, "raw")];
+            for n in 0..4 {
+                let name = if n == 0 { tool } else { "ctx_reduce" };
+                let mut call = wire_tool_call(
+                    &format!("owner-{n}"),
+                    n * 2 + 2,
+                    &format!("call_result-{n}"),
+                );
+                if let ck_wire::CkKind::ToolCall { name: value, .. } = &mut call.ck.content[0].kind
+                {
+                    *value = name.into();
+                }
+                let text = "word ".repeat(if n == 0 { 12000 } else { 20000 });
+                let mut result = wire_tool_result(
+                    &format!("result-{n}"),
+                    n * 2 + 3,
+                    json!({"kind":{"type":"text","text":text}}),
+                );
+                if let ck_wire::CkKind::ToolResult { tool_name, .. } =
+                    &mut result.ck.content[0].kind
+                {
+                    *tool_name = name.into();
+                }
+                messages.extend([call, result]);
+            }
+            messages.push(item("tail", 12, "continue"));
+            let mut request = with_usage(active_cc_req("ses", "cfg0", messages), 10000, 100000);
+            request.protected_tokens_effective = Some(4000);
+            request.tool_present = true;
+            transform(&s, &request, &ctx).unwrap();
+            transform(&s, &request, &ctx).unwrap();
+            let mut loaded = s.load("ses").unwrap();
+            // Keep the raw arc while priming, then measure its older nudge policy
+            // from those same served sources. This isolates policy adoption from
+            // automatic age reclaim, which could otherwise retire the specimen.
+            let rows = s.load_tags_for_session("ses").unwrap();
+            let projection = project_messages(&request.messages).unwrap();
+            let token_map = rows
+                .iter()
+                .map(|row| (row.block_id.as_str(), row.token_count as usize))
+                .collect();
+            let items = projection
+                .blocks
+                .iter()
+                .map(|block| sel_item_from_flat(block, &token_map))
+                .collect::<Vec<_>>();
+            let mut old_policy = crate::selection::default_protected_tools();
+            old_policy.insert(tool.into(), 0);
+            let old_protected =
+                crate::selection::protected_blocks_for_policy(&items, &HashSet::new(), &old_policy);
+            let window = ProtectionWindow::from_persisted_rows(&rows, 4000);
+            let measured = measure_tail_hygiene_with_pending_drops(
+                &projection,
+                &loaded.core,
+                loaded.meta.coverage_ordinal,
+                &rows,
+                &window.tag_numbers,
+                &old_protected,
+                &HashSet::new(),
+            );
+            let mut old_baseline = refresh_tail_hygiene_baseline_calibrated(
+                measured,
+                true,
+                None,
+                ctx.now_ms,
+                HygieneCalibration {
+                    units_version: 1,
+                    tools_ratio: 1.0,
+                    prose_ratio: 1.0,
+                },
+            )
+            .baseline;
+            old_baseline.protected_tools_policy = (!legacy).then_some(old_policy);
+            loaded.meta.tail_hygiene_baseline = Some(old_baseline);
+            let before_u = crate::tail_hygiene::effective_tail_hygiene(
+                loaded.meta.tail_hygiene_baseline.as_ref().unwrap(),
+            )
+            .0;
+            assert!(before_u > 6000);
+            loaded.meta.channel2_pressure_latched = true;
+            if legacy {
+                loaded
+                    .meta
+                    .tail_hygiene_baseline
+                    .as_mut()
+                    .unwrap()
+                    .protected_tools_policy = None;
+            }
+            s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+            ctx.protected_tools.insert(tool.into(), 1);
+            let deferred = transform(&s, &request, &ctx).unwrap();
+            assert_eq!(deferred.action, "SOFT+");
+            let after = s.load("ses").unwrap();
+            let after_u = crate::tail_hygiene::effective_tail_hygiene(
+                after.meta.tail_hygiene_baseline.as_ref().unwrap(),
+            )
+            .0;
+            assert_eq!(after_u, before_u);
+            assert!(after.meta.channel2_pressure_latched);
+            request.render_config = "cfg1".into();
+            transform(&s, &request, &ctx).unwrap();
+            let rebuilt = s.load("ses").unwrap();
+            assert!(
+                crate::tail_hygiene::effective_tail_hygiene(
+                    rebuilt.meta.tail_hygiene_baseline.as_ref().unwrap()
+                )
+                .0 < before_u
+            );
+            assert_eq!(
+                rebuilt
+                    .meta
+                    .tail_hygiene_baseline
+                    .as_ref()
+                    .unwrap()
+                    .protected_tools_policy
+                    .as_ref()
+                    .unwrap()
+                    .get(tool),
+                Some(&1)
+            );
+        }
     }
 
     #[test]

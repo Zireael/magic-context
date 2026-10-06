@@ -10998,3 +10998,210 @@ it("newest protected ctx_reduce results survive automatic stale stripping", asyn
     expect(getTagsBySession(db, id).every((tag) => tag.status === "active")).toBe(true);
     expect(JSON.stringify(messages.slice(0, 3))).toBe(before);
 });
+it("protected map edits on SOFT+ leave U and the Channel 2 lease unchanged until rebuilding", async () => {
+    const id = "protected-map-nudge";
+    const { add } = seedProtectedReviewSession(id, "probe", 12000);
+    const messages = [
+        add(1),
+        {
+            info: { id: "tail", role: "user" },
+            parts: [{ type: "text", text: "continue" }],
+        } as MessageLike,
+    ];
+    const state = new Map<string, Channel1State>();
+    const run = (overrides: Partial<PostTransformArgs> = {}) =>
+        runPostTransformPhase(
+            basePostTransformArgs(db, id, messages, {
+                tags: getActiveTagsBySession(db, id),
+                channel1StateBySession: state,
+                ...overrides,
+            }),
+        );
+    await run();
+    const before = JSON.stringify(messages);
+    const previousU = effectiveTailHygiene(state.get(id)!).u;
+    expect(previousU).toBeGreaterThan(6000);
+    setChannel2NudgeState(db, id, "delivered");
+    const deferred = await run({ protectedTools: { probe: 1 } });
+    expect(deferred.bustedThisPass).toBe(false);
+    expect(JSON.stringify(messages)).toBe(before);
+    expect({
+        u: effectiveTailHygiene(state.get(id)!).u,
+        lease: getChannel2NudgeState(db, id),
+    }).toEqual({ u: previousU, lease: "delivered" });
+    // A real queued drop gives the next pass an independently priced wire edit.
+    const trigger = makeToolMessage("flush-trigger");
+    messages.splice(1, 0, trigger);
+    insertTag(db, id, "flush-call", "tool", 4000, 2, 0, "bash", 0, "flush-trigger");
+    queuePendingOp(db, id, 2, "drop");
+    const rebuilt = await run({
+        protectedTools: { probe: 1 },
+        targets: new Map([[2, makeDropTarget(trigger)]]),
+        pendingMaterializationSessions: new Set([id]),
+    });
+    expect(rebuilt.bustedThisPass).toBe(true);
+    expect(effectiveTailHygiene(state.get(id)!).u).toBeLessThanOrEqual(6000);
+    expect(getChannel2NudgeState(db, id)).toBe("");
+});
+
+it("legacy default-only upgrade does not rearm Channel 2 on SOFT+", async () => {
+    const id = "protected-default-upgrade";
+    const { add } = seedProtectedReviewSession(id, "todowrite", 12000);
+    const messages = [
+        add(1),
+        {
+            info: { id: "tail", role: "user" },
+            parts: [{ type: "text", text: "continue" }],
+        } as MessageLike,
+    ];
+    const previous = refreshTailHygieneBaseline({
+        messages,
+        tags: getActiveTagsBySession(db, id),
+        protectedTagNumbers: new Set(),
+        protectedTools: { todowrite: 0 },
+        cacheBusting: true,
+    });
+    // Old baseline blobs have no policy field and excluded only ctx_reduce.
+    delete previous.protectedToolsPolicy;
+    expect(effectiveTailHygiene(previous).u).toBeGreaterThan(6000);
+    const state = new Map<string, Channel1State>([
+        [
+            id,
+            {
+                ...previous,
+                usableWindow: 128000,
+                realUserTurnCount: 1,
+                reducedSinceRefresh: false,
+                oldestReclaimableToolTags: [],
+            },
+        ],
+    ]);
+    setChannel2NudgeState(db, id, "delivered");
+    const before = JSON.stringify(messages);
+    const result = await runPostTransformPhase(
+        basePostTransformArgs(db, id, messages, {
+            tags: getActiveTagsBySession(db, id),
+            channel1StateBySession: state,
+        }),
+    );
+    expect(result.bustedThisPass).toBe(false);
+    expect(JSON.stringify(messages)).toBe(before);
+    expect(effectiveTailHygiene(state.get(id)!).u).toBe(effectiveTailHygiene(previous).u);
+    expect(getChannel2NudgeState(db, id)).toBe("delivered");
+});
+
+it("rotation on SOFT+ preserves served bytes and keeps queued mass out of U", async () => {
+    const id = "protected-nudge-rotation";
+    const { add } = seedProtectedReviewSession(id);
+    const first = add(1);
+    const messages = [
+        first,
+        {
+            info: { id: "tail", role: "user" },
+            parts: [{ type: "text", text: "continue" }],
+        } as MessageLike,
+    ];
+    const state = new Map<string, Channel1State>();
+    queuePendingOp(db, id, 1, "drop");
+    const run = () =>
+        runPostTransformPhase(
+            basePostTransformArgs(db, id, messages, {
+                tags: getActiveTagsBySession(db, id),
+                protectedTools: { probe: 1 },
+                channel1StateBySession: state,
+                targets: new Map([[1, makeDropTarget(first)]]),
+            }),
+        );
+    await run();
+    const before = JSON.stringify(messages);
+    const beforeU = effectiveTailHygiene(state.get(id)!).u;
+    messages.push(add(2));
+    const result = await run();
+    expect(result.bustedThisPass).toBe(false);
+    expect(JSON.stringify(messages.slice(0, 2))).toBe(before);
+    expect(getPendingOps(db, id)).toHaveLength(1);
+    expect(effectiveTailHygiene(state.get(id)!).u).toBe(beforeU);
+});
+
+import { effectiveTailHygiene, refreshTailHygieneBaseline } from "./tail-hygiene-walk";
+
+it("unchanged defaults do not imply identical emergency selection on a rebuilding upgrade", () => {
+    const id = "protected-upgrade-emergency";
+    const { add } = seedProtectedReviewSession(id, "todowrite", 12000);
+    for (let n = 1; n <= 8; n++) add(n);
+    const tags = getActiveTagsBySession(db, id).map((tag) => ({
+        ...tag,
+        servedTokens: 12000,
+        reclaimableTokens: 12000,
+    }));
+    const input = {
+        tags,
+        floorTags: tags,
+        maxTag: 8,
+        protectedCutoff: null,
+        usagePercentage: 95,
+        currentTotalInputTokens: 96000,
+        ceilingTokens: 16000,
+        priorInputSample: 0,
+        hasPriorDrop: false,
+    };
+    // The old emergency policy had no todowrite exemplar exemption.
+    expect(planEmergencyDrop({ ...input, protectedTools: { todowrite: 0 } }).tagNumbers).toContain(
+        8,
+    );
+    expect(planEmergencyDrop(input).tagNumbers).not.toContain(8);
+});
+
+it("a rotated held drop strips newer signed reasoning on its priced application", async () => {
+    const id = "protected-held-thinking";
+    const { add } = seedProtectedReviewSession(id);
+    const first = add(1);
+    const signed = {
+        info: { id: "signed", role: "assistant" },
+        parts: [
+            {
+                type: "reasoning",
+                text: "signed thinking",
+                metadata: { anthropic: { signature: "opaque" } },
+            },
+            { type: "text", text: "answer" },
+        ],
+    } as MessageLike;
+    const messages = [
+        first,
+        signed,
+        {
+            info: { id: "tail", role: "user" },
+            parts: [{ type: "text", text: "continue" }],
+        } as MessageLike,
+    ];
+    queuePendingOp(db, id, 1, "drop");
+    const run = (overrides: Partial<PostTransformArgs> = {}) =>
+        runPostTransformPhase(
+            basePostTransformArgs(db, id, messages, {
+                tags: getActiveTagsBySession(db, id),
+                protectedTools: { probe: 1 },
+                resolvedProviderID: "anthropic",
+                thinkingBindingRecoveryEnabledForModel: true,
+                targets: new Map([[1, makeDropTarget(first)]]),
+                ...overrides,
+            }),
+        );
+    await run();
+    expect(signed.parts.some((part) => part.type === "reasoning")).toBe(true);
+    messages.push(add(2));
+    const result = await run({
+        schedulerDecision: "execute",
+        pendingMaterializationSessions: new Set([id]),
+    });
+    expect(getTagsBySession(db, id)[0].status).toBe("dropped");
+    expect(result.proactiveThinkingStrip?.messageIds).toContain("signed");
+    expect(
+        signed.parts.some(
+            (part) =>
+                part.type === "reasoning" && (part as { text?: string }).text === "signed thinking",
+        ),
+    ).toBe(false);
+});
+
+import { planEmergencyDrop } from "./emergency-drop";

@@ -3807,10 +3807,12 @@ export function registerPiContextHandler(
 						result.bustedThisPass,
 						hygieneCalibration,
 					);
+					const previousBaseline = getPiChannel1Baseline(sessionId);
 					const baseline = refreshPiTailHygieneBaseline({
 						messages: outputMessages,
 						tags,
 						protectedTagNumbers,
+						protectedTools: options.protectedTools,
 						pendingDropTagNumbers,
 						stableId,
 						protectedToolTags: protectedToolTagNumbers(
@@ -3819,7 +3821,7 @@ export function registerPiContextHandler(
 						),
 						syntheticLeadingCount: result.syntheticLeadingCount,
 						cacheBusting: result.bustedThisPass,
-						previous: getPiChannel1Baseline(sessionId),
+						previous: previousBaseline,
 						calibration:
 							hygieneUnitsVersion >= HYGIENE_PROVIDER_UNITS_VERSION
 								? hygieneCalibration
@@ -3885,6 +3887,8 @@ export function registerPiContextHandler(
 								db: options.db,
 								sessionId,
 								baseline: channelState,
+								rebuilding: result.bustedThisPass,
+								previous: previousBaseline,
 							});
 						} catch (error) {
 							sessionLog(

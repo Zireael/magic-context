@@ -3915,6 +3915,7 @@ export async function runPostTransformPhase(
                     tags,
                     protectedTagNumbers: args.protectedTagNumbers,
                     protectedToolTags,
+                    protectedTools: args.protectedTools,
                     pendingDropTagNumbers,
                     cacheBusting: bustedThisPass,
                     previous,
@@ -3977,6 +3978,8 @@ export async function runPostTransformPhase(
                         db: args.db,
                         sessionId: args.sessionId,
                         baseline,
+                        rebuilding: bustedThisPass,
+                        previous,
                     });
                 } catch (error) {
                     sessionLog(

@@ -1938,6 +1938,31 @@ pub(crate) fn select_reductions_with_outcome(
     }
 }
 
+/// Compute coordination protection for a previously adopted nudge policy.
+pub(crate) fn protected_blocks_for_policy(
+    items: &[SelItem],
+    frozen: &HashSet<String>,
+    counts: &std::collections::BTreeMap<String, usize>,
+) -> HashSet<String> {
+    let arcs = group_arcs(items, frozen);
+    let protected = protected_tool_arc_ids(
+        &arcs,
+        &SelectionConfig {
+            protected_tools: counts.clone(),
+            ..SelectionConfig::default()
+        },
+    );
+    arcs.iter()
+        .filter(|arc| protected.contains(&arc.arc_id))
+        .flat_map(|arc| {
+            arc.call_inputs
+                .iter()
+                .map(|(id, _)| id.clone())
+                .chain(arc.result_ids.iter().cloned())
+        })
+        .collect()
+}
+
 /// Collapse to one decision per target_id (drop beats edit_marker beats skeleton) and
 /// sort by target_id for byte-deterministic output.
 fn dedupe_and_sort(decisions: Vec<ReductionDecision>) -> Vec<ReductionDecision> {

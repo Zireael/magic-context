@@ -91,6 +91,8 @@ export interface TailHygienePostReduceGrace {
 }
 
 export interface TailHygieneBaseline {
+    /** Keep counts adopted on the last rebuilding pass; absent on legacy baselines. */
+    protectedToolsPolicy?: Readonly<Record<string, number>>;
     baselineU: number;
     baselineT: number;
     turnDeltaU: number;
@@ -1164,18 +1166,24 @@ export function refreshTailHygieneBaseline(input: {
     protectedToolTags?: ReadonlySet<number>;
     pendingDropTagNumbers?: ReadonlySet<number>;
     cacheBusting: boolean;
+    protectedTools?: Readonly<Record<string, number>>;
     previous?: TailHygieneBaseline;
     /** Frozen decision ratios. They change only on an authorized bust. */
     calibration?: { toolsRatio: number; proseRatio: number };
     hygieneUnitsVersion?: number;
     now?: number;
 }): TailHygieneBaseline {
+    const protectedToolsPolicy = adoptedProtectedToolsPolicy(
+        input.protectedTools,
+        input.previous?.protectedToolsPolicy,
+        input.cacheBusting,
+        !!input.previous,
+    );
+    const protectedToolTags = protectedToolTagNumbers(input.tags, protectedToolsPolicy);
     input = {
         ...input,
-        protectedTagNumbers: new Set([
-            ...input.protectedTagNumbers,
-            ...(input.protectedToolTags ?? []),
-        ]),
+        protectedToolTags,
+        protectedTagNumbers: new Set([...input.protectedTagNumbers, ...protectedToolTags]),
     };
     const pendingDropTagNumbers = input.pendingDropTagNumbers ?? new Set<number>();
     const cached = input.previous
@@ -1254,6 +1262,7 @@ export function refreshTailHygieneBaseline(input: {
         retainBaselineMeasurement(frozen.baselineParts, memo);
         return {
             ...frozen,
+            protectedToolsPolicy,
             hygieneUnitsVersion: frozenCalibration.hygieneUnitsVersion,
             toolsRatio: frozenCalibration.toolsRatio,
             proseRatio: frozenCalibration.proseRatio,
@@ -1292,6 +1301,7 @@ export function refreshTailHygieneBaseline(input: {
     }
     return {
         ...input.previous,
+        protectedToolsPolicy,
         turnDeltaU,
         turnDeltaT,
         evaluable: true,
@@ -1331,3 +1341,5 @@ export function assertTailHygieneContentUnchangedIfEnabled(
         assertTailHygieneContentUnchanged(input);
     }
 }
+
+import { adoptedProtectedToolsPolicy } from "../../features/magic-context/reclaim-protection";

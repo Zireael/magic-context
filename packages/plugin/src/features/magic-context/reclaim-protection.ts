@@ -17,6 +17,18 @@ export {
 /** Default exemplar count, retained for fixtures that describe shipped policy. */
 export const CTX_REDUCE_KEEP = DEFAULT_PROTECTED_TOOLS.ctx_reduce;
 
+/** Keep the adopted policy stable while recency rotates inside its keep counts. */
+export function adoptedProtectedToolsPolicy(
+    current: Readonly<Record<string, number>> | undefined,
+    previous: Readonly<Record<string, number>> | undefined,
+    rebuilding: boolean,
+    hasBaseline: boolean,
+): Record<string, number> {
+    if (rebuilding || !hasBaseline) return mergeProtectedTools(current);
+    // Older baselines excluded ctx_reduce coordination state, but not todowrite.
+    return { ...(previous ?? { todowrite: 0, ctx_reduce: 3 }) };
+}
+
 /** Snapshot once per selection, before any lane mutates status. Inactive results
  * never occupy the window, and tag ordinals make rotation deterministic. */
 export function protectedToolTagNumbers(

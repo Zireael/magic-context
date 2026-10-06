@@ -694,12 +694,26 @@ export function measurePiTailHygiene(
 export function refreshPiTailHygieneBaseline(
 	input: PiTailHygieneWalkInput & {
 		cacheBusting: boolean;
+		protectedTools?: Readonly<Record<string, number>>;
 		previous?: TailHygieneBaseline;
 		calibration?: { toolsRatio: number; proseRatio: number };
 		hygieneUnitsVersion?: number;
 		now?: number;
 	},
 ): TailHygieneBaseline {
+	const protectedToolsPolicy = adoptedProtectedToolsPolicy(
+		input.protectedTools,
+		input.previous?.protectedToolsPolicy,
+		input.cacheBusting,
+		!!input.previous,
+	);
+	input = {
+		...input,
+		protectedToolTags: protectedToolTagNumbers(
+			input.tags,
+			protectedToolsPolicy,
+		),
+	};
 	const rawMeasured = measurePiTailHygiene(input);
 	const frozenCalibration =
 		!input.cacheBusting && input.previous
@@ -734,6 +748,7 @@ export function refreshPiTailHygieneBaseline(
 		mismatch?: TailHygienePrefixMismatch,
 	): TailHygieneBaseline => ({
 		...freezeTailHygieneMeasurement(measured),
+		protectedToolsPolicy,
 		hygieneUnitsVersion: frozenCalibration.hygieneUnitsVersion,
 		toolsRatio: frozenCalibration.toolsRatio,
 		proseRatio: frozenCalibration.proseRatio,
@@ -774,6 +789,7 @@ export function refreshPiTailHygieneBaseline(
 	}
 	return {
 		...input.previous,
+		protectedToolsPolicy,
 		turnDeltaU,
 		turnDeltaT,
 		evaluable: true,
@@ -822,3 +838,5 @@ export function assertPiTailHygieneContentUnchanged(
 		);
 	}
 }
+
+import { adoptedProtectedToolsPolicy } from "@magic-context/core/features/magic-context/reclaim-protection";

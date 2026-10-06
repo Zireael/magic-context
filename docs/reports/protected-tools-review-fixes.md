@@ -65,3 +65,25 @@ suites. A real native transform verifies held detection, a zero-count priced
 strip, and byte-identical frozen replay after protection is restored. All three
 guards were individually neutralized and each exact regression reddened; restored
 checks passed (266 Bun tests and one native integration-style unit test).
+
+## Nudge policy adoption
+
+The frozen baseline now carries the adopted keep-count policy. Recency rotates
+inside that policy on SOFT+, but a changed map is not adopted until rebuilding.
+Legacy baselines without the field retain the old ctx_reduce-three-only policy
+until rebuilding, including the default-only todowrite upgrade. Rust persists
+this optional map inside the existing baseline blob; there is no new table.
+
+An unchanged replay already below the nudge floor is not a new collapse, so it
+does not reset a delivered Channel 2 lease. Existing queued-drop action-state
+collapses remain valid; those are real reductions in actionable mass, not policy
+adoption. Both callers provide the previous baseline for that distinction.
+
+The review's map-edit, legacy-upgrade and rotation cases are in the postprocess
+suite, with Pi equivalents. The native regression activates the Claude Code
+surface and preserves a real raw arc before measuring its old-policy baseline;
+the transition pass intentionally has no actionable U. A restart test verifies
+policy persistence and legacy decoding in mc-store. Neutralizing policy freezing
+reddened the TS/Pi map-edit and upgrade tests and the native policy test;
+neutralizing the no-op lease guard separately reddened TS/Pi lease assertions.
+The TS rotation control stayed green in those runs.
