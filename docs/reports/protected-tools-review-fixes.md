@@ -300,3 +300,60 @@ the Pi unknown-model reviewer regression stayed green. Restored suites passed.
 These short final runs include the strengthened calibration-boundary assertions;
 the larger suite counts above record the earlier production-code verification.
 No production change was needed after the coherent checkpoint commit.
+
+## Agent self-stamp precedence after the master merge
+
+Master merged as `b26072aeec`. An agent cannot queue its own `ctx_reduce` result,
+regardless of its protected keep count; automatic and historian queues still
+honor `ctx_reduce: 3`. The conflicting agent-hold fixture moved to `custom: 3`.
+The shared fixture now retains a three-result ctx_reduce historian hold/retirement
+case and explicitly tests protected and unprotected agent self-stamp rejection
+in TypeScript, Pi and the native Rust facade.
+
+Mixed calls pin the order free drop, protected hold, then self-stamp note. Tests
+verify sibling queue contents and exclusion of the self-stamped tag. The Rust
+facade retains its existing visibility disclaimer. The OpenCode Rust-backend
+acknowledgment had discarded the self-stamp suffix when a held result existed;
+that composition bug is fixed without changing queue policy.
+
+**6981b25dfa: all preserved changes were intended and are covered by configuration, shared-fixture, facade, integration and persistence tests; the obsolete agent-ctx_reduce fixture is reconciled with issue 623.**
+
+### Verification counts
+
+| Check | Result |
+| --- | --- |
+| Shared TS/Pi holds and both ctx_reduce tool suites | 50 passed, 217 assertions |
+| Final shared TS/Pi holds and tool suites, including backend suffix correction | 51 passed, 218 assertions |
+| Updated OpenCode tool/backend acknowledgment suite | 23 passed, 50 assertions |
+| Plugin and Pi repository typechecks | Passed, TypeScript 5.9.3 |
+| Native `mc-module --lib ctx_reduce` | 23 passed, 0 failed |
+| Native `mc-module --lib protected` | 31 passed, 0 failed |
+| Native `mc-store --lib protected` | 3 passed, 0 failed |
+| Dashboard config parity from the dashboard directory | 7 passed, 11 assertions |
+| Full Pi `bun run test` | 1559 passed, 3 skipped, 0 failed; 84180 assertions across 144 files |
+| Full CLI `bun run test` | 637 passed, 2 skipped, 0 failed across its five runner phases (639 total tests) |
+| Full plugin `bun run test` | Incomplete: two 840s attempts and one 1740s attempt timed out; no final suite count exists |
+
+The required plugin script was used, including frozen installation and
+`bun test --parallel=4 --timeout 30000`, never a substituted bare test command.
+The second attempt logged 6913 passing, zero failing and four skipped outcomes,
+but timed out with `rust-mode-transform.test.ts` as the only unfinished file
+(659 seconds in that file). The longer attempt still had that file unfinished
+after 1590 seconds and logged 6910 passes, three failures and four skips. These
+are incomplete logged outcomes, not successful full-suite totals.
+
+The first attempt's failures were timeout-only in the 20,000-file sentinel scan
+hook and non-git directory Git smoke test. The longer attempt also had unrelated
+verification CLI timing failures (`runVerify disposition` and the 2/22 manifest
+case). Machine load was 35–40 with other workers compiling during diagnosis.
+No unrelated timing expectation was changed to make a full suite look green.
+The affected self-stamp/hold/backend tests and native suites passed independently.
+
+Logs are retained under ignored `target/self-stamp-verification/` as
+`plugin-first.*`, `plugin-full.*`, `plugin-long.*`, `pi-full.*` and `cli-full.*`.
+Bun 1.4.2 and Cargo/rustc 1.99.0 were used. Native checks ran serially with `-j 2`.
+The initial dashboard invocation from workspace root selected React JSX instead
+of the package's Solid configuration; its correct package-local retry passed.
+All storage was in-memory or preload/fixture-owned temporary roots; no live host
+or provider was started. Full-plugin completion remains an explicit verification
+gap, not a claimed pass.
