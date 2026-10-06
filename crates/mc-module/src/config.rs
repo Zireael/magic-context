@@ -140,8 +140,9 @@ pub struct McModuleConfig {
     pub prompt_surface_guidance_override: Option<String>,
     pub smart_drops: bool,
     pub cache_ttl: String,
-    /// Configured TTL entries (including an explicit `default`). Resolution uses the
-    /// shared exact, bare, dash-stripped, provider-wildcard, then default walk.
+    /// Configured cache lifetimes (including an explicit `default`). Try the exact model key first;
+    /// then try provider-qualified and bare model names, removing the final dash suffix and
+    /// retrying after each miss. Finally try `provider/*`, then the default.
     pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
     /// Settings only `tool.catalog` reads (`src/tool_catalog.rs`).
     pub catalog: CatalogConfigInputs,
@@ -204,7 +205,8 @@ impl Default for McModuleConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTtlProvenance {
     Explicit,
-    /// User/project default controls scheduling, but does not author provider cache markers.
+    /// A user or project default sets when an idle session expires; it does not tell the
+    /// provider to place a cache marker in a request.
     ConfiguredDefault,
     Default,
 }
@@ -652,7 +654,7 @@ fn apply_cache_ttl_config(cfg: &mut McModuleConfig, value: Option<&Value>) {
     match value {
         Some(Value::String(ttl)) if !ttl.trim().is_empty() => {
             cfg.cache_ttl = ttl.trim().to_string();
-            // A global project policy replaces the user map, just as in the TS loader.
+            // A project-wide cache lifetime clears the user's per-model entries and becomes the default.
             cfg.cache_ttl_by_model.clear();
             cfg.cache_ttl_by_model
                 .insert("default".to_string(), cfg.cache_ttl.clone());
@@ -665,7 +667,7 @@ fn apply_cache_ttl_config(cfg: &mut McModuleConfig, value: Option<&Value>) {
                 if key == "default" {
                     cfg.cache_ttl = ttl.to_string();
                 }
-                // Keeping the default entry records that it was configured, even for 5m.
+                // This distinguishes an explicitly configured `5m` from the built-in `5m` default.
                 cfg.cache_ttl_by_model.insert(key.clone(), ttl.to_string());
             }
         }
@@ -776,8 +778,8 @@ fn merge_tiers_with_warnings(
     }
 
     if let Some(project) = project {
-        // TTL is scheduling policy, not trusted model-facing text. Project policy follows
-        // the same per-key override merge as the TypeScript loaders.
+        // Cache lifetime controls idle-expiry scheduling, not prompt text, so project config may
+        // set it. Project entries replace user entries with the same key.
         apply_cache_ttl_config(&mut cfg, project.get("cache_ttl"));
         cfg.execute_threshold_project_config = execute_threshold_at(project);
         cfg.protected_tokens_project = protected_tokens_at(project, "project", &mut warnings);

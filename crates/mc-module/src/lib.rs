@@ -10378,8 +10378,8 @@ impl McHandler {
                     (
                         config::ResolvedCacheTtl {
                             value,
-                            // Host-resolved TTLs remain host-side; only a per-model config match may
-                            // instruct the Claude Code marker owner.
+                            // The host uses its resolved cache lifetime only for scheduling; Claude
+                            // Code adds provider cache markers only when a per-model config entry matches.
                             provenance: config::CacheTtlProvenance::Default,
                         },
                         None,

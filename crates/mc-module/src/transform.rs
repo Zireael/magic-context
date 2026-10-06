@@ -602,7 +602,7 @@ pub struct ProducerContext<'a> {
     pub cache_ttl: String,
     /// Whether the model-resolution walk selected a per-model entry or fell through to the default.
     pub cache_ttl_provenance: CacheTtlProvenance,
-    /// Hostless scheduling provenance, committed only with a successful transform.
+    /// The host's idle-expiry policy, not prompt text; save it only after a successful transform.
     pub cache_ttl_policy: Option<mc_store::SessionCacheTtlPolicy>,
     /// Provider/model key for threshold lookup. Per-model overrides are deferred, so
     /// production currently supplies None.

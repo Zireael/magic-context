@@ -268,8 +268,9 @@ function assertReadableHttpResponse(response: SmartNoteAddressResponse, url: str
     const { status, body } = response;
     const headers = response.headers ?? {};
     // GitHub can report secondary limits with quota remaining and no Retry-After.
-    // Classify the bounded body before diagnosing a 403 as inaccessible, including
-    // responses from container probes. Compile dry-runs and checks share this guard.
+    // Check the bounded body before treating a 403 as inaccessible, including the extra
+    // request that verifies the repository itself is readable. Newly compiled checks use
+    // this guard for their test run before acceptance, as do scheduled checks.
     const githubSecondaryLimit =
         ["api.github.com", "github.com", "raw.githubusercontent.com"].includes(
             new URL(url).hostname,

@@ -9,7 +9,7 @@ import { readReplayEnvelope, updateReplayDocument } from "./storage-replay-docum
 
 interface SessionCacheTtl extends ResolvedCacheTtl {
     config: CacheTtlConfig;
-    /** Kept separately so removing a user override restores the session's original default. */
+    /** Keep the built-in lifetime separate so removing an override restores this session's value for the model. */
     builtInDefault?: ResolvedCacheTtl;
 }
 
@@ -23,7 +23,7 @@ export function readSessionCacheTtl(
         : undefined;
 }
 
-/** User policy is live; only the built-in lifetime is frozen once the model is known. */
+/** Use current user and project settings on each pass; freeze only the built-in lifetime once the model is known. */
 export function resolveSessionCacheTtl(
     db: ContextDatabase,
     sessionId: string,
@@ -35,8 +35,8 @@ export function resolveSessionCacheTtl(
     const saved = readSessionCacheTtl(db, sessionId);
     const key = modelKey ?? saved?.modelKey;
     const live = resolveModelCacheTtl(config, key, configuredExplicitly);
-    // Legacy policies already record their source. Preserve a saved built-in value,
-    // but never reuse their frozen copy of the user's config for a new resolution.
+    // Older saved policies record where their lifetime came from. Preserve a saved built-in
+    // value, but resolve current settings afresh instead of reusing their saved user config.
     const builtInDefault =
         saved && saved.modelKey === key
             ? (saved.builtInDefault ??

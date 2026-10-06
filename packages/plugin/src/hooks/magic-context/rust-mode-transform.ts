@@ -1451,7 +1451,8 @@ function shouldRefreshMuralCandidate(args: {
     try {
         ttlMs = parseCacheTtl(args.cacheTtl);
     } catch {
-        // Invalid policy follows the scheduler's five-minute fallback.
+        // Keep ttlMs's initial 300,000-millisecond (five-minute) value, matching the scheduler's
+        // 5 * 60 * 1000 millisecond fallback.
     }
     return (
         !args.initialized ||
