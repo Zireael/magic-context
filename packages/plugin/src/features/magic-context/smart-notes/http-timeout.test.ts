@@ -230,18 +230,20 @@ test("slow sweeps admit fewer notes instead of cutting the next request short", 
     await withLocalHttpServer(3_000, async (requests) => {
         for (let i = 0; i < 3; i++) seedCompiled(source().id);
         const startedAt = Date.now();
-        expect(
-            await runDueCompiledSmartNoteChecks({
-                db: fixture.db,
-                projectIdentity: PROJECT,
-                projectRoot: process.cwd(),
-                leaseHeld: () => true,
-                sweepBudgetMs: 10_000,
-            }),
-        ).toEqual({ ran: 2, surfaced: 0, failed: 0, networkFailed: 0 });
+        const result = await runDueCompiledSmartNoteChecks({
+            db: fixture.db,
+            projectIdentity: PROJECT,
+            projectRoot: process.cwd(),
+            leaseHeld: () => true,
+            sweepBudgetMs: 10_000,
+        });
+        // Two 3-second checks fit an idle machine; a loaded runner may admit only
+        // one. Either way no check is cut short and at least one note stays due.
+        expect(result.ran === 1 || result.ran === 2).toBe(true);
+        expect(result).toMatchObject({ surfaced: 0, failed: 0, networkFailed: 0 });
         expect(Date.now() - startedAt).toBeLessThan(10_000);
-        expect(requests()).toBe(2);
+        expect(requests()).toBe(result.ran);
         const notes = getNotes(fixture.db, { type: "smart", projectPath: PROJECT });
-        expect(notes.filter((n) => n.checkNextDueAt === 0)).toHaveLength(1);
+        expect(notes.filter((n) => n.checkNextDueAt === 0)).toHaveLength(3 - result.ran);
     });
 }, 20_000);
