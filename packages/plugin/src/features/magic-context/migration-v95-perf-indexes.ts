@@ -1,3 +1,4 @@
+import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { isKnownAutocommit } from "../../shared/sqlite-helpers";
 import { decodeTemporalDecision } from "./temporal-decisions";
@@ -104,8 +105,23 @@ export function installV95PerfSchema(
                 "INSERT OR IGNORE INTO temporal_decisions(session_id,message_id,marker) VALUES (?,?,?)",
             );
             for (const row of rows) {
-                const entries: unknown = JSON.parse(row.entries);
-                if (!Array.isArray(entries)) throw new Error("Invalid temporal migration ledger");
+                let entries: unknown;
+                try {
+                    entries = JSON.parse(row.entries);
+                } catch {
+                    sessionLog(
+                        row.session_id,
+                        "v95 temporal metadata: malformed JSON skipped; original blob retained",
+                    );
+                    continue;
+                }
+                if (!Array.isArray(entries)) {
+                    sessionLog(
+                        row.session_id,
+                        "v95 temporal metadata: non-array JSON skipped; original blob retained",
+                    );
+                    continue;
+                }
                 const kept: unknown[] = [];
                 for (const entry of entries) {
                     const decision =

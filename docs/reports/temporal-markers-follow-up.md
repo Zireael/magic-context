@@ -116,6 +116,13 @@ runs once, not on every open. Runtime reads use the table's primary key and only
 the candidate ids on the current pass; they do not load or rewrite all historical
 decisions. Legacy tag-owner probes use the existing composite tag index.
 
+The re-review's malformed and non-array outer-blob cases now skip optional
+temporal conversion instead of aborting v95: the original blob is unchanged,
+one session-scoped diagnostic records the skip without echoing the blob, and
+the remaining migration still reaches version 95. A steady-state reopen does
+not log it again. Both cases and the odd-individual-entry control are ported
+into the package suite; all 14 v95 tests and the package typecheck passed.
+
 The shared session-owned table list includes temporal state after session-meta
 deletion, preserving another harness's surviving metadata row if applicable.
 Clone and fork filter and remap the row's message identity and preserve literal
