@@ -40,6 +40,17 @@ import {
  */
 let asyncModulePromise: Promise<QuickJSAsyncWASMModule> | null = null;
 let asyncModuleLoaded = false;
+let beforeModuleAcquisition: (() => Promise<void>) | undefined;
+
+/** Delay module availability in tests without slowing production checks. */
+export const __sandboxRunnerTest = {
+    setBeforeModuleAcquisition(hook: () => Promise<void>): void {
+        beforeModuleAcquisition = hook;
+    },
+    reset(): void {
+        beforeModuleAcquisition = undefined;
+    },
+};
 
 export function getQuickJsNativeMemoryStats(): { loadAttempted: boolean; loaded: boolean } {
     return { loadAttempted: asyncModulePromise !== null, loaded: asyncModuleLoaded };
@@ -72,7 +83,9 @@ function getAsyncModule(): Promise<QuickJSAsyncWASMModule> {
  * withSandboxLock, and a caller with an aborted signal returns immediately.
  */
 function acquireSandboxModule(signal?: AbortSignal): Promise<QuickJSAsyncWASMModule> {
-    const modulePromise = getAsyncModule();
+    const modulePromise = beforeModuleAcquisition
+        ? beforeModuleAcquisition().then(getAsyncModule)
+        : getAsyncModule();
     if (!signal) return modulePromise;
     if (signal.aborted) {
         return Promise.reject(signal.reason ?? new Error("smart-note check aborted"));
