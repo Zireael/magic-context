@@ -2,6 +2,7 @@ import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
+import { tagOrderConstraintIndex } from "./migration-v95-perf-indexes";
 import { newestCtxReduceTagNumbers } from "./reclaim-protection";
 import type { TagEntry } from "./types";
 
@@ -1895,7 +1896,7 @@ export function markTagsCompactedByMessageIds(
         .prepare(`WITH ids AS MATERIALIZED (
             SELECT value AS source_id, lower(value) AS folded_id FROM json_each(?)
         )
-        SELECT id, message_id, tool_owner_message_id FROM tags INDEXED BY idx_tags_session_tag_number
+        SELECT id, message_id, tool_owner_message_id FROM tags INDEXED BY ${tagOrderConstraintIndex(db)}
         WHERE session_id = ? AND status IN ('active', 'dropped') AND (
             message_id IN (SELECT source_id FROM ids)
             OR tool_owner_message_id IN (SELECT source_id FROM ids)

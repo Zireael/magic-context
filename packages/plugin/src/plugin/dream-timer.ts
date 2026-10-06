@@ -56,7 +56,7 @@ import {
 } from "../features/magic-context/project-embedding-registry";
 import { runDueCompiledSmartNoteChecks } from "../features/magic-context/smart-notes/runner";
 import {
-    openDatabase,
+    openCurrentDatabase as openDatabase,
     retryPendingRustSessionCleanupsForProject,
     runSqliteOptimize,
 } from "../features/magic-context/storage";

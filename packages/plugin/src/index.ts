@@ -31,7 +31,7 @@ import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smar
 import {
     getSchemaFenceRejection,
     isDatabasePersisted,
-    openDatabase,
+    openCurrentDatabase as openDatabase,
     setSqlitePragmaConfig,
 } from "./features/magic-context/storage-db";
 import { recordToolDefinition } from "./features/magic-context/tool-definition-tokens";
