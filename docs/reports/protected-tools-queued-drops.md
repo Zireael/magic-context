@@ -31,9 +31,10 @@ Cargo 1.99.0 (5f94df478), rustc 1.99.0 (b940084d7).
 - Frozen Bun install: 995 existing installs checked; no manifest or Bun lock changes.
 - Plugin typecheck and dashboard typecheck: passed.
 - Pi's normal typecheck encounters the pre-existing missing `Bun` ambient in
-  the imported `storage-permissions.ts` from master. The same Pi project passes
+  the imported `storage-permissions.ts`. The same Pi project passes
   `node_modules/.bin/tsc --noEmit --types node,bun`. The untouched CLI's normal
-  typecheck encounters the same master error; no unrelated source change was made.
+  typecheck encounters the same pre-existing ambient-type error; no unrelated
+  source change was made.
 - Scoped plugin behavior suites: 274 tests passed in five files.
 - Scoped Pi behavior suites: 158 tests passed in three files.
 - Dashboard suite: 120 tests passed in 22 files.
@@ -44,8 +45,8 @@ Cargo 1.99.0 (5f94df478), rustc 1.99.0 (b940084d7).
 - Plugin, Pi and dashboard lint: passed (1225, 233 and 70 files respectively).
 - `bun run build`: passed for plugin, Pi and CLI, including four v2 loader tests.
 - Dashboard production build: passed.
-- Mode-manifest validator: six tests passed. The merged master and feature branch
-  contain 170 live e2e test files, so the expected inventory count was corrected
+- Mode-manifest validator: six tests passed. The repository contains 170 live e2e
+  test files, so the expected inventory count was corrected
   from 169 to 170 without weakening the exact-once coverage checks. Its script
   also passes a scoped TypeScript 5.9.3 check with the e2e project's strict,
   ES2022/bundler and Bun-types settings.
@@ -71,12 +72,11 @@ package used its Solid configuration and produced exactly the intended failure.
 
 ## Daemon comparison
 
-The three integration tests are compared individually between master
-`3ba0f0004289798681054955226a1e47e7f6ed57` (which includes `4fb74c49`) and the
-protected-tools task branch. The master checkout is a detached temporary
-worktree underneath this task worktree's ignored `target/daemon-comparison/`.
-Each invocation has a ten-minute timeout; master and branch never run in parallel.
-Source and test code in the master checkout are unchanged.
+The three integration tests were compared individually between a reference
+checkout and the task checkout. The reference is a detached temporary worktree
+underneath this task worktree's ignored `target/daemon-comparison/`.
+Each invocation has a ten-minute timeout; the two checkouts never run in parallel.
+Source and test code in the reference checkout are unchanged.
 The background runner uses one subprocess group at a time, captures each log
 and duration independently, and terminates the entire group at the timeout before
 starting the next invocation. Test-owned temporary roots use an isolated
@@ -93,7 +93,7 @@ During the first comparison, those live sibling sources advanced again to
 `subc-core` 0.20.57 and `subc-daemon` 0.32.1. Both lockfiles were refreshed
 identically before retrying only the two affected test pairs.
 
-The first cold-cache master test-binary compile hit a 30-minute build timeout
+The first cold-cache reference test-binary compile hit a 30-minute build timeout
 while still compiling dependencies. Its output repeatedly reported all six
 machine-wide compile slots busy. This was a build-queue timeout, not an executed
 daemon-test hang. The comparison reuses warm artifacts to avoid duplicating the
@@ -101,7 +101,7 @@ registry dependency compile.
 
 ### Initial individual runs
 
-| Test | Master | Protected-tools branch |
+| Test | Reference checkout | Task checkout |
 | --- | --- | --- |
 | `hostless_store_init_first_transform_through_real_daemon` | Passed, 17.0 s total, one test | Passed, 362.7 s total, one test (3.06 s runtime; remainder mostly compile-slot waits) |
 | `mc_pipe_only_supervision_through_real_daemon` | Timed out at 600.1 s while the test's `ensure_binary` was still building `mc-module`; the process snapshot shows that nested cargo build, not a daemon request wait | Failed at 305.4 s because the nested `cargo build --locked -p mc-module` encountered the newly advanced sibling versions |
@@ -118,15 +118,15 @@ timeout. The hostless results are the successful initial invocations; the other
 two pairs are the prerequisite-repaired invocations. Times include outer cargo
 work and the test's nested builds, so they are not daemon latency comparisons.
 
-| Test | Master elapsed | Branch elapsed | Result |
+| Test | Reference elapsed | Task checkout elapsed | Result |
 | --- | --- | --- | --- |
 | `hostless_store_init_first_transform_through_real_daemon` | 17.0 s | 362.7 s | Both passed; no hang |
 | `mc_pipe_only_supervision_through_real_daemon` | 274.4 s | 345.3 s | Both passed; no hang |
 | `mc_transform_spine_through_real_daemon` | 48.8 s | 5.4 s | Both passed; no hang |
 
-Thus none of the three runtime hangs reproduced on master or on the branch in
-the final isolated, sequential runs. The one reproduced timeout on master was
-inside the test's module-build prerequisite, with compile-slot contention
+Thus none of the three runtime hangs reproduced in the reference or task checkout
+in the final isolated, sequential runs. The one reproduced timeout in the reference
+was inside the test's module-build prerequisite, with compile-slot contention
 visible in the captured process tree.
 
 Each invocation used:
@@ -137,8 +137,7 @@ cargo test --locked -j 1 -p mc-module --test real_daemon TEST_NAME -- --exact --
 
 The background runner, per-run logs, timeout process snapshot, and initial/retry
 JSON results remain in the task worktree's ignored `target/daemon-comparison/`.
-Master source revision was `3ba0f0004289798681054955226a1e47e7f6ed57`; branch
-source revision was `c47bb692031bb486a0ae8e1d22bc8a2b8f914c4b`. Both had the
-documented sibling-only lockfile refreshes. After the comparison, the 13
+The reference source and task source used the same final dependency versions and
+both had the documented sibling-only lockfile refreshes. After the comparison, the 13
 `mc-module` protected-tool tests and the one `mc-store` snapshot test passed
 again with the final dependency versions, and `cargo fmt --check` passed.

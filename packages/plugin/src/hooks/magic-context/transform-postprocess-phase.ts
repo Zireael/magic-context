@@ -1550,7 +1550,7 @@ interface RunPostTransformPhaseArgs {
         /** From the user-level `language` setting; English word rules when absent. */
         wordRules?: CavemanWordRules;
     };
-    /** Deprecated caller input, ignored. Supersession always rides the existing rebuild gate. */
+    /** Deprecated input retained for older callers; supersession runs only on cache-rebuilding passes. */
     smartDrops?: boolean;
     protectedTools?: Readonly<Record<string, number>>;
     /**
@@ -1699,8 +1699,9 @@ export function evaluateEmergencyFailClosed(input: {
     if (input.usagePercentage < 95) {
         return { shouldAbort: false, reason: "below-emergency-band" };
     }
-    // Without refusal-grade final-wire evidence, retain the provider-proven
-    // recovery rule. An admission upper envelope cannot originate a refusal.
+    // Without route-specific proof that the final request does not fit, retain
+    // the existing rule based on a provider-reported overflow. A conservative
+    // estimate used to decide whether to send is not enough to refuse.
     const shouldAbort =
         input.emergencyRecoveryArmed &&
         input.emergencyRecoveryOrigin === "provider_overflow" &&
@@ -2880,9 +2881,9 @@ export async function runPostTransformPhase(
             });
             deliveredPrefix = result;
             if (result.prefixTrimStatus === "applied") {
-                // Preparation can fold off-wire without trimming. Retire only
-                // source rows the delivered prefix actually removed, including
-                // held drops that ran before this later delivery trim.
+                // Preparation can summarize history without removing messages from
+                // the request. Retire only source rows omitted from the delivered
+                // prefix, including rows held until this later trim.
                 const retainedMessages = new Set(args.messages);
                 const trimmedMessageIds = messagesBeforeInjection
                     .filter((message) => !retainedMessages.has(message))

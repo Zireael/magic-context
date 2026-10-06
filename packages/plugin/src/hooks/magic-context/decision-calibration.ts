@@ -41,10 +41,11 @@ export interface LocalMass {
     prose?: number;
 }
 
-/** Inherited family/provider ratios are useful for admission, not non-fit proof. */
+/** Family/provider ratios can estimate fit for admission (deciding whether to send),
+ * but cannot prove that a request does not fit. */
 export function hasMeasuredDecisionCalibration(seed: DecisionCalibration): boolean {
-    // Persisted session freezes omit matchedPrefix. Recheck the model's measured
-    // seed instead of treating a missing diagnostic label as missing evidence.
+    // Persisted session policy may omit its diagnostic model-family label. Check
+    // the model's measured seed directly so that omission does not discard evidence.
     const measured = calibrationForModelKey(seed.modelKey);
     return seed.seeded && seed.source === "seed" && measured.seeded && measured.source === "seed";
 }

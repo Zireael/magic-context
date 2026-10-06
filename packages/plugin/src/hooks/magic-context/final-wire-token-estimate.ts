@@ -218,9 +218,11 @@ export interface FinalWireTokenEstimateInput {
     modelID: string | undefined;
     agentName: string | undefined;
     systemPromptHash?: string;
-    /** Only healthy refusal's uncertain band may substitute pathological byte bounds. */
+    /** Bound tokenizer work for refusal checks; ordinary admission uses its
+     * separate fit estimator. */
     boundedTokenization?: boolean;
-    /** A correlated preceding provider request; callers must prove prefix reuse. */
+    /** Counts from a prior provider request, reusable only after matching its
+     * exact route, envelope and prefix. */
     measuredPrefix?: { inputTokens: number; appendedMessages: readonly MessageLike[] };
 }
 
@@ -307,7 +309,8 @@ export function createFinalWireUsageTracker() {
                     }
                 }
             } catch {
-                /* Missing or uncorrelated evidence falls back to current calibration. */
+                /* If prior usage cannot be matched to this request, estimate from
+                 * current calibration instead. */
             }
             return estimateOutgoingWireForRefusal({ ...input, measuredPrefix }, limit);
         },
@@ -320,7 +323,7 @@ export function createFinalWireUsageTracker() {
                 if (!envelope || typeof parent !== "string" || !rows.every(hasCountableParts))
                     return;
                 const prefix = rows.map(rowBytes);
-                // Bound exact evidence independently of the much larger durable replay cache.
+                // Keep this exact-match evidence small without limiting the larger durable replay cache.
                 if (prefix.reduce((sum, text) => sum + text.length, 0) > 4 * 1024 * 1024) return;
                 if (served.size >= 16) served.delete(served.keys().next().value!);
                 served.set(sessionId, { envelope, prefix, parent, at: Date.now() });
@@ -334,7 +337,8 @@ export function createFinalWireUsageTracker() {
 export interface FinalWireTokenEstimate {
     tokens: number;
     trusted: boolean;
-    /** Unlike trusted, this excludes unknown/family fit and borrowed tool envelopes. */
+    /** Proof of non-fit, excluding unknown/family multipliers and tool counts
+     * borrowed from another route. */
     refusalGrade?: boolean;
     refusalTokens?: number;
     refusalBasis?: "calibrated" | "provider-prefix" | "byte-bound";
@@ -359,8 +363,9 @@ export interface FinalWireTokenEstimate {
  * This is not exact provider tokenization: provider framing remains unmeasured.
  * Fit callers must require trusted, not merely compare a numeric partial estimate.
  */
-/** Healthy-send checks settle cheap byte bounds before invoking BPE. Admission
- * continues to use its existing separate fit policy and complete envelope. */
+/** Before tokenizing with the byte-pair encoder, refusal checks use byte bounds
+ * when those bounds settle whether the request fits. Admission (deciding whether
+ * to send) continues to use its separate fit policy and complete envelope. */
 export function estimateOutgoingWireForRefusal(
     input: FinalWireTokenEstimateInput,
     limit?: number,

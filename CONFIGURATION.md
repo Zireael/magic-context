@@ -877,7 +877,7 @@ Tier boundaries are hardcoded to keep behavior predictable and prevent cache-bus
 
 User and project JSON-object maps merge over `{ "todowrite": 1, "ctx_reduce": 3 }`. Each nonnegative whole number keeps that many newest still-active results, ordered by tag number; dropped or historian-summarised results do not count. Project entries override matching user entries. Names ignore case and a leading `mcp_`; 0 disables a default.
 
-Emergency, age, supersession (including edit-marker compression), and duplicate removal honour the map even at ≥95%. There is no byte cap, so large protected outputs can reach refusal sooner. Queued drops, from the agent or historian publication, are held like the protected tail until newer calls displace the result and a later cache-rebuilding pass applies them. The historian's summary is unaffected; the raw result leaves at the next fold. Frozen strips are unaffected. Map changes and N+1 rotation never originate a bust or restore dropped results (issue 621).
+Emergency, age, supersession (including edit-marker compression), and duplicate removal honour the map even at ≥95%. There is no byte cap, so large protected outputs can reach refusal sooner. Queued drops, from the agent or historian publication, are held like the protected tail until newer calls displace the result and a later cache-rebuilding pass applies them. The historian's summary is unaffected; the raw result leaves at the next fold. Frozen strips are unaffected. Map changes and N+1 rotation never originate a bust or restore dropped results.
 
 ## Commands
 

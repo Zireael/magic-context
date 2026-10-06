@@ -1941,8 +1941,8 @@ export function markTagsCompactedByMessageIds(
                 row.tool_owner_message_id,
             ) as { tag_number: number } | null;
             if (retired) {
-                // The raw source is off-wire. Its held work must leave the queue
-                // in the same transaction, not await another priced drain.
+                // Retiring this source removes it from the request, so delete its queued
+                // operation in the same transaction instead of waiting for another drain.
                 removePendingOp(db, sessionId, retired.tag_number);
                 changed++;
             }

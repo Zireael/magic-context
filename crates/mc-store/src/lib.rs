@@ -4585,7 +4585,8 @@ fn one_f64() -> f64 {
 /// live tail rather than the full history.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TailHygieneBaseline {
-    /// Keep-count policy adopted by the last rebuilding nudge measurement.
+    /// Protected-tool keep counts saved by the last nudge measurement that
+    /// rebuilt the baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected_tools_policy: Option<std::collections::BTreeMap<String, usize>>,
     pub baseline_u: i64,
@@ -4928,9 +4929,9 @@ pub struct ModuleMeta {
     /// asynchronous reduction acknowledgements use the same floor as transforms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected_tokens_effective: Option<u64>,
-    /// The selection helper's latest protected-tool projection. Tool acknowledgements
-    /// reuse it without reconstructing names from tag rows, which store output text only.
-    /// This is decision metadata, never a render identity or cache-bust trigger.
+    /// Block IDs identified by selection as protected-tool results. Acknowledgements
+    /// use these IDs because tag rows store output text, not tool names. They guide
+    /// decisions but do not identify rendered content or trigger a cache bust.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub protected_tool_block_ids: std::collections::BTreeSet<String>,
     /// Decision calibration frozen at the last authorized bust. Absent legacy state stays

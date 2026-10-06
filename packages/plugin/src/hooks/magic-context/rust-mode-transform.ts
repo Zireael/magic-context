@@ -3483,7 +3483,8 @@ export function createRustModeTransform(
                 passInputs,
                 usage: {
                     ...passUsage(usage, contextLimit),
-                    // Native non-fit guards require refusal evidence, not fit admission.
+                    // The native refusal guard needs route-specific proof of non-fit,
+                    // not an estimate used to decide whether to send.
                     final_wire_input_tokens: finalWireEstimate?.refusalTokens ?? 0,
                     final_wire_trusted: finalWireEstimate?.refusalGrade === true,
                 },

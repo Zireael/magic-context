@@ -394,7 +394,8 @@ export function hasTokenizerForFit(): boolean {
     return getTokenizer() !== undefined;
 }
 
-/** Cost fence for refusal-only counting; shared estimates retain master's BPE. */
+/** Size check that keeps refusal-only estimates from expensive tokenization;
+ * shared estimates still tokenize whole texts. */
 export function tokenCountUsesByteBound(text: string): boolean {
     return text.length > 1024 * 1024 || /[\p{L}\p{N}]{16385}/u.test(text);
 }

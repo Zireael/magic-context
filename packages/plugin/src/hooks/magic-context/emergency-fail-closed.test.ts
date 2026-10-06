@@ -105,7 +105,7 @@ it("calibrated measured protected results still refuse with the protected-result
     const refusal = outgoingContextRefusal(estimate, 16000, protectedToolTokens);
     expect(refusal).toBe(golden.message);
     expect(contextRefusalError(refusal!).code).toBe(golden.code);
-    // Overall overflow with a fitting calibrated subset is not blamed on protection.
+    // When unprotected content causes the overflow, do not blame protected results.
     expect(outgoingContextRefusal(estimate, 16000, 100)).toContain("after reclaim");
 });
 

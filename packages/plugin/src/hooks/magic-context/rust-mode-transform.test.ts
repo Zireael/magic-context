@@ -1444,8 +1444,8 @@ describe("Rust mode authority adapter", () => {
             const messages = makeMessages(sessionId);
             const output: { messages: unknown[] } = { messages: [...messages] };
             const meta = makeMeta(db, sessionId);
-            // This test isolates byte identity, not admission of an oversized
-            // array. Give its 2048-message ballast a window that actually fits.
+            // This test checks byte-for-byte preservation, not whether the large
+            // request can be sent. Give its 2048-message fixture a fitting limit.
             recordDetectedContextLimit(db, sessionId, 4_000_000, "test-provider/test-model");
             await transform.run(sessionId, messages, output, meta);
             expect(output.messages).toHaveLength(2048);
@@ -4583,8 +4583,8 @@ describe("Rust mode authority adapter", () => {
                 makeMeta(db, sessionId),
             ),
         ).rejects.toBeInstanceOf(EmergencyFailClosedError);
-        // The fifth live pass is the existing parked retry opportunity. Invalid
-        // output still refuses and retains failure history instead of resetting it.
+        // The fifth live pass is the one retry allowed while parked. Another invalid
+        // response must refuse and increment the existing failure count.
         expect(pass).toBe(5);
         expect(transform.getState(sessionId).consecutiveFailures).toBe(4);
         expect(transform.getState(sessionId).parkCount).toBe(1);
@@ -8541,12 +8541,13 @@ for (const measured of [false, true])
             "read fixture",
             {},
         );
-        // Recovery is the only input path that computes and forwards this evidence.
+        // Only overflow recovery measures and sends this request-specific evidence
+        // to the native transform.
         recordOverflowDetected(db, sid, 16000, `${model.providerID}/${model.modelID}`);
         try {
             await runner.run(sid, messages, { messages: [...messages] }, meta);
         } catch {
-            /* Existing provider-proven recovery may refuse; the wire evidence is the contract here. */
+            /* Recovery may refuse when the measured request still exceeds its provider limit. */
         }
         expect(observations).toEqual([measured]);
     });

@@ -8,13 +8,11 @@ import type { PendingOp } from "../../features/magic-context/types";
 import { isEditTool } from "./edit-marker";
 import type { TagTarget } from "./tag-messages";
 
-// Smart-drops Phase 1: select provably-superseded "spent control-plane" tool
-// outputs for reclaim, on top of the positional watermark sweep. These classes
-// are dead by SUPERSESSION (not age), so selection ignores the watermark — but
-// the caller only ACTS on the result inside the existing
-// execute + already-mutating gate, so this never originates a cache bust.
+// Select completed tool results made obsolete by later state, regardless of
+// age. The caller acts on this selection only during an execute pass that is
+// already rebuilding the cache, so selection alone never invalidates a cache.
 //
-// The shared protected-tools snapshot supplies all keep-counts.
+// Keep counts come from the shared protected-tools snapshot.
 
 /** Preserve tool entries owned by the newest 20 messages as continuation context. */
 export const SUPERSESSION_RECENT_MESSAGE_WINDOW = 20;

@@ -36,10 +36,10 @@ does not claim an end-to-end gateway proof. The agreed gateway behavior is a
 terminal HTTP 400 displaying the module's message verbatim, not a passthrough.
 
 The refusal guards were mutation-checked: disabling the shared outgoing guard
-reddened the impossible-reclaim regression, the Pi context-handler refusal,
-and the Rust-mode final-wire refusal. The Rust-mode typed-error/no-replay control
-remained green. Disabling ck-mc's native lower-bound guard reddened the Claude
-Code handler regression. All breaks were staged safely, restored, and rerun green.
+made the impossible-reclaim regression, the Pi context-handler refusal, and the
+Rust-mode final-wire refusal fail. The Rust-mode typed-error/no-replay control
+remained green. Disabling ck-mc's native lower-bound guard made the Claude Code
+handler regression fail. All breaks were staged safely, restored, and rerun green.
 
 Verification: Bun 1.4.2, TypeScript 5.9.3; plugin and Pi typechecks pass. The
 postprocess/refusal/Pi fit suites passed 249 tests initially; focused final
@@ -64,8 +64,8 @@ design document now describes that distinction accurately.
 The two executed review regressions are in the postprocess and Pi cleanup
 suites. A real native transform verifies held detection, a zero-count priced
 strip, and byte-identical frozen replay after protection is restored. All three
-guards were individually neutralized and each exact regression reddened; restored
-checks passed (266 Bun tests and one native integration-style unit test).
+guards were individually neutralized, making each exact regression fail.
+Restored checks passed (266 Bun tests and one native integration-style unit test).
 
 ## Nudge policy adoption
 
@@ -83,10 +83,12 @@ adoption. Both callers provide the previous baseline for that distinction.
 The review's map-edit, legacy-upgrade and rotation cases are in the postprocess
 suite, with Pi equivalents. The native regression activates the Claude Code
 surface and preserves a real raw arc before measuring its old-policy baseline;
-the transition pass intentionally has no actionable U. A restart test verifies
-policy persistence and legacy decoding in mc-store. Neutralizing policy freezing
-reddened the TS/Pi map-edit and upgrade tests and the native policy test;
-neutralizing the no-op lease guard separately reddened TS/Pi lease assertions.
+the transition pass intentionally has no actionable U (reclaimable token mass
+still available to reduce). A restart test verifies policy persistence and legacy
+decoding in mc-store. Neutralizing policy freezing made the TS/Pi map-edit and
+upgrade tests and the native policy test fail;
+neutralizing the no-op lease guard separately made the TS/Pi lease assertions
+fail.
 The TS rotation control stayed green in those runs.
 
 ## Actual delivery-fold retirement
@@ -103,7 +105,7 @@ the retained raw copy survives, the covered tag is compacted and its pending row
 is gone before any subsequent drain. A retained protected row remains pending.
 
 Two separate mutations disabled the delivery-retirement call and the pending-row
-delete. Each reddened only that regression; `keeps OpenCode final bytes identical
+delete. Each made only that regression fail; `keeps OpenCode final bytes identical
 to a one-shot executed fold` remained green. Staged working bytes were restored
 after each break. The restored regression/control passed. Storage retirement and
 v86 migration tests passed (seven tests), including the unchanged 100k-tag/two-
@@ -127,7 +129,7 @@ The real historian regression `review regression: repeated historian publication
 of a held result must have bounded pending depth` makes 100 publications and
 asserts one unchanged held row. A separate storage test makes 100 generic enqueues
 and checks tuple isolation and re-enqueue after removal. Neutralizing each pending
-membership predicate reddened its own bound test alone; the historian's concurrent
+membership predicate made only its own bound test fail; the historian's concurrent
 identity/status revalidation and storage queue-order controls respectively stayed
 green. Both staged mutations were restored before a passing rerun.
 
@@ -139,11 +141,10 @@ clock or byte/identity assertions. Storage and historian suites passed 15 tests
 
 ## Final verification of the continued branch
 
-The requested fast-forward from `9d2736a3df` was impossible because this worktree's
-base had newer master changes. A normal merge preserved those changes: Cargo.lock
-keeps master's published/immutable Git dependencies (no lockfile edit), and Pi's
-acknowledgment retains both held-drop feedback and the newer self-stamp warning.
-Items 4 and 5 are separate commits: `79c0799d35` and `b721516125` respectively.
+A normal merge preserved the current shared dependency versions and Pi's
+acknowledgment behavior. Cargo.lock keeps published Git dependencies unchanged,
+and the acknowledgement includes both held-drop feedback and the self-stamp warning.
+The two changes were applied independently.
 
 Final suite runs used Bun 1.4.2; TypeScript 5.9.3; Cargo 1.99.0, rustc 1.99.0,
 rustfmt 1.10.0; and Biome 2.5.1. Every suite had an outer timeout (120–240 seconds
@@ -168,13 +169,11 @@ host or production store was opened.
 The **only final suite failures** are `TypeScript held drop: newest three
 ctx_reduce results hold agent drops` and `Pi held drop: newest three ctx_reduce
 results hold agent drops`. Their shared fixture expects a `Held:` acknowledgment,
-but the newer master policy rejects self-stamps with `§2§ is a ctx_reduce call;
-leave those alone, they are cleaned up automatically.` The fixture and both
-production tool files are byte-unchanged from merge commit `1b30440055`, before
-either remaining fix. The TS case failed identically on an isolated diagnostic
-rerun. This is an inherited integration mismatch, not an enqueue or retirement
-regression; no expected hold assertion was weakened to hide it. Reconciling that
-older fixture with master's self-stamp policy is outside these two review fixes.
+but the tool correctly rejects an agent dropping its own ctx_reduce result with
+`§2§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.`
+This is a fixture mismatch, not an enqueue or retirement regression; no expected
+hold assertion was weakened to hide it. Updating this older fixture is outside the
+two queue-retirement fixes covered here.
 
 All new tests and unaffected controls passed after their mutations were restored.
 Scoped `aft_inspect` reported incomplete Biome/server diagnostics, so explicit
@@ -183,12 +182,10 @@ provider probes were not run; no end-to-end provider acceptance is claimed.
 
 ## Healthy-send evidence correction after re-review
 
-Master was merged as `4e0244c5cf` before this correction. The two regressions from
-`refs/alfonso/accepted/bg_400f36ca65f86fc7:docs/reports/protected-tools-re-review.test.ts`
-are ported, with their exact names and 8,000-word/16,000-token specimens, into the
-OpenCode refusal and Pi fallback package suites. Their package versions do not
-depend on an archived master import. The other four closed findings and native
-Rust guard are unchanged.
+The two regressions identified during re-review are included, with their exact
+names and 8,000-word/16,000-token specimens, in the OpenCode refusal and Pi fallback
+package suites. Those suites do not depend on archived reference code. The other
+four closed findings and native Rust guard are unchanged.
 
 ### Two kinds of estimate
 
@@ -241,13 +238,13 @@ parentage and rewritten prefixes cannot borrow the old count.
 
 ### Mutation and final verification
 
-The admission-as-refusal mutation reddened each reviewer regression individually;
-the calibrated protected-overflow control stayed green in each lane. Suppressing
-all healthy refusals reddened each calibrated control individually while the
-unknown-model regression stayed green. Separately, disabling provider-prefix
-reuse reddened the OpenCode and Pi provider-preference tests individually, with
+Treating admission estimates as refusal evidence made each reviewer regression
+fail individually; the calibrated protected-overflow control stayed green in each
+lane. Suppressing all healthy refusals made each calibrated control fail individually
+while the unknown-model regression stayed green. Separately, disabling provider-prefix
+reuse made the OpenCode and Pi provider-preference tests fail individually, with
 their calibrated protected controls still green. Forwarding admission trust to
-native reddened only the unknown-route producer test; the measured-route producer
+native made only the unknown-route producer test fail; the measured-route producer
 test stayed green. Every mutation used staged live bytes, a nonempty mutant diff,
 index restoration plus touch, and an empty restored diff. All restored controls
 passed. The canonical refusal code/message at the top of this report are unchanged.
@@ -276,13 +273,13 @@ or repeat the earlier report's host handoff proof.
 
 ### Post-checkpoint TypeScript verification
 
-The coherent implementation was committed as `bf43c94a1e` before the short,
-lane-by-lane verification runs. The TypeScript refusal/estimation suites then
+The coherent implementation was in place before the short, lane-by-lane
+verification runs. The TypeScript refusal/estimation suites then
 passed 21 tests and 68 assertions with Bun 1.4.2 under a 120-second bound.
 
 The calibrated positive control now deliberately crosses the boundary: its local
 protected count is below 16,000, while measured Fable pricing puts that subset
-above 16,000. Neutralizing protected-subset calibration reddened only
+above 16,000. Neutralizing protected-subset calibration made only
 `calibrated measured protected results still refuse with the protected-results code`;
 the unknown-model reviewer regression remained green. Restoring the staged bytes
 and rerunning the two suites passed. This defends calibration itself, not just a
@@ -290,22 +287,22 @@ specimen whose unscaled mass was already over the limit.
 
 ### Post-checkpoint Pi verification
 
-After the TypeScript verification commit, the targeted Pi refusal, provider-usage
+After TypeScript verification, the targeted Pi refusal, provider-usage
 and fit-envelope suites passed 23 tests and 109 assertions (Bun 1.4.2, 120-second
 bound). Pi's calibrated positive likewise has local protected mass below 16,000
-and calibrated protected mass above it. Neutralizing subset calibration reddened
+and calibrated protected mass above it. Neutralizing subset calibration made
 only `Pi refuses a complete protected over-limit final envelope but not untrusted counts`;
 the Pi unknown-model reviewer regression stayed green. Restored suites passed.
 
 These short final runs include the strengthened calibration-boundary assertions;
 the larger suite counts above record the earlier production-code verification.
-No production change was needed after the coherent checkpoint commit.
+No production change was needed after the coherent implementation checkpoint.
 
-## Agent self-stamp precedence after the master merge
+## Agent self-stamp precedence
 
-Master merged as `b26072aeec`. An agent cannot queue its own `ctx_reduce` result,
-regardless of its protected keep count; automatic and historian queues still
-honor `ctx_reduce: 3`. The conflicting agent-hold fixture moved to `custom: 3`.
+An agent cannot queue its own `ctx_reduce` result, regardless of its protected
+keep count; automatic and historian queues still honor `ctx_reduce: 3`. The
+conflicting agent-hold fixture uses `custom: 3`.
 The shared fixture now retains a three-result ctx_reduce historian hold/retirement
 case and explicitly tests protected and unprotected agent self-stamp rejection
 in TypeScript, Pi and the native Rust facade.
@@ -316,7 +313,9 @@ facade retains its existing visibility disclaimer. The OpenCode Rust-backend
 acknowledgment had discarded the self-stamp suffix when a held result existed;
 that composition bug is fixed without changing queue policy.
 
-**6981b25dfa: all preserved changes were intended and are covered by configuration, shared-fixture, facade, integration and persistence tests; the obsolete agent-ctx_reduce fixture is reconciled with issue 623.**
+All retained changes are covered by configuration, shared-fixture, facade,
+integration, and persistence tests. The obsolete agent-ctx_reduce fixture now
+matches the rejection of self-drops.
 
 ### Verification counts
 
@@ -360,8 +359,8 @@ gap, not a claimed pass.
 
 ## Synchronous tokenizer hang correction
 
-The earlier full-plugin gap is now closed. Master was merged at `47234a3745`.
-The isolated oversized-priced-snapshot regression hit a hard 10-second timeout
+The earlier full-plugin gap is now closed. The isolated oversized-priced-snapshot
+regression hit a hard 10-second timeout
 before the fix. A temporary diagnostic confirmed the stack: the Rust-mode healthy
 refusal path called `estimateFinalWireInputTokens` → `estimateMessageTokens` →
 `serializedTokens` with **12,583,912 characters**, before replay admission's cheap
@@ -413,8 +412,8 @@ fixture Git-commit timeouts: inherited command-line `core.hooksPath` pointed at
 external AFT hooks. The final run removed only inherited `GIT_CONFIG_*` hook
 environment from test subprocesses; fixture-local Git configuration and all tests
 remain enabled. No test timeout was increased or assertion removed to obtain the
-successful full-suite result. Package import organization was checked, including
-the Pi context-handler imports already moved to the top on merged master.
+successful full-suite result. Package import organization was checked,
+including the Pi context-handler imports, which now appear at the top of their files.
 
 Logs: ignored `target/self-stamp-verification/plugin-complete.*`,
 `pi-complete.*` and `root-lint-final.*`. Bun 1.4.2 and Biome 2.5.1 were used.
@@ -422,11 +421,11 @@ All stores remained in-memory or preload/fixture-owned temporary roots; no live
 host/provider/store was opened. Native Rust and package manifests/lockfiles were
 not changed in this correction.
 
-## Exact master estimator parity and failure-accounting correction
+## Exact estimator parity and failure-accounting correction
 
-The 451e79ad chunking and its 8 MiB threshold are removed. A fail-first parity test
-loads six real repository texts over 4 KiB and compares `estimateTokens` directly
-with the tokenizer's whole-text `encode(..., "all").length`. It failed on the
+The earlier chunking behavior and its 8 MiB threshold are removed. A fail-first
+parity test loads six real repository texts over 4 KiB and compares `estimateTokens`
+directly with the tokenizer's whole-text `encode(..., "all").length`. It failed on the
 chunked implementation: current schema text counted 21,180 instead of 21,173.
 After restoration all six texts match exactly (24 assertions).
 
@@ -438,26 +437,25 @@ retry still fails closed, retains count 4, and does not create a second parking
 transition. Native typed refusals that return no invalid array remain distinct.
 The first oversized refusal is still below one second (1.6 ms in the final suite).
 
-### Classification of the three Pi failures against master
+### Classification of the three Pi failures
 
-Reference checked with `git show master:<path>` at `9de884724d`:
+The three failures are in hygiene regression tests unrelated to these corrections:
 
 - `nudge hygiene three-leg differential corpus > keeps TypeScript and Pi aligned
-  with the Rust-consumed golden`: **unchanged from master**; its entire test file
-  is byte-identical to master.
+  with the Rust-consumed golden`: **unchanged by these corrections**; its test file
+  contains no edits from this work.
 - `TS/Pi/module differential hygiene corpus > keeps Pi as the third leg across
-  the full shared corpus`: **test body unchanged from master**. The file's branch
-  changes are separate lease/policy tests, not this corpus assertion.
+  the full shared corpus`: **test body unchanged by these corrections**. Other
+  edits to the file cover separate lease and policy behavior.
 - `Pi hygiene walk performance > memoized 250k-token rendered tail walks are cheap
-  relative to the cold walk`: **test body unchanged from master**.
+  relative to the cold walk`: **test body unchanged by these corrections**.
 
 No expected corpus count, tolerance, performance ratio or synthetic input was
-changed. The other branch bug was a72572751a's global byte fallback in the shared
-estimator, which inflated these larger-prose inputs. Comparing the actual master
-source showed that `estimateTokens` uses whole-text encoding directly. That
-function now matches the reference exactly; the only added helper is a cost-fence
-predicate used by refusal-only counting. The 1 MiB/16,385-letter-or-digit limits
-remain in the new refusal path, not in shared threshold/protection/nudge counting.
+changed. The unrelated estimator defect was a global byte fallback that inflated
+these larger-prose inputs. The established `estimateTokens` behavior encodes whole
+texts, and the implementation now preserves that behavior; the only added helper
+is a cost-fence predicate used by refusal-only counting. The 1 MiB/16,385-letter-or-digit
+limits remain in the new refusal path, not in shared threshold/protection/nudge counting.
 Obvious byte decisions still precede all refusal tokenization, and uncertain
 pathological refusal parts use byte bounds without altering the shared estimator.
 

@@ -116,7 +116,7 @@ export function dropStaleReduceCalls(
     options: {
         detect?: boolean;
         protectedCount?: number;
-        /** Current per-tool protection applies only to first detection, never replay. */
+        /** Per-tool keep counts apply on first stripping a call, not when replaying a saved strip. */
         protectedCallIds?: ReadonlySet<string>;
         /** Reports only newly edited locations, never frozen-id replay. */
         onFirstApplication?: (message: MessageLike, partIndex: number) => void;

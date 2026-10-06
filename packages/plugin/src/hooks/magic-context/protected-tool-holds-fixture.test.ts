@@ -43,8 +43,8 @@ export async function checkProtectedToolHold(
         targets.set(tag, { setContent: () => true, canDrop: () => true, drop: () => "removed" });
     };
     for (const [i, name] of spec.tools.entries()) add(i + 1, name);
-    // These later results separate the requested tag from the independent token
-    // tail, so only per-tool protection can explain why the request is held.
+    // Large later results keep the token-window hold independent from the
+    // per-tool keep count being tested here.
     for (const n of [100, 101, 102]) add(n, "bash", 8000);
     try {
         if (spec.historian) {
@@ -93,7 +93,7 @@ export async function checkProtectedToolHold(
         expect(apply()).toBe(false);
         expect(getPendingOps(db, sessionId)).toHaveLength(1);
         if (spec.historian) {
-            // The fold trims the covered raw copy, independently of a queue hold.
+            // Summarizing the source removes its raw result even while its queued drop is held.
             markTagsCompactedByMessageIds(db, sessionId, [`call-${spec.drop}`]);
             expect(status()).toBe("compacted");
             expect(
@@ -109,7 +109,7 @@ export async function checkProtectedToolHold(
             return;
         }
         add(200, spec.new_tool);
-        // Arrival alone performs no application: a later priced pass is required.
+        // A newer call displaces the result; a later rebuilding pass applies the drop.
         expect(status()).toBe("active");
         expect(apply()).toBe(true);
         expect(status()).toBe("dropped");

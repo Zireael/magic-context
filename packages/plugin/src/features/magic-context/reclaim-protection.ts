@@ -15,10 +15,11 @@ export {
     mergeProtectedTools,
     normalizeProtectedToolName,
 } from "../../shared/protected-tools-policy";
-/** Default exemplar count, retained for fixtures that describe shipped policy. */
+/** Default ctx_reduce keep count, exposed so fixtures can use the shipped policy. */
 export const CTX_REDUCE_KEEP = DEFAULT_PROTECTED_TOOLS.ctx_reduce;
 
-/** Keep the adopted policy stable while recency rotates inside its keep counts. */
+/** Use saved keep counts until a rebuilding pass measures a new baseline; newer
+ * calls still rotate through each count by tag order. */
 export function adoptedProtectedToolsPolicy(
     current: Readonly<Record<string, number>> | undefined,
     previous: Readonly<Record<string, number>> | undefined,
@@ -26,7 +27,7 @@ export function adoptedProtectedToolsPolicy(
     hasBaseline: boolean,
 ): Record<string, number> {
     if (rebuilding || !hasBaseline) return mergeProtectedTools(current);
-    // Older baselines excluded ctx_reduce coordination state, but not todowrite.
+    // Legacy baselines did not protect todowrite results and kept three ctx_reduce results.
     return { ...(previous ?? { todowrite: 0, ctx_reduce: 3 }) };
 }
 
@@ -58,8 +59,8 @@ export function protectedToolTokenCount(
         (sum, tag) => sum + (protectedTags.has(tag.tagNumber) ? (tag.tokenCount ?? 0) : 0),
         0,
     );
-    // This subset diagnoses a refusal, not fit admission. Unknown/family ratios
-    // cannot prove that protection alone makes the request too large.
+    // Admission decides whether a request can be sent; this subset can justify a
+    // refusal only with measured calibration proving protected results alone do not fit.
     return calibration && hasMeasuredDecisionCalibration(calibration)
         ? providerMass({ tools: tokens }, calibration)
         : 0;

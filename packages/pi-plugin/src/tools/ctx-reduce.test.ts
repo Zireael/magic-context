@@ -166,7 +166,7 @@ describe("Pi ctx_reduce tool", () => {
 				[3, "bash"],
 			] as const)
 				insertTag(db, sessionId, `call-${number}`, "tool", 4, number, 0, name);
-			// Later large results keep the requested free tag outside the independent tail hold.
+			// Large later results keep token-window protection separate from the per-tool hold being tested.
 			for (const number of [100, 101, 102])
 				insertTag(
 					db,

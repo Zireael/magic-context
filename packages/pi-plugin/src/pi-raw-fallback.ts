@@ -73,18 +73,19 @@ export interface PiFitEnvelope {
 	modelKey: string;
 	systemTokens: number;
 	toolDefinitionTokens: number;
-	/** Current route's active definitions, not the all-registered-tools fit envelope. */
+	/** Token count for definitions active on this route, not all registered tools. */
 	refusalToolDefinitionTokens?: number;
 	toolDefinitionsMeasured?: boolean;
-	/** Serialized complete envelope with an empty messages array. */
+	/** Serialized system-and-tool envelope before conversation messages are added. */
 	envelopeBytes?: number;
-	/** Fingerprint of the complete host system/tools snapshot. */
+	/** Identity of the system prompt and tool definitions used for this route. */
 	envelopeSignature?: string;
-	/** The session's frozen policy; an absent freeze uses the unknown-model fit rule. */
+	/** Session's saved fit policy; without one, use the unknown-model rule. */
 	calibration?: DecisionCalibration;
 }
 
-/** A complete final envelope is required; missing metadata must not reject a healthy pass. */
+/** Require current system/tool counts for an estimate. Missing metadata alone
+ * must not reject a request. */
 export function estimatePiOutgoingInputTokens(
 	messages: readonly unknown[],
 	observed?: PiFitEnvelope,
@@ -236,8 +237,9 @@ export function estimatePiOutgoingInputTokens(
 	const raw = tokenizePiMessages([...messages]);
 	const calibration =
 		observed.calibration ?? calibrationForModelKey(observed.modelKey);
-	// Admission keeps its frozen policy. Refusal independently requires this
-	// route's measured model seed, never that policy's unknown fit multiplier.
+	// Admission (deciding whether to send) uses the session's saved fit policy.
+	// Refusal-grade evidence must instead use this route's measured model seed,
+	// never the unknown-model fit multiplier.
 	const refusalCalibration = calibrationForModelKey(observed.modelKey);
 	const tokens = providerMass(
 		{

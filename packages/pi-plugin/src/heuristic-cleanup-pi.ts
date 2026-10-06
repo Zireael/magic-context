@@ -354,7 +354,7 @@ export function applyPiHeuristicCleanup(
 			? maxTag + 1
 			: (config.protectedCutoff ?? maxTag - config.protectedTags);
 	const routine = config.routine !== false;
-	// Stale detection uses the same effective per-tool set as other result lanes.
+	// Stale-result detection uses the same protected-tool cutoff as the other result-handling paths.
 	const toolAgeCutoff = protectedCutoff;
 
 	let droppedTools = 0;

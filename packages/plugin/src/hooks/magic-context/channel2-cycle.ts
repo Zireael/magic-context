@@ -30,8 +30,8 @@ export function rearmChannel2AfterMeasuredCollapse(input: {
     rebuilding: boolean;
     previous?: Channel2PredicateBaseline;
 }): boolean {
-    // A replay already below the floor is not a new collapse. Preserve legitimate
-    // action-state deltas (queued drops) without rearming from unchanged old data.
+    // An unchanged replay below the reminder floor is not a new reduction. A real
+    // queued drop can reduce actionable content and still rearm the reminder.
     if (
         !input.rebuilding &&
         (!input.previous ||

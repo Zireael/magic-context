@@ -1,4 +1,4 @@
-/** Shared schema/runtime policy. This DB-free module is also packed for the TUI. */
+/** Default result keep counts shared by runtime and configuration; this database-free module is bundled with the TUI. */
 export const DEFAULT_PROTECTED_TOOLS: Readonly<Record<string, number>> = {
     todowrite: 1,
     ctx_reduce: 3,

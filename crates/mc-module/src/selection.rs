@@ -1001,17 +1001,17 @@ fn recent_supersession_owner_message_ids(items: &[SelItem], arcs: &[ToolArc]) ->
         .collect()
 }
 
-/// 1.1 Control-plane supersession + 1.2 edit supersession (the smart_drops selectors).
-/// Newest-arc-first, per tool name: spent todowrite/ctx_reduce, zero-value
-/// meta drop-all, ctx_note drop-on-zero-value-action; edit/write older-per-file →
-/// edit_marker. Returns per-arc intents so the caller expands + shapes them. Active
-/// (non-reduced, client-executed) arcs only.
+/// For active tool-call/result groups, drop older todowrite/ctx_reduce results
+/// and zero-value metadata calls; drop ctx_note only for read/dismiss actions.
+/// Keep a short path-and-diff marker for older edit/write calls to the same file.
+/// Consider newest calls first and let the caller expand intents into block-level
+/// changes. Exclude calls already summarized or not executed by the client.
 fn select_supersession(
     arcs: &[&ToolArc],
     recent_message_ids: &HashSet<String>,
 ) -> HashMap<String, ArcIntent> {
     let mut intents: HashMap<String, ArcIntent> = HashMap::new();
-    // Newest-arc-first for keep-N and newest-per-file semantics.
+    // Newest calls determine which results and file edits remain current.
     let mut newest_first: Vec<&&ToolArc> = arcs.iter().collect();
     newest_first.sort_by(|a, b| {
         b.ordinal
@@ -1023,7 +1023,7 @@ fn select_supersession(
 
     for arc in newest_first {
         let name = arc.name.as_str();
-        // Edit supersession first (1.2): older-per-file → edit_marker.
+        // Keep the newest edit to each file; mark older edits for that file.
         if is_edit_tool(name) {
             if let Some(fp) = read_input_str(&arc.input, FILE_PATH_KEYS) {
                 if seen_file.contains(&fp) {
@@ -1042,7 +1042,7 @@ fn select_supersession(
             }
             // no resolvable filePath → skip (fail-safe); still fall through to name rules
         }
-        // Control-plane supersession (1.1).
+        // Older completed control and metadata results no longer carry current state.
         let is_drop_target =
             if name == "todowrite" || name == "ctx_reduce" || ZERO_VALUE_META_TOOLS.contains(&name)
             {
@@ -1060,7 +1060,7 @@ fn select_supersession(
                 .as_ref()
                 .is_some_and(|owner| !recent_message_ids.contains(owner))
         {
-            // A full drop supersedes an edit_marker for the same arc (drop wins).
+            // If another rule also selects this arc, remove it rather than marking it.
             intents.insert(arc.arc_id.clone(), ArcIntent { edit_marker: false });
         }
     }
@@ -1938,7 +1938,9 @@ pub(crate) fn select_reductions_with_outcome(
     }
 }
 
-/// Compute coordination protection for a previously adopted nudge policy.
+/// Return blocks protected by the keep counts frozen when the reminder's tail
+/// baseline was last rebuilt. Config changes take effect after a rebuilding pass
+/// saves a new baseline.
 pub(crate) fn protected_blocks_for_policy(
     items: &[SelItem],
     frozen: &HashSet<String>,
@@ -5317,7 +5319,8 @@ mod tests {
         assert!(!decisions
             .iter()
             .any(|decision| decision.target_id == "todo-3#1"));
-        // Agent drops share the protected count and remain queued until rotation.
+        // Agent-requested drops use the same keep count and stay queued until
+        // a newer call displaces this result.
         ctx.agent_drop_ids = vec!["todo-3#1".to_string()];
         assert!(!select_reductions(&items, &frozen, &ctx, &cfg)
             .iter()
@@ -5342,8 +5345,8 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/protected-tool-holds.json"))
                 .unwrap();
         for case in cases {
-            // Agent self-stamps are rejected at the facade before selection;
-            // historian queues still reach this planner and honor keep counts.
+            // The facade rejects an agent dropping its own ctx_reduce result. Drops queued
+            // by historian publication reach this planner and still obey the keep counts.
             if case.agent_self_stamp {
                 continue;
             }
@@ -5424,8 +5427,8 @@ mod tests {
         };
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.pass_already_busting = true;
-        // The durable queue has the same selection semantics regardless of who
-        // published it. A fold's trim later removes the covered arc from the tail.
+        // Agent and historian drops use the same durable queue and protection
+        // rules. A summarized result stops counting when a fold trims its source.
         ctx.agent_drop_ids = vec!["covered#1".to_string()];
         assert!(!select_reductions(&items, &HashSet::new(), &ctx, &cfg)
             .iter()

@@ -29,10 +29,9 @@ export { CTX_REDUCE_LIGHT_DESCRIPTION } from "../light-descriptions";
 export interface CtxReduceToolDeps {
     db: Database;
     /**
-     * Union projection form: protectedSet (tag-number set form).
-     * Coordinate space: tag-number space.
-     * Empty-window behavior: empty set applies no tail hold. Protected-tool
-     * membership still holds queued drops until displacement and a rebuilding pass.
+     * Tag numbers protected by the current token window. An empty set means no
+     * results are held by that window; per-tool keep counts still hold queued
+     * drops until newer calls displace the result and a rebuilding pass applies them.
      */
     protectedSet?: ReadonlySet<number> | ((sessionId: string) => ReadonlySet<number>);
     protectedTools?: Readonly<Record<string, number>>;

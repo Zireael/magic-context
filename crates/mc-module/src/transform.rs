@@ -18819,9 +18819,9 @@ pub(crate) mod tests {
             transform(&s, &request, &ctx).unwrap();
             transform(&s, &request, &ctx).unwrap();
             let mut loaded = s.load("ses").unwrap();
-            // Keep the raw arc while priming, then measure its older nudge policy
-            // from those same served sources. This isolates policy adoption from
-            // automatic age reclaim, which could otherwise retire the specimen.
+            // Initialize the cached state, then measure the baseline with the same
+            // messages that were served. This isolates policy adoption from age-based
+            // cleanup, which could otherwise remove the tool result under test.
             let rows = s.load_tags_for_session("ses").unwrap();
             let projection = project_messages(&request.messages).unwrap();
             let token_map = rows
@@ -18971,7 +18971,8 @@ pub(crate) mod tests {
         let context = smart_pctx();
         let mut messages = vec![item("a", 1, "raw")];
         messages.extend(todowrite_arc("held", 2));
-        // Separate the result from the independent protected token tail.
+        // Large unrelated results exercise the token-window hold separately from
+        // the per-tool protection on the todowrite result.
         for n in 0..3 {
             messages.push(assistant_tool_call(
                 &format!("bash-{n}"),
@@ -18988,7 +18989,8 @@ pub(crate) mod tests {
         let mut request = with_usage(active_cc_req("ses", "cfg0", messages), 10_000, 100_000);
         request.protected_tokens_effective = Some(4000);
         transform(&s, &request, &context).unwrap();
-        // Agent and historian publication share this durable, origin-free queue.
+        // Agent and historian requests share one durable pending-drop queue; rows do not
+        // record which publisher added them.
         s.append_pending_agent_drops("ses", &["held_result#0".to_string()], 1)
             .unwrap();
         for config in ["cfg1", "cfg2"] {
@@ -19000,7 +19002,8 @@ pub(crate) mod tests {
                 .contains("todo output"));
             assert!(!frozen_red_targets(&s.load("ses").unwrap().core).contains("held_result#0"));
         }
-        // Rotation alone must not rewrite the cached output or drain the queue.
+        // A newer todowrite result changes which call is protected, but this deferred
+        // pass must not rewrite cached output or apply the queued drop.
         request.messages.extend(todowrite_arc("newest", 10));
         let defer = transform(&s, &request, &context).unwrap();
         assert_eq!(defer.action, "SOFT+");

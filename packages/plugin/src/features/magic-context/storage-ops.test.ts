@@ -42,8 +42,8 @@ describe("storage-ops", () => {
             for (let n = 0; n < 99; n++) queuePendingOp(db, "ses-1", 1, "drop", 20 + n);
             expect(getPendingOps(db, "ses-1")).toEqual(first);
             expect(getPendingOpsCount(db, "ses-1")).toBe(1);
-            // A different operation does not block a drop, nor does another
-            // session's same tag number or another tag in this session.
+            // Queue identity includes the operation and session: a noop can coexist
+            // with a drop, and tag numbers are independent across sessions.
             db.prepare(
                 "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at) VALUES (?, ?, ?, ?)",
             ).run("ses-1", 2, "noop", 1);

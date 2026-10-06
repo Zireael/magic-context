@@ -34,14 +34,17 @@ export function protectedToolRefusal(error: unknown): EmergencyFailClosedError |
 
 export interface ContextRefusalEstimate {
     tokens: number;
-    /** Admission-grade completeness; may include a conservative fit multiplier. */
+    /** Completeness for admission (deciding whether to send); may use a conservative
+     * fit multiplier. */
     trusted: boolean;
-    /** Complete, route-measured and calibrated evidence of non-fit. */
+    /** Refusal-grade evidence: complete, calibrated proof for this route that the
+     * request does not fit. */
     refusalGrade?: boolean;
     refusalTokens?: number;
 }
 
-/** Admission upper bounds must never originate healthy-send refusals. */
+/** An estimate used for admission (deciding whether to send) cannot alone justify
+ * refusing a healthy request. */
 export function outgoingContextRefusal(
     estimate: ContextRefusalEstimate | undefined,
     limit: number | undefined,

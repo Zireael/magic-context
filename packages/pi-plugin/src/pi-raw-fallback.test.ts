@@ -60,7 +60,8 @@ it("re-review: Pi must not refuse a fitting uncalibrated request on the unknown-
 		refusalToolDefinitionTokens: 20,
 	};
 	const estimate = estimatePiOutgoingInputTokens(messages, envelope);
-	// A unit-ratio control checks local pricing only, not provenance.
+	// This altered ratio checks local token pricing only; it does not prove that
+	// the route has a measured calibration suitable for refusing the request.
 	const local = estimatePiOutgoingInputTokens(messages, {
 		...envelope,
 		calibration: { ...unknown, seeded: true },

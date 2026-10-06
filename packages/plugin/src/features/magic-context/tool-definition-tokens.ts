@@ -102,7 +102,7 @@ export function getCurrentToolSetHash(
     return createHash("sha256").update(Array.from(toolIds.keys()).sort().join("\0")).digest("hex");
 }
 
-/** Exact observed schemas, not just names, for correlating a provider usage sample. */
+/** Hash observed tool IDs and full schemas so usage is reused only for the same definitions. */
 export function getToolDefinitionMeasurementSignature(
     providerID: string,
     modelID: string,

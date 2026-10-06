@@ -3690,8 +3690,8 @@ describe("ride-only supersession reclaim", () => {
         );
 
         const statuses = tagStatuses(sessionId);
-        expect(statuses.get(1)).toBe("dropped"); // dropped by its own queued drop, not smart-drops
-        expect(statuses.get(2)).toBe("dropped"); // backlog rides the existing rebuild, never the legacy flag
+        expect(statuses.get(1)).toBe("dropped"); // Its explicit queued drop is applied.
+        expect(statuses.get(2)).toBe("dropped"); // The queued older result is also removed during this rebuild.
         expect(statuses.get(3)).toBe("active");
 
         const afterRebuild = JSON.stringify(messages);
@@ -11107,7 +11107,7 @@ it("protected map edits on SOFT+ leave U and the Channel 2 lease unchanged until
         u: effectiveTailHygiene(state.get(id)!).u,
         lease: getChannel2NudgeState(db, id),
     }).toEqual({ u: previousU, lease: "delivered" });
-    // A real queued drop gives the next pass an independently priced wire edit.
+    // This queued drop changes the request bytes, unlike replaying an unchanged baseline.
     const trigger = makeToolMessage("flush-trigger");
     messages.splice(1, 0, trigger);
     insertTag(db, id, "flush-call", "tool", 4000, 2, 0, "bash", 0, "flush-trigger");
@@ -11139,7 +11139,8 @@ it("legacy default-only upgrade does not rearm Channel 2 on SOFT+", async () => 
         protectedTools: { todowrite: 0 },
         cacheBusting: true,
     });
-    // Old baseline blobs have no policy field and excluded only ctx_reduce.
+    // Legacy baselines have no saved policy; they protect three ctx_reduce results
+    // but do not protect todowrite results.
     delete previous.protectedToolsPolicy;
     expect(effectiveTailHygiene(previous).u).toBeGreaterThan(6000);
     const state = new Map<string, Channel1State>([
@@ -11223,7 +11224,7 @@ it("unchanged defaults do not imply identical emergency selection on a rebuildin
         priorInputSample: 0,
         hasPriorDrop: false,
     };
-    // The old emergency policy had no todowrite exemplar exemption.
+    // Under the old policy, one todowrite result was not exempt from emergency removal.
     expect(planEmergencyDrop({ ...input, protectedTools: { todowrite: 0 } }).tagNumbers).toContain(
         8,
     );
