@@ -231,21 +231,53 @@ const DEFAULT_STACK_LIMIT_BYTES = 512 * 1024;
 const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
 const MAX_SANDBOX_ERROR_CHARS = 2 * 1024;
 
-// Host calls can outlive the VM interrupt path, so any capability that touches
-// the outside world must listen to this run's controller. Otherwise one tarpit
-// request can keep the shared QuickJS module suspended past the sandbox budget
-// and block the next caller on the process-wide lock.
+// Interrupt handlers cannot run while asyncify is suspended in a host promise.
+// Bound every capability at the VM boundary, even if its transport ignores abort.
+// Rejecting this await lets QuickJS resume, interrupt and dispose normally before
+// releasing the shared suspension stack; racing the whole eval and disposing a
+// still-suspended context would instead risk use-after-free on a late response.
 function resolveCapabilitiesForRun(
     options: RunCompiledSmartNoteCheckOptions,
     signal: AbortSignal,
 ): SmartNoteCapabilityApi {
-    if (options.capabilityFactory) {
-        return options.capabilityFactory(signal);
-    }
-    if (options.capabilities) {
-        return options.capabilities;
-    }
-    throw new Error("smart-note check requires capabilities");
+    const capabilities = options.capabilityFactory?.(signal) ?? options.capabilities;
+    if (!capabilities) throw new Error("smart-note check requires capabilities");
+    return {
+        readFile: (path) => awaitCapability(() => capabilities.readFile(path), signal),
+        httpGet: (url) => awaitCapability(() => capabilities.httpGet(url), signal),
+        gitHeadSha: () => awaitCapability(() => capabilities.gitHeadSha(), signal),
+        gitTag: () => awaitCapability(() => capabilities.gitTag(), signal),
+        gitLog: (opts) => awaitCapability(() => capabilities.gitLog(opts), signal),
+    };
+}
+
+function awaitCapability<T>(call: () => Promise<T>, signal: AbortSignal): Promise<T> {
+    throwIfRunAborted(signal);
+    return new Promise<T>((resolve, reject) => {
+        const cleanup = () => signal.removeEventListener("abort", abort);
+        const abort = () => {
+            cleanup();
+            reject(signal.reason ?? new Error("smart-note check aborted"));
+        };
+        signal.addEventListener("abort", abort, { once: true });
+        try {
+            // Both handlers remain attached to the transport after abort. Late
+            // fulfillment/rejection is consumed without touching any VM handles.
+            void call().then(
+                (value) => {
+                    cleanup();
+                    resolve(value);
+                },
+                (error) => {
+                    cleanup();
+                    reject(error);
+                },
+            );
+        } catch (error) {
+            cleanup();
+            reject(error);
+        }
+    });
 }
 
 function throwIfRunAborted(signal: AbortSignal): void {

@@ -26,29 +26,48 @@ export async function withLocalHttpServer<T>(
     delayMs: number | null,
     run: (requests: () => number) => Promise<T>,
 ): Promise<T> {
-    let requests = 0;
     const timers = new Set<ReturnType<typeof setTimeout>>();
-    const server = http.createServer((_request, response) => {
-        requests++;
-        if (delayMs === null) return;
-        const timer = setTimeout(() => {
-            timers.delete(timer);
-            response.end('{"ready":false}');
-        }, delayMs);
-        timers.add(timer);
+    const fixture = await localSmartNoteHttpTransport(
+        "smart-note-timeout.test",
+        (_request, response) => {
+            if (delayMs === null) return;
+            const timer = setTimeout(() => {
+                timers.delete(timer);
+                response.end('{"ready":false}');
+            }, delayMs);
+            timers.add(timer);
+        },
+    );
+    try {
+        return await run(() => fixture.paths.length);
+    } finally {
+        for (const timer of timers) clearTimeout(timer);
+        await fixture.dispose();
+    }
+}
+
+/** Run the real HTTP stream lifecycle without opening public sockets or doing DNS. */
+export async function localSmartNoteHttpTransport(
+    hostname: string,
+    respond: (request: http.IncomingMessage, response: http.ServerResponse) => void,
+): Promise<{ paths: string[]; dispose: () => Promise<void> }> {
+    const paths: string[] = [];
+    const server = http.createServer((request, response) => {
+        paths.push(request.url ?? "");
+        respond(request, response);
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("missing test server address");
-    const lookup = spyOn(dns, "lookup").mockImplementation((async (hostname: string) => {
-        if (hostname !== "smart-note-timeout.test") throw new Error(`unexpected DNS: ${hostname}`);
+    const lookup = spyOn(dns, "lookup").mockImplementation((async (target: string) => {
+        if (target !== hostname) throw new Error(`unexpected DNS: ${target}`);
         return [{ address: "1.1.1.1", family: 4 }];
     }) as typeof dns.lookup);
     const request = spyOn(https, "request").mockImplementation(((
         options: https.RequestOptions,
         callback: (response: http.IncomingMessage) => void,
     ) => {
-        if (options.hostname !== "smart-note-timeout.test")
+        if (options.hostname !== hostname)
             throw new Error(`unexpected network destination: ${options.hostname}`);
         // SSRF policy stays production-strict. Only this test connector may reach
         // loopback, and no DNS, TLS or socket is opened against a public service.
@@ -64,18 +83,18 @@ export async function withLocalHttpServer<T>(
             callback,
         );
     }) as typeof https.request);
-    try {
-        return await run(() => requests);
-    } finally {
-        request.mockRestore();
-        lookup.mockRestore();
-        for (const timer of timers) clearTimeout(timer);
-        const closed = new Promise<void>((resolve, reject) =>
-            server.close((error) => (error ? reject(error) : resolve())),
-        );
-        server.closeAllConnections();
-        await closed;
-    }
+    return {
+        paths,
+        dispose: async () => {
+            request.mockRestore();
+            lookup.mockRestore();
+            const closed = new Promise<void>((resolve, reject) =>
+                server.close((error) => (error ? reject(error) : resolve())),
+            );
+            server.closeAllConnections();
+            await closed;
+        },
+    };
 }
 
 let isolationProven = false;

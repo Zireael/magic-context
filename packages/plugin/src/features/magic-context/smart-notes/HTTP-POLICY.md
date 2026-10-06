@@ -38,6 +38,15 @@ it admits no more notes after that. Caller/lease cancellation still interrupts a
 active check. External cancellation leaves note health unchanged unless running
 JavaScript has already exhausted its CPU budget, which remains a logic failure.
 
+Every host capability await is bounded at the VM bridge by the run's abort signal,
+not just by the transport's cooperation. A promise that never settles cannot keep
+the VM or serialization lock suspended beyond the check deadline (plus event-loop
+resumption/cleanup). On timeout the bridge rejects, QuickJS resumes into its
+interrupt handler, and the context is disposed before another check starts. Late
+host fulfillment or rejection is consumed without accessing the disposed context.
+The whole evaluation is not raced against cancellation: running JavaScript still
+classifies CPU exhaustion itself, and only queued callers can give up immediately.
+
 HTTP/DNS deadlines and a check's own deadline while suspended in HTTP carry a
 transient retry time with a five-minute minimum. Storage applies exponential
 network backoff on top, without spending compilation/logic strikes or creating
