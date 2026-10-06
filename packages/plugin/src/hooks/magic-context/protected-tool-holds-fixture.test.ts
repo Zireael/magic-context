@@ -22,6 +22,8 @@ export interface HoldCase {
     drop: number;
     new_tool: string;
     historian?: boolean;
+    agent_self_stamp?: boolean;
+    protected_after_trim?: number[];
 }
 export const holdCases = fixture as HoldCase[];
 export async function checkProtectedToolHold(
@@ -60,6 +62,17 @@ export async function checkProtectedToolHold(
                   }).ctx_reduce.execute({ drop: String(spec.drop) }, {
                       sessionID: sessionId,
                   } as never);
+            if (spec.agent_self_stamp) {
+                expect(text).toBe(
+                    `§${spec.drop}§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.`,
+                );
+                expect(getPendingOps(db, sessionId)).toHaveLength(0);
+                expect(
+                    getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === spec.drop)
+                        ?.status,
+                ).toBe("active");
+                return;
+            }
             expect(text).toContain(`Held: §${spec.drop} is inside the protected working set`);
         }
         expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([spec.drop]);
@@ -83,12 +96,14 @@ export async function checkProtectedToolHold(
             // The fold trims the covered raw copy, independently of a queue hold.
             markTagsCompactedByMessageIds(db, sessionId, [`call-${spec.drop}`]);
             expect(status()).toBe("compacted");
-            expect([
-                ...protectedToolTagNumbers(
-                    getActiveTagsBySession(db, sessionId),
-                    spec.protected_tools,
-                ),
-            ]).toEqual([1]);
+            expect(
+                [
+                    ...protectedToolTagNumbers(
+                        getActiveTagsBySession(db, sessionId),
+                        spec.protected_tools,
+                    ),
+                ].sort((a, b) => a - b),
+            ).toEqual(spec.protected_after_trim ?? [1]);
             expect(apply()).toBe(false);
             expect(getPendingOps(db, sessionId)).toHaveLength(0);
             return;

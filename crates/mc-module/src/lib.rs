@@ -30594,6 +30594,149 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_agent_self_stamp_shared_fixture() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            label: String,
+            tools: Vec<String>,
+            drop: usize,
+            protected_tools: std::collections::BTreeMap<String, usize>,
+            #[serde(default)]
+            agent_self_stamp: bool,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/protected-tool-holds.json"))
+                .unwrap();
+        for case in cases.into_iter().filter(|case| case.agent_self_stamp) {
+            let resolver =
+                FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+            let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+                Arc::new(ProducerState::default()),
+                default_test_config(),
+                resolver,
+            );
+            let mut tags = case
+                .tools
+                .iter()
+                .enumerate()
+                .map(|(i, _)| TagMintInput {
+                    block_id: format!("m{}#0", i + 1),
+                    kind: "tool_result".to_string(),
+                    token_count: 10,
+                    source_bytes: b"result".to_vec(),
+                })
+                .collect::<Vec<_>>();
+            for i in 100..103 {
+                tags.push(TagMintInput {
+                    block_id: format!("m{i}#0"),
+                    kind: "tool_result".to_string(),
+                    token_count: 8000,
+                    source_bytes: b"padding".to_vec(),
+                });
+            }
+            store.seed_tags_for_test("ses", &tags, 1000).unwrap();
+            let mut loaded = store.load("ses").unwrap();
+            loaded.meta.protected_tokens_effective = Some(8000);
+            if case.protected_tools.get("ctx_reduce").copied().unwrap_or(3) > 0 {
+                loaded
+                    .meta
+                    .protected_tool_block_ids
+                    .insert(format!("m{}#0", case.drop));
+            }
+            store
+                .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+            cache_last_served_test_messages(
+                &handler,
+                "ses",
+                case.tools
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| cached_tool_result(&format!("m{}", i + 1), name))
+                    .collect(),
+            );
+            let ack = tool_text(
+                call_facade(
+                    &handler,
+                    "ctx_reduce",
+                    json!({"drop":case.drop.to_string()}),
+                )
+                .await,
+            );
+            assert_eq!(
+                ack,
+                ctx_reduce_self_stamp_message(case.drop as u64),
+                "{}",
+                case.label
+            );
+            let delivered = tool_body(handler.handle_agent_drops_value(
+                7,
+                json!({
+                    "method":"agent_drops.append", "session_id":"ses", "drop":case.drop.to_string(),
+                    "command_id":case.label,
+                }),
+            ));
+            assert_eq!(delivered["queued"], json!(0));
+            assert_eq!(delivered["ctx_reduce_self_stamps"], json!([case.drop]));
+            assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_mixed_reply_orders_free_held_and_self_stamp() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let tags = (1..=6)
+            .map(|i| TagMintInput {
+                block_id: format!("m{i}#0"),
+                kind: "tool_result".to_string(),
+                token_count: if i > 3 { 8000 } else { 10 },
+                source_bytes: b"result".to_vec(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &tags, 1000).unwrap();
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.protected_tokens_effective = Some(8000);
+        loaded
+            .meta
+            .protected_tool_block_ids
+            .insert("m1#0".to_string());
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        cache_last_served_test_messages(
+            &handler,
+            "ses",
+            vec![
+                cached_tool_result("m1", "custom"),
+                cached_tool_result("m2", "ctx_reduce"),
+                cached_tool_result("m3", "read"),
+            ],
+        );
+        let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({"drop":"2,1,3"})).await);
+        assert_eq!(ack, "Queued: drop §3§. Held: §1§ is inside the protected working set; it applies once newer work displaces it. Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later. §2§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.");
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+        let delivered = tool_body(handler.handle_agent_drops_value(7, json!({
+            "method":"agent_drops.append", "session_id":"ses", "drop":"2,1,3", "command_id":"mixed-reply",
+        })));
+        assert_eq!(delivered["ctx_reduce_self_stamps"], json!([2]));
+        assert_eq!(delivered["ctx_reduce_queued_tags"], json!([1, 3]));
+        assert_eq!(
+            store
+                .load_pending_agent_drops("ses")
+                .unwrap()
+                .into_iter()
+                .map(|drop| drop.target_id)
+                .collect::<Vec<_>>(),
+            vec!["m1#0", "m3#0"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn facade_ctx_reduce_ack_validates_unknown_queued_and_protected_tags_without_committing()
     {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);

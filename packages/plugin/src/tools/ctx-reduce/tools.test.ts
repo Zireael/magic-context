@@ -200,6 +200,28 @@ describe("createCtxReduceTools", () => {
             );
         });
 
+        it("orders mixed outcomes as free drop, protected hold, then ctx_reduce self-stamp", async () => {
+            seedTags(db, [
+                { id: 1, sessionId: "ses-1", type: "tool", toolName: "custom" },
+                { id: 2, sessionId: "ses-1", type: "tool", toolName: "ctx_reduce" },
+                { id: 3, sessionId: "ses-1", type: "tool", toolName: "bash" },
+            ]);
+            const tool = createCtxReduceTools({
+                db,
+                protectedSet: new Set(),
+                protectedTools: { custom: 1 },
+            });
+            const result = await tool.ctx_reduce.execute({ drop: "2,1,3" }, toolContext());
+            expect(result).toBe(
+                "Queued: drop §3§. Held: §1 is inside the protected working set; it applies once newer work displaces it. §2§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+            expect(
+                getPendingOps(db, "ses-1")
+                    .map((op) => op.tag_id)
+                    .sort(),
+            ).toEqual([1, 3]);
+        });
+
         it("resets the rolling nudge anchor to the current token count", async () => {
             seedTags(db, [
                 { id: 3, sessionId: "ses-1" },

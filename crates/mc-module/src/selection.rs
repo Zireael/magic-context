@@ -5335,11 +5335,18 @@ mod tests {
             new_tool: String,
             #[serde(default)]
             historian: bool,
+            #[serde(default)]
+            agent_self_stamp: bool,
         }
         let cases: Vec<Case> =
             serde_json::from_str(include_str!("../tests/fixtures/protected-tool-holds.json"))
                 .unwrap();
         for case in cases {
+            // Agent self-stamps are rejected at the facade before selection;
+            // historian queues still reach this planner and honor keep counts.
+            if case.agent_self_stamp {
+                continue;
+            }
             let mut items = Vec::new();
             for (i, name) in case.tools.iter().enumerate() {
                 let id = format!("hold-{}", i + 1);
