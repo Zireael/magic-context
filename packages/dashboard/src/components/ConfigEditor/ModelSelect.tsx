@@ -121,6 +121,7 @@ export default function ModelSelect(props: ModelSelectProps) {
         aria-label={props.label}
         aria-expanded={open()}
         aria-haspopup="dialog"
+        title={displayValue()}
       >
         <span class={`model-select-value ${!valueStr() ? "placeholder" : ""}`}>
           {valueStr() ? (
@@ -189,6 +190,7 @@ export default function ModelSelect(props: ModelSelectProps) {
                           class={`model-select-option ${props.value === model ? "active" : ""}`}
                           onClick={() => selectModel(model)}
                           type="button"
+                          title={model}
                         >
                           {modelName(model)}
                         </button>

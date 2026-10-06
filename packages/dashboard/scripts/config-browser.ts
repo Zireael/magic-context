@@ -1,12 +1,17 @@
 // Fixture-only visual and interaction gate. No native backend or operator config is contacted.
-// Run: timeout 240s bun packages/dashboard/scripts/config-browser.ts "$TMPDIR/magic-context/dashboard-iter2"
+// Run: timeout 300s bun packages/dashboard/scripts/config-browser.ts "$TMPDIR/magic-context/dashboard-responsive"
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { parseJsonc } from "../src/lib/jsonc";
 
 const root = resolve(process.argv[2] ?? "");
 if (!process.argv[2]) throw new Error("Screenshot directory required");
 mkdirSync(root, { recursive: true });
 const dashboard = resolve(import.meta.dir, "..");
+const viewports = process.env.CONFIG_BROWSER_VIEWPORTS
+  ? process.env.CONFIG_BROWSER_VIEWPORTS.split(",").map((size) => size.split("x").map(Number))
+  : [[900, 800], [1100, 800], [1400, 900], [1900, 1100]];
+if (viewports.some((size) => size.length !== 2 || size.some((value) => !Number.isInteger(value) || value <= 0))) throw new Error("Invalid browser viewport");
 const fixture = `{
   // Operator's comment must survive form saves.
   "enabled": true,
@@ -15,31 +20,35 @@ const fixture = `{
     "endpoint": "https://openrouter.ai/api/v1",
     "model": "qwen/qwen3-embedding-8b",
   },
-  "mural": { "model": "google/antigravity-gemini-3-flash" },
+  "mural": { "model": "google/antigravity-gemini-3.8-flash" },
   "historian": { "opencode": {
     "model": { "model": "anthropic/claude-sonnet-4-5", "variant": "high" },
-    "fallback_models": [ { "model": "openrouter/qwen/qwen3-235b-a22b", "variant": "medium" } ],
+    "fallback_models": [ { "model": "deepseek/deepseek-flash", "variant": "high" }, "openrouter/qwen/qwen3-235b-a22b" ],
   } },
-  "dreamer": { "opencode": { "model": "google/antigravity-gemini-3-flash" } },
+  "dreamer": { "opencode": {
+    "model": "google/antigravity-gemini-3.8-flash",
+    "fallback_models": [ { "model": "deepseek/deepseek-flash", "variant": "high" }, "openai/gpt-5" ],
+  } },
   "prompt_surface": { "models": { "anthropic/*": "full", "openrouter/qwen/qwen3-235b-a22b": "light" } },
   "pi": { "subagent_extensions": ["extensions/project-specific-tooling.ts", "npm:@cortexkit/example-extension"] },
   "future_operator_setting": { "keep_spacing" :  42, },
 }
 `.replaceAll("\n", "\r\n");
 const catalogs = {
-  opencode: ["anthropic/claude-sonnet-4-5", "google/antigravity-gemini-3-flash", "openai/gpt-5", "openrouter/qwen/qwen3-235b-a22b"],
+  opencode: ["anthropic/claude-sonnet-4-5", "google/antigravity-gemini-3.8-flash", "deepseek/deepseek-flash", "openai/gpt-5", "openrouter/qwen/qwen3-235b-a22b"],
   pi: ["anthropic/claude-sonnet-4-5", "openai/gpt-4o"],
   omp: ["opencode-zen/gpt-5"],
-  opencodeVariants: { "anthropic/claude-sonnet-4-5": ["low", "high", "adaptive"], "google/antigravity-gemini-3-flash": [] },
+  opencodeVariants: { "anthropic/claude-sonnet-4-5": ["low", "high", "adaptive"], "google/antigravity-gemini-3.8-flash": [] },
 };
 const preload = `(() => {
   let config = ${JSON.stringify(fixture)};
+  window.__fixtureConfig = ${JSON.stringify(parseJsonc(fixture))};
   window.__fixtureCalls = []; window.__fixtureSaved = null;
   window.__TAURI_INTERNALS__ = {
     transformCallback: () => 1, unregisterCallback: () => {},
     invoke: async (cmd, args) => {
       window.__fixtureCalls.push(cmd);
-      if (cmd === 'get_config') return { path: '/fixture/cortexkit/magic-context.jsonc', exists: true, content: config, error: null };
+      if (cmd === 'get_config') return { path: '/fixture/operator/configuration-directory/cortexkit/magic-context.jsonc', exists: true, content: config, error: null };
       if (cmd === 'save_config') { config = args.content; window.__fixtureSaved = config; return null; }
       if (cmd === 'get_model_catalogs') return ${JSON.stringify(catalogs)};
       if (cmd === 'get_opencode_install_state') return 'cli';
@@ -51,11 +60,12 @@ const preload = `(() => {
   window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
 })()`;
 
-const vite = Bun.spawn(["timeout", "210s", join(dashboard, "node_modules/.bin/vite"), "--port", "1427", "--host", "127.0.0.1"], { cwd: dashboard, stdout: "pipe", stderr: "inherit" });
-const chrome = Bun.spawn(["timeout", "210s", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--disable-extensions", "--remote-debugging-port=0", `--user-data-dir=${join(root, "chrome-profile")}`, "about:blank"], { stdout: "ignore", stderr: "pipe" });
+const vite = Bun.spawn(["timeout", "270s", join(dashboard, "node_modules/.bin/vite"), "--port", "1427", "--host", "127.0.0.1"], { cwd: dashboard, stdout: "pipe", stderr: "inherit" });
+const chrome = Bun.spawn(["timeout", "270s", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--disable-extensions", "--remote-debugging-port=0", `--user-data-dir=${join(root, "chrome-profile")}`, "about:blank"], { stdout: "ignore", stderr: "pipe" });
 let socket: WebSocket | undefined;
 const screenshots: string[] = [];
 const checks: string[] = [];
+const layoutMeasurements: unknown[] = [];
 try {
   let ready = "";
   for await (const chunk of vite.stdout) {
@@ -96,7 +106,10 @@ try {
     return result.result.value;
   };
   const assert = async (name: string, expression: string) => {
-    if (!await evaluate<boolean>(expression)) throw new Error(`Browser check failed: ${name}`);
+    if (!await evaluate<boolean>(expression)) {
+      writeFileSync(join(root, "failure.json"), JSON.stringify({ name, checks, layoutMeasurements }, null, 2));
+      throw new Error(`Browser check failed: ${name}`);
+    }
     checks.push(name);
   };
   const frame = () => evaluate("new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done)))");
@@ -116,7 +129,7 @@ try {
   };
   await send("Page.enable", {}, sid);
   await send("Page.addScriptToEvaluateOnNewDocument", { source: preload }, sid);
-  for (const [width, height] of [[1600, 1000], [1100, 800]]) {
+  for (const [width, height] of viewports) {
     const size = `${width}x${height}`;
     await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false }, sid);
     await send("Page.navigate", { url: "http://127.0.0.1:1427" }, sid);
@@ -124,11 +137,33 @@ try {
     await click('.nav-item[title="Config"]');
     await waitFor('.config-section-panel');
     await assert(`${size} clean save is disabled`, "document.querySelector('.config-save').disabled");
+    await assert(`${size} config path stays on one line with full hover text`, "(()=>{const e=document.querySelector('.config-file-meta code'),s=getComputedStyle(e);return e.title===e.textContent && s.whiteSpace==='nowrap' && s.textOverflow==='ellipsis'})()");
     for (const name of ["General", "Context window", "History", "Memory & search", "Background models", "Dreamer schedule", "Prompt surface", "Advanced"]) {
       await section(name);
       const slug = name.toLowerCase().replaceAll(/[^a-z]+/g, "-").replace(/-$/, "");
       await assert(`${size} ${name} single-column rows`, `[...document.querySelectorAll('.config-card-content')].filter(e=>e.getClientRects().length).every(e=>getComputedStyle(e).flexDirection==='column')`);
       await assert(`${size} ${name} last row has no bottom border`, `getComputedStyle([...document.querySelectorAll('.config-section-panel .config-field')].filter(e=>e.getClientRects().length).at(-1)).borderBottomWidth==='0px'`);
+      // Width-bearing data controls must not collapse. Icon buttons and checkbox tracks
+      // intentionally remain compact, so they are not data-entry controls in this check.
+      const controls = await evaluate<{ label: string; width: number; height: number }[]>(`[...document.querySelectorAll('.config-section-panel input:not([type="checkbox"]), .config-section-panel select, .config-section-panel textarea, .config-section-panel .model-select-trigger')].filter(e=>e.getClientRects().length).map(e=>({label:e.getAttribute('aria-label')||e.title||e.placeholder||e.textContent.trim(),width:e.getBoundingClientRect().width,height:e.getBoundingClientRect().height}))`);
+      layoutMeasurements.push({ size, section: name, controls });
+      await assert(`${size} ${name} data controls are at least 120px wide`, `${controls.length}>0 && ${JSON.stringify(controls)}.every(control=>control.width>=120 && control.height>=20)`);
+      await assert(`${size} ${name} stays within the page width`, "(()=>{const e=document.querySelector('.scroll-area');return e.scrollWidth<=e.clientWidth})()");
+      await assert(`${size} ${name} model and qualifier values do not wrap`, "[...document.querySelectorAll('.config-section-panel .model-select-trigger')].filter(e=>e.getClientRects().length).every(button=>{const value=button.querySelector('.model-select-value'),style=getComputedStyle(value);return button.title===value.textContent.trim() && style.whiteSpace==='nowrap' && style.textOverflow==='ellipsis' && button.getBoundingClientRect().height<=40})");
+      if (name === "Background models") {
+        for (const agent of ["historian", "dreamer"]) {
+          const entries = await evaluate<string[]>(`window.__fixtureConfig.${agent}.opencode.fallback_models.map(entry=>typeof entry==='string'?entry:entry.model)`);
+          await assert(`${size} ${agent} fallback rows match configured entries`, `document.querySelectorAll('[data-agent="${agent}"] .model-chain-item').length===${entries.length}`);
+          for (const model of entries) {
+            const measurement = await evaluate(`(()=>{const button=[...document.querySelectorAll('[data-agent="${agent}"] .model-chain-item .model-select-trigger')].find(e=>e.querySelector('.model-select-value').textContent.trim()===${JSON.stringify(model)});if(!button)return{model:${JSON.stringify(model)},rendered:false};button.scrollIntoView({block:'center'});const r=button.getBoundingClientRect(),hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return{model:${JSON.stringify(model)},rendered:true,width:r.width,height:r.height,uncovered:button.contains(hit),hit:hit?.closest('button')?.textContent.trim()}})()`);
+            layoutMeasurements.push({ size, agent, fallback: measurement });
+            console.log(`Fallback layout ${size} ${agent}: ${JSON.stringify(measurement)}`);
+            const snapshot = `(${JSON.stringify(measurement)})`;
+            await assert(`${size} ${agent} configured fallback ${model} is visible`, `${snapshot}.rendered && ${snapshot}.width>=120 && ${snapshot}.height>=20 && ${snapshot}.uncovered`);
+          }
+        }
+        await section(name);
+      }
       await capture(`${size}-${slug}`);
       const scroll = await evaluate<{ total: number; viewport: number }>("(()=>{const e=document.querySelector('.scroll-area');return{total:e.scrollHeight,viewport:e.clientHeight}})()");
       for (let y = scroll.viewport - 120, page = 2; y < scroll.total - 120; y += scroll.viewport - 120, page++) {
@@ -192,7 +227,7 @@ try {
     await assert(`${size} auto update inherits on without undefined labels`, "!document.querySelector('.config-editor').textContent.includes('Default: undefined') && [...document.querySelectorAll('.config-field')].find(e=>e.getClientRects().length&&e.textContent.includes('Auto Update')).textContent.includes('Default: on')");
     await assert(`${size} only fixture commands used`, "!window.__fixtureCalls.includes('test_embedding_endpoint')");
   }
-  writeFileSync(join(root, "report.json"), JSON.stringify({ browser: version.product, checks, screenshots }, null, 2));
+  writeFileSync(join(root, "report.json"), JSON.stringify({ browser: version.product, checks, screenshots, layoutMeasurements }, null, 2));
   console.log(`PASS: ${checks.length} browser checks; ${screenshots.length} screenshots in ${root}`);
 } finally {
   socket?.close();
