@@ -302,7 +302,11 @@ export function markNoteNudgeDelivered(
     const outcome = db
         .transaction(() => {
             const delivered = deliverNoteNudgeAtomic(db, sessionId, messageId, text);
-            const noticeId = text?.match(
+            // Both hosts persist the instruction envelope, not the bare nudge.
+            // Match its contents so a delivered warning is acknowledged instead
+            // of being selected again at every later work boundary.
+            const nudgeText = text?.replace(/^\s*<instruction name="deferred_notes">/, "") ?? "";
+            const noticeId = nudgeText.match(
                 /^Smart note check unavailable: [\s\S]*Read ctx_note #(\d+) for the condition/,
             );
             if (delivered.ok && noticeId) {

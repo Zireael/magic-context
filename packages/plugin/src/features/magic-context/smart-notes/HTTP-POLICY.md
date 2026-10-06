@@ -81,6 +81,10 @@ Generic document origins have no universal container-metadata API, so their
 sites disguising authorization failures as 404. Explicit 401/403 and legal-access
 451 responses are persistent access failures. HTTP 401/403/429 with exhausted
 rate-limit headers or Retry-After is transient, not an authorization diagnosis.
+GitHub 403/429 bodies mentioning a secondary rate limit are also transient,
+even with quota remaining and no Retry-After. This classification runs at the
+shared HTTP guard before access/absence diagnosis, for compile dry-runs, scheduled
+checks and repository-readability probes alike.
 The host preserves the maximum reset epoch / Retry-After (seconds or HTTP date)
 through sandbox and compiler failures into scheduled-check, compilation and
 liveness backoff. Retries wait until at least that deadline and the ordinary
@@ -98,6 +102,11 @@ checks, liveness checks and fallback evaluation all skip them. Updating the note
 and schedules compilation again. Content-only edits do not un-park a note.
 Other persistent failures, such as oversized responses after bounded-endpoint
 repair, retain the existing week-long recompilation backoff.
+
+Owner failure notices are acknowledged only after the host persists a delivered
+deferred-notes instruction. They do not generate new warning lines on later turns
+or after a restart. The original instruction remains attached to its original
+message for byte-stable prompt-cache replay; it is never moved to a new turn.
 
 ## GitHub authentication
 

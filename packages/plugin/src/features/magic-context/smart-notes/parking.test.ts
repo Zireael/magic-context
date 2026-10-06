@@ -7,6 +7,12 @@ import { acquireLease } from "../dreamer/lease";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { addNote, dismissNote, getNotes } from "../storage-notes";
+import {
+    GITHUB_FAILURE_CHECK,
+    GITHUB_FAILURE_CONDITION,
+    githubPrivateResponses,
+    githubRateLimitResponses,
+} from "./__tests__/github-http-fixture.test";
 import { localSmartNoteHttpTransport } from "./__tests__/http-timeout-fixture.test";
 import { createSmartNoteCapabilities } from "./capabilities";
 import { compileSmartNoteCheck } from "./compiler";
@@ -43,10 +49,10 @@ afterEach(async () => {
     __wakePlaneTest.reset();
 });
 
-async function transport(status: number, headers: Record<string, string> = {}) {
+async function transport(status: number, headers: Record<string, string> = {}, body = "") {
     const fixture = await localSmartNoteHttpTransport("api.github.com", (_request, response) => {
         response.writeHead(status, headers);
-        response.end();
+        response.end(body);
     });
     restoreTransport = fixture.dispose;
     return fixture.paths;
@@ -283,6 +289,93 @@ test.each([
     expect(state()).toMatchObject({ checkStatus: "parked", checkNextDueAt: null });
     expect(state().readyReason).toContain(`HTTP ${status}`);
     expect(notices()).toHaveLength(1);
+});
+
+for (const response of githubRateLimitResponses(Math.floor(Date.now() / 1000) + 7200)) {
+    test.each([
+        "compile",
+        "due",
+    ])(`GitHub ${response.name} defers %s without parking or notices`, async (phase) => {
+        await transport(response.status, response.headers, response.body);
+        const source = addNote(db, "smart", {
+            projectPath: PROJECT,
+            sessionId: OWNER,
+            content: "wake on CI failure",
+            surfaceCondition: GITHUB_FAILURE_CONDITION,
+        });
+        if (phase === "due") seedCompiled(source.id, false, GITHUB_FAILURE_CHECK);
+        const compiler = carrier(GITHUB_FAILURE_CHECK);
+        const startedAt = Date.now();
+        await sweep(compiler.executor);
+        expect(state()).toMatchObject({
+            status: "pending",
+            checkStatus: phase === "compile" ? "uncompiled" : "compiled",
+            checkFailureCount: 0,
+            checkNetworkFailureCount: 1,
+            readyReason: null,
+        });
+        const retryFloor =
+            response.name === "primary 403"
+                ? Number(response.headers["x-ratelimit-reset"]) * 1000
+                : startedAt + response.delayMs;
+        expect(state().checkNextDueAt).toBeGreaterThanOrEqual(retryFloor);
+        expect(getSmartNotesNeedingCompilation(db, PROJECT, retryFloor - 1, 10)).toEqual([]);
+        expect(notices()).toEqual([]);
+        expect(getDueCompiledSmartNoteChecks(db, PROJECT, retryFloor - 1, 10)).toEqual([]);
+    });
+}
+
+for (const response of githubPrivateResponses) {
+    test.each([
+        "compile",
+        "due",
+    ])(`GitHub private ${response.status} parks on %s, unlike rate limits`, async (phase) => {
+        await transport(response.status, {}, response.body);
+        const source = note();
+        if (phase === "due") seedCompiled(source.id);
+        await sweep(carrier().executor);
+        expect(state()).toMatchObject({
+            status: "pending",
+            checkStatus: "parked",
+            checkNextDueAt: null,
+        });
+        expect(notices()).toHaveLength(1);
+    });
+}
+
+test.each([
+    "compile",
+    "due",
+])("GitHub CI-failure wake survives a rate-limited %s and fires when checkable", async (phase) => {
+    const response = githubRateLimitResponses(Math.floor(Date.now() / 1000) + 7200)[3];
+    await transport(response.status, response.headers, response.body);
+    const source = addNote(db, "smart", {
+        projectPath: PROJECT,
+        sessionId: OWNER,
+        content: "wake on CI failure",
+        surfaceCondition: GITHUB_FAILURE_CONDITION,
+    });
+    if (phase === "due") seedCompiled(source.id, false, GITHUB_FAILURE_CHECK);
+    const compiler = carrier(GITHUB_FAILURE_CHECK);
+    await sweep(compiler.executor);
+    expect(state().status).toBe("pending");
+    await restoreTransport?.();
+    restoreTransport = undefined;
+    await transport(
+        200,
+        {},
+        JSON.stringify({
+            workflow_runs: [
+                { event: "schedule", created_at: "2026-10-01T00:00:00Z", conclusion: "failure" },
+            ],
+        }),
+    );
+    db.prepare("UPDATE notes SET check_next_due_at=0, check_quarantined_until=NULL WHERE id=?").run(
+        source.id,
+    );
+    expect(await sweep(compiler.executor)).toMatchObject({ surfaced: 1, pending: 0 });
+    expect(state().status).toBe("ready");
+    expect(notices()).toEqual([]);
 });
 
 test("older compiled code-search checks park without attempting a request", async () => {
