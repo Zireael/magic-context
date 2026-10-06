@@ -48,9 +48,10 @@ const BASELINE_META_BYTES: usize = 22_404;
 const ATTEMPT_FIELD: &str = ",\"producer_attempt\":0";
 // The nudge baseline freezes the protected-tool keep counts it adopted on a
 // rebuilding pass, so a later config edit can't move the reminder mid-cache.
-// With default config that is the two built-in defaults.
+// With default config that is the two built-in defaults. It is the first field
+// of the tail-hygiene baseline, so its separator comma follows it.
 const PROTECTED_POLICY_FIELD: &str =
-    ",\"protected_tools_policy\":{\"ctx_reduce\":3,\"todowrite\":1}";
+    "\"protected_tools_policy\":{\"ctx_reduce\":3,\"todowrite\":1},";
 
 fn digest(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
