@@ -46,6 +46,11 @@ const BASELINE_META_DIGEST: &str =
 // longer. Nothing about the attempt field changed.
 const BASELINE_META_BYTES: usize = 22_404;
 const ATTEMPT_FIELD: &str = ",\"producer_attempt\":0";
+// The nudge baseline freezes the protected-tool keep counts it adopted on a
+// rebuilding pass, so a later config edit can't move the reminder mid-cache.
+// With default config that is the two built-in defaults.
+const PROTECTED_POLICY_FIELD: &str =
+    ",\"protected_tools_policy\":{\"ctx_reduce\":3,\"todowrite\":1}";
 
 fn digest(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
@@ -135,10 +140,14 @@ async fn gate_probe_default_runner_request_and_meta_digests() {
         meta_blob.contains(ATTEMPT_FIELD),
         "the attempt rides the blob as a plain field: {meta_blob:.200}"
     );
+    assert!(
+        meta_blob.contains(PROTECTED_POLICY_FIELD),
+        "the frozen protected-tool policy rides the blob as a plain field"
+    );
     assert_eq!(
         meta_blob.len(),
-        BASELINE_META_BYTES + ATTEMPT_FIELD.len(),
-        "the blob must grow by exactly the new field and nothing else"
+        BASELINE_META_BYTES + ATTEMPT_FIELD.len() + PROTECTED_POLICY_FIELD.len(),
+        "the blob must grow by exactly the attempt and policy fields and nothing else"
     );
 }
 
