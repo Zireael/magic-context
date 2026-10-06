@@ -103,13 +103,14 @@ async function run(index: number) {
     const parsed = parseCompartmentOutput(first.text);
     if (!parsed.compartments.length || parsed.droppedFacts || parsed.droppedFactBlocks) throw new Error("Unusable historian output");
     const pool = eligible(memories, input.before);
-    const lexicalMatches = parsed.facts.map(f => retrieve(f, pool, vectors));
-    save(join(root, "results", `${index}-lexical.json`), { facts: parsed.facts, matches: lexicalMatches, poolSize: pool.length, compartments: parsed.compartments.length });
+    const lexicalPath = join(root, "results", `${index}-lexical.json`);
+    const lexicalMatches = existsSync(lexicalPath) ? (await Bun.file(lexicalPath).json()).matches : parsed.facts.map(f => retrieve(f, pool, vectors));
+    if (!existsSync(lexicalPath)) save(lexicalPath, { facts: parsed.facts, matches: lexicalMatches, poolSize: pool.length, compartments: parsed.compartments.length });
     if (phase === "first") return;
     if (existsSync(join(root, "results", `${index}-turn2-admission.json`))) throw new Error(`Refusing repeated second turn for case ${index}`);
     const queries = provider ? await provider.embedBatch(parsed.facts.map(f => f.content), undefined, "query") : [];
     if (provider && queries.some(q => !q)) throw new Error("Query embedding failed; do not silently change retrieval lane");
-    const matches = parsed.facts.map((f, i) => retrieve(f, pool, vectors, queries[i] ?? undefined));
+    const matches = parsed.facts.map((f, i) => retrieve(f, pool, vectors, queries[i] ?? undefined, lexicalMatches[i]));
     const prompt = mergePrompt(parsed.facts, matches);
     save(join(root, "results", `${index}-candidates.json`), { facts: parsed.facts, matches, poolSize: pool.length, prompt, compartments: parsed.compartments.length });
     const second = await turn(identity, prompt, index, 2);

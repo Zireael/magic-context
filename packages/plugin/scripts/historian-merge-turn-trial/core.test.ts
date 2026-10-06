@@ -46,6 +46,14 @@ describe("merge-turn trial controls", () => {
         expect(() => parseDecisions('[{"fact":1,"action":"new","reason":"a"},{"fact":1,"action":"new","reason":"b"}]', [matches[0]!, matches[0]!])).toThrow();
         expect(parseDecisions("[]", [])).toEqual([]);
     });
+    test("hybrid reuses lexical evidence even for embedded memories outside semantic top fifteen", () => {
+        const pool = Array.from({ length: 25 }, (_, i) => memory(i + 1, i === 24 ? "unique constant needle" : "general topic"));
+        const vectors = new Map(pool.map(m => [m.id, new Float32Array(m.id === 25 ? [0, 1] : [1, 0])]));
+        const lexical = bm25("needle", pool).slice(0, 20);
+        const result = retrieve({ category: "ARCHITECTURE", content: "needle" }, pool, vectors, new Float32Array([1, 0]), lexical);
+        expect(result.find(m => m.id === 25)?.lane).toBe("bm25");
+        expect(result.length).toBe(20);
+    });
     test("merge prompt contains each fact and actual candidate ids", () => {
         const prompt = mergePrompt([{ category: "ARCHITECTURE", content: "new rule" }], [bm25("old", [memory(42, "old rule")])]);
         expect(prompt).toContain('"id":42');

@@ -27,7 +27,7 @@ This phase fetches only `apikey:openrouter` through the authorized `mc-e2e` vaul
 
 The supplied namespace is OpenRouter `qwen/qwen3-embedding-8b`, 8,192 max input tokens. The production embedding provider is used directly. Document self-checks use `passage` purpose (no prefix); fact queries use `query` purpose and the canonical production Qwen3 web-search instruction. No `input_type` overrides are supplied. The provider identity must exactly match the snapshot, and five evenly spaced active stored documents must each retrieve their own row as the top cosine neighbour before any second turn. These are fresh endpoint vectors, not stored-vector-versus-itself comparisons.
 
-Candidate eligibility is snapshot status `active` and `created_at < run.created_at`. The snapshot does not retain status or content revision history: this is a timestamp-cut snapshot pool, not a provably exact historical status reconstruction. Report this limitation. Hybrid retrieval supplies fifteen cosine neighbours from covered rows plus five BM25 candidates from uncovered rows (filling small uncovered pools lexically); scores are not combined as if on the same scale. BM25 uses Unicode word tokens, `k1=1.2`, `b=0.75`, and no stopword filtering. Each fact gets at most twenty distinct candidates.
+Candidate eligibility is snapshot status `active` and `created_at < run.created_at`. The snapshot does not retain status or content revision history: this is a timestamp-cut snapshot pool, not a provably exact historical status reconstruction. Report this limitation. Hybrid retrieval supplies fifteen cosine neighbours from covered rows plus the five highest-ranked distinct candidates from the staged top-20 BM25 lists. Embedded documents remain eligible for the lexical lane: literal names and constants can be useful despite lower semantic ranking. Scores are not combined as if on the same scale. BM25 uses Unicode word tokens, `k1=1.2`, `b=0.75`, and no stopword filtering. Each fact gets at most twenty distinct candidates.
 
 The second prompt asks for one JSON decision per first-turn fact, with supplied IDs only and complete rewrites for destructive decisions. It explicitly requires preserving still-valid target information. Even zero-fact cases send a second turn, for honest cost accounting. No decision is applied to the database.
 
@@ -41,6 +41,15 @@ timeout 60s bun scripts/historian-merge-turn-trial/inspect-review.ts "$TMPDIR/ma
 ```
 
 `review.ts` prepares evidence, not judgments. Judge independently against candidates and, when needed, the entire earlier pool. For every second-turn decision retain correct/wrong/debatable plus a one-line reason in the report. List every wrong merge/replaces separately. Do not use model rationales or cosine thresholds as a correctness oracle.
+
+The optional sixth argument of `inspect-review.ts` is `FIRST` or `ORIGINAL` to inspect only that fact set. Write independent annotations into the private root's `judgments.json`, with `decisions` and `originals` arrays. Decision rows contain `case`, `fact`, `grade`, `reason` and optionally `known`. Original rows contain `case`, `fact`, `duplicate` (`yes`/`no`/`debatable`), `reason`, and optional `firstFact`/`caught` linking an actually represented claim to a correctly judged non-new decision. Do not commit this raw annotation file.
+
+```sh
+timeout 60s bun scripts/historian-merge-turn-trial/analyze.ts
+timeout 60s bun scripts/historian-merge-turn-trial/validate.ts
+```
+
+The analyzer checks all forty same-session continuations, completed provider steps, input hashes, every decision target/rewrite, complete and unique manual annotations, and supported catch links. It emits private summary and judgment ledgers, preserving missing usage counters as reporting gaps rather than claiming they were measured zero. A target-text check compares each chosen memory to the captured pre-run block and exposes current-content history gaps. Only reviewed aggregate results, explanatory examples and judgment/ID ledgers belong in the report.
 
 For original outcomes, normalized-text equality to a historian-source row created within ten minutes after the run is an observed insertion candidate; earlier exact equality is a possible exact-dedup suppression. Later edits, missing source-session IDs, concurrent runs and absent publish audit records limit attribution. Do not silently equate unmatched output facts with skipped facts. Original-token estimates use the repository's Claude BPE estimator and are explicitly not Gemini billing counts. Replay usage comes from completed provider `step_finished` events; distinguish cached/uncached input, output and reasoning counters. Do not infer cache hits merely because the lineage is shared.
 
