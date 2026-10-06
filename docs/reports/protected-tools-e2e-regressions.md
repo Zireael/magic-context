@@ -182,3 +182,37 @@ paths. Native launcher artifacts enforce matching private HOME/CFFIXED_USER_HOME
 both generations, including the plain-master controls. Further full host results
 will be recorded after the fresh reruns; this checkpoint does not claim an all-green
 delivery or a completed OC1 lane yet.
+
+### Pre-reboot checkpoint, 20:10Z
+
+The complete plain-master Rust shard 0 has now run against the independently built
+`53bfd742` plugin and native module. Its final per-file attempts have the same
+38 passes, one failure and 60 skips as the task branch. The sparse-gaps assertion
+fails identically (a promise resolves where rejection was expected), with
+HARD/first_render decisions rather than ttl_expiry. This is inherited and the test
+is unchanged. Plain-master native artifacts used a separate Cargo target after a
+shared-target attempt exposed stale internal-crate metadata; that failed build is
+not counted as a successful reference build.
+
+The complete OC1 manifest lane also ran: **85 passed, 1 failed, 239 skipped across
+41 files**. Every original functional failure, including the long-running session,
+cleared after the scoped retirement correction. The sole failure was the native
+compaction test's database helper, before its /compact assertions: it required all
+databases to be under `data/`, but CFFIXED_USER_HOME correctly places ONNX Runtime's
+telemetry database under the fixture's private HOME. No invalid external DB was
+reported by the all-DB monitor.
+
+The task giver approved correcting that helper to use the complete throwaway root,
+while retaining explicit OpenCode/context database presence under `data/` and every
+/compact behavior assertion. Its inventory now checks all database paths instead
+of ignoring ONNX by name. The corrected file passes both tests, including the
+unchanged /compact test. Widening the allowed root to its parent makes only the new
+outside-root fence test fail; /compact stays green. The mutation was staged, showed
+a three-line nonempty diff, restored from the index plus touch, and left an empty
+unstaged diff. A final restored rerun is recorded separately.
+
+The full lane plus its corrected failed-file rerun covers all original OC1 cases;
+a fresh unified manifest rerun, the post-fix OC2 conversion comparison, and the
+remaining final gates are still to be performed after the checkpoint. All source
+progress is committed before the scheduled reboot; no all-green release assertion
+is made prematurely.
