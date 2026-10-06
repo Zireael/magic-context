@@ -180,6 +180,15 @@ Use the v2 readable ranked layout: a heading per fact; complete candidate text; 
 
 The wire may use a structured `covered` action and integer target ID; `covered by #N` is its human-readable form. Keep decisions separate from prose and correlation IDs. Validate each fact independently: unknown/duplicate fact IDs invalidate that fact; a valid sibling shadow decision can be recorded. An unparseable envelope leaves all unresolved facts pending. Never infer integer indices from text, silently repair IDs, or convert every valid sibling to `new` because one entry is malformed.
 
+### Agent-written memories are classified by the next historian run
+
+A memory an agent saves with `ctx_memory` keeps its text and is never rewritten by this step. It does not get a source-based starting importance. Instead, every agent-written memory created since the session's previous historian run is listed in the next run's second turn, as a classification-only item: the historian assigns importance with the same rubric and proposes the decay class, judging from the transcript around the save (which turn one already reads, including the `ctx_memory` call through `historian.expand_tools`). This replaces the source-ranking idea in issue 579 (decided by the operator, 2026-10-06): who wrote a memory is provenance, not a priority.
+
+- **Text is untouched.** The item carries the saved text and its save context; the only outputs are importance and a proposed class, plus `covered by #N` if an older memory already states it (a reinforcement of #N and a duplicate proposal for the inbox, never an automatic archive).
+- **Standing rule still needs its evidence.** The historian may propose `standing rule` only when the transcript shows a user statement or an explicit instruction to save one. An agent save alone is not that evidence (see the authority section).
+- **Until classified,** the memory keeps today's default importance and has no decay class, so freshness selection treats it as importance-only. A memory saved after the last run of a session that never runs the historian again stays unclassified; the later backfill covers those.
+- **Cache:** importance and class are attention metadata. They reach the prompt only through the projection rules in section 7 (adopted on an independently required rebuild), like any other score.
+
 ### Gates and publication
 
 Port the v2 deterministic token/evidence gate from investigative code into a shared contract: preserve backticked identifiers, paths, refusal codes, quantities/units and named keys unless the exact containing claim is explicitly replaced with verbatim evidence **from the actual source transcript**, not examples/candidate memories (`docs/reports/historian-merge-turn-trial-v2.md:17–20`). Treat stored/model text as untrusted data, not instructions.
