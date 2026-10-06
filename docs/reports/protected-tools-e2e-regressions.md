@@ -2,15 +2,20 @@
 
 ## Delivery status
 
-The refusal correction is implemented and verified, but **this is not an all-green
-release delivery**. The complete host sweep could not be certified by the 18:30Z
-cutoff. Do not ship protected_tools on the strength of the unit results alone.
+The resumed branch is rebased onto **`b6ee864f91bb01abe287e647de8d2d5c6f77a07f`**,
+the master revision named for this verification window. The full OpenCode 1 host
+lane is now certified with only the documented exact Foundation HTTP-cache
+exception. Both targeted OpenCode 2 files pass on the branch and on separately
+built plain master. Rust shard 0 retains one independently reproduced master
+sparse-gaps failure; **this is not an all-green release claim**. The other Rust
+shards and the full Pi/OpenCode 2 host lanes were not rerun in this window.
 
-The branch is rebased onto `99ae86b1eb`. Because that master contains the feature's
-revert, the rebase first restores protected_tools, then applies the correction.
-Conflict resolution retains issue 624's live TTL configuration and persisted TTL
-policy. The Rust metadata-length gate accounts for both policy fields and passed
-the full native suite. ARCHITECTURE.md and STRUCTURE.md were not edited.
+The feature restoration and refusal/retirement corrections from `643369c3` were
+preserved through the rebase, together with master's TTL and host-harness fixes.
+No production behavior or existing regression expectation was changed during
+this final verification window. ARCHITECTURE.md and STRUCTURE.md were not edited.
+The earlier sections below are historical checkpoints; the final section supplies
+the current counts and supersedes their pending-certification statements.
 
 ## Cause and correction
 
@@ -216,3 +221,131 @@ a fresh unified manifest rerun, the post-fix OC2 conversion comparison, and the
 remaining final gates are still to be performed after the checkpoint. All source
 progress is committed before the scheduled reboot; no all-green release assertion
 is made prematurely.
+
+## Final verification on master b6ee864f
+
+The existing `643369c3` tip was resumed and rebased cleanly onto `b6ee864f`.
+Plain-master plugin/Pi products were installed with `bun install --frozen-lockfile`
+and built from a `git archive` inside the task worktree. A blob comparison checked
+all **1,721** archived native/plugin/Pi source files against that exact revision,
+with zero mismatches. Only the reference **test harness** received private
+CFFIXED_USER_HOME and the same exact-file Foundation-cache opt-in; the product
+sources and the three existing regression files were not changed.
+
+The native reference used its own Cargo target. Copying dependency artifacts
+initially retained a stale branch executable; that attempt was rejected after its
+hash matched the branch. Cleaning the reference mc-module/mc-store artifacts and
+rebuilding produced a genuinely distinct plain-master executable. Both normal
+and drive-fault branch binaries and the committed sibling daemon were built
+serially, then supplied through the harness's supported prebuilt-pair variables
+to prevent per-file build-slot waits from consuming Bun's hook deadlines.
+
+Tools: **Bun 1.4.2**, **TypeScript 5.9.3**, **Cargo/rustc 1.99.0**,
+**Biome 2.5.1**, **OpenCode 1.18.30**, **OpenCode 2.0.22**.
+
+| Gate | Final result |
+| --- | --- |
+| `MC_E2E_SHARD=0/4 scripts/run-rust-hermetic-e2e.sh` with current-tree prebuilt normal/fault module and daemon | **38 pass / 1 fail / 60 skip**, 99 cases in 15 files. Counts use each file's final attempt; only the sparse-gaps file needed its mandated retry and failed twice. |
+| Plain-master `bun test --timeout 600000 --max-concurrency=1 tests/rust-compaction-marker-byte-identity.test.ts` using independently built master plugin/module | **3 pass / 1 fail**, 4 cases in 1 file; the same sparse-gaps assertion, with its three unchanged controls green. |
+| Complete TS OpenCode 1 manifest selection, `MC_E2E_HOST=opencode MC_E2E_MODE=ts bun test --timeout 600000 --max-concurrency=1 <all selected files>` | **87 pass / 0 fail / 239 skip**, 326 cases in **41 files**, one unified invocation. Includes both native-compaction tests and all original functional regressions. |
+| TS OpenCode 2 reporter-emergency-drop and store-generation-conversion files, branch | **15 pass / 0 fail**, 2 files, 139 assertions. |
+| Same two OpenCode 2 files, separately built plain master b6ee864f | **15 pass / 0 fail**, 2 files, 139 assertions. |
+| `bun run --cwd packages/plugin test`, correct unit environment | **7,174 pass / 0 fail / 5 skip**, 7,179 cases in 698 files. Frozen install checked 996 installs across 1,251 packages without changes. |
+| `bun run --cwd packages/pi-plugin test`, correct unit environment | **1,584 pass / 0 fail / 3 skip**, 1,587 cases in 149 files; its child-process isolation control also passed 1 test. Frozen install checked 996 installs across 1,251 packages without changes. |
+| Root `bun run typecheck` | Pass, four package scripts; TypeScript 5.9.3, exit 0 for the repository's silent-on-success tsc commands. |
+| Root `bun run lint` | Pass, **1,629 files** checked across four packages, zero errors. |
+| Branch and plain-master root `bun run build` | Pass; each includes **4 passing OC2 loader tests**. |
+| Fresh default-policy differential against actual b6ee864f production functions | **2 equal comparisons / 10 wire passes**, complete fold/refusal records plus agent-drop acknowledgment, queue and ledger; **9,020 bytes identical**. |
+| Restored retirement/default-policy, exact-cache fence, and native-compaction controls after mutations | **4/4**, **3/3**, and **2/2** pass respectively; final branch build also passes its 4 loader tests. |
+| Scoped TypeScript diagnostics for the three restored mutation targets | **0 errors / 0 warnings** from TypeScript 5.9.3. Overall inspection is partial because its Biome producer is unavailable; the independent repository lint script passed. |
+
+### Failure classification and default-policy identity
+
+The unchanged Rust test `recovers ALF-like seven sparse gaps but preserves the old
+cut when a post-marker gap contains a real message` fails at the rejected-promise
+assertion in both products: the promise resolves instead. The relevant logged
+decision remains **HARD / first_render**, not ttl_expiry. The other three marker
+tests pass on plain master. This independently confirms an inherited failure,
+not a protected-tools regression; neither its expectation nor product code was
+changed to make it green.
+
+The reporter's old emergency-drop failure does **not** reproduce on b6ee864f:
+`converted 750k session explicit flush exercises reporter emergency drop path`
+now passes its original **145-tag** assertion on both branch and master. The
+brief's older-master failure classification must not be carried forward as a
+current red. The conversion file completes its ctx_reduce-ledger phase and all
+14 test cases on both products, confirming the scoped-retirement fix.
+All three regression files are byte-identical to their master b6ee864f versions.
+
+For the default-policy proof, the deterministic input scaffold calls the actual
+plain-master `injectM0M1`, `runPostTransformPhase`,
+`evaluateEmergencyFailClosed`, and `createCtxReduceTools` exports from the archive;
+the expected outputs are not computed by the branch implementation. The fresh
+master and branch records have SHA-256
+`e5f95166aed3eec064091fa9265704b61fc6b6144139f4dd1247b7315f6d5fb6`.
+This is default-config **wire/decision/ledger compatibility**, not a claim that
+the additive protected_tools schema field leaves serialized configuration JSON
+unchanged.
+
+### Isolation evidence and discarded attempts
+
+Every host/build/test gate used a canonical throwaway HOME with matching CFFIXED_USER_HOME,
+private XDG roots/TMPDIR, and no inherited application-store or SUBC credentials.
+Every certified host run retained a descendant lsof monitor and the existing
+harness fences. The monitor follows **PID plus start time**, so a recycled PID
+cannot become a different session's process. The only external database exception
+was the exact observed
+`/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/C/opencode/Cache.db`
+and its `-wal`/`-shm` handles. The OC1 run logged those separately; no other host
+database/configuration path was outside the throwaway roots.
+
+| Certified host run | Successful lsof samples | Database-owning PIDs | Forbidden paths |
+| --- | --- | --- | --- |
+| Rust shard 0 | 1,528 | 116 | 0 |
+| Plain-master marker file | 295 | 19 | 0 |
+| Full OpenCode 1 | 1,271 | 59 | 0 |
+| Targeted OpenCode 2 branch | 84 | 8 | 0 |
+| Targeted OpenCode 2 master | 80 | 10 | 0 |
+
+Operator-store metadata changed concurrently while fleet sessions were active.
+The task giver approved the required PID/group-scoped proof rather than a global
+unchanged-store assertion that cannot hold on this shared machine. Those global
+changes are recorded, not attributed to this task. No operator database was
+opened even read-only for a snapshot, and no operator HTTP-cache file was removed.
+
+An early discarded monitor retained bare historical PIDs across lengthy queued
+build retries. It sampled a recycled PID running unrelated prefrontal tests and
+stopped five still-present historical PIDs; possible collateral interruption is
+disclosed, not counted as a live-store leak or a successful gate. The monitor was
+corrected before all certified runs. Another shard attempt lost its monitor at
+the outer 30-minute timeout after a tool restart; its remaining timestamp-verified
+owned build descendants were stopped and the entire shard rerun with explicit
+prebuilt pairs. Neither discarded attempt supplies the final counts.
+
+Initial unit invocations mistakenly inherited the host lane's empty NODE_ENV:
+plugin **7,135 pass / 39 fail / 5 skip**, Pi **1,545 pass / 39 fail / 3 skip**.
+That disables the unit-only historian seams. Narrow controls confirmed the
+environment cause (plugin 2/2 and Pi 44/44 green with NODE_ENV=test); the complete
+suites were rerun in the correct unit environment and passed as tabulated above.
+An initial root-CWD mutation invocation also collected the archived master's
+same-named native test; only the package-scoped exact-file rerun is counted as
+the mutation proof. No test expectation was changed for any of these attempts.
+
+### Refreshed mutation controls
+
+Each mutation was marked `NON-VACUITY BREAK`, staged against the live implementation
+first, showed a nonempty unstaged diff, then restored from the index with a touch
+and an empty unstaged diff. No mutation remains in the delivery.
+
+| Mutant | Exact red | Unchanged green controls | Mutant diff |
+| --- | --- | --- | --- |
+| Restore unscoped delivery retirement | `default protection preserves master agent-drop acknowledgment and ledger after a fold` | Default wire/fold/refusal differential; held-historian retirement; protection disabled/restored rotation | transform-postprocess-phase.ts: 2 insertions, 8 deletions; 3 pass / 1 fail. |
+| Permit the HTTP-cache filename anywhere | `Foundation HTTP-cache exception permits only the exact opted-in file and SQLite handles` | Unsafe-root environment fence; operator-path fd fence | spawn.ts: 2 insertions, 1 deletion; 2 pass / 1 fail. |
+| Widen the native-compaction database root to its parent | `native compaction database fence rejects a database outside the complete throwaway root` | `re-anchors the baseline once on the first pass after /compact` | native-compaction-baseline.test.ts: 2 insertions, 1 deletion; 1 pass / 1 fail. |
+
+Full logs, fresh master/branch default-policy records, native binaries, and per-PID
+inventories are retained in the ignored task-local directory
+`target/protected-tools-e2e-final/`. Master subsequently advanced to `cd43800a8e`
+with an independent note-nudge change and design/diagnosis reports; these counts
+remain explicitly pinned to the requested b6ee864f rebase, not silently attributed
+to that later product revision.
