@@ -120,3 +120,51 @@ The copied trajectory viewer renders v1 plus every available v2 pass, inventorie
 raw/effective decisions, schema/preservation rejections and both grades. Its HTML
 output is fenced inside the private root. Commit scripts and aggregate report
 only, never private prompts, memory text, replies, credentials, HTML or annotations.
+
+## Fresh memory-block paired control
+
+`prepare-paired.ts` copies only the supplied snapshot, descriptor, forty inputs,
+forty recorded first replies, manifest and judgments into the separately fenced
+`$TMPDIR/magic-context/historian-paired-control-bg7d08` root. It refuses an existing
+destination, verifies all 84 copies and checks the forty newest case identities.
+The source root is never modified; the copied database is read-only (0400).
+
+`run-paired.ts` sends two **fresh first turns** per case: F reads the entire original
+user prompt directly from `historian_runs`, verifying its recorded hash; S uses
+the byte-identical stripped input. T in the analysis denotes the trial's recorded
+stripped first reply, not the historical full-memory reply. All three use the same
+system golden, model, tools and generation settings. Twenty pairs run F then S,
+twenty S then F; up to three pairs execute concurrently. Every session is checked
+empty before sending. Completed runs are validated and reused, admitted runs can
+be reattached, and neither is resent. There are no second turns or memory writes.
+
+```sh
+# From packages/plugin; all commands have outer deadlines.
+timeout 60s bun scripts/historian-merge-turn-trial/prepare-paired.ts
+timeout 1800s bun scripts/historian-merge-turn-trial/run-paired.ts "$TMPDIR/magic-context/historian-paired-control-bg7d08"
+timeout 60s bun scripts/historian-merge-turn-trial/analyze-paired.ts "$TMPDIR/magic-context/historian-paired-control-bg7d08" inspect 0 10
+timeout 30s bun scripts/historian-merge-turn-trial/analyze-paired.ts "$TMPDIR/magic-context/historian-paired-control-bg7d08" search 1 'guidance|quantiz'
+timeout 90s bun scripts/historian-merge-turn-trial/analyze-paired.ts "$TMPDIR/magic-context/historian-paired-control-bg7d08"
+timeout 180s bun run typecheck
+timeout 60s bun test scripts/historian-merge-turn-trial/paired.test.ts
+```
+
+Read all forty F/T/S fact sets and the complete earlier-pool evidence. The inspect
+packets show two BM25 neighbours as search aids, not coverage verdicts; `search`
+returns full matching eligible passages, and `memory` accepts comma-separated IDs.
+Private `paired-judgments.json` contains one case object with `case`, `reason`,
+`claims` (`label`, `arms` in F/T/S order), and `facts` (F/T/S arrays in output order).
+Each fact judgment is `new: reason`, `known#ID,ID: reason`, or
+`debatable#ID: reason`. Known means completely covered by the earlier active pool,
+including joint coverage, not merely related or a refinement. Claim labels compare
+durable rule families rather than byte equality; qualifications and changed scope
+must be described in each case's reason. This manual coding is not automated by
+retrieval scores and is not a formal recall ground truth.
+
+The analyzer validates 120 completed provider runs, 80 independent empty sessions,
+every coverage annotation and eligible evidence ID, prompt/settings hashes and
+unchanged source/copy hashes. Exact duplicates are reported both against earlier
+pool text and in a sequential insertion simulation that includes within-run
+repeats. No inserts are actually applied. Token counters retain reporting gaps;
+the Antigravity events contain no billed monetary charge, so any tariff calculation
+must be labelled illustrative, not actual cost. Raw reviews and outputs stay private.
