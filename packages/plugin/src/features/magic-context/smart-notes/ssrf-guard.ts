@@ -33,6 +33,7 @@ export interface SmartNoteResolver {
 interface SmartNoteAddressResponse {
     status: number;
     body: string;
+    headers?: IncomingHttpHeaders;
     location?: string;
     bytesRead?: number;
 }
@@ -185,6 +186,7 @@ export async function guardedSmartNoteHttpGet(
                 );
             }
             if (!HTTP_REDIRECT_STATUSES.has(response.status)) {
+                assertReadableHttpResponse(response, validation.url.href);
                 return { status: response.status, body: response.body };
             }
             if (redirects >= MAX_HTTP_REDIRECTS) {
@@ -213,7 +215,6 @@ export async function guardedSmartNoteHttpGet(
         return await Promise.race([
             (async () => {
                 const response = await follow(input);
-                assertReadableHttpStatus(response.status, input);
                 if (response.status === 404 || response.status === 410) {
                     const parent = readableParentUrl(new URL(input));
                     if (parent) {
@@ -221,7 +222,6 @@ export async function guardedSmartNoteHttpGet(
                         // treating its watched resource as missing. Reuse the resource
                         // request's SSRF policy, byte budget and wall-clock deadline.
                         const container = await follow(parent);
-                        assertReadableHttpStatus(container.status, parent);
                         if (container.status < 200 || container.status >= 300) {
                             throw new SmartNoteNetworkError(
                                 `SMART_NOTE_NETWORK: source container is not publicly readable at ${parent} (HTTP ${container.status}); cannot check ${input}`,
@@ -264,7 +264,28 @@ function rateLimitRetryAt(headers: IncomingHttpHeaders): number {
     );
 }
 
-function assertReadableHttpStatus(status: number, url: string): void {
+function assertReadableHttpResponse(response: SmartNoteAddressResponse, url: string): void {
+    const { status, body } = response;
+    const headers = response.headers ?? {};
+    // GitHub can report secondary limits with quota remaining and no Retry-After.
+    // Classify the bounded body before diagnosing a 403 as inaccessible, including
+    // responses from container probes. Compile dry-runs and checks share this guard.
+    const githubSecondaryLimit =
+        ["api.github.com", "github.com", "raw.githubusercontent.com"].includes(
+            new URL(url).hostname,
+        ) && /secondary rate limit/i.test(body);
+    if (
+        (status === 401 || status === 403 || status === 429) &&
+        (status === 429 ||
+            headers["x-ratelimit-remaining"] === "0" ||
+            headers["retry-after"] !== undefined ||
+            githubSecondaryLimit)
+    ) {
+        throw new SmartNoteNetworkError(
+            `SMART_NOTE_NETWORK: rate-limited HTTP ${status} at ${url}`,
+            { terminal: true, retryAt: rateLimitRetryAt(headers) },
+        );
+    }
     if (status === 401 || status === 403 || status === 451) {
         throw new SmartNoteNetworkError(
             `SMART_NOTE_NETWORK: source is not publicly readable at ${url} (HTTP ${status})`,
@@ -457,31 +478,10 @@ export function requestValidatedAddress(
                 });
                 response.on("end", () => {
                     const status = response.statusCode ?? 0;
-                    const rateLimited =
-                        (status === 401 || status === 403 || status === 429) &&
-                        (status === 429 ||
-                            response.headers["x-ratelimit-remaining"] === "0" ||
-                            response.headers["retry-after"] !== undefined);
-                    if (rateLimited) {
-                        reject(
-                            new SmartNoteNetworkError(
-                                `SMART_NOTE_NETWORK: rate-limited HTTP ${status} at ${url.href}`,
-                                { terminal: true, retryAt: rateLimitRetryAt(response.headers) },
-                            ),
-                        );
-                        return;
-                    }
-                    if (status >= 500) {
-                        reject(
-                            new SmartNoteNetworkError(
-                                `SMART_NOTE_NETWORK: transient HTTP ${status}`,
-                            ),
-                        );
-                        return;
-                    }
                     resolve({
                         status,
                         body: Buffer.concat(chunks).toString("utf8"),
+                        headers: response.headers,
                         location: response.headers.location,
                         bytesRead: bytes,
                     });

@@ -2516,6 +2516,50 @@ describe("registerPiContextHandler", () => {
 		}
 	});
 
+	it("delivers an unavailable smart-note warning once, not on later Pi turns", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-unavailable-once";
+		try {
+			const notice = addNote(db, "session", {
+				sessionId,
+				content:
+					"Smart note #42 cannot be checked.\nCondition: CI fails\nReason: HTTP 403\nRepair the condition.",
+			});
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const handler = fake.handlers.get("context") as (
+				event: { messages: never[] },
+				ctx: never,
+			) => Promise<{ messages: never[] }>;
+			onNoteTrigger(db, sessionId, "historian_complete");
+			const turn = async (id: string) => {
+				const msg = userMessage("next turn", 1);
+				return handler(
+					{ messages: [msg] as never[] },
+					fakeContext(sessionId, process.cwd(), [id], [msg]) as never,
+				);
+			};
+			await turn("entry-1");
+			const delivered = await turn("entry-2");
+			expect(delivered.messages.map(textOf).join("\n")).toContain(
+				"Smart note check unavailable",
+			);
+			expect(
+				db.prepare("SELECT status FROM notes WHERE id=?").get(notice.id),
+			).toEqual({ status: "dismissed" });
+			clearContextHandlerSession(sessionId);
+			onNoteTrigger(db, sessionId, "todos_complete");
+			await turn("entry-3");
+			const later = await turn("entry-4");
+			expect(later.messages.map(textOf).join("\n")).not.toContain(
+				"Smart note check unavailable",
+			);
+		} finally {
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("replays note anchors by message id but skips new note persistence on ref failure", async () => {
 		const db = createTestDb();
 		try {
