@@ -111,3 +111,27 @@ and pending-queue columns required by atomic retirement; assertions are unchange
 Plugin typecheck passed with TypeScript 5.9.3. Scoped formatting passed with Biome
 2.5.1 from the plugin directory; invoking Biome at workspace root hit the existing
 nested-root configuration error. Bun test version: 1.4.2.
+
+## Idempotent historian enqueue
+
+Both generic enqueue and the historian's identity-revalidated INSERT now check
+pending membership per `(session, tag, operation)` inside the same SQLite write
+statement. This bounds overlapping/repeated publications without a new schema
+or a whole-session scan under the writer; the existing session/tag index supports
+the probe. The first row's ID, timestamp and queue order survive retries. Different
+sessions, tags and operations stay independent, and a consumed row can be enqueued
+again. Pre-existing duplicates are not migrated, but cannot grow via these APIs.
+
+The real historian regression `review regression: repeated historian publication
+of a held result must have bounded pending depth` makes 100 publications and
+asserts one unchanged held row. A separate storage test makes 100 generic enqueues
+and checks tuple isolation and re-enqueue after removal. Neutralizing each pending
+membership predicate reddened its own bound test alone; the historian's concurrent
+identity/status revalidation and storage queue-order controls respectively stayed
+green. Both staged mutations were restored before a passing rerun.
+
+The older prepared-publication differential explicitly expected a duplicate of
+an already-pending tag. That expectation is intentionally changed from
+`[3, 1, 3, 4, 5]` to `[3, 1, 4, 5]` for idempotency, without altering its frozen
+clock or byte/identity assertions. Storage and historian suites passed 15 tests
+(42 assertions); plugin typecheck passed (TypeScript 5.9.3).
