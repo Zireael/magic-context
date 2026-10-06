@@ -61,10 +61,13 @@ async function call(batch: Batch) {
         }
         const raw = JSON.parse(readFileSync(rawFile, "utf8"));
         const steps = raw.events.filter((e: Json) => (e.type ?? e.kind) === "step_finished");
-        if (!raw.text.trim() || steps.length !== 1 || steps[0].finish_reason !== "stop") throw new Error(`Incomplete one-shot output: ${key}`);
-        const evaluated = evaluate(raw.text, batch.targets);
-        save(file, { pass, key: batch.key, ids: batch.targets.map(t => t.memory.id), model: MODEL, generation, promptHash: hash(input), systemHash: hash(SYSTEM), labelsHash: manifest.labelsHash, ...raw, usage: steps[0].usage, ...evaluated });
-        console.log(JSON.stringify({ key, runId: raw.runId, seconds: raw.durationMs / 1000, usage: steps[0].usage, schemaError: evaluated.schemaError, rejected: evaluated.gates.filter(g => g.rejected).length }));
+        if (steps.length !== 1) throw new Error(`Unexpected provider step count: ${key}`);
+        // A length-limited terminal is an observed abstention, not a reason to
+        // reroll the trial. Count its usage and retain all targets unchanged.
+        const incomplete = !raw.text.trim() || steps[0].finish_reason !== "stop";
+        const evaluated = evaluate(incomplete ? "" : raw.text, batch.targets);
+        save(file, { pass, key: batch.key, ids: batch.targets.map(t => t.memory.id), model: MODEL, generation, promptHash: hash(input), systemHash: hash(SYSTEM), labelsHash: manifest.labelsHash, ...raw, usage: steps[0].usage, finishReason: steps[0].finish_reason, incomplete, ...evaluated });
+        console.log(JSON.stringify({ key, runId: raw.runId, seconds: raw.durationMs / 1000, usage: steps[0].usage, incomplete, schemaError: evaluated.schemaError, rejected: evaluated.gates.filter(g => g.rejected).length }));
     } catch (error) {
         save(join(results, `${key}-error.json`), { identity, runId, events, error: String(error) });
         throw error;
