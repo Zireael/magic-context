@@ -1,6 +1,9 @@
 import { expect, it, spyOn } from "bun:test";
 import golden from "./__fixtures__/default-protection-pressure.master.json";
-import { defaultProtectionPressureScenario } from "./default-protection-pressure.test-support";
+import {
+    defaultProtectionAgentDropScenario,
+    defaultProtectionPressureScenario,
+} from "./default-protection-pressure.test-support";
 
 it("default protection preserves master wire bytes, folds and refusals under pressure", async () => {
     const clock = spyOn(Date, "now").mockReturnValue(1700000000000);
@@ -12,6 +15,20 @@ it("default protection preserves master wire bytes, folds and refusals under pre
         expect(actual.find((pass) => pass.stage === "provider-overflow")?.refusal.shouldAbort).toBe(
             true,
         );
+    } finally {
+        clock.mockRestore();
+    }
+});
+
+it("default protection preserves master agent-drop acknowledgment and ledger after a fold", async () => {
+    const clock = spyOn(Date, "now").mockReturnValue(1700000000000);
+    try {
+        const actual = await defaultProtectionAgentDropScenario();
+        expect(actual).toEqual(golden.agentDrop);
+        expect(actual.ledgerBefore).toBe("active");
+        expect(actual.queued).toEqual([1]);
+        expect(actual.ledgerAfter).toBe("dropped");
+        expect(actual.pendingAfter).toEqual([]);
     } finally {
         clock.mockRestore();
     }

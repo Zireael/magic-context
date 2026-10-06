@@ -9,6 +9,7 @@ import todoRideGolden from "../../../../../crates/mc-module/testdata/todo-ride-o
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
+import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import {
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
@@ -4038,6 +4039,84 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             "active",
         ]);
         expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([2]);
+    });
+
+    it("folded protected results stay out of N when protection is disabled and restored", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        createOpenCodeDbWithoutMessages("postprocess-rotated-protection-");
+        const sessionId = "ses-folded-protection-rotation";
+        materializeBaseline(sessionId);
+        const messages = [1, 2, 3].map((number) => {
+            const message = makeToolMessage(`rotation-owner-${number}`);
+            const part = message.parts[0] as { tool: string; callID: string };
+            part.tool = "probe";
+            part.callID = `rotation-call-${number}`;
+            insertTag(
+                db,
+                sessionId,
+                part.callID,
+                "tool",
+                4000,
+                number,
+                0,
+                "probe",
+                0,
+                message.info.id,
+            );
+            return message;
+        });
+        const channel1StateBySession = new Map<string, Channel1State>();
+        const toolMessages = messages.slice();
+        const run = (protectedTools: Record<string, number>, rebuilding = false) =>
+            runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets: new Map(
+                        toolMessages.map((message, index) => [index + 1, makeDropTarget(message)]),
+                    ),
+                    protectedTools,
+                    channel1StateBySession,
+                    m0M1: {
+                        projectPath: FOLD_PROJECT,
+                        projectDirectory: FOLD_PROJECT,
+                        historyBudgetTokens: 98_000,
+                        hardSignals: rebuilding
+                            ? { ...BASE_HARD, modelKey: "anthropic/sonnet" }
+                            : BASE_HARD,
+                    },
+                }),
+            );
+        await run({ probe: 3 });
+        queuePendingOp(db, sessionId, 1, "drop");
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "rotation-owner-1",
+                endMessageId: "rotation-owner-2",
+                title: "folded probes",
+                content: "The first two probes were recorded.",
+            },
+        ]);
+        const fold = await run({ probe: 0 }, true);
+        expect(fold.materialized).toBe(true);
+        expect(getTagsBySession(db, sessionId).map((tag) => tag.status)).toEqual([
+            "compacted",
+            "compacted",
+            "active",
+        ]);
+        expect(getPendingOps(db, sessionId)).toEqual([]);
+        expect([
+            ...protectedToolTagNumbers(getActiveTagsBySession(db, sessionId), { probe: 3 }),
+        ]).toEqual([3]);
+        await run({ probe: 3 });
+        expect(getTagsBySession(db, sessionId).map((tag) => tag.status)).toEqual([
+            "compacted",
+            "compacted",
+            "active",
+        ]);
     });
 
     it("keeps OpenCode final bytes identical to a one-shot executed fold", async () => {

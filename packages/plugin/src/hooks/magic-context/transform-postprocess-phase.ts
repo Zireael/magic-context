@@ -1,5 +1,9 @@
 import { compareOpenCodeMessagesByCanonicalOrder } from "../../features/magic-context/compaction-marker";
-import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
+import {
+    mergeProtectedTools,
+    normalizeProtectedToolName,
+    protectedToolTagNumbers,
+} from "../../features/magic-context/reclaim-protection";
 import {
     HYGIENE_PROVIDER_UNITS_VERSION,
     sessionDecisionCalibration,
@@ -2926,7 +2930,35 @@ export async function runPostTransformPhase(
                     .filter((message) => !retainedMessages.has(message))
                     .map((message) => message.info.id)
                     .filter((id): id is string => typeof id === "string");
-                markTagsCompactedByMessageIds(args.db, args.sessionId, trimmedMessageIds);
+                // This additional delivery-time retirement exists for result
+                // protection. Ordinary message/tool metadata keeps its existing
+                // lifecycle, including agent drops of summarized message tags.
+                // Retire every folded result of an adopted protected tool, not
+                // just its newest N, so older folded results cannot re-enter N
+                // when newer results or keep counts rotate. Include the previous
+                // policy when a rebuilding pass disables a tool's protection.
+                const currentPolicy = mergeProtectedTools(args.protectedTools);
+                const previousPolicy = args.channel1StateBySession?.get(
+                    args.sessionId,
+                )?.protectedToolsPolicy;
+                const eligibleTagNumbers = new Set(
+                    args.tags
+                        .filter(
+                            (tag) =>
+                                tag.type === "tool" &&
+                                ((currentPolicy[normalizeProtectedToolName(tag.toolName)] ?? 0) >
+                                    0 ||
+                                    (previousPolicy?.[normalizeProtectedToolName(tag.toolName)] ??
+                                        0) > 0),
+                        )
+                        .map((tag) => tag.tagNumber),
+                );
+                markTagsCompactedByMessageIds(
+                    args.db,
+                    args.sessionId,
+                    trimmedMessageIds,
+                    eligibleTagNumbers,
+                );
             }
             if (result.injected) {
                 m0M1InjectedThisPass = true;

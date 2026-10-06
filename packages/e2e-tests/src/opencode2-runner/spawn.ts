@@ -527,6 +527,16 @@ export function assertOpenPaths(
 	const under = (path: string, base: string) =>
 		path === base || path.startsWith(`${base}/`);
 	const home = homedir();
+	// Opt-in only after lsof identifies Foundation's per-user HTTP cache on
+	// macOS. Exempt this exact SQLite file and its handles, never a directory,
+	// an application store, or a similarly named database elsewhere.
+	const httpCacheDb = process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB;
+	const verifiedHttpCacheDb = process.platform === "darwin" && httpCacheDb &&
+		(/^\/private\/var\/folders\/[^/]+\/[^/]+\/C\/opencode\/Cache\.db$/.test(httpCacheDb) ||
+			/^\/Users\/[^/]+\/Library\/Caches\/opencode\/Cache\.db$/.test(httpCacheDb))
+		? httpCacheDb : undefined;
+	const isHttpCacheHandle = (path: string) => verifiedHttpCacheDb !== undefined &&
+		(path === verifiedHttpCacheDb || path === `${verifiedHttpCacheDb}-wal` || path === `${verifiedHttpCacheDb}-shm`);
 	const protectedRoots = [
 		join(home, ".local/share/opencode"),
 		join(home, ".local/share/cortexkit/magic-context"),
@@ -537,7 +547,7 @@ export function assertOpenPaths(
 	for (const path of paths) {
 		if (!path.startsWith("/")) continue; // lsof socket/pipe labels are not filesystem paths.
 		if (protectedRoots.some((base) => under(path, base)) ||
-			(/\.(?:db|sqlite)(?:-(?:wal|shm))?$/.test(path) && !under(path, root)) ||
+			(/\.(?:db|sqlite)(?:-(?:wal|shm))?$/.test(path) && !under(path, root) && !isHttpCacheHandle(path)) ||
 			// Config and state live under the home XDG roots; a source file that merely sits
 			// in a directory named `config` (the plugin's own src/config/index.ts, which the
 			// TUI loads) is not operator configuration.
@@ -548,7 +558,7 @@ export function assertOpenPaths(
 	}
 	for (const path of writable) {
 		if (!path.startsWith("/")) continue;
-		if (![root, ...allowed].some((base) => under(path, base)))
+		if (![root, ...allowed].some((base) => under(path, base)) && !isHttpCacheHandle(path))
 			throw new Error(`v2 process holds a forbidden writable path: ${path}`);
 	}
 }

@@ -1846,9 +1846,10 @@ export function markTagsCompactedByMessageIds(
     db: Database,
     sessionId: string,
     messageIds: Iterable<string>,
+    eligibleTagNumbers?: ReadonlySet<number>,
 ): number {
     const ids = new Set(messageIds);
-    if (ids.size === 0) return 0;
+    if (ids.size === 0 || eligibleTagNumbers?.size === 0) return 0;
 
     // SQLite's default LIKE folds ASCII only, whereas String.toLowerCase also
     // folds Unicode. Wildcards in the source id were escaped by the old query.
@@ -1895,7 +1896,7 @@ export function markTagsCompactedByMessageIds(
         .prepare(`WITH ids AS MATERIALIZED (
             SELECT value AS source_id, lower(value) AS folded_id FROM json_each(?)
         )
-        SELECT id, message_id, tool_owner_message_id FROM tags INDEXED BY ${tagOrderConstraintIndex(db)}
+        SELECT id, tag_number, message_id, tool_owner_message_id FROM tags INDEXED BY ${tagOrderConstraintIndex(db)}
         WHERE session_id = ? AND status IN ('active', 'dropped') AND (
             message_id IN (SELECT source_id FROM ids)
             OR tool_owner_message_id IN (SELECT source_id FROM ids)
@@ -1913,10 +1914,15 @@ export function markTagsCompactedByMessageIds(
             nulPrefixes.size > 0 ? 1 : 0,
         ) as {
         id: number;
+        tag_number: number;
         message_id: string | null;
         tool_owner_message_id: string | null;
     }[];
-    const candidates = rows.filter((row) => matches(row.message_id, row.tool_owner_message_id));
+    const candidates = rows.filter(
+        (row) =>
+            (eligibleTagNumbers === undefined || eligibleTagNumbers.has(row.tag_number)) &&
+            matches(row.message_id, row.tool_owner_message_id),
+    );
     if (candidates.length === 0) return 0;
 
     // Recheck identity as well as status: another process can retarget or retire

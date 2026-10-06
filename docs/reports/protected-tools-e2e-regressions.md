@@ -130,3 +130,55 @@ ignored worktree directory `target/protected-tools-e2e/`. The next verification
 window must first finish the all-DB isolation proof, classify the OC2 conversion
 failures, integrate any separately delivered harness fix, and rerun the complete
 post-rebase host/hermetic sweep without weakening assertions.
+
+## Continued verification on master 53bfd742
+
+The branch has since been rebased onto `53bfd742`, preserving v95's canonical tag
+ordering index and its fixture constraint as well as protection's atomic pending
+retirement. The scoped storage/performance and pressure tests passed after rebase.
+
+The complete Rust shard 0 still has 38 passes and the same single sparse-gaps
+failure; the original protected-tools refusal and synthetic-todo cases stay green.
+Plain-master confirmation at this newer commit is pending at this checkpoint.
+
+The two OC2 failures are now separated. A separately built plain `53bfd742` product
+fails the reporter test identically at its line 213 assertion requiring exactly
+145 emergency drops. That inherited assertion is unchanged. Plain master passes
+the conversion test's early ctx_reduce ledger phase and reaches a later v1-back
+readiness failure. The task branch instead failed the early phase repeatedly.
+Readonly examination of a retained throwaway fixture established the cause:
+ordinary message tag 1 was `compacted`, its pending queue was empty, and the actual
+ctx_reduce result was `Error: Conflicting operations — §1§ is from before compaction.`
+
+The additional delivery-time retirement introduced by protected_tools had retired
+every trimmed tag, including ordinary message tags. The task giver approved
+restricting that additional retirement to protected-tool bookkeeping, rather than
+changing the existing conversion expectation. It now retires only tool tags whose
+tool name belongs to the current or previous adopted protection policy. All folded
+results for those names retire, not only the newest N, including a rebuilding pass
+that disables protection. The existing ordinary retirement path is unchanged.
+
+The master oracle now also records a real ctx_reduce invocation after a coverage
+fold: its acknowledgment, queued tag, subsequent application, final ledger and
+served bytes. The default-config agent-drop differential and the retained held-tool
+retirement regression pass. A new regression proves disabled/restored protection
+cannot let folded results re-enter N. Restoring unscoped delivery retirement makes
+only the agent-drop differential fail, with both protected retirement controls green.
+
+Foundation's cache was also probed with the native OC1 binary launched with matching
+throwaway HOME and CFFIXED_USER_HOME. The earlier observation at the per-user Darwin
+cache directory is not an application store. The task giver explicitly approved
+an exception for this exact OS HTTP-cache file, not an exception for a directory or
+arbitrary database. The opt-in test flag `MC_E2E_FOUNDATION_HTTP_CACHE_DB` accepts only
+an explicitly identified macOS `opencode/Cache.db` location and its WAL/SHM handles;
+it is unset by default. Protected application stores and every other external DB,
+configuration path and writable path remain forbidden. No production setting changed.
+The exact-file and existing closed-fence tests pass; broadening the exception to
+the cache filename anywhere fails only the new exact-file test, while the existing
+operator-path and unsafe-environment controls remain green.
+
+The private lsof monitor logs the permitted OS-cache handles separately from invalid
+paths. Native launcher artifacts enforce matching private HOME/CFFIXED_USER_HOME for
+both generations, including the plain-master controls. Further full host results
+will be recorded after the fresh reruns; this checkpoint does not claim an all-green
+delivery or a completed OC1 lane yet.

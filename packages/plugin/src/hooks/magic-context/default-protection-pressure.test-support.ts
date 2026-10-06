@@ -1,8 +1,15 @@
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
-import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
+import {
+    getActiveTagsBySession,
+    getOrCreateSessionMeta,
+    getPendingOps,
+    getTagsBySession,
+    insertTag,
+} from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
+import { createCtxReduceTools } from "../../tools/ctx-reduce/tools";
 import { injectM0M1 } from "./inject-compartments";
 import type { MessageLike } from "./tag-messages";
 import { evaluateEmergencyFailClosed, runPostTransformPhase } from "./transform-postprocess-phase";
@@ -15,6 +22,12 @@ export async function defaultProtectionPressureScenario(
         runPostTransformPhase,
         evaluateEmergencyFailClosed,
     },
+    afterPass?: (input: {
+        db: Database;
+        sessionId: string;
+        stage: string;
+        pending: Set<string>;
+    }) => Promise<void>,
 ) {
     const db = new Database(":memory:");
     initializeDatabase(db);
@@ -46,6 +59,7 @@ export async function defaultProtectionPressureScenario(
     const materializations = new Set<string>();
     const tagger = createTagger();
     let modelKey = hardSignals.modelKey;
+    if (afterPass) insertTag(db, sessionId, "u1:p0", "message", 20, 1);
     try {
         // Start past first_render so the pressure pass is not accidentally defended
         // only by bootstrap, then publish real coverage and execute a HARD fold.
@@ -94,8 +108,21 @@ export async function defaultProtectionPressureScenario(
                 sessionId,
                 db,
                 messages,
-                tags: [],
-                targets: new Map(),
+                tags: afterPass ? getActiveTagsBySession(db, sessionId) : [],
+                targets: afterPass
+                    ? new Map([
+                          [
+                              1,
+                              {
+                                  message: messages[0],
+                                  setContent: (text: string) => {
+                                      (messages[0].parts[0] as { text: string }).text = text;
+                                      return true;
+                                  },
+                              },
+                          ],
+                      ])
+                    : new Map(),
                 reasoningByMessage: new Map(),
                 messageTagNumbers: new Map(),
                 tagger,
@@ -167,9 +194,49 @@ export async function defaultProtectionPressureScenario(
                 fold: result.materialized,
                 refusal,
             });
+            await afterPass?.({ db, sessionId, stage, pending });
         }
         return records;
     } finally {
         db.close();
     }
+}
+
+/** Exercise the real agent facade and queue application after the same fold.
+ * The injected engine/tool factory is used only to capture the master oracle. */
+export async function defaultProtectionAgentDropScenario(
+    engine?: Parameters<typeof defaultProtectionPressureScenario>[0],
+    toolFactory = createCtxReduceTools,
+) {
+    let acknowledgment = "";
+    let ledgerBefore = "";
+    let ledgerAfter = "";
+    let queued: number[] = [];
+    let pendingAfter: number[] = [];
+    const passes = await defaultProtectionPressureScenario(
+        engine,
+        async ({ db, sessionId, stage, pending }) => {
+            if (stage === "fold") {
+                ledgerBefore = getTagsBySession(db, sessionId)[0].status;
+                const result = await toolFactory({
+                    db,
+                    protectedSet: new Set(),
+                }).ctx_reduce.execute({ drop: "1" }, {
+                    sessionID: sessionId,
+                    directory: "/fixture/default-pressure-parity",
+                    callID: "agent-drop",
+                } as never);
+                if (typeof result !== "string")
+                    throw new Error("The ctx_reduce acknowledgment must be text.");
+                acknowledgment = result;
+                queued = getPendingOps(db, sessionId).map((op) => op.tagId);
+                pending.add(sessionId);
+            }
+            if (stage === "defer") {
+                ledgerAfter = getTagsBySession(db, sessionId)[0].status;
+                pendingAfter = getPendingOps(db, sessionId).map((op) => op.tagId);
+            }
+        },
+    );
+    return { passes, acknowledgment, ledgerBefore, ledgerAfter, queued, pendingAfter };
 }
