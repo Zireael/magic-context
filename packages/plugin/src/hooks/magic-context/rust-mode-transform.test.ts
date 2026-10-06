@@ -4554,9 +4554,11 @@ describe("Rust mode authority adapter", () => {
 
         const secondInput = makeMessages(sessionId);
         const secondOutput = { messages: [...secondInput] as unknown[] };
+        const startedAt = performance.now();
         await expect(
             transform.run(sessionId, secondInput, secondOutput, makeMeta(db, sessionId)),
         ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(performance.now() - startedAt).toBeLessThan(1000);
 
         // Refusal can follow an in-place managed edit, but no sendable result is returned.
         expect(getSlot(sessionId)).toBeUndefined();
