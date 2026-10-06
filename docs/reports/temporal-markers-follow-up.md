@@ -142,6 +142,27 @@ domain-fingerprint test passed against that regenerated schema.
 
 ## Shared runtime fixture
 
+Mode switches are rebuilding passes; each engine keeps its own first-writer-wins temporal choices after that rebuild.
+
+The re-review's forced state-sync seed and predecessor-edit cases are ported
+as documentation of that contract, not as a new TS/Rust transfer protocol.
+The strip transport control still passes; the temporal seed test explicitly
+records that temporal choices are not transferred. TS retains its prior `+5m`
+on a priced return and then stays stable across three defers. A cold native
+store beside a synthetic context.db containing that TS choice may select
+`+10m` on its HARD switching pass, then must retain it across three SOFT+
+passes even after the predecessor changes again. The native test compares
+against its own literal switching result, not against the other engine.
+
+`testdata/temporal-mode-switch.json` is the actual TS CK encoder's raw request
+after the predecessor edit; the TS test verifies the encoding directly, and
+the native test consumes it without an environment-provided fixture, ignored
+gate or repository-history dependency. Regenerate it with
+`bun packages/plugin/scripts/capture-temporal-mode-fixture.ts`.
+The 28 state-sync/mode-switch TS tests and the native switching test passed;
+native lsof output listed only the synthetic context.db/store.db and their
+WAL/SHM files under the test-owned temporal-mode-switch root.
+
 `testdata/temporal-session-parity.json` supplies one timestamped session and
 literal model-visible user bytes. Pi and both OpenCode production transforms
 compare their outputs directly to each other and to those literals. The actual
