@@ -11037,7 +11037,12 @@ it("impossible protected reclaim refuses an over-limit wire before provider reje
             emergencyRecoveryArmed: false,
             emergencyRecoveryOrigin: null,
             foldMaterializedThisPass: false,
-            finalWireEstimate: { tokens: total, trusted: true },
+            finalWireEstimate: {
+                tokens: total,
+                trusted: true,
+                refusalGrade: true,
+                refusalTokens: total,
+            },
             providerProvenLimitTokens: 16000,
         }).shouldAbort,
     ).toBe(true);

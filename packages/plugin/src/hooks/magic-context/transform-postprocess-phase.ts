@@ -1640,7 +1640,7 @@ export interface EmergencyFailClosedDecision {
         | "below-emergency-band"
         | "provider-overflow-abort"
         | "proceed"
-        | "trusted-final-wire-over-limit"
+        | "refusal-grade-final-wire-over-limit"
         | "trusted-final-wire-disarm";
     /** Trusted current-pass wire evidence that lets the caller clear its durable latch. */
     disarm?: { finalWireTokens: number; provenLimitTokens: number };
@@ -1652,7 +1652,12 @@ export function evaluateEmergencyFailClosed(input: {
     emergencyRecoveryArmed: boolean;
     emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null;
     foldMaterializedThisPass: boolean;
-    finalWireEstimate?: { tokens: number; trusted: boolean };
+    finalWireEstimate?: {
+        tokens: number;
+        trusted: boolean;
+        refusalGrade?: boolean;
+        refusalTokens?: number;
+    };
     /** A current-model limit parsed from a provider overflow response, never a catalog fallback. */
     providerProvenLimitTokens?: number;
     contextLimitTokens?: number;
@@ -1666,7 +1671,7 @@ export function evaluateEmergencyFailClosed(input: {
         input.protectedToolTokens,
     );
     if (refusalMessage) {
-        return { shouldAbort: true, reason: "trusted-final-wire-over-limit", refusalMessage };
+        return { shouldAbort: true, reason: "refusal-grade-final-wire-over-limit", refusalMessage };
     }
     if (
         input.emergencyRecoveryArmed &&
@@ -1687,8 +1692,8 @@ export function evaluateEmergencyFailClosed(input: {
     if (input.usagePercentage < 95) {
         return { shouldAbort: false, reason: "below-emergency-band" };
     }
-    // Without complete final-wire evidence, retain the provider-proven recovery
-    // rule. Partial local estimates must not originate a refusal.
+    // Without refusal-grade final-wire evidence, retain the provider-proven
+    // recovery rule. An admission upper envelope cannot originate a refusal.
     const shouldAbort =
         input.emergencyRecoveryArmed &&
         input.emergencyRecoveryOrigin === "provider_overflow" &&

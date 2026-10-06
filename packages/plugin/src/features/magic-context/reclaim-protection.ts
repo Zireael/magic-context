@@ -1,5 +1,6 @@
 import {
     type DecisionCalibration,
+    hasMeasuredDecisionCalibration,
     providerMass,
 } from "../../hooks/magic-context/decision-calibration";
 import {
@@ -57,5 +58,9 @@ export function protectedToolTokenCount(
         (sum, tag) => sum + (protectedTags.has(tag.tagNumber) ? (tag.tokenCount ?? 0) : 0),
         0,
     );
-    return calibration ? providerMass({ tools: tokens }, calibration, true) : tokens;
+    // This subset diagnoses a refusal, not fit admission. Unknown/family ratios
+    // cannot prove that protection alone makes the request too large.
+    return calibration && hasMeasuredDecisionCalibration(calibration)
+        ? providerMass({ tools: tokens }, calibration)
+        : 0;
 }

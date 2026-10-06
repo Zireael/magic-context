@@ -87,7 +87,10 @@ import {
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
-import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
+import {
+    createFinalWireUsageTracker,
+    estimateFinalWireInputTokens,
+} from "./final-wire-token-estimate";
 import { createHistorianHostRunner } from "./historian-host-runner";
 import { clearPersistedLkgSlotStrict, saveLkgSlotToDb } from "./lkg-persist";
 import {
@@ -1632,6 +1635,7 @@ export function createRustModeTransform(
     replayParticipant: RustLkgReplayParticipant;
 } {
     const states = new Map<string, RustSessionState>();
+    const finalWireUsage = createFinalWireUsageTracker();
     const clock = options.clockForTests ?? { setTimeout, clearTimeout, now: Date.now };
     // The model this pass resolves when the messages carry none. OpenCode 1 reads it
     // back out of the host's own database; hosts that keep no such database supply
@@ -3461,8 +3465,9 @@ export function createRustModeTransform(
                 passInputs,
                 usage: {
                     ...passUsage(usage, contextLimit),
-                    final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
-                    final_wire_trusted: finalWireEstimate?.trusted === true,
+                    // Native non-fit guards require refusal evidence, not fit admission.
+                    final_wire_input_tokens: finalWireEstimate?.refusalTokens ?? 0,
+                    final_wire_trusted: finalWireEstimate?.refusalGrade === true,
                 },
                 geometry: transformGeometry,
                 ...renderIdentityFields,
@@ -3780,8 +3785,8 @@ export function createRustModeTransform(
                         passInputs,
                         usage: {
                             ...passUsage(usage, contextLimit),
-                            final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
-                            final_wire_trusted: finalWireEstimate?.trusted === true,
+                            final_wire_input_tokens: finalWireEstimate?.refusalTokens ?? 0,
+                            final_wire_trusted: finalWireEstimate?.refusalGrade === true,
                         },
                         geometry: transformGeometry,
                         ...renderIdentityFields,
@@ -4154,12 +4159,13 @@ export function createRustModeTransform(
                     cacheBustingPass ||
                     response.scheduler_decision === "execute"
                 ) {
-                    servedFinalWireEstimate = estimateFinalWireInputTokens({
+                    servedFinalWireEstimate = finalWireUsage.estimate(sessionId, {
                         messages: appliedMessages as MessageLike[],
                         systemPromptTokens: sessionMeta.systemPromptTokens,
                         providerID: model?.providerID,
                         modelID: model?.modelID,
                         agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                        systemPromptHash: sessionMeta.systemPromptHash,
                     });
                     const refusal = outgoingContextRefusal(
                         servedFinalWireEstimate,
@@ -4430,6 +4436,14 @@ export function createRustModeTransform(
                 );
             }).catch((error) => {
                 sessionLog(sessionId, "single-store embedding drain failed (ignored):", error);
+            });
+            finalWireUsage.capture(sessionId, {
+                messages: output.messages as MessageLike[],
+                systemPromptTokens: sessionMeta.systemPromptTokens,
+                providerID: model?.providerID,
+                modelID: model?.modelID,
+                agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                systemPromptHash: sessionMeta.systemPromptHash,
             });
             finishPass(true);
             // Validation, message replacement, synchronous LKG persistence and

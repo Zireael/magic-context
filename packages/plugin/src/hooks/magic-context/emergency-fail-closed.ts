@@ -32,19 +32,29 @@ export function protectedToolRefusal(error: unknown): EmergencyFailClosedError |
     return undefined;
 }
 
-/** Refuse only complete outgoing estimates, never a partial count or stale usage. */
+export interface ContextRefusalEstimate {
+    tokens: number;
+    /** Admission-grade completeness; may include a conservative fit multiplier. */
+    trusted: boolean;
+    /** Complete, route-measured and calibrated evidence of non-fit. */
+    refusalGrade?: boolean;
+    refusalTokens?: number;
+}
+
+/** Admission upper bounds must never originate healthy-send refusals. */
 export function outgoingContextRefusal(
-    estimate: { tokens: number; trusted: boolean } | undefined,
+    estimate: ContextRefusalEstimate | undefined,
     limit: number | undefined,
     protectedToolTokens = 0,
 ): string | undefined {
     if (
-        estimate?.trusted !== true ||
-        !Number.isFinite(estimate.tokens) ||
+        estimate?.refusalGrade !== true ||
+        typeof estimate.refusalTokens !== "number" ||
+        !Number.isFinite(estimate.refusalTokens) ||
         !limit ||
         !Number.isFinite(limit) ||
         limit <= 0 ||
-        estimate.tokens <= limit
+        estimate.refusalTokens <= limit
     )
         return undefined;
     return Number.isFinite(protectedToolTokens) && protectedToolTokens > limit

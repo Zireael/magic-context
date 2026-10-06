@@ -109,6 +109,7 @@ import {
 import {
     describeFinalWireTail,
     estimateFinalWireInputTokens,
+    createFinalWireUsageTracker,
     estimateMessageTokens,
 } from "./final-wire-token-estimate";
 import type { LiveModelBySession } from "./hook-handlers";
@@ -657,6 +658,7 @@ export function resolveTransformHostSeams(
 }
 
 export function createTransform(deps: TransformDeps) {
+    const finalWireUsage = createFinalWireUsageTracker();
     const host = resolveTransformHostSeams(deps);
     const loadedSessions = new Set<string>();
     // Sessions whose history was clearly over the model's window, with no
@@ -2715,12 +2717,13 @@ export function createTransform(deps: TransformDeps) {
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (postTransformResult.bustedThisPass) {
             try {
-                finalWireEstimate = estimateFinalWireInputTokens({
+                finalWireEstimate = finalWireUsage.estimate(sessionId, {
                     messages,
                     systemPromptTokens: sessionMeta.systemPromptTokens,
                     providerID: modelForBudget?.providerID,
                     modelID: modelForBudget?.modelID,
                     agentName: notificationParams.agent,
+                    systemPromptHash: sessionMeta.systemPromptHash,
                 });
             } catch {
                 sessionLog(
@@ -2740,12 +2743,13 @@ export function createTransform(deps: TransformDeps) {
             finalWireEstimate =
                 finalWireEstimate ??
                 (emergencyUsagePercentage >= 95 || schedulerDecision === "execute"
-                    ? estimateFinalWireInputTokens({
+                    ? finalWireUsage.estimate(sessionId, {
                           messages,
                           systemPromptTokens: sessionMeta.systemPromptTokens,
                           providerID: modelForBudget?.providerID,
                           modelID: modelForBudget?.modelID,
                           agentName: notificationParams.agent,
+                          systemPromptHash: sessionMeta.systemPromptHash,
                       })
                     : undefined);
             if (finalWireEstimate) {
@@ -3222,6 +3226,15 @@ export function createTransform(deps: TransformDeps) {
                 `thinking binding recovery: stripped bound reasoning from ${bindingRecovery.messageIds.length} assistant(s) [${bindingRecovery.messageIds.join(",")}]; flag=${cleared ? "cleared" : "rearmed"}`,
             );
         }
+        if (passOutcome.captureEligible)
+            finalWireUsage.capture(sessionId, {
+                messages,
+                systemPromptTokens: sessionMeta.systemPromptTokens,
+                providerID: modelForBudget?.providerID,
+                modelID: modelForBudget?.modelID,
+                agentName: notificationParams.agent,
+                systemPromptHash: sessionMeta.systemPromptHash,
+            });
     };
 
     return Object.assign(transform, {

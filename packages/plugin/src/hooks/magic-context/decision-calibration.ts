@@ -41,6 +41,14 @@ export interface LocalMass {
     prose?: number;
 }
 
+/** Inherited family/provider ratios are useful for admission, not non-fit proof. */
+export function hasMeasuredDecisionCalibration(seed: DecisionCalibration): boolean {
+    // Persisted session freezes omit matchedPrefix. Recheck the model's measured
+    // seed instead of treating a missing diagnostic label as missing evidence.
+    const measured = calibrationForModelKey(seed.modelKey);
+    return seed.seeded && seed.source === "seed" && measured.seeded && measured.source === "seed";
+}
+
 /** Accumulate fractional provider mass, then ceil once at the decision boundary. */
 export function providerMass(raw: LocalMass, seed: DecisionCalibration, fit = false): number {
     const { system = 0, tools = 0, prose = 0 } = raw;

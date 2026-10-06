@@ -1,13 +1,18 @@
 import {
     getLargestMeasuredToolDefinitionTokens,
     getMeasuredToolDefinitionTokens,
+    getToolDefinitionMeasurementSignature,
 } from "../../features/magic-context/tool-definition-tokens";
-import { providerMass, resolveDecisionCalibration } from "./decision-calibration";
+import {
+    hasMeasuredDecisionCalibration,
+    providerMass,
+    resolveDecisionCalibration,
+} from "./decision-calibration";
 import {
     estimateImageTokensFromDataUrl,
     estimateToolAttachmentImageTokens,
 } from "./image-token-estimate";
-import { createTokenCountMemo } from "./read-session-formatting";
+import { createTokenCountMemo, hasTokenizerForFit } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import { UNKNOWN_FIT_RATIO } from "./tokenizer-calibration";
 
@@ -207,11 +212,121 @@ export interface FinalWireTokenEstimateInput {
     providerID: string | undefined;
     modelID: string | undefined;
     agentName: string | undefined;
+    systemPromptHash?: string;
+    /** A correlated preceding provider request; callers must prove prefix reuse. */
+    measuredPrefix?: { inputTokens: number; appendedMessages: readonly MessageLike[] };
+}
+
+/** Keep only exact served requests. A usage sample is reusable solely when the
+ * same route/envelope and complete prefix survive, followed by its own reply.
+ * No durable session aggregate or another route's usage can stand in for this.
+ */
+export function createFinalWireUsageTracker() {
+    const served = new Map<
+        string,
+        { envelope: string; prefix: string[]; parent: string; at: number }
+    >();
+    const wireRows = (input: FinalWireTokenEstimateInput) =>
+        input.messages.filter((message) =>
+            message.parts.some(
+                (part) =>
+                    !part ||
+                    typeof part !== "object" ||
+                    !["step-start", "step-finish"].includes(
+                        String((part as { type?: string }).type),
+                    ),
+            ),
+        );
+    const rowBytes = (message: MessageLike) =>
+        JSON.stringify({ id: message.info.id, role: message.info.role, parts: message.parts });
+    const envelopeFor = (input: FinalWireTokenEstimateInput): string | undefined => {
+        if (!input.providerID || !input.modelID || !input.systemPromptHash) return;
+        const tools = getToolDefinitionMeasurementSignature(
+            input.providerID,
+            input.modelID,
+            input.agentName,
+        );
+        if (!tools) return;
+        return JSON.stringify([
+            input.providerID,
+            input.modelID,
+            input.agentName,
+            input.systemPromptHash,
+            input.systemPromptTokens,
+            tools,
+        ]);
+    };
+    return {
+        estimate(sessionId: string, input: FinalWireTokenEstimateInput): FinalWireTokenEstimate {
+            let measuredPrefix: FinalWireTokenEstimateInput["measuredPrefix"];
+            try {
+                const previous = served.get(sessionId);
+                const rows = wireRows(input);
+                if (
+                    previous &&
+                    previous.envelope === envelopeFor(input) &&
+                    rows.length > previous.prefix.length &&
+                    previous.prefix.every((bytes, i) => rowBytes(rows[i]) === bytes)
+                ) {
+                    const reply = rows[previous.prefix.length]?.info as Record<string, unknown>;
+                    const tokens = reply.tokens as
+                        | { input?: number; cache?: { read?: number; write?: number } }
+                        | undefined;
+                    const time = reply.time as { completed?: number } | undefined;
+                    const counts = [tokens?.input, tokens?.cache?.read, tokens?.cache?.write];
+                    if (
+                        reply.role === "assistant" &&
+                        reply.parentID === previous.parent &&
+                        reply.providerID === input.providerID &&
+                        reply.modelID === input.modelID &&
+                        ["stop", "tool-calls", "length"].includes(String(reply.finish)) &&
+                        !reply.error &&
+                        typeof time?.completed === "number" &&
+                        time.completed >= previous.at &&
+                        counts.every(
+                            (n) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0,
+                        )
+                    ) {
+                        const inputTokens = counts.reduce<number>((sum, n) => sum + (n ?? 0), 0);
+                        if (inputTokens > 0)
+                            measuredPrefix = {
+                                inputTokens,
+                                appendedMessages: rows.slice(previous.prefix.length),
+                            };
+                    }
+                }
+            } catch {
+                /* Missing or uncorrelated evidence falls back to current calibration. */
+            }
+            return estimateFinalWireInputTokens({ ...input, measuredPrefix });
+        },
+        capture(sessionId: string, input: FinalWireTokenEstimateInput): void {
+            served.delete(sessionId);
+            try {
+                const envelope = envelopeFor(input);
+                const rows = wireRows(input);
+                const parent = [...rows].reverse().find((row) => row.info.role === "user")?.info.id;
+                if (!envelope || typeof parent !== "string" || !rows.every(hasCountableParts))
+                    return;
+                const prefix = rows.map(rowBytes);
+                // Bound exact evidence independently of the much larger durable replay cache.
+                if (prefix.reduce((sum, text) => sum + text.length, 0) > 4 * 1024 * 1024) return;
+                if (served.size >= 16) served.delete(served.keys().next().value!);
+                served.set(sessionId, { envelope, prefix, parent, at: Date.now() });
+            } catch {
+                /* A failed evidence capture must not reject a healthy request. */
+            }
+        },
+    };
 }
 
 export interface FinalWireTokenEstimate {
     tokens: number;
     trusted: boolean;
+    /** Unlike trusted, this excludes unknown/family fit and borrowed tool envelopes. */
+    refusalGrade?: boolean;
+    refusalTokens?: number;
+    refusalBasis?: "calibrated" | "provider-prefix";
     messageTokens: MessageTokenEstimate;
     systemTokens: number;
     toolDefinitionTokens: number | undefined;
@@ -278,6 +393,36 @@ export function estimateFinalWireInputTokens(
         input.systemPromptTokens > 0 &&
         toolDefinitions !== undefined &&
         input.messages.every(hasCountableParts);
+    const refusalGrade =
+        complete &&
+        hasTokenizerForFit() &&
+        measuredToolDefinitions !== undefined &&
+        hasMeasuredDecisionCalibration(calibration);
+    const measured = input.measuredPrefix;
+    const useMeasured =
+        refusalGrade &&
+        measured &&
+        Number.isSafeInteger(measured.inputTokens) &&
+        measured.inputTokens > 0 &&
+        measured.appendedMessages.every(hasCountableParts);
+    const tail = useMeasured
+        ? measured.appendedMessages.reduce<MessageTokenEstimate>(
+              (sum, message) => {
+                  const next = estimateMessageTokens(message);
+                  return {
+                      conversation: sum.conversation + next.conversation,
+                      toolCall: sum.toolCall + next.toolCall,
+                  };
+              },
+              { conversation: 0, toolCall: 0 },
+          )
+        : undefined;
+    const refusalTokens = refusalGrade
+        ? tail && measured
+            ? measured.inputTokens +
+              providerMass({ tools: tail.toolCall, prose: tail.conversation }, calibration)
+            : providerMass(rawComponents, calibration)
+        : undefined;
     const systemTokens = Math.round(
         Math.max(0, input.systemPromptTokens) * calibration.systemRatio,
     );
@@ -291,6 +436,9 @@ export function estimateFinalWireInputTokens(
     return {
         tokens,
         trusted: complete,
+        refusalGrade,
+        refusalTokens,
+        refusalBasis: refusalGrade ? (useMeasured ? "provider-prefix" : "calibrated") : undefined,
         rawTokens: rawComponents.system + rawComponents.tools + rawComponents.prose,
         rawComponents,
         completeness: complete ? "complete" : "partial",

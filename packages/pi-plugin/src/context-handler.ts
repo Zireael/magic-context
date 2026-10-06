@@ -4024,6 +4024,13 @@ export function registerPiContextHandler(
 				const estimate = estimatePiOutgoingInputTokens(
 					outputMessages,
 					envelope,
+					lkgPassSnapshot
+						? lkgCoordinator.measureOutgoingPrefix(
+								lkgPassSnapshot,
+								outputMessages,
+								(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
+							)
+						: undefined,
 				);
 				const refusal = outgoingContextRefusal(
 					estimate,
@@ -4031,7 +4038,7 @@ export function registerPiContextHandler(
 					protectedToolTokenCount(
 						getActiveTagsBySession(options.db, sessionId),
 						options.protectedTools,
-						envelope?.calibration,
+						envelope ? calibrationForModelKey(envelope.modelKey) : undefined,
 					),
 				);
 				if (refusal) throw contextRefusalError(refusal);
@@ -8046,3 +8053,4 @@ import {
 	outgoingContextRefusal,
 } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import { estimatePiOutgoingInputTokens } from "./pi-raw-fallback";
+import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";

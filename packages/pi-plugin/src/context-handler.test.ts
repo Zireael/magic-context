@@ -7972,3 +7972,50 @@ it("Pi protected results refuse a successful no-op reclaim before transport", as
 		closeQuietly(db);
 	}
 });
+
+it("Pi healthy send admits an uncalibrated protected result above the fit upper-envelope limit", async () => {
+	const db = createTestDb();
+	const sessionId = "pi-uncalibrated-protected-admission";
+	const fake = createFakePi();
+	Object.assign(fake.pi, { getAllTools: () => [] });
+	registerPiContextHandler(fake.pi as never, {
+		db,
+		protectedTools: { custom: 1 },
+		protectedTags: 0,
+		heuristics: {},
+		injection: { injectionBudgetTokens: 10000 },
+	});
+	const handler = fake.handlers.get("context") as Parameters<typeof runPass>[0];
+	const messages = [
+		userMessage("start", 1),
+		assistantToolCall("custom-1", "custom", {}, 2),
+		{
+			...toolResultMessage("custom-1", "word ".repeat(8000), 3),
+			toolName: "custom",
+		},
+	];
+	const ctx = {
+		...fakeContext(sessionId),
+		getSystemPrompt: () => "You are helpful.",
+		model: {
+			provider: "unmeasured-provider",
+			id: "unmeasured-model",
+			contextWindow: 16000,
+		},
+		getContextUsage: () => ({
+			tokens: 8000,
+			percent: 50,
+			contextWindow: 16000,
+		}),
+	};
+	try {
+		const result = await handler(
+			{ messages: messages as never[] },
+			ctx as never,
+		);
+		expect(JSON.stringify(result)).toContain("word word");
+	} finally {
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
+});

@@ -11,10 +11,11 @@ that Claude Code could interpret as an instruction to compact.
 
 ## Trusted over-limit refusal
 
-The healthy send paths now refuse complete over-limit outgoing estimates after
-reclaim, including successful no-op reclaim. Partial estimates do not originate
-a refusal. A request still over the limit for other reasons gets an explanatory
-post-reclaim refusal rather than incorrectly attributing all its mass to tools.
+Healthy send paths require refusal-grade evidence after reclaim, including
+successful no-op reclaim: complete counts, a measured model seed and this route's
+measured tool definitions. Conservative fit envelopes remain admission-only.
+The protected-results message requires the calibrated protected subset alone to
+exceed the limit; otherwise proven non-fit takes the generic post-reclaim path.
 
 The Rust-mode OpenCode adapter checks its final returned array, not the module's
 ingress estimate, before installation/LKG capture. Typed native protected-tool
@@ -179,3 +180,96 @@ All new tests and unaffected controls passed after their mutations were restored
 Scoped `aft_inspect` reported incomplete Biome/server diagnostics, so explicit
 package typechecks and formatting are authoritative. Full lint and live gateway/
 provider probes were not run; no end-to-end provider acceptance is claimed.
+
+## Healthy-send evidence correction after re-review
+
+Master was merged as `4e0244c5cf` before this correction. The two regressions from
+`refs/alfonso/accepted/bg_400f36ca65f86fc7:docs/reports/protected-tools-re-review.test.ts`
+are ported, with their exact names and 8,000-word/16,000-token specimens, into the
+OpenCode refusal and Pi fallback package suites. Their package versions do not
+depend on an archived master import. The other four closed findings and native
+Rust guard are unchanged.
+
+### Two kinds of estimate
+
+`trusted` still means a complete admission estimate. Unknown-model fit inflation,
+family inheritance, largest-tool-set borrowing and Pi's all-registered-tools
+envelope remain usable for replay/fit admission, not for originating a healthy
+refusal. `refusalGrade`, `refusalTokens` and `refusalBasis` separately name non-fit
+evidence. Refusal requires a real measured model seed, a working tokenizer and
+route-owned measured definitions; missing evidence serves the healthy request.
+Family and model-id-only provider inheritance are admission-only. Persisted
+calibration freezes can omit their diagnostic prefix, so measured provenance is
+checked against the model's seed rather than that optional label.
+
+Both the entire refusal estimate and protected subset use calibrated ratios,
+never `UNKNOWN_FIT_RATIO`. Pi retains its frozen fit policy independently of the
+current measured refusal seed and counts only the introspected active tool subset
+for refusal. Missing active-set introspection leaves the all-tools figure usable
+for admission only. A fitting protected subset cannot receive the specific
+protected-results message merely because other context exceeds the limit.
+
+OpenCode's Rust-mode TS adapter also forwards only refusal-grade counts/trust to
+the native guard's existing fields, including full-sync retries. No native Rust
+guard or wire schema changed. Its recovery-wire tests reach both unknown and
+measured model routes; the unknown upper envelope never becomes native non-fit
+proof. Healthy final-array tests admit the unknown model and still refuse the
+calibrated known model. The old positive adapter specimen used an unknown model;
+it now uses measured Fable and route-owned definitions. Its 12,000-word specimen
+is still calibrated over the 16,000 limit, without conflating refusal with upload
+paging. Handwritten positive estimate fixtures now declare refusal evidence
+explicitly instead of claiming completeness alone proves overflow.
+
+### Provider evidence wins
+
+OpenCode keeps bounded, detached evidence of exact served prefixes, the system
+hash and exact measured schema fingerprints. A completed same-route reply must
+match the captured request's real user parent and chronology before its input +
+cache-read + cache-write usage can replace the full-prefix estimate. Only the
+actual new tail is then estimated. A changed prefix, system, schema, route or
+parent invalidates that basis. Missing/cold/evicted evidence falls back to current
+measured calibration, never a stale session usage aggregate.
+
+Pi reuses its existing correlated captured-request/JSONL usage proof through a
+non-replaying accessor. Exact served prefix and envelope equality are still
+required. Tagging the new reply may change its content without invalidating its
+provider usage identity; the actual returned tail is priced separately. Tests
+prove both directions: a small provider measurement prevents a false refusal
+from a much larger full-prefix estimate, and a large provider measurement proves
+generic overflow despite a small local full-array estimate. Mismatched metadata,
+parentage and rewritten prefixes cannot borrow the old count.
+
+### Mutation and final verification
+
+The admission-as-refusal mutation reddened each reviewer regression individually;
+the calibrated protected-overflow control stayed green in each lane. Suppressing
+all healthy refusals reddened each calibrated control individually while the
+unknown-model regression stayed green. Separately, disabling provider-prefix
+reuse reddened the OpenCode and Pi provider-preference tests individually, with
+their calibrated protected controls still green. Forwarding admission trust to
+native reddened only the unknown-route producer test; the measured-route producer
+test stayed green. Every mutation used staged live bytes, a nonempty mutant diff,
+index restoration plus touch, and an empty restored diff. All restored controls
+passed. The canonical refusal code/message at the top of this report are unchanged.
+
+Tools: Bun 1.4.2, TypeScript 5.9.3, Biome 2.5.1, Cargo/rustc 1.99.0. Exact `./`
+test paths prevent accidental discovery of archives. Bun checks had 120–240s
+outer bounds and isolated preload-owned stores under the worktree's ignored temp
+root; no host or live provider/store was opened. Cargo ran once, foreground,
+`--locked -j 2`, with serial tests and no simultaneous build or host.
+
+| Final gate | Result |
+| --- | --- |
+| TS refusal/estimation, replay fit, full postprocess, calibration and tool-definition suites (6 files) | 302 passed, 0 failed, 1654 assertions |
+| Pi refusal, measured-prefix and fit-envelope suites (3 files) | 23 passed, 0 failed, 107 assertions |
+| Pi context/cleanup/hygiene protected and closed-review controls (3 files, targeted filter) | 24 passed, 0 failed, 94 assertions |
+| Rust-mode TS healthy refusal/admission, native trust provenance and typed-error/no-replay controls | 5 passed, 0 failed |
+| `cargo test --locked -j 2 -p mc-module --lib protected -- --nocapture --test-threads=1` | 31 passed, 0 failed; native Rust guard unchanged |
+| Plugin and Pi repository `typecheck` scripts | Passed |
+| `bun run build` | Plugin/OpenCode 2, Pi and CLI passed; 4 loader tests, 19 assertions |
+| Scoped package-local Biome formatting | Passed for 19 edited TypeScript files |
+
+Scoped `aft_inspect` had incomplete Biome/Pi server diagnostics; explicit package
+typechecks/builds are authoritative. Full workspace tests/lint and real-host/
+gateway/provider probes were not run. This does not claim a live-vendor acceptance
+or repeat the earlier report's host handoff proof.
