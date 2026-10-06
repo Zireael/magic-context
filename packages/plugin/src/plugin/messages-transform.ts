@@ -473,8 +473,10 @@ export function createMessagesTransformHandler(args: {
                                           resolvedProviderID: keys.providerKey ?? undefined,
                                       }),
                         });
-                        // TypeScript has no Rust participant, but a known model's
-                        // replay must use the same measured-prefix admission.
+                        // TypeScript mode has no Rust result to check, but replaying
+                        // the saved request for a known model still has to pass the
+                        // same fit check as Rust mode: measured size of the saved
+                        // request plus an estimate for the messages added since.
                         let tsFit = true;
                         if (replay.ok && !rust && keys.providerKey && keys.modelKey) {
                             const model = {

@@ -60,8 +60,10 @@ function envelope(modelKey: string, systemPromptTokens: number, agentName?: stri
     ]);
 }
 
-/** OpenCode 2 creates its reply row after context. The previous row is a fence:
- * rereading its usage must never attribute it to the new request. */
+/** On OpenCode 2 the assistant reply row for a request is only created after the
+ * context hook has run, so the request is remembered by the reply row that came
+ * before it. Usage read later from that earlier row belongs to the previous
+ * request and must never be credited to this one. */
 export function beginV2LkgRequest(
     sessionId: string,
     modelKey: string,
@@ -70,8 +72,10 @@ export function beginV2LkgRequest(
     requests.set(sessionId, { kind: "v2", previousResponseId, startedAt: Date.now(), modelKey });
 }
 
-/** Freeze at preparation, not asynchronous commit: the next turn may start before
- * a deferred Rust snapshot is installed. */
+/** Take the request identity when the request is prepared, not when its saved
+ * copy (last-known-good request) is committed: in Rust mode that commit can
+ * finish after the next turn has already started, and that turn's identity
+ * must not be attached to this request's copy. */
 export function claimLkgRequestIdentity(sessionId: string): LkgRequestIdentity | undefined {
     const request = requests.get(sessionId);
     if (!request || claimedRequests.has(request)) return;
@@ -99,8 +103,10 @@ export function noteCapturedLkgRequest(args: {
     });
 }
 
-/** Bind provider input (including cache reads/writes, system and tools) to the
- * request that captured this slot, never to the session's latest pressure value. */
+/** Record the provider's measured input size (cache reads and writes, system
+ * prompt and tools included) against the exact request whose bytes were saved
+ * as the last-known-good request. The session's most recent usage reading may
+ * belong to a different request, so it is never used in its place. */
 export function noteLkgProviderResponse(args: {
     sessionId: string;
     responseId?: string;
@@ -187,8 +193,10 @@ export function clearLkgMeasuredRequest(sessionId: string): void {
     captures.delete(sessionId);
 }
 
-/** A priced pass drops the old slot before capturing the current request. Keep
- * the current response identity so that new capture can still bind its usage. */
+/** A pass that rebuilds the cached prefix discards the previously saved request
+ * before saving the current one. Only the saved measurement is cleared here: the
+ * current response identity stays, so the new saved request can still be
+ * matched to its usage when the reply arrives. */
 export function clearCapturedLkgMeasurement(sessionId: string): void {
     captures.delete(sessionId);
 }

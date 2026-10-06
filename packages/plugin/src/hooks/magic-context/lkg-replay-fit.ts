@@ -140,7 +140,8 @@ export function measureLkgReplayRequest(args: {
               })
             : undefined;
     } catch {
-        // Missing capture identity is not permission to borrow session pressure.
+        // If the saved request can't be matched to its own usage, fall back to the
+        // full estimate; the session's latest usage reading may belong to another request.
         measured = undefined;
     }
     const estimator = args.estimator ?? estimateFinalWireInputTokens;

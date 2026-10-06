@@ -422,8 +422,9 @@ export function captureLkgSlot(args: LkgCaptureInput): boolean {
         noteCapturedLkgRequest({
             sessionId: args.sessionId,
             slot,
-            // A TS slot can end before the request's active tool tail. Such a partial
-            // snapshot is not the request the provider measured.
+            // In TypeScript mode the saved last-known-good copy can stop before the
+            // tool calls still running at the end of the request. Such a partial copy
+            // is not what the provider measured, so it gets no usage identity.
             request:
                 built.anchorIndex === args.input.length - 1
                     ? claimLkgRequestIdentity(args.sessionId)
