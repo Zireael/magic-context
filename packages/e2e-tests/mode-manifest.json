@@ -11,6 +11,14 @@
             "hosts": ["opencode"]
         },
         {
+            "path": "tests/protected-tools.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "OpenCode 1.18.30 mock provider custom tool newest-two protection through emergency; PID lsof proves throwaway-store containment. Pi and Rust share the selection golden.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/subagent-write-tools.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

@@ -4585,6 +4585,10 @@ fn one_f64() -> f64 {
 /// live tail rather than the full history.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TailHygieneBaseline {
+    /// Protected-tool keep counts saved by the last nudge measurement that
+    /// rebuilt the baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_tools_policy: Option<std::collections::BTreeMap<String, usize>>,
     pub baseline_u: i64,
     pub baseline_t: i64,
     pub turn_delta_u: i64,
@@ -4937,6 +4941,11 @@ pub struct ModuleMeta {
     /// asynchronous reduction acknowledgements use the same floor as transforms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected_tokens_effective: Option<u64>,
+    /// Block IDs identified by selection as protected-tool results. Acknowledgements
+    /// use these IDs because tag rows store output text, not tool names. They guide
+    /// decisions but do not identify rendered content or trigger a cache bust.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub protected_tool_block_ids: std::collections::BTreeSet<String>,
     /// Decision calibration frozen at the last authorized bust. Absent legacy state stays
     /// neutral until the next bust so a binary table update cannot alter a defer decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -20028,6 +20037,78 @@ mod tests {
             .remove("protected_tokens_effective");
         let legacy: ModuleMeta = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.protected_tokens_effective, None);
+    }
+
+    #[test]
+    fn protected_tool_selection_snapshot_round_trips_without_a_schema_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let expected = std::collections::BTreeSet::from(["result#0".to_string()]);
+        {
+            let store = McStore::open_for_test(&descriptor).unwrap();
+            let meta = ModuleMeta {
+                protected_tool_block_ids: expected.clone(),
+                ..ModuleMeta::default()
+            };
+            store
+                .commit("held-tool", None, &CoreState::default(), &meta)
+                .unwrap();
+        }
+        let restarted = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            restarted
+                .load("held-tool")
+                .unwrap()
+                .meta
+                .protected_tool_block_ids,
+            expected
+        );
+        let legacy: ModuleMeta =
+            serde_json::from_value(serde_json::to_value(ModuleMeta::default()).unwrap()).unwrap();
+        assert!(legacy.protected_tool_block_ids.is_empty());
+    }
+
+    #[test]
+    fn protected_nudge_policy_round_trips_in_the_existing_baseline_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let policy = std::collections::BTreeMap::from([("probe".to_string(), 2)]);
+        let baseline = TailHygieneBaseline {
+            protected_tools_policy: Some(policy.clone()),
+            ..TailHygieneBaseline::default()
+        };
+        {
+            let store = McStore::open_for_test(&descriptor).unwrap();
+            let meta = ModuleMeta {
+                tail_hygiene_baseline: Some(baseline.clone()),
+                ..ModuleMeta::default()
+            };
+            store
+                .commit("nudge-policy", None, &CoreState::default(), &meta)
+                .unwrap();
+        }
+        let store = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            store
+                .load("nudge-policy")
+                .unwrap()
+                .meta
+                .tail_hygiene_baseline
+                .unwrap()
+                .protected_tools_policy,
+            Some(policy)
+        );
+        let mut legacy = serde_json::to_value(baseline).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("protected_tools_policy");
+        assert_eq!(
+            serde_json::from_value::<TailHygieneBaseline>(legacy)
+                .unwrap()
+                .protected_tools_policy,
+            None
+        );
     }
 
     #[test]
