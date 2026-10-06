@@ -672,7 +672,7 @@ export function loadPiConfigDetailed(
 	const recoveredTopLevelKeys: string[] = [];
 	const cacheTtlConfigured = Object.hasOwn(rawConfig, "cache_ttl");
 	const parsed = parsePiConfig(rawConfig, recoveredTopLevelKeys);
-	// Runtime provenance must not become a user setting when config is serialized.
+	// This runtime-only flag records whether cache_ttl was present; do not expose it as a user setting.
 	Object.defineProperty(parsed.config, "cacheTtlConfigured", {
 		value: cacheTtlConfigured,
 	});

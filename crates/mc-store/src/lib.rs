@@ -4670,7 +4670,7 @@ pub struct FrozenDecisionCalibration {
     pub source: String,
 }
 
-/// Scheduling provenance and the built-in fallback frozen for one session/model.
+/// Why the host chose this cache lifetime, with the built-in fallback kept for this session and model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionCacheTtlPolicy {
     pub value: String,
@@ -4682,7 +4682,7 @@ pub struct SessionCacheTtlPolicy {
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
-    /// Scheduling policy only: never part of the render identity or cached prompt bytes.
+    /// Idle-expiry policy only; it never changes rendered context or cached prompt text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl_policy: Option<SessionCacheTtlPolicy>,
     /// Host ordinals and module block IDs used for rendering, only while the shared

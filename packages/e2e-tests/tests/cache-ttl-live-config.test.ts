@@ -57,8 +57,8 @@ test("OpenCode 1 live cache_ttl edits affect the next idle check without changin
         const edit = (ttl: string) => {
             config.cache_ttl["mock-anthropic/mock-sonnet"] = ttl;
             writeFileSync(configPath, JSON.stringify(config, null, 2));
-            // Age only the isolated provider-completion clock. No real-hour sleeps or
-            // policy-row edits: the live loader and resolver must choose the new TTL.
+            // Set only this test session's last provider-response time to an older value. Avoid
+            // real-time waits and saved-policy edits so the live loader must choose the new lifetime.
             writer!.query("UPDATE session_meta SET last_response_time = ? WHERE session_id = ?").run(Date.now() - 2 * 60 * 60 * 1000, session);
         };
         const decision = () => h.contextDb().query("SELECT decision, materialize_reason FROM transform_decisions WHERE session_id = ? ORDER BY ts_ms DESC LIMIT 1").get(session) as { decision: string; materialize_reason: string | null };

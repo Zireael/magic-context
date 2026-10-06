@@ -124,8 +124,8 @@ async fn gate_probe_default_runner_request_and_meta_digests() {
         "the default runner's completion request must match its pinned prompt bytes"
     );
 
-    // Scheduling provenance is durable metadata, never a prompt input. Pin its exact
-    // addition along with the producer attempt so unrelated blob changes still fail.
+    // The idle-expiry policy is saved as metadata, not sent in the prompt. Pin its exact addition
+    // and the producer's attempt identifier so any other metadata change still fails.
     const TTL_POLICY_FIELD: &str = ",\"cache_ttl_policy\":{\"value\":\"5m\",\"source\":\"built-in default, frozen for this session\",\"model_key\":null,\"built_in_default\":\"5m\"}";
     assert!(meta_blob.contains(&TTL_POLICY_FIELD[1..]));
     assert_ne!(

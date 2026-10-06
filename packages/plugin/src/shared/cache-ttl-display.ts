@@ -20,9 +20,9 @@ export interface ResolveCacheTtlDisplayArgs {
 }
 
 /**
- * Resolve status-only TTL text without changing the scheduler's persisted truth.
- * Live user policy is the value the next pass will use. A saved built-in lifetime
- * remains authoritative only for the same model, even after an override is removed.
+ * Resolve the lifetime shown in status without changing the value saved for the scheduler.
+ * The next pass uses current settings; a saved built-in lifetime applies only to the same
+ * model, even after an override is removed.
  */
 export function resolveCacheTtlDisplay(args: ResolveCacheTtlDisplayArgs): CacheTtlDisplay {
     const resolved = resolveModelCacheTtl(

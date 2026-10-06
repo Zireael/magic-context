@@ -918,7 +918,7 @@ export interface MuralConfig {
 }
 
 export interface MagicContextConfig {
-    /** Loader provenance, not a user-facing setting. Distinguishes explicit 5m from the schema default. */
+    /** The loader sets this to distinguish an explicit `5m` from the built-in default; users do not configure it. */
     cacheTtlConfigured?: boolean;
     enabled: boolean;
     /** User-level setting that lets a session in the canonical home directory use project memory. */
