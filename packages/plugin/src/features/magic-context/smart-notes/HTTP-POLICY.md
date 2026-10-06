@@ -30,8 +30,13 @@ The dreamer's due-check sweep still has a 10-second outer budget (standalone tim
 sweeps retain 15 seconds). After the first attempt, another note is admitted only
 if a full 6-second check budget remains. Fast checks can still fill the existing
 10-note cap, but slow sweeps process fewer notes instead of truncating each HTTP
-request. The outer deadline also covers WASM loading and queuing for the shared VM;
-external cancellation leaves note health unchanged.
+request. The outer deadline covers WASM loading and queuing for the shared VM.
+Once admitted to execution, even the first check gets its full 6-second deadline
+instead of the sweep's remainder: cold loading cannot deprive JavaScript of its
+2-second CPU budget. A sweep may therefore overrun by at most one check deadline;
+it admits no more notes after that. Caller/lease cancellation still interrupts an
+active check. External cancellation leaves note health unchanged unless running
+JavaScript has already exhausted its CPU budget, which remains a logic failure.
 
 HTTP/DNS deadlines and a check's own deadline while suspended in HTTP carry a
 transient retry time with a five-minute minimum. Storage applies exponential
