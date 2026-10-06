@@ -117,7 +117,11 @@ export function timeoutTestDatabase(): { db: Database; dispose: () => void } {
         });
         const dbLines = output.split("\n").filter((line) => /\.db(?:[-\s]|$)/.test(line));
         expect(dbLines.some((line) => line.includes(path))).toBe(true);
-        for (const line of dbLines) expect(line).toContain(root);
+        // The test runner shares one process across test files, so other files' throwaway
+        // databases may still be open here. The invariant is that every database this
+        // process holds lives under the temp directory, never in a live store.
+        const tempRoot = realpathSync(tmpdir());
+        for (const line of dbLines) expect(line).toContain(tempRoot);
         console.log(`lsof -p ${process.pid}: isolated database descriptors\n${dbLines.join("\n")}`);
         isolationProven = true;
     }
