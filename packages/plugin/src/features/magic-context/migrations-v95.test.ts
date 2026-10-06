@@ -67,6 +67,23 @@ const identities = (db: Database) =>
     db.prepare("SELECT rowid,sha FROM git_commits_fts ORDER BY rowid").all();
 
 describe("migration 95", () => {
+    test("v95 upgrades a populated sparse session table before reading optional replay metadata", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec(
+                "CREATE TABLE session_meta(session_id TEXT PRIMARY KEY); INSERT INTO session_meta VALUES ('legacy')",
+            );
+            MIGRATIONS.find((migration) => migration.version === 95)!.up(db);
+            expect(
+                db
+                    .prepare("SELECT session_id,merged_reasoning_stripped_ids FROM session_meta")
+                    .all(),
+            ).toEqual([{ session_id: "legacy", merged_reasoning_stripped_ids: "" }]);
+            expect(getTemporalDecisions(db, "legacy").size).toBe(0);
+        } finally {
+            db.close();
+        }
+    });
     test.each([
         ["malformed JSON", '["temporal-message-v1:'],
         ["non-array JSON", '{"unrelated":"temporal-message-v1:"}'],
@@ -192,10 +209,24 @@ describe("migration 95", () => {
                 cachedM1Bytes: Buffer.from("frozen m1"),
                 counter: 4,
             });
+            // Both features share one upgrade transaction. A prerelease temporal
+            // blob may change, but unrelated replay state and cached bytes must not.
+            const legacyEntries = [
+                "assistant-reasoning",
+                'temporal-message-v1:["m1","<!-- +5m -->\\n"]',
+                'temporal-message-v1:["m2",""]',
+            ];
+            db.prepare(
+                "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id=?",
+            ).run(JSON.stringify(legacyEntries), "session");
             insertTag(db, "session", "m1:p0", "message", 30, 1);
             updateTagStatus(db, "session", 1, "dropped");
             upsertCommits(db, "project", [commit, { ...commit, sha: "sha-b", shortSha: "b" }]);
             const meta = db.prepare("SELECT * FROM session_meta").all();
+            const expectedMeta = meta.map((row) => ({
+                ...(row as Record<string, unknown>),
+                merged_reasoning_stripped_ids: JSON.stringify(["assistant-reasoning"]),
+            }));
             const tags = db.prepare("SELECT * FROM tags").all();
             const before = fts(db);
             const ranked = () =>
@@ -205,16 +236,40 @@ describe("migration 95", () => {
                     )
                     .all();
             const ranks = ranked();
+            expect(MIGRATIONS.filter((migration) => migration.version === 95)).toHaveLength(1);
             runMigrations(db);
             expect(LATEST_SUPPORTED_VERSION).toBe(95);
             expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
                 v: 95,
             });
-            expect(db.prepare("SELECT * FROM session_meta").all()).toEqual(meta);
+            expect(db.prepare("SELECT * FROM session_meta").all()).toEqual(expectedMeta);
             expect(db.prepare("SELECT * FROM tags").all()).toEqual(tags);
             expect(fts(db)).toEqual(before);
             expect(ranked()).toEqual(ranks);
             expect(map(db)).toEqual(identities(db));
+            expect(getTemporalDecisions(db, "session")).toEqual(
+                new Map([
+                    ["m1", "<!-- +5m -->\n"],
+                    ["m2", ""],
+                ]),
+            );
+            for (const name of V95_REDUNDANT_INDEXES)
+                expect(db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name)).toBeNull();
+            for (const name of [
+                "idx_message_fts_rowid_map_session_rowid",
+                "idx_transform_decisions_retention",
+                "idx_plugin_messages_session",
+                "idx_user_memory_candidates_session",
+            ])
+                expect(
+                    db.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(name),
+                ).not.toBeNull();
+            runMigrations(db);
+            initializeDatabase(db);
+            expect(db.prepare("SELECT * FROM session_meta").all()).toEqual(expectedMeta);
+            expect(
+                db.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version=95").get(),
+            ).toEqual({ n: 1 });
             expect(markTagsCompactedByMessageIds(db, "session", ["m1"])).toBe(1);
         } finally {
             db.close();

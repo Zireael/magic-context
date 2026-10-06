@@ -1,6 +1,7 @@
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { isKnownAutocommit } from "../../shared/sqlite-helpers";
+import { ensureColumn } from "./storage-schema-helpers";
 import { decodeTemporalDecision } from "./temporal-decisions";
 
 // NULL records a message first observed on a defer without a served marker. It
@@ -96,6 +97,9 @@ export function installV95PerfSchema(
         // Preserve unrelated replay entries, and never parse the blob on an
         // ordinary open after the table has been installed.
         if (schema.has("session_meta")) {
+            // Sparse legacy schemas reach migrations before the normal initializer
+            // supplies this replay column. They have no temporal blob to adopt yet.
+            ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");
             const rows = db
                 .prepare(
                     "SELECT session_id, merged_reasoning_stripped_ids AS entries FROM session_meta WHERE merged_reasoning_stripped_ids LIKE '%temporal-message-v1:%'",

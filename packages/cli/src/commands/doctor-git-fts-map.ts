@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
     GIT_COMMIT_FTS_ROWID_MAP_DDL,
@@ -8,6 +8,10 @@ import {
 import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import {
+    ensureStorageDirectorySync,
+    writeStorageFileSync,
+} from "@magic-context/core/shared/storage-permissions";
 import {
     getPersistedSchemaVersion,
     openExistingContextDatabase,
@@ -173,11 +177,11 @@ export function runDoctorGitFtsMap(
                 `A host appeared before backup: ${[...stillFree.blockers, stillFree.uncertainty].filter(Boolean).join("; ")}`,
             );
         const backupRoot = resolve(options.backupRoot ?? join(deps.storageDir, "backups"));
-        mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
+        ensureStorageDirectorySync(backupRoot, true);
         const backup = mkdtempSync(join(backupRoot, "git-fts-map-"));
         snapshot(context, join(backup, "context.db"));
         snapshot(store, join(backup, "store.db"));
-        writeFileSync(
+        writeStorageFileSync(
             join(backup, "manifest.json"),
             JSON.stringify(
                 {
@@ -189,6 +193,7 @@ export function runDoctorGitFtsMap(
                 null,
                 2,
             ),
+            { forcePrivate: true },
         );
         deps.print(`Paired backup verified: ${backup}. Restore both stores or neither.`);
         if (!shape) {

@@ -72,6 +72,7 @@ fn cold_rust_mode_rebuilds_its_own_choice_then_replays_stably() {
         smart_drops: false,
         cache_ttl: "5m".into(),
         cache_ttl_provenance: CacheTtlProvenance::Default,
+        cache_ttl_policy: None,
         model_key: None,
         observed_last_response_at_ms: None,
         guidance_date: Some("Today's date: Thu Jan 01 1970".into()),
