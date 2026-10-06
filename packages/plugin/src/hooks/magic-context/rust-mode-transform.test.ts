@@ -7197,6 +7197,115 @@ describe("LKG durability across restarts", () => {
         }
     });
 
+    it("releases an over-context frozen replay to fitting module output on a healthy defer", async () => {
+        const sessionId = `rust-lkg-context-escape-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeRestartInput(sessionId);
+        const largePrefix = [
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "x".repeat(20_000) }],
+            },
+        ];
+        const fittingOutput = [
+            {
+                info: { id: "m1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "§123§ fitting fresh prefix" }],
+            },
+        ];
+        let pass = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                pass += 1;
+                if (pass === 2) throw new Error("daemon unavailable");
+                return {
+                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    row_version: pass,
+                    native_messages: structuredClone(pass === 1 ? largePrefix : fittingOutput),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+            const fallback = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, fallback, makeMeta(db, sessionId));
+            expect(fallback.messages).toEqual(largePrefix);
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+            recordDetectedContextLimit(db, sessionId, 1_000, "test-provider/test-model");
+            const healthy = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, healthy, makeMeta(db, sessionId));
+            expect(healthy.messages).toEqual(fittingOutput);
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+            expect(getSlot(sessionId)?.jsonPrefix).toBe(JSON.stringify(fittingOutput));
+            expect(
+                logSpy.mock.calls.filter(([sid]) => sid === sessionId).map(([, line]) => line),
+            ).toContain("lkg_frozen_replay_released reason=frozen_over_context_limit");
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    for (const invalidation of ["model", "anchor"] as const) {
+        it(`releases a frozen replay on ${invalidation} validation failure on a healthy defer`, async () => {
+            const sessionId = `rust-lkg-validation-${invalidation}-${Date.now()}`;
+            sessions.push(sessionId);
+            const db = makeDb();
+            installRawProvider(sessionId);
+            const input = makeRestartInput(sessionId);
+            let pass = 0;
+            const fresh = [
+                {
+                    info: { id: "fresh", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "§123§ fresh validated output" }],
+                },
+            ];
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method }) => {
+                    if (method !== "transform") return { ok: true };
+                    pass += 1;
+                    if (pass === 2) throw new Error("daemon unavailable");
+                    return {
+                        decision: pass === 1 ? "HARD" : "SOFT+",
+                        row_version: pass,
+                        native_messages: structuredClone(pass === 1 ? input : fresh),
+                    };
+                },
+            };
+            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+            const changed = structuredClone(input);
+            if (invalidation === "model")
+                changed[0]!.info.model = { providerID: "test-provider", modelID: "other-model" };
+            else changed[0]!.info.id = "replacement-anchor";
+            const healthy = { messages: [...changed] as unknown[] };
+            await transform.run(sessionId, changed, healthy, makeMeta(db, sessionId));
+            expect(healthy.messages).toEqual(fresh);
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+        });
+    }
+
     it("releases an invalid frozen replay to priced module output without raw refusal", async () => {
         const sessionId = `rust-lkg-frozen-invalid-${Date.now()}`;
         sessions.push(sessionId);
@@ -7259,7 +7368,288 @@ describe("LKG durability across restarts", () => {
         }
     });
 
-    it("releases a valid frozen replay on the eighth consecutive healthy defer", async () => {
+    for (const alias of [true, false]) {
+        for (const replayPath of [
+            "failure ladder",
+            "parked shortcut",
+            "parked health probe",
+            "outer wrapper",
+        ] as const) {
+            it(`preserves the frozen replay after one new raw message with ${alias ? "aliased" : "separate"} arrays (${replayPath})`, async () => {
+                const sessionId = `rust-lkg-ingress-${alias}-${replayPath}-${Date.now()}`;
+                sessions.push(sessionId);
+                const db = makeDb();
+                installRawProvider(sessionId);
+                const raw = Array.from({ length: 40 }, (_, index) => ({
+                    info: {
+                        id: index === 0 ? "m1" : `raw-${index}`,
+                        role: "user",
+                        sessionID: sessionId,
+                        model: { providerID: "test-provider", modelID: "test-model" },
+                    },
+                    parts: [{ type: "text", text: `raw message ${index}` }],
+                })) as MessageLike[];
+                const representation = [
+                    {
+                        info: { id: "m1", role: "user", sessionID: sessionId },
+                        parts: [{ type: "text", text: "frozen prefix" }],
+                    },
+                ];
+                let fail = false;
+                let transformCalls = 0;
+                let statusCalls = 0;
+                const moduleClient: RustModeModuleClient = {
+                    call: async ({ method }) => {
+                        if (method === "session.status") {
+                            statusCalls += 1;
+                            if (fail) throw new Error("daemon unavailable");
+                        }
+                        if (method !== "transform") return { ok: true };
+                        transformCalls += 1;
+                        if (fail) throw new Error("daemon unavailable");
+                        return {
+                            decision: transformCalls === 1 ? "HARD" : "SOFT+",
+                            scheduler_decision: transformCalls === 1 ? "execute" : "defer",
+                            row_version: transformCalls,
+                            native_messages: structuredClone(
+                                transformCalls === 1
+                                    ? representation
+                                    : [
+                                          {
+                                              ...representation[0],
+                                              parts: [
+                                                  {
+                                                      type: "text",
+                                                      text: "§123§ fresh module prefix",
+                                                  },
+                                              ],
+                                          },
+                                      ],
+                            ),
+                        };
+                    },
+                };
+                const deps = makeDeps(db, moduleClient);
+                const transform = createRustModeTransform(deps, { moduleClient });
+                await transform.run(
+                    sessionId,
+                    raw,
+                    { messages: [...raw] },
+                    makeMeta(db, sessionId),
+                );
+                const saved = getSlot(sessionId)!;
+                fail = true;
+                if (replayPath.startsWith("parked")) {
+                    // Park without a replay, so the chosen parked caller must create
+                    // the first freeze rather than keep an earlier baseline.
+                    lkgSlot.dropSlot(sessionId);
+                    for (let pass = 0; pass < RUST_FAILURE_PARK_THRESHOLD; pass += 1) {
+                        await expect(
+                            transform.run(
+                                sessionId,
+                                raw,
+                                { messages: [...raw] },
+                                makeMeta(db, sessionId),
+                            ),
+                        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                    }
+                    if (replayPath === "parked shortcut") {
+                        // Pass five is a health probe; pass six is the shortcut.
+                        await expect(
+                            transform.run(
+                                sessionId,
+                                raw,
+                                { messages: [...raw] },
+                                makeMeta(db, sessionId),
+                            ),
+                        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                    }
+                    expect(transform.getState(sessionId).parked).toBe(true);
+                    expect(transform.getState(sessionId).lkgFrozenAtInputCount).toBeNull();
+                    expect(lkgSlot.captureSlot(sessionId, saved)).toBe(true);
+                }
+                const ingress = [...raw];
+                const fallback = { messages: alias ? ingress : ([...ingress] as unknown[]) };
+                const beforeTransform = transformCalls;
+                const beforeStatus = statusCalls;
+                if (replayPath === "outer wrapper") {
+                    const wrapper = createMessagesTransformHandler({
+                        magicContext: {
+                            "experimental.chat.messages.transform": async () => {
+                                throw new Error("hook unavailable");
+                            },
+                        },
+                    });
+                    await wrapper({}, fallback as never);
+                } else {
+                    await transform.run(sessionId, ingress, fallback, makeMeta(db, sessionId));
+                }
+                expect(transformCalls - beforeTransform).toBe(
+                    replayPath === "failure ladder" ? 1 : 0,
+                );
+                expect(statusCalls - beforeStatus).toBe(
+                    replayPath === "parked health probe" ? 1 : 0,
+                );
+                expect(fallback.messages).toEqual(representation);
+                expect(fallback.messages === ingress).toBe(alias);
+                const frozenBytes = JSON.stringify(fallback.messages);
+                const baseline = transform.getState(sessionId).lkgFrozenAtInputCount;
+
+                fail = false;
+                // Bypass the parked shortcut to exercise an actual healthy defer.
+                if (replayPath.startsWith("parked"))
+                    deps.contextUsageMap.set(sessionId, {
+                        usage: {
+                            inputTokens: 90_000,
+                            percentage: RUST_PARK_PROBE_PRESSURE_BYPASS_PCT,
+                        },
+                        updatedAt: Date.now(),
+                    });
+                const nextRaw = [
+                    ...raw,
+                    {
+                        info: {
+                            id: "next",
+                            role: "user",
+                            sessionID: sessionId,
+                            model: { providerID: "test-provider", modelID: "test-model" },
+                        },
+                        parts: [{ type: "text", text: "one new raw message" }],
+                    } as MessageLike,
+                ];
+                const deferred = { messages: alias ? [...nextRaw] : ([...nextRaw] as unknown[]) };
+                const nextInput = alias ? (deferred.messages as MessageLike[]) : nextRaw;
+                await transform.run(sessionId, nextInput, deferred, makeMeta(db, sessionId));
+                expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+                expect(JSON.stringify(deferred.messages.slice(0, fallback.messages.length))).toBe(
+                    frozenBytes,
+                );
+                expect(deferred.messages.at(-1)).toEqual(nextRaw.at(-1));
+                expect(baseline).toBe(40);
+                expect(transformCalls).toBe(
+                    beforeTransform + (replayPath === "failure ladder" ? 2 : 1),
+                );
+            });
+        }
+    }
+
+    for (const alias of [true, false]) {
+        it(`keeps frozen bytes through twenty new raw messages and ten healthy defers with ${alias ? "aliased" : "separate"} arrays until a genuine rebuild`, async () => {
+            const sessionId = `rust-lkg-debt-${alias}-${Date.now()}`;
+            sessions.push(sessionId);
+            const db = makeDb();
+            installRawProvider(sessionId);
+            const raw = makeRestartInput(sessionId);
+            let pass = 0;
+            let rebuild = false;
+            let lastRaw = raw;
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method }) => {
+                    if (method !== "transform") return { ok: true };
+                    pass += 1;
+                    if (pass === 2) throw new Error("daemon unavailable");
+                    return {
+                        decision: pass === 1 || rebuild ? "HARD" : "SOFT+",
+                        scheduler_decision: pass === 1 || rebuild ? "execute" : "defer",
+                        row_version: pass,
+                        native_messages: structuredClone(lastRaw).map((message) => ({
+                            ...message,
+                            parts: [{ type: "text", text: `§123§ tagged ${message.info.id}` }],
+                        })),
+                    };
+                },
+            };
+            let transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            const serve = async (input: MessageLike[]) => {
+                lastRaw = input;
+                const ingress = structuredClone(input);
+                const output = { messages: alias ? ingress : ([...ingress] as unknown[]) };
+                await transform.run(sessionId, ingress, output, makeMeta(db, sessionId));
+                return output.messages;
+            };
+            const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+            try {
+                await serve(raw);
+                const outageTail = [
+                    {
+                        info: { id: "outage-assistant", role: "assistant", sessionID: sessionId },
+                        parts: [
+                            { type: "text", text: "already served without a tag" },
+                            {
+                                type: "tool",
+                                callID: "outage-read",
+                                tool: "read",
+                                state: {
+                                    status: "completed",
+                                    input: { path: "fixture.txt" },
+                                    output: "already served tool result",
+                                    title: "read fixture",
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        info: {
+                            id: "outage-user",
+                            role: "user",
+                            sessionID: sessionId,
+                            model: { providerID: "test-provider", modelID: "test-model" },
+                        },
+                        parts: [{ type: "text", text: "already served user tail" }],
+                    },
+                ] as MessageLike[];
+                raw.push(...outageTail);
+                const fallback = await serve(raw);
+                const frozenBytes = JSON.stringify(fallback);
+                const appended = Array.from({ length: 20 }, (_, index) => ({
+                    info: {
+                        id: `new-${index}`,
+                        role: "user",
+                        sessionID: sessionId,
+                        model: { providerID: "test-provider", modelID: "test-model" },
+                    },
+                    parts: [{ type: "text", text: `new raw message ${index}` }],
+                })) as MessageLike[];
+                raw.push(...appended);
+                const expectedBytes = JSON.stringify([...fallback, ...appended]);
+                for (let healthyPass = 1; healthyPass <= 10; healthyPass += 1) {
+                    const served = await serve(raw);
+                    expect(JSON.stringify(served)).toBe(expectedBytes);
+                    expect(JSON.stringify(served.slice(0, fallback.length))).toBe(frozenBytes);
+                    expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+                    expect(transform.getState(sessionId).lkgFrozenHealthyPasses).toBe(healthyPass);
+                }
+                const lines = logSpy.mock.calls
+                    .filter(([sid]) => sid === sessionId)
+                    .map(([, line]) => String(line));
+                expect(lines).toContain("lkg_frozen_replay_debt healthy_passes=10 raw_messages=20");
+                expect(lines.some((line) => line.startsWith("lkg_frozen_replay_released"))).toBe(
+                    false,
+                );
+                // Restarting must not turn pending tags into permission to rewrite
+                // the raw-served tail recorded in the durable snapshot.
+                transform.dispose();
+                resetLkgSlotsForTest();
+                registerLkgPersistence(createDbLkgPersistence(db));
+                transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+                expect(JSON.stringify(await serve(raw))).toBe(expectedBytes);
+                expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+                rebuild = true;
+                const adopted = await serve(raw);
+                expect(JSON.stringify(adopted)).not.toBe(expectedBytes);
+                expect((adopted[1] as MessageLike).parts).toEqual([
+                    { type: "text", text: "§123§ tagged outage-assistant" },
+                ]);
+                expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+                expect(transform.getState(sessionId).lkgFrozenHealthyPasses).toBe(0);
+                expect(transform.getState(sessionId).lkgFrozenAtInputCount).toBeNull();
+            } finally {
+                logSpy.mockRestore();
+            }
+        });
+    }
+
+    it("keeps a valid frozen replay past the eighth healthy defer until a module rebuild", async () => {
         const sessionId = `rust-lkg-frozen-bounded-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
@@ -7278,13 +7668,14 @@ describe("LKG durability across restarts", () => {
             },
         ];
         let pass = 0;
+        let rebuild = false;
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) => {
                 if (method !== "transform") return { ok: true };
                 pass += 1;
                 if (pass === 2) throw new Error("daemon unavailable");
                 return {
-                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    decision: pass === 1 || rebuild ? "HARD" : "SOFT+",
                     served_from: "transform",
                     row_version: pass,
                     native_messages: structuredClone(
@@ -7301,21 +7692,20 @@ describe("LKG durability across restarts", () => {
         expect(fallback.messages).toEqual(representationA);
         expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
 
-        const healthyDeferLimit = 8;
-        for (let healthyPass = 1; healthyPass <= healthyDeferLimit; healthyPass += 1) {
+        for (let healthyPass = 1; healthyPass <= 10; healthyPass += 1) {
             const output = { messages: [...input] as unknown[] };
             await transform.run(sessionId, input, output, makeMeta(db, sessionId));
-            if (healthyPass < healthyDeferLimit) {
-                expect(output.messages).toEqual(representationA);
-                expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
-            } else {
-                expect(output.messages).toEqual(representationB);
-                expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
-            }
+            expect(output.messages).toEqual(representationA);
+            expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
         }
+        rebuild = true;
+        const rebuilt = { messages: [...input] as unknown[] };
+        await transform.run(sessionId, input, rebuilt, makeMeta(db, sessionId));
+        expect(rebuilt.messages).toEqual(representationB);
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
     });
 
-    it("releases a valid frozen replay when the raw tail grows by sixteen messages", async () => {
+    it("keeps a valid frozen replay after sixteen new raw messages until a module rebuild", async () => {
         const sessionId = `rust-lkg-frozen-tail-bound-${Date.now()}`;
         sessions.push(sessionId);
         const db = makeDb();
@@ -7334,13 +7724,14 @@ describe("LKG durability across restarts", () => {
             },
         ];
         let pass = 0;
+        let rebuild = false;
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) => {
                 if (method !== "transform") return { ok: true };
                 pass += 1;
                 if (pass === 2) throw new Error("daemon unavailable");
                 return {
-                    decision: pass === 1 ? "HARD" : "SOFT+",
+                    decision: pass === 1 || rebuild ? "HARD" : "SOFT+",
                     served_from: "transform",
                     row_version: pass,
                     native_messages: structuredClone(
@@ -7368,6 +7759,10 @@ describe("LKG durability across restarts", () => {
         const released = { messages: [...grownInput] as unknown[] };
         await transform.run(sessionId, grownInput, released, makeMeta(db, sessionId));
 
+        expect(released.messages).toEqual([...frozenRepresentation, ...grownInput.slice(1)]);
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        rebuild = true;
+        await transform.run(sessionId, grownInput, released, makeMeta(db, sessionId));
         expect(released.messages).toEqual(moduleRepresentation);
         expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
     });
@@ -8130,20 +8525,20 @@ describe("proactive thinking strip on a released frozen replay", () => {
             .map(([, message]) => String(message));
     }
 
-    it("serves byte-identical bytes when a healthy_pass_limit release changes nothing", async () => {
+    it("serves byte-identical bytes past eight healthy defers without granting strip authority", async () => {
         const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
         try {
             const session = await frozenSession("healthy");
-            // The pass above was the first healthy frozen defer; the eighth releases.
+            // Healthy defers accumulate debt but do not authorize any representation change.
             let served: unknown[] = session.frozenServed;
             for (let healthyPass = 2; healthyPass <= 8; healthyPass += 1) {
                 served = await session.run(session.frozenInput);
             }
             expect(session.transform.getState(session.sessionId).lkgRepresentationFrozen).toBe(
-                false,
+                true,
             );
             const lines = sessionLines(logSpy, session.sessionId);
-            expect(lines).toContain("lkg_frozen_replay_released reason=healthy_pass_limit");
+            expect(lines).toContain("lkg_frozen_replay_debt healthy_passes=8 raw_messages=0");
             expect(JSON.stringify(served)).toBe(JSON.stringify(session.frozenServed));
             expect(lines.some((line) => line.includes("proactive thinking strip"))).toBe(false);
 

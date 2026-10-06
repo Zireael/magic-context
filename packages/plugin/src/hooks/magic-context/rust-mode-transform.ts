@@ -216,10 +216,16 @@ export const RUST_PARK_PROBE_PRESSURE_BYPASS_PCT = 90;
 const RUST_SEND_TIMEOUT_MS = 15_000;
 export const RUST_STALL_PROBE_AFTER_MS = 10_000;
 export const RUST_HEALTH_PROBE_TIMEOUT_MS = 2_000;
-// A frozen defer prevents an immediate LKG/module/LKG double bust. After eight healthy module
-// passes or sixteen new raw messages, continued replay adds more stale-snapshot risk than value.
-const RUST_LKG_FROZEN_HEALTHY_PASS_LIMIT = 8;
-const RUST_LKG_FROZEN_RAW_TAIL_GROWTH_LIMIT = 16;
+// Healthy passes and raw growth are recovery debt, not permission to rewrite bytes
+// the provider already cached. A valid, fitting replay waits for a producer rebuild.
+
+/** Representation adoption does not grant marker, reduction or blanket strip authority. */
+function shouldAdoptModuleAfterFreeze(
+    prefixRebuildPermitted: boolean,
+    frozenReplayReleased: boolean,
+): boolean {
+    return prefixRebuildPermitted || frozenReplayReleased;
+}
 
 function activeAgentFromMessages(messages: readonly MessageLike[]): string | undefined {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -2063,10 +2069,12 @@ export function createRustModeTransform(
             if (fit.detail) sessionLog(sessionId, fit.detail);
             return false;
         }
+        // OpenCode aliases input and output; count ingress before replay shortens that array.
+        const replayInputCount = currentMessages.length;
         replaceMessagesInPlace(output, replay.messages);
         // Every provider-visible replay enters the freeze here: the failure ladder,
         // the parked shortcut and the parked health-probe failure alike.
-        enterLkgReplayFreeze(ensureState(states, sessionId), currentMessages.length);
+        enterLkgReplayFreeze(ensureState(states, sessionId), replayInputCount);
         sessionLog(sessionId, "lkg_replay_served");
         return true;
     };
@@ -3852,19 +3860,17 @@ export function createRustModeTransform(
                 );
             }
             const decisionUpper = explicitDecision.toUpperCase();
-            // `let`: a frozen LKG replay that can no longer validate (or hits its bound) releases
-            // the freeze on this pass, which then behaves as priced below.
-            let cacheBustingPass =
+            const cacheBustingPass =
                 decisionUpper === "HARD" ||
                 decisionUpper === "MIGRATE_HARD" ||
                 decisionUpper === "EXECUTE" ||
                 // SOFT re-renders m1 (delta folds, coverage folds): the served bytes changed,
                 // so the previously saved request is already stale.
                 decisionUpper === "SOFT";
-            // The module's own permission. A released frozen replay below also makes the
-            // pass priced, but it changes bytes only from the first message the freeze
-            // served raw, so it is not a permission to rewrite from the start.
+            // Only the producer grants prefix-rebuild authority. A local safety escape
+            // may replace the frozen representation, but cannot grant any other edits.
             const moduleDecisionBusts = cacheBustingPass;
+            let frozenReplayReleased = false;
             if (markerAdmissionRecovery && !moduleDecisionBusts)
                 throw new RustTransformProtocolError(
                     "rust marker admission recovery: module did not return a rebuilding decision",
@@ -3989,9 +3995,8 @@ export function createRustModeTransform(
                         state.lkgRepresentationFrozen = true;
                         state.forceFullWire = true;
                         // Count raw tail growth from the first message the freeze served
-                        // raw, not from this pass, so a restart does not reset the budget
-                        // that ends a freeze. That start can sit a message or two before
-                        // the original freeze's input count, which only ends it sooner.
+                        // raw, not from this pass, so restart does not hide recovery debt.
+                        // That start may precede the original freeze's ingress count.
                         state.lkgFrozenAtInputCount =
                             coldStart.rawRunStart >= 0 ? coldStart.rawRunStart : inputCount;
                         sessionLog(
@@ -4029,7 +4034,10 @@ export function createRustModeTransform(
                 } else if (coldStartLastServed) {
                     frozenReleaseLastServed = coldStartLastServed;
                 }
-                if (state.lkgRepresentationFrozen && !cacheBustingPass) {
+                if (
+                    state.lkgRepresentationFrozen &&
+                    !shouldAdoptModuleAfterFreeze(moduleDecisionBusts, frozenReplayReleased)
+                ) {
                     if (state.lkgFrozenAtInputCount === null) {
                         state.lkgFrozenAtInputCount = inputCount;
                     }
@@ -4053,22 +4061,18 @@ export function createRustModeTransform(
                             }),
                     });
                     if (!frozen.ok) {
-                        cacheBustingPass = true;
+                        frozenReplayReleased = true;
                         frozenReleaseReason = frozen.reason;
                         frozenReleaseLastServed = lastServedSnapshot();
                     } else {
                         frozenHealthyPassesAfterApply = state.lkgFrozenHealthyPasses + 1;
                         const rawTailGrowth = Math.max(0, inputCount - state.lkgFrozenAtInputCount);
-                        const releaseReason =
-                            frozenReplayAdmission(frozen.messages, moduleMessages) ??
-                            (rawTailGrowth >= RUST_LKG_FROZEN_RAW_TAIL_GROWTH_LIMIT
-                                ? "raw_tail_growth_limit"
-                                : frozenHealthyPassesAfterApply >=
-                                    RUST_LKG_FROZEN_HEALTHY_PASS_LIMIT
-                                  ? "healthy_pass_limit"
-                                  : null);
+                        const releaseReason = frozenReplayAdmission(
+                            frozen.messages,
+                            moduleMessages,
+                        );
                         if (releaseReason) {
-                            cacheBustingPass = true;
+                            frozenReplayReleased = true;
                             frozenReleaseReason = releaseReason;
                             frozenReleaseLastServed = lastServedSnapshot();
                         } else {
@@ -4076,6 +4080,10 @@ export function createRustModeTransform(
                             replayedFrozenRepresentation = true;
                             servedFrom = "lkg_frozen";
                             sessionLog(sessionId, "lkg_frozen_replay_served");
+                            sessionLog(
+                                sessionId,
+                                `lkg_frozen_replay_debt healthy_passes=${frozenHealthyPassesAfterApply} raw_messages=${rawTailGrowth}`,
+                            );
                         }
                     }
                 }
@@ -4218,9 +4226,9 @@ export function createRustModeTransform(
                     dropSlot(sessionId, "lkg_cache_bust_pending_capture");
                     state.lkgAcceptedCapture = undefined;
                 }
-                // Build the capture from the installed array. A priced replacement commits its
-                // snapshot before this transform can return, so a process death cannot leave the
-                // previous priced representation durable. Defer-only refreshes remain asynchronous.
+                // Build the capture from the installed array. Rebuilds and local safety
+                // replacements commit before returning, so a restart cannot resurrect the
+                // prior representation. Ordinary frozen refreshes remain asynchronous.
                 const capturePlan = prepareRustCapture(
                     state,
                     sessionId,
@@ -4253,14 +4261,23 @@ export function createRustModeTransform(
                     captureMode = "declined";
                     const error = new Error("LKG snapshot preparation was rejected");
                     captureFailed("async", error);
-                    if (cacheBustingPass) throw error;
-                } else if (cacheBustingPass || state.lkgSyncCaptureRequired) {
-                    captureMode = cacheBustingPass ? "sync_priced" : "sync_recovery";
+                    if (shouldAdoptModuleAfterFreeze(moduleDecisionBusts, frozenReplayReleased))
+                        throw error;
+                } else if (
+                    shouldAdoptModuleAfterFreeze(moduleDecisionBusts, frozenReplayReleased) ||
+                    state.lkgSyncCaptureRequired
+                ) {
+                    captureMode = moduleDecisionBusts ? "sync_priced" : "sync_recovery";
                     try {
-                        commitRustCapture(state, capturePlan, cacheBustingPass);
+                        commitRustCapture(
+                            state,
+                            capturePlan,
+                            shouldAdoptModuleAfterFreeze(moduleDecisionBusts, frozenReplayReleased),
+                        );
                     } catch (error) {
                         captureFailed("sync", error);
-                        if (cacheBustingPass) throw error;
+                        if (shouldAdoptModuleAfterFreeze(moduleDecisionBusts, frozenReplayReleased))
+                            throw error;
                     }
                 } else {
                     try {
@@ -4295,7 +4312,7 @@ export function createRustModeTransform(
                 throw error;
             }
             const bookkeepingStartedAt = performance.now();
-            if (cacheBustingPass) {
+            if (shouldAdoptModuleAfterFreeze(moduleDecisionBusts, frozenReplayReleased)) {
                 if (frozenReleaseReason) {
                     sessionLog(
                         sessionId,
@@ -4355,7 +4372,7 @@ export function createRustModeTransform(
             state.warningSent = false;
             // A frozen LKG representation is not the module's acknowledged native prefix, so
             // output deltas cannot safely splice against it. Full transport resumes deltas only
-            // after a cache-busting pass adopts the module representation.
+            // after a producer rebuild or safety escape adopts the module representation.
             state.forceFullWire = state.lkgRepresentationFrozen;
 
             const directiveText = directiveTextOf(response);

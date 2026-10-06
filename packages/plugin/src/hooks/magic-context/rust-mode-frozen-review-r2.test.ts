@@ -389,8 +389,8 @@ describe("review r2: the four-bytes-per-token proxy over whole OpenCode messages
     });
 });
 
-describe("review r2: a restart and the count-release budget", () => {
-    it("FINDING: a freeze resumed by each restart never reaches its count release", async () => {
+describe("review r2: a restart and frozen recovery debt", () => {
+    it("preserves raw-served bytes across repeated restarts until a producer rebuild", async () => {
         const s = reviewSession("restart-budget");
         const sid = s.sessionId;
         s.setModuleOutput(tagAllUsers);
@@ -400,36 +400,42 @@ describe("review r2: a restart and the count-release budget", () => {
             assistant(sid, "a1"),
             s.user("m2", "turn 2"),
         ];
-        await s.run([...conversation], "throw");
+        const replay = await s.run([...conversation], "throw");
+        const frozenBytes = JSON.stringify(replay);
         expect(s.transform.getState(sid).lkgRepresentationFrozen).toBe(true);
         let turn = 2;
         let frozenPasses = 0;
         const frozenInputCount = conversation.length;
-        // Three restarts, each after six frozen healthy passes. The count release
-        // ends a freeze after 8 healthy passes or 16 messages of raw tail growth.
+        // Three restarts, each after six defers. Neither healthy-pass debt nor
+        // growing raw input authorizes tags on messages already served raw.
         for (let cycle = 0; cycle < 3; cycle += 1) {
             for (let index = 0; index < 6; index += 1) {
                 turn += 1;
                 conversation.push(assistant(sid, `a${turn}`), s.user(`m${turn}`, `turn ${turn}`));
-                await s.run([...conversation], "SOFT+");
+                const served = await s.run([...conversation], "SOFT+");
+                expect(JSON.stringify(served.slice(0, replay.length))).toBe(frozenBytes);
                 if (s.transform.getState(sid).lkgRepresentationFrozen) frozenPasses += 1;
             }
             s.restart();
         }
         turn += 1;
         conversation.push(assistant(sid, `a${turn}`), s.user(`m${turn}`, `turn ${turn}`));
-        await s.run([...conversation], "SOFT+");
+        const served = await s.run([...conversation], "SOFT+");
+        expect(JSON.stringify(served.slice(0, replay.length))).toBe(frozenBytes);
         const stillFrozen = s.transform.getState(sid).lkgRepresentationFrozen;
-        // The freeze must end within the count budget whatever the restarts do.
+        // Repeated restarts must not hide the raw tail's already-served bytes.
         expect({
             frozenPasses,
             rawTailGrowth: conversation.length - frozenInputCount,
             stillFrozen,
         }).toEqual({
-            frozenPasses,
-            rawTailGrowth: conversation.length - frozenInputCount,
-            stillFrozen: false,
+            frozenPasses: 18,
+            rawTailGrowth: 38,
+            stillFrozen: true,
         });
+        const rebuilt = await s.run([...conversation], "HARD");
+        expect(s.transform.getState(sid).lkgRepresentationFrozen).toBe(false);
+        expect(JSON.stringify(rebuilt)).not.toBe(JSON.stringify(served));
     });
 });
 
