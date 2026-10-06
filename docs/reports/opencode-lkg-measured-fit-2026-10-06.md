@@ -77,8 +77,13 @@ unchanged. Raw-history fallback admission is unchanged.
 ## Isolation and regression coverage
 
 Verification uses repository unit/integration fixtures only, with all XDG
-homes, OpenCode database override, Magic Context storage override and TMPDIR
-under a task-owned throwaway root. No OpenCode host or provider was launched;
+homes, Magic Context storage override and TMPDIR under a task-owned throwaway
+root. Narrow tests also set `OPENCODE_DB` there. The broader Rust suite creates
+per-test OpenCode databases beneath that TMPDIR and changes XDG_DATA_HOME to
+select them, so its rerun omitted the fixed OPENCODE_DB override: a first run
+with that override caused 13 fixture-path failures, not implementation failures.
+The rerun passed all 164 Rust tests; the other 159 tests in the original
+11-file invocation passed. No OpenCode host or provider was launched;
 no live database/configuration was opened, migrated or written. The plugin log
 was read without modification.
 
@@ -87,3 +92,18 @@ near-limit input plus a large tail, a tail that passes the byte proxy but fails
 calibrated token fit, and full estimation when attribution does not match. They
 exercise TypeScript wrapper serving/refusal and both hosts' Rust failure paths,
 alongside identity, envelope, prefix mutation and unknown-tail controls.
+
+Three isolated mutation probes each produced exactly one intended failing test:
+
+- Ignoring the matched usage broke `v1 Rust failure serves measured 633258 LKG
+  plus a small tail instead of inflated 912733`; the untrusted raw-fallback
+  refusal control stayed green (1 fail, 1 pass).
+- Removing the capture identity comparison broke `a replaced slot cannot borrow
+  the previous capture's usage even with identical bytes`; measured-small-tail
+  admission and measured-large-tail refusal stayed green (1 fail, 2 pass).
+- Omitting calibrated tail tokens broke `tail token calibration refuses a
+  replay whose tail byte proxy alone fits`; large-tail proxy refusal and the
+  already-measured-envelope control stayed green (1 fail, 2 pass).
+
+Each probe staged the live file first, showed a non-empty mutation diff, then
+restored from the index and showed an empty diff. No mutant was committed.
