@@ -1574,6 +1574,7 @@ interface RunPostTransformPhaseArgs {
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
     temporalCandidates?: ReadonlyMap<string, string>;
     temporalReplayIds?: readonly string[];
+    temporalObservedDecisions?: ReadonlyMap<string, string>;
     passOutcome?: PassOutcome;
     historyRefreshSessions?: Set<string>;
     m0M1?: {
@@ -2091,11 +2092,14 @@ export async function runPostTransformPhase(
     const isCacheBustingPass = publishedWorkDrainAllowed;
     const previousTemporalDecisions =
         args.temporalCandidates && !compactionOff
-            ? getTemporalDecisions(
-                  args.db,
-                  args.sessionId,
-                  args.temporalReplayIds ?? args.temporalCandidates.keys(),
-              )
+            ? new Map([
+                  ...(args.temporalObservedDecisions ?? []),
+                  ...getTemporalDecisions(
+                      args.db,
+                      args.sessionId,
+                      args.temporalReplayIds ?? args.temporalCandidates.keys(),
+                  ),
+              ])
             : undefined;
     const temporalDecisions =
         args.temporalCandidates && !compactionOff

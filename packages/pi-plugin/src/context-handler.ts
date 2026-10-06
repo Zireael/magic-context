@@ -5528,7 +5528,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.db,
 				args.sessionId,
 				temporalCandidates,
-				() => readServedTemporalDecisions(args.db, args.sessionId, "pi"),
+				(ids) =>
+					readServedTemporalDecisions(args.db, args.sessionId, "pi", ids),
 			)
 		: new Map<string, string>();
 	if (args.temporalAwareness) {

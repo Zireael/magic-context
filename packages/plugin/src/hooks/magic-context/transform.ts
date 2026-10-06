@@ -2109,16 +2109,17 @@ export function createTransform(deps: TransformDeps) {
         let hasRecentReduceCall = false;
         // Replay before tagging. New choices wait for the independently priced
         // rebuild permission in postprocess; a cut never recomputes an old gap.
+        let temporalObservedDecisions: ReadonlyMap<string, string> | undefined;
         if (deps.experimentalTemporalAwareness && !compactionOff) {
             const tTemporal = performance.now();
-            const frozen = observeTemporalDecisions(
+            temporalObservedDecisions = observeTemporalDecisions(
                 db,
                 sessionId,
                 temporalCandidates ?? new Map(),
-                () => readServedTemporalDecisions(db, sessionId, "opencode"),
+                (ids) => readServedTemporalDecisions(db, sessionId, "opencode", ids),
                 temporalReplayIds,
             );
-            const injected = injectTemporalMarkers(messages, frozen);
+            const injected = injectTemporalMarkers(messages, temporalObservedDecisions);
             if (injected > 0) {
                 sessionLog(sessionId, `temporal: injected ${injected} gap markers`);
             }
@@ -2622,6 +2623,7 @@ export function createTransform(deps: TransformDeps) {
             fullFeatureMode,
             temporalCandidates,
             temporalReplayIds,
+            temporalObservedDecisions,
             compactionOff,
             canRunCompartments,
             awaitedCompartmentRun,

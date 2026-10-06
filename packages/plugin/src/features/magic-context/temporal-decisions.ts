@@ -64,7 +64,7 @@ export function observeTemporalDecisions(
     db: Database,
     sessionId: string,
     candidates: ReadonlyMap<string, string>,
-    previouslyServed?: () => ReadonlyMap<string, string>,
+    previouslyServed?: (messageIds: Iterable<string>) => ReadonlyMap<string, string>,
     messageIds?: Iterable<string>,
 ): Map<string, string> {
     // Eligibility decides new choices only. A message that has been edited to
@@ -79,6 +79,7 @@ export function observeTemporalDecisions(
                 row.marker === null ? [] : [[row.message_id, row.marker] as const],
             ),
         );
+    const transient = new Map<string, string>();
     db.transaction(() => {
         const insert = db.prepare(
             "INSERT OR IGNORE INTO temporal_decisions(session_id,message_id,marker) VALUES (?,?,?)",
@@ -90,15 +91,19 @@ export function observeTemporalDecisions(
         for (const [id, candidate] of missing) {
             const historical = servedTag.get(sessionId, id, sessionId, `${id}:p`, `${id}:q`);
             if (historical) {
-                served ??= previouslyServed?.() ?? new Map();
+                served ??= previouslyServed?.(missing.map(([missingId]) => missingId)) ?? new Map();
                 const previous = served.get(id);
+                if (previous === undefined) {
+                    // A tag proves identity, not previously served bytes. Keep
+                    // this legacy choice undecided (no row) until a rebuild.
+                    // Its transient display follows the old renderer; NULL
+                    // rows remain reserved for newly observed unmarked text.
+                    transient.set(id, candidate);
+                    continue;
+                }
                 // A newly discoverable gap is not adoption when the exact last
                 // served projection proves that this message had no marker.
-                insert.run(
-                    sessionId,
-                    id,
-                    previous === "" && candidate !== "" ? null : (previous ?? candidate),
-                );
+                insert.run(sessionId, id, previous === "" && candidate !== "" ? null : previous);
             } else {
                 // Remember that this was a new, unmarked message, rather than
                 // mistaking its newly minted tag for old-code served evidence.
@@ -106,7 +111,7 @@ export function observeTemporalDecisions(
             }
         }
     }).immediate();
-    return getTemporalDecisions(db, sessionId, ids);
+    return new Map([...transient, ...getTemporalDecisions(db, sessionId, ids)]);
 }
 
 /** First writer wins by message identity. Never change served bytes before commit. */

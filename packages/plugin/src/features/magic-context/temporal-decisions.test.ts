@@ -8,6 +8,7 @@ import { getOrCreateSessionMeta, insertTag } from "./storage";
 import { initializeDatabase } from "./storage-db";
 import { addMergedReasoningStrippedIds } from "./storage-meta-persisted";
 import { deleteSessionScopedRows } from "./storage-session-tables";
+import { replaceSourceContent } from "./storage-source";
 import { createTagger } from "./tagger";
 import {
     freezeTemporalDecisions,
@@ -160,6 +161,69 @@ it("Pi adopts a persisted pre-ownership LKG marker at a changed cut seam", () =>
                 "user",
             ),
         ).toBe("<!-- +5m -->\n");
+        replaceSourceContent(db, "legacy-lkg", 7, "<!-- +17m -->\nquestion");
+        expect(readServedTemporalDecisions(db, "legacy-lkg", "pi", ["user"]).get("user")).toBe(
+            "<!-- +5m -->\n",
+        );
+    } finally {
+        db.close();
+    }
+});
+
+it("unproven legacy candidates render transiently but never freeze before a rebuilding pass", () => {
+    const db = new Database(":memory:");
+    initializeDatabase(db);
+    runMigrations(db);
+    try {
+        insertTag(db, "unproven", "user:p0", "message", 1, 1);
+        const evidence = (ids: Iterable<string>) =>
+            readServedTemporalDecisions(db, "unproven", "pi", ids);
+        expect(
+            observeTemporalDecisions(
+                db,
+                "unproven",
+                new Map([["user", "<!-- +5m -->\n"]]),
+                evidence,
+            ).get("user"),
+        ).toBe("<!-- +5m -->\n");
+        expect(getTemporalDecisions(db, "unproven").size).toBe(0);
+        expect(
+            observeTemporalDecisions(
+                db,
+                "unproven",
+                new Map([["user", "<!-- +10m -->\n"]]),
+                evidence,
+            ).get("user"),
+        ).toBe("<!-- +10m -->\n");
+        expect(getTemporalDecisions(db, "unproven").size).toBe(0);
+        expect(
+            freezeTemporalDecisions(db, "unproven", new Map([["user", "<!-- +12m -->\n"]])).get(
+                "user",
+            ),
+        ).toBe("<!-- +12m -->\n");
+        expect(
+            observeTemporalDecisions(db, "unproven", new Map([["user", ""]]), evidence).get("user"),
+        ).toBe("<!-- +12m -->\n");
+    } finally {
+        db.close();
+    }
+});
+
+it("a missing first text source is not replaced by a later part's marker evidence", () => {
+    const db = new Database(":memory:");
+    initializeDatabase(db);
+    runMigrations(db);
+    try {
+        insertTag(db, "first-source", "user:p1", "message", 1, 1);
+        insertTag(db, "first-source", "user:p0", "message", 1, 2);
+        replaceSourceContent(db, "first-source", 1, "later text has no marker");
+        expect(readServedTemporalDecisions(db, "first-source", "pi", ["user"]).has("user")).toBe(
+            false,
+        );
+        replaceSourceContent(db, "first-source", 2, "<!-- +5m -->\nfirst text");
+        expect(readServedTemporalDecisions(db, "first-source", "pi", ["user"]).get("user")).toBe(
+            "<!-- +5m -->\n",
+        );
     } finally {
         db.close();
     }

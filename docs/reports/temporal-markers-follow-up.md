@@ -75,11 +75,31 @@ because the predecessor has disappeared. The LKG is consulted lazily only when
 an unknown historical decision needs adoption, not on routine frozen replay.
 The diagnostic served-array ledger is not needed or opened.
 
-If no served projection can identify the message, adoption falls back to the
-old code's current-array timestamp computation, as required by the handoff rule.
+If no LKG projection can identify the message, adoption reads the first durable
+user-text source through the persisted tag owner; a missing first source cannot
+be replaced by a later text part's no-marker evidence. If neither authority
+identifies served bytes, the legacy choice remains undecided and its display
+temporarily follows the old current-array computation without freezing it.
 If the LKG proves that a historical message had no marker but the current walk
 now discovers one, the new marker remains pending until a rebuild. Already
 frozen empty decisions remain authoritative.
+
+The re-review's source-backed cut-seam regression and exact-LKG control are now
+in the Pi package suite. Without evidence, a historical choice stays absent
+and pending until a rebuilding pass, rather than being written as a final
+empty or current-neighbour marker. NULL rows still identify newly observed
+unmarked messages; this distinction prevents a new tag from turning a pending
+new message into legacy history on its next defer. The transient legacy display
+is carried through final rendering in both TypeScript harness paths, but is
+never an authoritative persisted choice.
+
+Item-one verification passed 12 shared temporal tests and 10 Pi upgrade/drain/
+content-replay tests with Bun 1.4.2; both package typechecks passed with TypeScript
+5.9.3. Disabling durable-source fallback reddened only the reviewer's no-LKG
+cut-seam test, while the ordinary upgrade and exact-LKG control stayed green.
+Persisting an unsupported neighbour guess reddened only the unproven-legacy
+pending test, while the persisted-LKG control stayed green. Both mutations were
+staged, observed as two added lines, restored and touched with empty working diffs.
 
 ## Indexed storage in v95
 
