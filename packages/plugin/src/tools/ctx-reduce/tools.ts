@@ -171,9 +171,11 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                             held.length === 1
                                 ? `Held: §${held[0]} is inside the protected working set; it applies once newer work displaces it.`
                                 : `Held: ${held.map((id) => `§${id}`).join(", ")} are inside the protected working set; they apply once newer work displaces them.`;
-                        return immediate.length > 0
-                            ? `Queued: drop ${formatIds(immediate)}. ${sentence}`
-                            : sentence;
+                        const acknowledgement =
+                            immediate.length > 0
+                                ? `Queued: drop ${formatIds(immediate)}. ${sentence}`
+                                : sentence;
+                        return `${acknowledgement}${refusedStampNote ? ` ${refusedStampNote}` : ""}`;
                     }
                     // The module owns range parsing and tag canonicalization. Keep the
                     // existing queued acknowledgement shape without reimplementing that

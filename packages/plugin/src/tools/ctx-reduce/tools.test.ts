@@ -409,6 +409,27 @@ describe("createCtxReduceTools", () => {
             );
         });
 
+        it("retains free, held and self-stamp outcomes from the Rust backend in stable order", async () => {
+            const tool = createCtxReduceTools({
+                db,
+                protectedSet: new Set(),
+                rustToolBackends: {
+                    reduce: async () => ({
+                        ok: true,
+                        queued: 2,
+                        ctx_reduce_queued_tags: [1, 3],
+                        ctx_reduce_self_stamps: [2],
+                        held_tag_numbers: [1],
+                        immediate_tag_numbers: [3],
+                    }),
+                },
+            });
+            const result = await tool.ctx_reduce.execute({ drop: "2,1,3" }, toolContext());
+            expect(result).toBe(
+                "Queued: drop §3§. Held: §1 is inside the protected working set; it applies once newer work displaces it. §2§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+        });
+
         it("uses the raw drop string and stable call id in rust mode", async () => {
             seedTags(db, [{ id: 3, sessionId: "ses-1" }]);
             const calls: Array<{ drop: string; commandId: string; projectRoot: string }> = [];
