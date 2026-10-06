@@ -52,6 +52,9 @@ test("OpenCode 1 live cache_ttl edits affect the next idle check without changin
         await h.sendPrompt(session, "Keep the original prefix.");
         const prior = h.requests().filter(r => !bytes(r.body.system).includes("title generator")).at(-1)!;
         writer = new Database(h.contextDbPath());
+        // The host finishes usage/event writes after the prompt HTTP response. Let
+        // this fixture's clock edit wait for that short SQLite writer, not race it.
+        writer.exec("PRAGMA busy_timeout = 5000");
         const configPath = join(h.opencode.env.configDir, "cortexkit", "magic-context.jsonc");
         const config = JSON.parse(readFileSync(configPath, "utf8"));
         const edit = (ttl: string) => {
@@ -61,9 +64,10 @@ test("OpenCode 1 live cache_ttl edits affect the next idle check without changin
             // real-time waits and saved-policy edits so the live loader must choose the new lifetime.
             writer!.query("UPDATE session_meta SET last_response_time = ? WHERE session_id = ?").run(Date.now() - 2 * 60 * 60 * 1000, session);
         };
-        const decision = () => h.contextDb().query("SELECT decision, materialize_reason FROM transform_decisions WHERE session_id = ? ORDER BY ts_ms DESC LIMIT 1").get(session) as { decision: string; materialize_reason: string | null };
+        const decision = () => h.contextDb().query("SELECT ts_ms, decision, materialize_reason FROM transform_decisions WHERE session_id = ? ORDER BY ts_ms DESC LIMIT 1").get(session) as { ts_ms: number; decision: string; materialize_reason: string | null };
         edit("13h");
         await h.sendPrompt(session, "The two-hour idle cache should stay warm.");
+        expect(JSON.parse(readFileSync(configPath, "utf8")).cache_ttl["mock-anthropic/mock-sonnet"]).toBe("13h");
         expect(meta().cache_ttl).toBe("13h");
         expect(decision()).toMatchObject({ decision: "defer" });
         const raised = h.requests().filter(r => !bytes(r.body.system).includes("title generator")).at(-1)!;
@@ -71,8 +75,14 @@ test("OpenCode 1 live cache_ttl edits affect the next idle check without changin
         expect(bytes(raised.body.tools)).toBe(bytes(prior.body.tools));
         expect(bytes(raised.body.messages?.slice(0, prior.body.messages?.length))).toBe(bytes(prior.body.messages));
         edit("1h");
+        const expiredTurnStarted = Date.now();
         await h.sendPrompt(session, "Now the same idle interval is expired.");
+        expect(JSON.parse(readFileSync(configPath, "utf8")).cache_ttl["mock-anthropic/mock-sonnet"]).toBe("1h");
         expect(meta().cache_ttl).toBe("1h");
+        // Cache-bust telemetry binds to the completed assistant and writes on a
+        // later event-loop tick. The prompt response is not its completion fence;
+        // without one, fast hosts read the seed turn's first_render row instead.
+        await h.waitFor(() => decision()?.ts_ms >= expiredTurnStarted, { timeoutMs: 5000, label: "expired turn transform decision" });
         expect(decision()).toMatchObject({ decision: "execute", materialize_reason: "ttl_idle" });
         const policy = JSON.parse(meta().trailing_blank_decisions).cacheTtlPolicy;
         expect(policy).toMatchObject({ value: "1h", source: "config" });

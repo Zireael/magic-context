@@ -47,6 +47,10 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			// ctx_memory and ctx_note to task child sessions through OpenCode 1's
 			// primary_tools list (528f693e84, "hide memory and note tools from
 			// OpenCode subagents"); OpenCode 2 filters them per request instead.
+			// Re-minted for the v95 merge (4ec6c1fc4a): ebd7052c03 changed the v1
+			// opener to openCurrentDatabase, so host paths cannot synchronously run
+			// migrations after async boot. This deliberate v1 safety change is not
+			// v2 loader leakage; the worker applies pending migrations off-thread.
 			bytes = bytes
 				.replace('import { setup } from "./v2/server";\n', "")
 				.replace("PluginModule & { setup: typeof setup }", "PluginModule")
