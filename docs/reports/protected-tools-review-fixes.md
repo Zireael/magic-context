@@ -135,3 +135,47 @@ an already-pending tag. That expectation is intentionally changed from
 `[3, 1, 3, 4, 5]` to `[3, 1, 4, 5]` for idempotency, without altering its frozen
 clock or byte/identity assertions. Storage and historian suites passed 15 tests
 (42 assertions); plugin typecheck passed (TypeScript 5.9.3).
+
+## Final verification of the continued branch
+
+The requested fast-forward from `9d2736a3df` was impossible because this worktree's
+base had newer master changes. A normal merge preserved those changes: Cargo.lock
+keeps master's published/immutable Git dependencies (no lockfile edit), and Pi's
+acknowledgment retains both held-drop feedback and the newer self-stamp warning.
+Items 4 and 5 are separate commits: `79c0799d35` and `b721516125` respectively.
+
+Final suite runs used Bun 1.4.2; TypeScript 5.9.3; Cargo 1.99.0, rustc 1.99.0,
+rustfmt 1.10.0; and Biome 2.5.1. Every suite had an outer timeout (120–240 seconds
+for Bun, 900 seconds for Cargo). Rust ran once, foreground, `-j 2`, with serial
+tests and no concurrent build or host. Bun's test preload redirected data/config
+to throwaway roots under this worktree's ignored `target/protected-tools-final/tmp`
+for final runs; fixture-specific OpenCode stores stayed isolated. No live model,
+host or production store was opened.
+
+| Final check | Result |
+| --- | --- |
+| TS configuration, selection/holds, stale strip, refusal, full postprocess/Channel 2, ctx_reduce, storage-ops and historian queue suites (10 files, `timeout 240s bun test`) | 338 passed, 1 inherited fixture failure, 1778 assertions |
+| Pi selection/holds, context/refusal, cleanup and hygiene suites (6 files, filter `protected\|protection\|held drop\|review\|legacy.*SOFT\|smart_drops`) | 21 passed, 1 inherited fixture failure, 83 assertions |
+| Pi tests outside that filter: map adoption, legacy upgrade, queued rotation and custom stale keep count | 4 passed, 13 assertions |
+| Rust-mode host final-wire refusal and typed-error/no-LKG tests | 2 passed, 2 assertions |
+| `timeout 900s cargo test --locked -j 2 -p mc-module --lib protected -- --nocapture --test-threads=1` | 31 passed, 0 failed; compiled in 2m14s, tests in 21.25s |
+| `timeout 120s bun run --cwd packages/plugin typecheck` | Passed |
+| `timeout 120s bun run --cwd packages/pi-plugin typecheck` | Passed |
+| `timeout 240s bun run build` | Plugin/OpenCode 2, Pi and CLI builds passed; 4 OpenCode 2 loader tests, 19 assertions |
+| `timeout 120s cargo fmt --check` and scoped Biome formatting | Passed |
+
+The **only final suite failures** are `TypeScript held drop: newest three
+ctx_reduce results hold agent drops` and `Pi held drop: newest three ctx_reduce
+results hold agent drops`. Their shared fixture expects a `Held:` acknowledgment,
+but the newer master policy rejects self-stamps with `§2§ is a ctx_reduce call;
+leave those alone, they are cleaned up automatically.` The fixture and both
+production tool files are byte-unchanged from merge commit `1b30440055`, before
+either remaining fix. The TS case failed identically on an isolated diagnostic
+rerun. This is an inherited integration mismatch, not an enqueue or retirement
+regression; no expected hold assertion was weakened to hide it. Reconciling that
+older fixture with master's self-stamp policy is outside these two review fixes.
+
+All new tests and unaffected controls passed after their mutations were restored.
+Scoped `aft_inspect` reported incomplete Biome/server diagnostics, so explicit
+package typechecks and formatting are authoritative. Full lint and live gateway/
+provider probes were not run; no end-to-end provider acceptance is claimed.
