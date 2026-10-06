@@ -59,7 +59,7 @@ export function concreteTokens(text: string): string[] {
     const patterns = [
         /`([^`\n]+)`/g,
         /(?:~\/|\/|\b[\w.-]+\/)[\w./@+-]+/g,
-        /\b\d+(?:\.\d+)?\s*(?:[KMGT]i?B|bytes?|[km]?s|milliseconds?|seconds?|minutes?|hours?|days?|weeks?|tokens?|percent|%|MiB|KiB)\b|\b\d+(?:\.\d+)?%/gi,
+        /\b\d+(?:\.\d+)?(?:\s*[-‑]?\s*)(?:[KMGT]i?B|bytes?|ns|us|µs|ms|s|secs?|milliseconds?|seconds?|m|mins?|minutes?|h|hours?|d|days?|w|weeks?|tokens?|percent)\b|\b\d+(?:\.\d+)?\s*%/gi,
         /\b[A-Z][A-Z0-9]*(?:[-_][A-Z0-9]+)+\b/g,
         /\b[a-zA-Z]\w*(?:[._][a-zA-Z]\w*)+\b/g,
         /\b[a-z]+(?:[A-Z][a-zA-Z0-9]*)+\b/g,

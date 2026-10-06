@@ -61,3 +61,62 @@ timeout 60s bun test scripts/historian-merge-turn-trial/core.test.ts
 ```
 
 No package changes, build outputs or generated production prompts are required. Raw artifacts are needed to continue the staged phases but must remain private and outside git until their root can be removed after review.
+
+## V2 preservation trial
+
+V2 is also investigative only. Copy the original root into the separately fenced
+`$TMPDIR/magic-context/merge-turn-trial-v2-bg663b` root (0700, files 0600), including
+the descriptor, read-only database, inputs, recorded first replies and candidate
+lists. Never modify the original root. No new embeddings or first-turn inference
+are needed. `v2.ts` fuses retained semantic ranks with whole-pool BM25 ranks using
+reciprocal rank fusion (k=60), then presents eight candidates as readable prose
+with source, category and age. The semantic rank outside the retained fifteen is
+unknown, not a computed zero similarity.
+
+The original lineages already contain the v1 second answers. `run-v2.ts` uses
+Broca `session.import` to seed **actual user and assistant roles** with only the
+recorded first exchange in fresh lineages, verifies it through `session.read`,
+then sends the same production system/model/generation settings through the
+original `session.send`/`session.subscribe` path. It can reattach an admitted run,
+but never redispatch it. A/B/C never see one another's or v1's second answers.
+
+```sh
+# From packages/plugin; provider runs may be background tasks with completion reminders.
+timeout 1800s bun scripts/historian-merge-turn-trial/run-v2.ts "$TMPDIR/magic-context/merge-turn-trial-v2-bg663b" A
+timeout 1800s bun scripts/historian-merge-turn-trial/run-v2.ts "$TMPDIR/magic-context/merge-turn-trial-v2-bg663b" B
+timeout 1800s bun scripts/historian-merge-turn-trial/run-v2.ts "$TMPDIR/magic-context/merge-turn-trial-v2-bg663b" C
+timeout 60s bun scripts/historian-merge-turn-trial/inspect-v2.ts "$TMPDIR/magic-context/merge-turn-trial-v2-bg663b" A
+```
+
+A runs all forty cases (including the zero-fact case). B/C repeat the thirteen
+cases with v1 wrong/debatable rewrites plus cases 1 and 31 as wrong-skip controls:
+the source judgments contain thirteen, not fifteen, rewrite-concern cases.
+The report discloses this approved fifteen-case selection.
+
+The claim inventory is required before rewrite text. The deterministic gate
+checks exact target quotes, verbatim evidence **inside `<new_messages>` only**,
+and preservation of concrete tokens unless their exact claim is evidenced as
+replaced. Invalid batches fall back to all `new`; a rejected valid rewrite alone
+falls back to `new`. For `new`, insert the **original first-turn fact**, never an
+unvalidated model `text` field. No storage mutation is actually applied. This is
+not a semantic contradiction verifier or a guarantee of prose preservation.
+
+Judge every effective decision and raw semantic proposal before opening v1
+verdicts; store private `v2-judgments-A.json` (and B/C) with `decisions` rows
+containing case, fact, grade, proposedGrade and reason. Raw invalid proposals are
+linked by output ordinal only for review, not repaired into executable decisions.
+`analyze-v2.ts` requires complete unique annotations, freezes their hashes before
+baseline comparison, and validates seventy independent runs and their imports,
+candidate derivation, prompt hashes and recomputed gate results.
+
+```sh
+timeout 90s bun scripts/historian-merge-turn-trial/analyze-v2.ts "$TMPDIR/magic-context/merge-turn-trial-v2-bg663b"
+timeout 60s bun scripts/historian-merge-turn-trial/trajectory-view.ts "$TMPDIR/magic-context/merge-turn-trial-v2-bg663b" 2,6,12,18,27,35
+timeout 180s bun run typecheck
+timeout 60s bun test scripts/historian-merge-turn-trial/core.test.ts scripts/historian-merge-turn-trial/v2.test.ts
+```
+
+The copied trajectory viewer renders v1 plus every available v2 pass, inventories,
+raw/effective decisions, schema/preservation rejections and both grades. Its HTML
+output is fenced inside the private root. Commit scripts and aggregate report
+only, never private prompts, memory text, replies, credentials, HTML or annotations.

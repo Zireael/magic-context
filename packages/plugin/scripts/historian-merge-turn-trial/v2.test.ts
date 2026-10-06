@@ -43,6 +43,9 @@ test("concrete token extraction covers identifiers paths units codes and key bou
     expect(concreteTokens("storage.enforce_private_permissions sessionScopedToolsDisabled 100% 384 MiB ~/store/data.db E_REFUSED")).toEqual(expect.arrayContaining([
         "storage.enforce_private_permissions", "sessionScopedToolsDisabled", "100%", "384 MiB", "~/store/data.db", "E_REFUSED"]));
     expect(preservationGate(decision(target.content.replace("MC-H06", "MC-H060")), target, "").rejected).toBe(true);
+    expect(concreteTokens("A 30-minute ceiling, 60s deadline and 5 min retry.")).toEqual(expect.arrayContaining(["30-minute", "60s", "5 min"]));
+    const timeTarget = { ...target, content: "A 30-minute execution ceiling." };
+    expect(preservationGate({ ...decision("A foreground execution ceiling."), claims: [{ quote: timeTarget.content, status: "keep" }] }, timeTarget, "").rejected).toBe(true);
 });
 test("transcript evidence excludes examples and unescapes actual lines", () => {
     expect(transcriptEvidence("<examples>old is false</examples><new_messages>A &lt; B</new_messages>")).toBe("A < B");

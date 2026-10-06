@@ -8,11 +8,13 @@ const root = v2Root(process.argv[2]);
 const db = new Database(join(root, "trial.db"), { readonly: true });
 const memories = db.query("SELECT * FROM memories ORDER BY id").all() as Memory[];
 const system = readFileSync(join(import.meta.dir, "../../../..", "crates/mc-module/testdata/historian-system-prompt.txt"), "utf8");
+const { estimateTokens } = await import("../../src/hooks/magic-context/read-session-formatting");
 const load = (path: string) => Bun.file(join(root, path)).json();
 const save = (path: string, data: unknown) => writeFileSync(join(root, path), JSON.stringify(data, null, 2), { mode: 0o600 });
 const rows: any[] = [];
 const runs: any[] = [];
 const reviewHashes: Record<string, string> = {};
+let originalSecondPromptTokens = 0, v2SecondPromptTokens = 0;
 for (const pass of ["A", "B", "C"]) {
     const annotationText = readFileSync(join(root, `v2-judgments-${pass}.json`), "utf8");
     reviewHashes[pass] = hash(annotationText);
@@ -28,6 +30,7 @@ for (const pass of ["A", "B", "C"]) {
         const prior = await load(`v2-results/${pass}/${index}-prior.json`);
         const decisions = await load(`v2-results/${pass}/${index}-decisions.json`);
         const matches = staged.facts.map((f: any, i: number) => rankCandidates(f, staged.matches[i], eligible(memories, input.before)));
+        if (pass === "A") { originalSecondPromptTokens += estimateTokens(staged.prompt); v2SecondPromptTokens += estimateTokens(c.prompt); }
         if (JSON.stringify(c.matches) !== JSON.stringify(matches) || JSON.stringify(c.facts) !== JSON.stringify(staged.facts)) throw new Error("Candidate derivation changed");
         if (hash(c.prompt) !== hash(mergePromptV2(c.facts, matches, input.before)) || r.promptHash !== hash(c.prompt)) throw new Error("V2 prompt changed");
         if (first.promptHash !== hash(input.prompt) || first.systemHash !== hash(system) || r.systemHash !== first.systemHash || r.model !== MODEL
@@ -104,7 +107,8 @@ const noise = firstRows.filter(r => REPEAT_CASES.includes(r.case)).map(a => {
     return { key: `${a.case}:${a.fact}`, actions: triple.map(r => `${r.action}${r.target ? ` #${r.target}` : ""}`), grades: triple.map(r => r.grade),
         stableAction: new Set(triple.map(r => `${r.action}:${r.target ?? ""}`)).size === 1, stableGrade: new Set(triple.map(r => r.grade)).size === 1 };
 });
-const summary = { cases: runs.length, decisions: rows.length, passSummaries, baselineWrong, baselineConcern, noise, rows, reviewHashes };
+const summary = { cases: runs.length, decisions: rows.length, passSummaries, baselineWrong, baselineConcern, noise, rows, reviewHashes,
+    estimatedSecondPromptTokens: { v1: originalSecondPromptTokens, v2: v2SecondPromptTokens } };
 save("v2-summary.json", summary);
 const esc = (s: string) => s.replace(/\|/g, "\\|").replace(/\n/g, " ");
 for (const pass of ["A", "B", "C"]) writeFileSync(join(root, `v2-ledger-${pass}.md`), ["| Case:fact | Effective decision | Grade | Proposed grade / gate | Reason |", "| --- | --- | --- | --- | --- |",

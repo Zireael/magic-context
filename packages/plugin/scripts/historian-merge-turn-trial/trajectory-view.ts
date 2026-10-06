@@ -65,11 +65,14 @@ function renderV2(index: number): string {
         const reply = readJson(join(dir, `${index}-turn2.json`));
         const prior = readJson(join(dir, `${index}-prior.json`));
         const decisions = readJson(join(dir, `${index}-decisions.json`));
+        const observed = JSON.parse(reply.text.trim().replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, ""));
         const judgmentPath = join(root, `v2-judgments-${pass}.json`);
         const reviewed = existsSync(judgmentPath) ? readJson(judgmentPath).decisions : [];
         const rows = candidates.facts.map((fact: { category: string; content: string }, i: number) => {
             const gate = decisions.gates.find((g: { proposed: { fact: number } }) => g.proposed.fact === i + 1);
-            const d = gate.proposed;
+            // Invalid batches are never repaired for execution. Display raw
+            // proposals by output position, separately from the safe fallback.
+            const d = decisions.schemaError ? observed[i] : gate.proposed;
             const j = reviewed.find((r: { case: number; fact: number }) => r.case === index && r.fact === i + 1);
             const matches = candidates.matches[i].map((m: any, rank: number) => `<tr${m.id === d.target ? ' class="target"' : ""}><td>${rank + 1}</td><td>#${m.id}</td><td>${escape(m.category)}</td><td>${escape(m.source_type)}</td><td>${((candidates.before - m.created_at) / 86400000).toFixed(1)} days</td><td>${m.hybridScore.toFixed(6)}</td><td>${escape(m.content)}</td></tr>`).join("");
             return `<section class="fact"><h4>V2 fact ${i + 1} · ${escape(fact.category)}</h4><p>${escape(fact.content)}</p>
@@ -83,6 +86,7 @@ ${d.text ? block("Complete proposed rewrite", d.text, true) : ""}
 ${j?.proposedGrade ? `<p><b>Reviewer (proposed):</b> ${escape(j.proposedGrade)}</p>` : ""}</section>`;
         }).join("\n");
         return `<h3>V2 pass ${pass} · independently imported first-turn exchange</h3><p>Prior mode: ${escape(prior.mode)}; recorded first run ${escape(prior.firstRunId)}. Neither the v1 second turn nor any other v2 answer is in this lineage.</p>
+${decisions.schemaError ? `<p class="judgment grade-wrong"><b>Batch schema rejection:</b> ${escape(decisions.schemaError)}. Raw proposals below are linked by array position for review only, not repaired or accepted decisions. Every effective action is new.</p>` : ""}
 ${block("V2 second-turn user prompt", candidates.prompt)}
 <p class="meta">${reply.usage.input_tokens.toLocaleString("en-US")} uncached input · ${(reply.usage.cached_input_tokens ?? 0).toLocaleString("en-US")} reported cached input (absent means unknown) · ${reply.usage.output_tokens.toLocaleString("en-US")} output · ${(reply.durationMs / 1000).toFixed(1)} s</p>
 ${block("V2 raw second-turn reply", reply.text)}${rows}`;
