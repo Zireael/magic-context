@@ -767,6 +767,8 @@ export function applyRustModeDeferredCompactionMarker(args: {
      * write alone does not permit changing the compaction marker.
      */
     cacheBustingPass: boolean;
+    /** False keeps the pending target without attempting an unadmitted host cut. */
+    admissionProven?: boolean;
     /** Block replay of the previous request before the host may omit earlier history. */
     beforeApply?: () => void;
     /** Report whether the marker moved, or may have moved, before later state writes can fail. */
@@ -850,6 +852,9 @@ export function applyRustModeDeferredCompactionMarker(args: {
 
     const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
     if (!pending) return;
+    // Record the latest target above even when this pass cannot prove the cut safe.
+    // Deferral does not spend retry attempts or arm the post-cut replay fence.
+    if (args.admissionProven === false) return;
     const trustedBoundary =
         boundary &&
         pending.ordinal === boundary.ordinal &&
@@ -1015,6 +1020,7 @@ export function runRustModePostprocess(args: {
     projectPath?: string;
     sessionDirectory?: string;
     materializedBoundary?: RustMaterializedCompactionBoundary;
+    markerAdmissionProven?: boolean;
     beforeMarkerApply?: () => void;
     afterMarkerApply?: (outcome: MarkerUpdateOutcome) => void;
     compactionMarkerStrategy?: CompactionMarkerStrategy;
@@ -1092,6 +1098,7 @@ export function runRustModePostprocess(args: {
     if (args.cacheBustingPass) {
         applyRustModeDeferredCompactionMarker({
             cacheBustingPass: true,
+            admissionProven: args.markerAdmissionProven,
             beforeApply: args.beforeMarkerApply,
             afterApply: args.afterMarkerApply,
             ...(args.compactionMarkerStrategy

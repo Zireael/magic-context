@@ -15,6 +15,7 @@ import { updateSessionMeta } from "../features/magic-context/storage-meta-sessio
 import { DegradedPassRefusalError } from "../hooks/magic-context/degraded-pass-refusal";
 import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
 import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-replay";
+import { lkgReplayFits, lkgReplayLimit } from "../hooks/magic-context/lkg-replay-fit";
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import {
@@ -472,10 +473,43 @@ export function createMessagesTransformHandler(args: {
                                           resolvedProviderID: keys.providerKey ?? undefined,
                                       }),
                         });
+                        // TypeScript mode has no Rust result to check, but replaying
+                        // the saved request for a known model still has to pass the
+                        // same fit check as Rust mode: measured size of the saved
+                        // request plus an estimate for the messages added since.
+                        let tsFit = true;
+                        if (replay.ok && !rust && keys.providerKey && keys.modelKey) {
+                            const model = {
+                                providerID: keys.providerKey,
+                                modelID: keys.modelKey.slice(keys.providerKey.length + 1),
+                            };
+                            if (
+                                lkgReplayLimit({
+                                    db,
+                                    sessionId,
+                                    model,
+                                    modelKey: keys.modelKey,
+                                }) !== undefined
+                            ) {
+                                const fit = lkgReplayFits({
+                                    db,
+                                    sessionId,
+                                    messages: replay.messages,
+                                    model,
+                                    modelKey: keys.modelKey,
+                                    systemPromptTokens: getOrCreateSessionMeta(db, sessionId)
+                                        .systemPromptTokens,
+                                    agentName: agent,
+                                });
+                                tsFit = fit.fits;
+                                if (!fit.fits && fit.detail) sessionLog(sessionId, fit.detail);
+                            }
+                        }
                         if (
                             replay.ok &&
-                            rust &&
-                            !rust.replayFits(sessionId, replay.messages, inputMessages)
+                            (!tsFit ||
+                                (rust &&
+                                    !rust.replayFits(sessionId, replay.messages, inputMessages)))
                         ) {
                             replayBlocked = true;
                             sessionLog(sessionId, "lkg_replay_does_not_fit");

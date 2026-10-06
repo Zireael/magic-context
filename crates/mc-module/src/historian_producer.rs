@@ -2345,7 +2345,12 @@ mod tests {
         assert!(client.command_route.is_none());
         assert!(client.subscribe_route.is_none());
         client.purge_session("another-snapshot").await.unwrap_err();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Goodbye frames reach the fake server asynchronously; a loaded runner can
+        // take longer than a fixed sleep, so wait for both with a deadline.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.log.lock().await.goodbyes.len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let log = server.log.lock().await;
         assert_eq!(log.route_sessions, vec!["mc-dreamer:classify:snapshot"; 2]);
         assert_eq!(log.goodbyes, vec![11, 10]);

@@ -85,6 +85,11 @@ import {
     ENGINE_RECONNECTING_USER_MESSAGE,
 } from "./emergency-fail-closed";
 import { getVisibleMemoryIds } from "./inject-compartments";
+import {
+    beginV2LkgRequest,
+    clearLkgMeasuredRequest,
+    noteLkgProviderResponse,
+} from "./lkg-measured-request";
 import { createDbLkgPersistence, loadPersistedLkgSlot } from "./lkg-persist";
 import * as lkgSlot from "./lkg-slot";
 import { getSlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
@@ -350,6 +355,9 @@ describe("Rust mode authority adapter", () => {
         fault: "fence" | "after-marker" | "capture" | "bookkeeping" | "host-lock-capture",
         queueOldCapture = false,
         noCutOutcome?: MarkerUpdateOutcome,
+        admissionEstimator?: Parameters<
+            typeof createRustModeTransform
+        >[1]["rawFallbackEstimatorForTests"],
     ) {
         const sid = `marker-admission-${fault}-${Date.now()}`;
         sessions.push(sid);
@@ -469,6 +477,7 @@ describe("Rust mode authority adapter", () => {
             };
             return createRustModeTransform(deps, {
                 moduleClient,
+                rawFallbackEstimatorForTests: admissionEstimator,
                 ...(queueOldCapture
                     ? {
                           scheduleLkgCapture: (capture: () => void) => {
@@ -818,6 +827,91 @@ describe("Rust mode authority adapter", () => {
         expect(listSessionCompactionMarkers(sid)).toHaveLength(0);
         expect(isRustMarkerAdmissionFenced(db, sid)).toBe(false);
     });
+
+    it("serves a rebuilding output above the fixed prompt floor without cutting, then cuts when room returns", async () => {
+        const fixture = markerFaultFixture("capture");
+        const log = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            fixture.stopFault();
+            await fixture.serve();
+            updateSessionMeta(fixture.db, fixture.sid, { systemPromptTokens: 1_000 });
+            recordDetectedContextLimit(fixture.db, fixture.sid, 1_000, "test-provider/test-model");
+            recordToolDefinition(
+                "test-provider",
+                "test-model",
+                undefined,
+                "large-tool",
+                "schema ".repeat(1_000),
+                {
+                    type: "object",
+                },
+            );
+
+            // The fixed system/tool floor exceeds this window even after the engine folds.
+            // Failure to admit an optional host cut must not reject the fresh engine output.
+            const served = await fixture.serve();
+            expect(served).toContain("new admitted prefix");
+            expect(fixture.markerOutcomes).toHaveLength(0);
+            expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(0);
+            expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(fixture.db, fixture.sid)?.jsonPrefix).toBe(served);
+            const pending = getPendingCompactionMarkerState(fixture.db, fixture.sid);
+            expect(pending).toMatchObject({ ordinal: 1, endMessageId: "m1" });
+            const deferrals = log.mock.calls.filter((call) =>
+                String(call[1]).startsWith("rust compaction-marker admission deferred:"),
+            );
+            expect(deferrals).toHaveLength(1);
+            expect(deferrals[0]?.[1]).toContain("fit=over");
+            expect(deferrals[0]?.[1]).toContain("limit=1000");
+            expect(deferrals[0]?.[1]).toMatch(/estimated=\d+ trusted=true proxy_tokens=\d+/);
+
+            fixture.setDeferredRebuild(true);
+            expect(await fixture.serve()).toContain("new admitted prefix");
+            expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)).toEqual(pending);
+            expect(fixture.markerOutcomes).toHaveLength(0);
+
+            recordDetectedContextLimit(
+                fixture.db,
+                fixture.sid,
+                200_000,
+                "test-provider/test-model",
+            );
+            fixture.setDeferredRebuild(false);
+            expect(await fixture.serve()).toContain("new admitted prefix");
+            expect(fixture.markerOutcomes.at(-1)?.kind).toBe("applied");
+            expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(1);
+            expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+        } finally {
+            log.mockRestore();
+            fixture.dispose();
+        }
+    });
+    for (const unavailable of ["untrusted", "throwing"] as const) {
+        it(`serves fresh output and retains the pending cut with an ${unavailable} admission estimate`, async () => {
+            const fixture = markerFaultFixture("capture", false, undefined, () => {
+                if (unavailable === "throwing") throw new Error("tokenizer unavailable");
+                return {
+                    tokens: 1,
+                    trusted: false,
+                    messageTokens: { conversation: 1, toolCall: 0 },
+                    systemTokens: 0,
+                };
+            });
+            try {
+                fixture.stopFault();
+                await fixture.serve();
+                expect(await fixture.serve()).toContain("new admitted prefix");
+                expect(fixture.markerOutcomes).toHaveLength(0);
+                expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)?.ordinal).toBe(1);
+                expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(0);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            } finally {
+                fixture.dispose();
+            }
+        });
+    }
     it("retains pending indexed markers while a healthy SOFT+ serves the frozen representation", async () => {
         const sessionId = `rust-frozen-marker-${Date.now()}`;
         sessions.push(sessionId);
@@ -7713,6 +7807,81 @@ describe("rust-mode wire transport (protected_tokens_effective)", () => {
         expect(transformBodies[0]?.protected_tokens_effective).toBe(10_240);
     });
 });
+
+for (const host of ["v1", "v2"] as const) {
+    it(`${host} Rust failure serves measured 633258 LKG plus a small tail instead of inflated 912733`, async () => {
+        const sessionId = `measured-rust-replay-${host}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        const modelKey = "test-provider/test-model";
+        if (host === "v1")
+            noteLkgProviderResponse({ sessionId, modelKey, responseId: "reply", inputTokens: 0 });
+        else beginV2LkgRequest(sessionId, modelKey, "previous-reply");
+        let failing = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (failing) throw new Error("rust module request timed out");
+                return {
+                    decision: "HARD",
+                    row_version: 1,
+                    native_messages: structuredClone(input),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            rawFallbackEstimatorForTests: () => ({
+                tokens: 912_733,
+                trusted: true,
+                messageTokens: { conversation: 900_000, toolCall: 0 },
+                systemTokens: 100,
+                toolDefinitionTokens: 12_633,
+            }),
+        });
+        const meta = makeMeta(db, sessionId);
+        recordDetectedContextLimit(db, sessionId, 872_000, modelKey);
+        await transform.run(sessionId, input, { messages: [...input] }, meta);
+        const saved = getSlot(sessionId)!;
+        expect(saved).toBeDefined();
+        noteLkgProviderResponse({
+            sessionId,
+            modelKey,
+            responseId: "reply",
+            inputTokens: 633_258,
+            finish: "stop",
+            completedAt: Date.now() + 1,
+            ...(host === "v2" ? { v2: true, createdAt: Date.now() + 1 } : {}),
+        });
+        const next: MessageLike[] = [
+            ...input,
+            {
+                info: { id: "reply", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "small reply" }],
+            } as MessageLike,
+            {
+                info: {
+                    id: "next",
+                    role: "user",
+                    sessionID: sessionId,
+                    model: { providerID: "test-provider", modelID: "test-model" },
+                },
+                parts: [{ type: "text", text: "continue" }],
+            } as MessageLike,
+        ];
+        failing = true;
+        const output = { messages: structuredClone(next) as unknown[] };
+        await transform.run(sessionId, next, output, meta);
+        expect(output.messages).toEqual([
+            ...JSON.parse(saved.jsonPrefix),
+            ...next.slice(input.length),
+        ]);
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        clearLkgMeasuredRequest(sessionId);
+    });
+}
 
 it("refuses a tiny untrusted fallback estimate instead of treating the byte proxy as fit proof", async () => {
     const sessionId = "fit-incomplete-fallback";

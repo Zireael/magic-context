@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
-
 import {
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
@@ -92,6 +91,11 @@ import {
     estimateFinalWireInputTokens,
 } from "./final-wire-token-estimate";
 import { createHistorianHostRunner } from "./historian-host-runner";
+import {
+    claimLkgRequestIdentity,
+    type LkgRequestIdentity,
+    noteCapturedLkgRequest,
+} from "./lkg-measured-request";
 import { clearPersistedLkgSlotStrict, saveLkgSlotToDb } from "./lkg-persist";
 import {
     coldStartRawServedIndex,
@@ -103,6 +107,7 @@ import {
     lkgReplayFits,
     lkgReplayLimit,
     measureLkgReplay,
+    measureLkgReplayRequest,
     RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN,
 } from "./lkg-replay-fit";
 import {
@@ -291,6 +296,9 @@ interface RustLkgCapturePlan {
     capturedAt: number;
     rowVersion: number;
     captureSequence: number;
+    requestIdentity?: LkgRequestIdentity;
+    systemPromptTokens: number;
+    agentName?: string;
 }
 
 interface RustWireCache {
@@ -2247,6 +2255,7 @@ export function createRustModeTransform(
         inputSnapshots: readonly Pick<MessageContentSnapshot, "fields">[],
         nativeMessages: readonly unknown[],
         responseRowVersion: number,
+        systemPromptTokens: number,
     ): RustLkgCapturePlan | null => {
         state.lkgCaptureSequence += 1;
         if (
@@ -2269,6 +2278,9 @@ export function createRustModeTransform(
             capturedAt: Date.now(),
             rowVersion: responseRowVersion,
             captureSequence: state.lkgCaptureSequence,
+            requestIdentity: claimLkgRequestIdentity(sessionId),
+            systemPromptTokens,
+            agentName: deps.getNotificationParams?.(sessionId)?.agent,
         };
     };
 
@@ -2333,6 +2345,13 @@ export function createRustModeTransform(
             captureSequence: plan.captureSequence,
             rowVersion: plan.rowVersion,
         };
+        noteCapturedLkgRequest({
+            sessionId: plan.sessionId,
+            slot,
+            request: plan.requestIdentity,
+            systemPromptTokens: plan.systemPromptTokens,
+            agentName: plan.agentName,
+        });
         options.onLkgCaptureForTests?.(reusedPrefix);
         // Durability across restarts: store the exact accepted snapshot (the
         // jsonPrefix string is reused as-is, never re-serialized). Best-effort —
@@ -2573,19 +2592,18 @@ export function createRustModeTransform(
         };
         // The measurement every last-known-good replay is admitted with (see
         // `measureLkgReplay`), here with this pass's model and estimator.
-        const measureAgainstLimit = (candidate: readonly unknown[], limit: number): FrozenFit =>
-            measureLkgReplay({
+        const measureOutputAgainstLimit = (candidate: readonly unknown[], limit: number) =>
+            measureLkgReplayRequest({
+                sessionId,
                 messages: candidate as MessageLike[],
                 limit,
-                estimate: () =>
-                    rawFallbackEstimator({
-                        messages: candidate as MessageLike[],
-                        systemPromptTokens: sessionMeta.systemPromptTokens,
-                        providerID: model?.providerID,
-                        modelID: model?.modelID,
-                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
-                    }),
-            }).fit;
+                model,
+                systemPromptTokens: sessionMeta.systemPromptTokens,
+                agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                estimator: rawFallbackEstimator,
+            });
+        const measureAgainstLimit = (candidate: readonly unknown[], limit: number): FrozenFit =>
+            measureOutputAgainstLimit(candidate, limit).fit;
         /**
          * Admission for a healthy pass that would serve the frozen replay `candidate`
          * instead of `moduleOutput`. Returns a release reason when the frozen bytes no
@@ -3915,21 +3933,26 @@ export function createRustModeTransform(
                     !sessionMeta.isSubagent &&
                     (materializedBoundary !== undefined ||
                         getPendingCompactionMarkerState(deps.db, sessionId) !== null);
+                let markerAdmissionProven = true;
                 if (markerCandidate) {
                     const ids = messages.map((message) => message.info.id);
-                    if (
-                        ids.length === 0 ||
-                        ids.some((id) => typeof id !== "string") ||
-                        new Set(ids).size !== ids.length ||
-                        pendingWireCache.rawContentSnapshots.length !== ids.length
-                    ) {
-                        throw new RustTransformProtocolError(
-                            "rust transform wire invariant failed: cannot prepare coherent priced capture inputs before marker application",
-                        );
-                    }
-                    if (measureAgainstLimit(moduleMessages, contextLimit) !== "under") {
-                        throw new RustTransformProtocolError(
-                            "rust transform wire invariant failed: native output admission was not proven before marker application",
+                    const coherentInputs =
+                        ids.length > 0 &&
+                        ids.every((id) => typeof id === "string") &&
+                        new Set(ids).size === ids.length &&
+                        pendingWireCache.rawContentSnapshots.length === ids.length;
+                    const measure = measureOutputAgainstLimit(moduleMessages, contextLimit);
+                    markerAdmissionProven = coherentInputs && measure.fit === "under";
+                    if (!markerAdmissionProven) {
+                        // A host cut is optional. Retain its pending target and serve the
+                        // fresh engine output when local fit/capture proof is unavailable.
+                        // Only a fault after a possible cut may fence this representation.
+                        sessionLog(
+                            sessionId,
+                            `rust compaction-marker admission deferred: reason=${coherentInputs ? "output_fit" : "capture_inputs"} fit=${measure.fit} ` +
+                                `estimated=${measure.tokens ?? "unavailable"} trusted=${measure.trusted} ` +
+                                `proxy_tokens=${measure.proxy ? Math.ceil(measure.proxy.bytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN) : "unavailable"} ` +
+                                `proxy_bytes=${measure.proxy?.bytes ?? "unavailable"} limit=${contextLimit}`,
                         );
                     }
                 }
@@ -4081,6 +4104,7 @@ export function createRustModeTransform(
                         projectPath: memoryProjectPath,
                         sessionDirectory: directory,
                         materializedBoundary,
+                        markerAdmissionProven,
                         beforeMarkerApply: () => {
                             if (!markerAdmissionRecovery) markerSafeSnapshot = getSlot(sessionId);
                             markerOriginalMessages = messages.slice();
@@ -4217,6 +4241,7 @@ export function createRustModeTransform(
                     pendingWireCache.rawContentSnapshots,
                     output.messages,
                     rowVersion,
+                    sessionMeta.systemPromptTokens,
                 );
                 let captureMode = "async";
                 if (capturePlan) state.lkgLastServedCaptureSequence = capturePlan.captureSequence;

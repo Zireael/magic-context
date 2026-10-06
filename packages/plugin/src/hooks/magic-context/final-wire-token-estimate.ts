@@ -451,6 +451,37 @@ export function estimateFinalWireInputTokens(
     };
 }
 
+/** A measured request already paid for its envelope; estimate only new messages. */
+export function estimateAppendedWireTokens(
+    input: Pick<FinalWireTokenEstimateInput, "messages" | "providerID" | "modelID">,
+): FinalWireTokenEstimate {
+    const messageTokens = input.messages.reduce<MessageTokenEstimate>(
+        (total, message) => {
+            const next = estimateMessageTokens(message);
+            total.conversation += next.conversation;
+            total.toolCall += next.toolCall;
+            return total;
+        },
+        { conversation: 0, toolCall: 0 },
+    );
+    const tokens = providerMass(
+        { prose: messageTokens.conversation, tools: messageTokens.toolCall },
+        resolveDecisionCalibration(input.providerID, input.modelID),
+        true,
+    );
+    return {
+        tokens,
+        trusted:
+            hasTokenizerForFit() &&
+            Number.isFinite(tokens) &&
+            tokens >= 0 &&
+            input.messages.every(hasCountableParts),
+        messageTokens,
+        systemTokens: 0,
+        toolDefinitionTokens: 0,
+    };
+}
+
 function hasCountableParts(message: MessageLike): boolean {
     return message.parts.every((part) => {
         if (!part || typeof part !== "object") return false;
