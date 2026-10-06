@@ -64,6 +64,10 @@ import {
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import type { Tagger } from "../../features/magic-context/tagger";
+import {
+    freezeTemporalDecisions,
+    getTemporalDecisions,
+} from "../../features/magic-context/temporal-decisions";
 import type { SessionMeta, TagEntry } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
@@ -182,6 +186,7 @@ import {
     type TailHygieneStructuralSignature,
     tailHygieneStructuralSignature,
 } from "./tail-hygiene-walk";
+import { injectTemporalMarkers } from "./temporal-awareness";
 import { buildSyntheticTodoPart, isSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
 import {
     advanceToolReclaimWatermarkToCurrentMax,
@@ -1574,6 +1579,9 @@ interface RunPostTransformPhaseArgs {
     thinkingBindingRecoveryEnabledForModel?: boolean;
     /** Raw harness observations captured before any Magic Context insertion or sentinelization. */
     trailingBlankSourceDecisions?: TrailingBlankSourceDecisions;
+    temporalCandidates?: ReadonlyMap<string, string>;
+    temporalReplayIds?: readonly string[];
+    temporalObservedDecisions?: ReadonlyMap<string, string>;
     passOutcome?: PassOutcome;
     historyRefreshSessions?: Set<string>;
     m0M1?: {
@@ -2089,6 +2097,34 @@ export async function runPostTransformPhase(
     // Every first-application lane and m[1] refresh uses this same permission.
     // It authorizes mutation; individual lanes may still find no eligible work.
     const isCacheBustingPass = publishedWorkDrainAllowed;
+    const previousTemporalDecisions =
+        args.temporalCandidates && !compactionOff
+            ? new Map([
+                  ...(args.temporalObservedDecisions ?? []),
+                  ...getTemporalDecisions(
+                      args.db,
+                      args.sessionId,
+                      args.temporalReplayIds ?? args.temporalCandidates.keys(),
+                  ),
+              ])
+            : undefined;
+    const temporalDecisions =
+        args.temporalCandidates && !compactionOff
+            ? isCacheBustingPass
+                ? new Map([
+                      ...(previousTemporalDecisions ?? []),
+                      ...freezeTemporalDecisions(args.db, args.sessionId, args.temporalCandidates),
+                  ])
+                : previousTemporalDecisions
+            : undefined;
+    const temporalInjected = temporalDecisions
+        ? injectTemporalMarkers(args.messages, temporalDecisions)
+        : 0;
+    const temporalFirstApplication =
+        temporalInjected > 0 &&
+        [...(temporalDecisions ?? [])].some(
+            ([id, marker]) => marker && !previousTemporalDecisions?.has(id),
+        );
     // A permission deny known before the first freeze already made the verdict
     // "unavailable" (see primeCtxReduceSpawnPermission). A deny added after the
     // freeze cannot flip it without rewriting the cached prefix, so observe the
@@ -2223,6 +2259,7 @@ export async function runPostTransformPhase(
         firstApplicationEdits.any = true;
         firstApplicationEdits.beforeNewerThinking ||= beforeNewerThinking;
     };
+    if (temporalFirstApplication) recordFirstApplicationWireEdit(true);
     const firstApplicationLocations = new Map<MessageLike, number>();
     const recordFirstApplicationAt = (message: MessageLike, partIndex: number): void => {
         recordFirstApplicationWireEdit(false);
@@ -3844,6 +3881,9 @@ export async function runPostTransformPhase(
     }
 
     const tFinalRepresentation = performance.now();
+    // Drops and compression may restore a raw body. Restore the same frozen
+    // prefix after those edits, without consulting the new seam neighbours.
+    if (temporalDecisions) injectTemporalMarkers(args.messages, temporalDecisions);
     const finalRepresentation = finalizeMessageRepresentation(
         args.messages,
         args.resolvedProviderID,

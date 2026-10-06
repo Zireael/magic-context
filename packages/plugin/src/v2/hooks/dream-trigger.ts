@@ -3,7 +3,7 @@ import { buildDreamTaskRuntimeConfigs } from "../../features/magic-context/dream
 import { createDreamTaskExecutor } from "../../features/magic-context/dreamer/task-executor";
 import { runDueTasksForProject } from "../../features/magic-context/dreamer/task-scheduler";
 import { advanceSessionActivity } from "../../features/magic-context/session-activity";
-import { openDatabase } from "../../features/magic-context/storage";
+import { openCurrentDatabase as openDatabase } from "../../features/magic-context/storage";
 import type { HiddenCompletionExecutor } from "../../hooks/magic-context/compartment-runner-types";
 import { getDataDir } from "../../shared/data-path";
 import { log } from "../../shared/logger";

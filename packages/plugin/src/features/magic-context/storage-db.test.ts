@@ -577,11 +577,11 @@ describe("storage-db", () => {
 
             expect(indexNames).toEqual(
                 expect.arrayContaining([
-                    "idx_tags_session_tag_number",
-                    "idx_pending_ops_session",
-                    "idx_source_contents_session",
-                    "idx_compartments_session",
-                    "idx_compression_depth_session",
+                    "idx_message_fts_rowid_map_session_rowid",
+                    "idx_pending_ops_session_tag_id",
+                    "idx_transform_decisions_retention",
+                    "idx_plugin_messages_session",
+                    "idx_user_memory_candidates_session",
                     "idx_session_facts_session",
                     "idx_notes_session_status",
                     "idx_notes_project_status",
