@@ -5,7 +5,9 @@ import {
     type ProtectionWindowResult,
 } from "../../features/magic-context/protection-window";
 import { parseRangeString } from "../../features/magic-context/range-parser";
+import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import {
+    getActiveTagsBySession,
     getOrCreateSessionMeta,
     getPendingOps,
     getTagsByNumbers,
@@ -29,10 +31,11 @@ export interface CtxReduceToolDeps {
     /**
      * Union projection form: protectedSet (tag-number set form).
      * Coordinate space: tag-number space.
-     * Empty-window behavior: empty set means zero tool tags are protected by the window;
-     * requested drops apply immediately, and non-tool tags are never reclaim targets.
+     * Empty-window behavior: empty set applies no tail hold. Protected-tool
+     * membership still holds queued drops until displacement and a rebuilding pass.
      */
     protectedSet?: ReadonlySet<number> | ((sessionId: string) => ReadonlySet<number>);
+    protectedTools?: Readonly<Record<string, number>>;
     getProtectionWindow?: (sessionId: string) => ProtectionWindowResult;
     floor?: number;
     getSessionTokens?: (sessionId: string) => number;
@@ -152,6 +155,26 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                         if (refusedStampNote) return refusedStampNote;
                         return "All requested tags were already queued or processed. No new action is needed.";
                     }
+                    if (
+                        Array.isArray(record.held_tag_numbers) &&
+                        record.held_tag_numbers.length > 0
+                    ) {
+                        const held = record.held_tag_numbers.filter(
+                            (number): number is number => typeof number === "number",
+                        );
+                        const immediate = Array.isArray(record.immediate_tag_numbers)
+                            ? record.immediate_tag_numbers.filter(
+                                  (number): number is number => typeof number === "number",
+                              )
+                            : [];
+                        const sentence =
+                            held.length === 1
+                                ? `Held: §${held[0]} is inside the protected working set; it applies once newer work displaces it.`
+                                : `Held: ${held.map((id) => `§${id}`).join(", ")} are inside the protected working set; they apply once newer work displaces them.`;
+                        return immediate.length > 0
+                            ? `Queued: drop ${formatIds(immediate)}. ${sentence}`
+                            : sentence;
+                    }
                     // The module owns range parsing and tag canonicalization. Keep the
                     // existing queued acknowledgement shape without reimplementing that
                     // parsing in the OpenCode tool.
@@ -214,6 +237,13 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
             }
 
             const tagStatusMap = new Map(allTags.map((tag) => [tag.tagNumber, tag.status]));
+            protectedSet = new Set([
+                ...protectedSet,
+                ...protectedToolTagNumbers(
+                    getActiveTagsBySession(deps.db, sessionId),
+                    deps.protectedTools,
+                ),
+            ]);
             const inertWhitespaceTagNumbers = new Set(
                 getInertWhitespaceAssistantTags(deps.db, sessionId).map((tag) => tag.tagNumber),
             );

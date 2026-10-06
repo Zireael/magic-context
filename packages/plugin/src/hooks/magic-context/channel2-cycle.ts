@@ -27,7 +27,17 @@ export function rearmChannel2AfterMeasuredCollapse(input: {
     db: Database;
     sessionId: string;
     baseline: Channel2PredicateBaseline;
+    rebuilding: boolean;
+    previous?: Channel2PredicateBaseline;
 }): boolean {
+    // A replay already below the floor is not a new collapse. Preserve legitimate
+    // action-state deltas (queued drops) without rearming from unchanged old data.
+    if (
+        !input.rebuilding &&
+        (!input.previous ||
+            effectiveTailHygiene(input.baseline).u >= effectiveTailHygiene(input.previous).u)
+    )
+        return false;
     if (!input.baseline.evaluable || input.baseline.generationInvalidated) return false;
     if (effectiveTailHygiene(input.baseline).u >= CHANNEL1_FLOOR_TOKENS) return false;
     return casChannel2NudgeState(input.db, input.sessionId, "delivered", "");

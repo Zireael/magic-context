@@ -1,20 +1,61 @@
-/** Number of recent ctx_reduce arcs retained as visible housekeeping exemplars. */
-export const CTX_REDUCE_KEEP = 3;
+import {
+    type DecisionCalibration,
+    providerMass,
+} from "../../hooks/magic-context/decision-calibration";
+import {
+    DEFAULT_PROTECTED_TOOLS,
+    mergeProtectedTools,
+    normalizeProtectedToolName,
+} from "../../shared/protected-tools-policy";
+import type { TagEntry } from "./types";
 
-/**
- * Return the tag numbers of the newest visible ctx_reduce arcs.
- *
- * Callers supply their active tool population so every reclaim lane protects the
- * same exemplars even when its other eligibility rules differ.
- */
-export function newestCtxReduceTagNumbers(
-    tags: readonly { tagNumber: number; toolName: string | null }[],
+export {
+    DEFAULT_PROTECTED_TOOLS,
+    mergeProtectedTools,
+    normalizeProtectedToolName,
+} from "../../shared/protected-tools-policy";
+/** Default exemplar count, retained for fixtures that describe shipped policy. */
+export const CTX_REDUCE_KEEP = DEFAULT_PROTECTED_TOOLS.ctx_reduce;
+
+/** Keep the adopted policy stable while recency rotates inside its keep counts. */
+export function adoptedProtectedToolsPolicy(
+    current: Readonly<Record<string, number>> | undefined,
+    previous: Readonly<Record<string, number>> | undefined,
+    rebuilding: boolean,
+    hasBaseline: boolean,
+): Record<string, number> {
+    if (rebuilding || !hasBaseline) return mergeProtectedTools(current);
+    // Older baselines excluded ctx_reduce coordination state, but not todowrite.
+    return { ...(previous ?? { todowrite: 0, ctx_reduce: 3 }) };
+}
+
+/** Snapshot once per selection, before any lane mutates status. Inactive results
+ * never occupy the window, and tag ordinals make rotation deterministic. */
+export function protectedToolTagNumbers(
+    tags: readonly { tagNumber: number; toolName: string | null; status?: string; type?: string }[],
+    protectedTools?: Readonly<Record<string, number>>,
 ): Set<number> {
-    return new Set(
-        tags
-            .filter((tag) => tag.toolName === "ctx_reduce")
-            .sort((left, right) => right.tagNumber - left.tagNumber)
-            .slice(0, CTX_REDUCE_KEEP)
-            .map((tag) => tag.tagNumber),
+    const counts = mergeProtectedTools(protectedTools);
+    const protectedTags = new Set<number>();
+    for (const tag of [...tags].sort((left, right) => right.tagNumber - left.tagNumber)) {
+        if (tag.status !== undefined && tag.status !== "active") continue;
+        if (tag.type !== undefined && tag.type !== "tool") continue;
+        const name = normalizeProtectedToolName(tag.toolName);
+        if (!Object.hasOwn(counts, name) || counts[name] <= 0) continue;
+        protectedTags.add(tag.tagNumber);
+        counts[name] -= 1;
+    }
+    return protectedTags;
+}
+export function protectedToolTokenCount(
+    tags: readonly TagEntry[],
+    counts?: Readonly<Record<string, number>>,
+    calibration?: DecisionCalibration,
+): number {
+    const protectedTags = protectedToolTagNumbers(tags, counts);
+    const tokens = tags.reduce(
+        (sum, tag) => sum + (protectedTags.has(tag.tagNumber) ? (tag.tokenCount ?? 0) : 0),
+        0,
     );
+    return calibration ? providerMass({ tools: tokens }, calibration, true) : tokens;
 }

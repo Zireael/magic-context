@@ -4149,7 +4149,11 @@ export function createRustModeTransform(
                         cacheBustingPass,
                     });
                 }
-                if (passInputs.emergency_recovery_armed === true) {
+                if (
+                    passInputs.emergency_recovery_armed === true ||
+                    cacheBustingPass ||
+                    response.scheduler_decision === "execute"
+                ) {
                     servedFinalWireEstimate = estimateFinalWireInputTokens({
                         messages: appliedMessages as MessageLike[],
                         systemPromptTokens: sessionMeta.systemPromptTokens,
@@ -4157,6 +4161,16 @@ export function createRustModeTransform(
                         modelID: model?.modelID,
                         agentName: deps.getNotificationParams?.(sessionId)?.agent,
                     });
+                    const refusal = outgoingContextRefusal(
+                        servedFinalWireEstimate,
+                        resolvedWindowGeometry?.usableHard ?? resolvedContextLimit,
+                        protectedToolTokenCount(
+                            getActiveTagsBySession(deps.db, sessionId),
+                            deps.protectedTools,
+                            resolveDecisionCalibration(model?.providerID, model?.modelID),
+                        ),
+                    );
+                    if (refusal) throw contextRefusalError(refusal);
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
                 // output.messages commonly aliases the raw input array, so preserve the entry ids
@@ -4516,6 +4530,13 @@ export function createRustModeTransform(
                 throw new EmergencyFailClosedError(error.message, { cause: error });
             }
             const migration = singleStoreMigrationRequiredFailure(error);
+            const protectedRefusal = protectedToolRefusal(error);
+            if (protectedRefusal || error instanceof EmergencyFailClosedError) {
+                decision = "error";
+                servedFrom = "refused";
+                finishPass(false, false);
+                throw protectedRefusal ?? error;
+            }
             if (migration) {
                 decision = "error";
                 materializeReason = migration.code;
@@ -4744,3 +4765,12 @@ export const __rustModeTransformTest = {
     createRustModeTransform,
     directiveTextOf,
 };
+
+import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
+import { getActiveTagsBySession } from "../../features/magic-context/storage";
+import { resolveDecisionCalibration } from "./decision-calibration";
+import {
+    contextRefusalError,
+    outgoingContextRefusal,
+    protectedToolRefusal,
+} from "./emergency-fail-closed";

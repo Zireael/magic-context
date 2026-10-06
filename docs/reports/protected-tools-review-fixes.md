@@ -1,0 +1,89 @@
+# Protected tool cache-review corrections
+
+Refusal code: `protected_tool_results_over_limit`
+
+Refusal message: `The tool results kept by protected_tools are larger than this model's context window, so this turn was not sent. Lower the protected_tools counts.`
+
+These are a public contract. TypeScript and Rust each define the production text
+once and test it against `protected-tool-refusal.json`. OpenCode 1, OpenCode 2,
+Pi/OMP and Claude Code share that text. The message deliberately avoids language
+that Claude Code could interpret as an instruction to compact.
+
+## Trusted over-limit refusal
+
+The healthy send paths now refuse complete over-limit outgoing estimates after
+reclaim, including successful no-op reclaim. Partial estimates do not originate
+a refusal. A request still over the limit for other reasons gets an explanatory
+post-reclaim refusal rather than incorrectly attributing all its mass to tools.
+
+The Rust-mode OpenCode adapter checks its final returned array, not the module's
+ingress estimate, before installation/LKG capture. Typed native protected-tool
+errors also bypass fallback and LKG replay. Pi measures its final array with a
+complete current system/tool envelope and only guards priced/reclaim passes.
+
+ck-mc counts protected result mass remaining after the actual fold's coverage
+trim. Its native lower-bound guard requires the current request's
+`usage.final_wire_trusted`, a positive model hard limit, and calibrated protected
+mass above that limit; stale persisted trust is insufficient. No module wire
+schema was added. Its Claude Code handler returns `HandlerOutcome::Error` with
+the exact code and message above, no sendable/passthrough response, and no
+transform-state commit. The handler regression exercises the real Claude Code
+profile and route config; an untrusted-count control remains admitted.
+
+THALAMUS owns the gateway mapping/test in its own repository. This delivery
+does not claim an end-to-end gateway proof. The agreed gateway behavior is a
+terminal HTTP 400 displaying the module's message verbatim, not a passthrough.
+
+The refusal guards were mutation-checked: disabling the shared outgoing guard
+reddened the impossible-reclaim regression, the Pi context-handler refusal,
+and the Rust-mode final-wire refusal. The Rust-mode typed-error/no-replay control
+remained green. Disabling ck-mc's native lower-bound guard reddened the Claude
+Code handler regression. All breaks were staged safely, restored, and rerun green.
+
+Verification: Bun 1.4.2, TypeScript 5.9.3; plugin and Pi typechecks pass. The
+postprocess/refusal/Pi fit suites passed 249 tests initially; focused final
+contract/fit tests passed six, adapter/byte-identity controls three, and the Pi
+handler control one. Cargo 1.99.0 ran 29 protected-behavior tests successfully
+with one build at a time; rustfmt 1.10.0 check passed. A combined full adapter
+invocation exceeded its 20-minute outer bound and is not claimed as passing.
+Its old 2048-message byte-identity fixture was over the former artificial window;
+the fixture now supplies an isolated SDK window large enough for its unchanged
+ballast. Its exact SHA256 assertions remain unchanged and all three pass classes
+pass, while the separate over-limit regression proves refusal.
+
+## Stale result stripping
+
+First detection in OpenCode, Pi and ck-mc consumes the effective per-tool
+selection set. Pi's old hardcoded newest-three selector is removed; its exported
+default-count alias is only fixture metadata. A zero override permits stale
+selection, while custom counts above three hold all requested results. Frozen
+replay is unchanged and cannot resurrect a previously stripped result. The
+design document now describes that distinction accurately.
+
+The two executed review regressions are in the postprocess and Pi cleanup
+suites. A real native transform verifies held detection, a zero-count priced
+strip, and byte-identical frozen replay after protection is restored. All three
+guards were individually neutralized and each exact regression reddened; restored
+checks passed (266 Bun tests and one native integration-style unit test).
+
+## Nudge policy adoption
+
+The frozen baseline now carries the adopted keep-count policy. Recency rotates
+inside that policy on SOFT+, but a changed map is not adopted until rebuilding.
+Legacy baselines without the field retain the old ctx_reduce-three-only policy
+until rebuilding, including the default-only todowrite upgrade. Rust persists
+this optional map inside the existing baseline blob; there is no new table.
+
+An unchanged replay already below the nudge floor is not a new collapse, so it
+does not reset a delivered Channel 2 lease. Existing queued-drop action-state
+collapses remain valid; those are real reductions in actionable mass, not policy
+adoption. Both callers provide the previous baseline for that distinction.
+
+The review's map-edit, legacy-upgrade and rotation cases are in the postprocess
+suite, with Pi equivalents. The native regression activates the Claude Code
+surface and preserves a real raw arc before measuring its old-policy baseline;
+the transition pass intentionally has no actionable U. A restart test verifies
+policy persistence and legacy decoding in mc-store. Neutralizing policy freezing
+reddened the TS/Pi map-edit and upgrade tests and the native policy test;
+neutralizing the no-op lease guard separately reddened TS/Pi lease assertions.
+The TS rotation control stayed green in those runs.

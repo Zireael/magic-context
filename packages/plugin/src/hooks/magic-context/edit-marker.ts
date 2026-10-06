@@ -10,7 +10,7 @@
 // existing skeleton bytes — that path replays on every pass, including flag-off
 // defer passes, so altering it would silently bust the cache for users who never
 // enabled smart-drops. Edit-marker bytes are produced ONLY for `drop_mode =
-// "edit_marker"` rows, which only exist when `smart_drops` is on.
+// "edit_marker"` rows produced by supersession reclaim on cache-rebuilding passes.
 //
 // Determinism / idempotency: callers always start from the ORIGINAL wire part
 // (the transform rebuilds the message array from source every pass), so applying

@@ -96,7 +96,7 @@ import {
 } from "./ctx-reduce-nudge";
 import { DegradedPassRefusalError, degradedPassError } from "./degraded-pass-refusal";
 import { deriveTriggerBudget } from "./derive-budgets";
-import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { contextRefusalError, EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
     historyBudgetPolicyIdentity,
@@ -439,6 +439,7 @@ export interface TransformDeps {
      *  later call supersedes, on top of the age-based auto-drop. Off → messages
      *  sent to the model are byte-identical to the age-based-only behavior. */
     smartDrops?: boolean;
+    protectedTools?: Readonly<Record<string, number>>;
     clearReasoningAge: number;
     /** Commit-cluster historian trigger config (`commit_cluster_trigger`). */
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
@@ -2673,6 +2674,7 @@ export function createTransform(deps: TransformDeps) {
             // the primary agent that spawned them.
             cavemanTextCompression: !reducedMode ? deps.cavemanTextCompression : undefined,
             smartDrops: deps.smartDrops === true,
+            protectedTools: deps.protectedTools,
             // Pass the single resolved provider through to postprocess so every
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
@@ -2737,7 +2739,7 @@ export function createTransform(deps: TransformDeps) {
                   : contextUsage.percentage;
             finalWireEstimate =
                 finalWireEstimate ??
-                (emergencyUsagePercentage >= 95
+                (emergencyUsagePercentage >= 95 || schedulerDecision === "execute"
                     ? estimateFinalWireInputTokens({
                           messages,
                           systemPromptTokens: sessionMeta.systemPromptTokens,
@@ -2867,6 +2869,12 @@ export function createTransform(deps: TransformDeps) {
                 foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
                 finalWireEstimate,
                 providerProvenLimitTokens,
+                contextLimitTokens: boundaryContextLimit,
+                protectedToolTokens: protectedToolTokenCount(
+                    getActiveTagsBySession(db, sessionId),
+                    deps.protectedTools,
+                    resolveDecisionCalibration(modelForBudget?.providerID, modelForBudget?.modelID),
+                ),
             });
             if (emergencyFailClosed.disarm) {
                 clearEmergencyRecovery(db, sessionId);
@@ -2876,6 +2884,9 @@ export function createTransform(deps: TransformDeps) {
                 );
             }
             if (emergencyFailClosed.shouldAbort) {
+                if (emergencyFailClosed.refusalMessage) {
+                    throw contextRefusalError(emergencyFailClosed.refusalMessage);
+                }
                 // The notice must finish before host refusal so recovery instructions survive interruption.
                 try {
                     await host.hostRefusalNotice(
@@ -3289,3 +3300,6 @@ export function resolveHistoryBudgetTokens(
             historyBudgetPercentage,
     );
 }
+
+import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
+import { resolveDecisionCalibration } from "./decision-calibration";

@@ -1328,10 +1328,32 @@ describe("Rust mode authority adapter", () => {
                 call: async ({ method }) =>
                     method === "transform" ? { decision, native_messages: native } : { ok: true },
             };
-            const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+            installAvailabilityDb(sessionId);
+            clearModelsDevCache();
+            await refreshModelLimitsFromApi({
+                config: {
+                    providers: async () => ({
+                        data: {
+                            providers: [
+                                {
+                                    id: "test-provider",
+                                    models: { "test-model": { limit: { context: 4_000_000 } } },
+                                },
+                            ],
+                        },
+                    }),
+                },
+            });
+            const deps = makeDeps(db, moduleClient);
+            deps.getModelKey = () => "test-provider/test-model";
+            const transform = createRustModeTransform(deps, { moduleClient });
             const messages = makeMessages(sessionId);
             const output: { messages: unknown[] } = { messages: [...messages] };
-            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+            const meta = makeMeta(db, sessionId);
+            // This test isolates byte identity, not admission of an oversized
+            // array. Give its 2048-message ballast a window that actually fits.
+            recordDetectedContextLimit(db, sessionId, 4_000_000, "test-provider/test-model");
+            await transform.run(sessionId, messages, output, meta);
             expect(output.messages).toHaveLength(2048);
             const beforeHash = sha(serializedBefore);
             const afterHash = sha(JSON.stringify(output.messages));
@@ -1340,6 +1362,7 @@ describe("Rust mode authority adapter", () => {
             );
             expect(afterHash).toBe(beforeHash);
             expect(JSON.stringify(native)).toBe(serializedBefore);
+            clearModelsDevCache();
         }
     });
 
@@ -8216,4 +8239,56 @@ it("rechecks mural candidates on bootstrap, pressure and flush but not ordinary 
     await run();
     expect(resolutions).toBe(3);
     expect(muralHashes.at(-1)).toBe("c");
+});
+it("Rust-mode final outgoing wire refuses successful no-op reclaim without LKG fallback", async () => {
+    const sid = "rust-mode-final-over-limit";
+    sessions.push(sid);
+    installRawProvider(sid);
+    installAvailabilityDb(sid);
+    const db = makeDb();
+    const messages = makeMessages(sid);
+    messages[0].parts = [{ type: "text", text: "word ".repeat(96000) }];
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method }) =>
+            method === "transform"
+                ? {
+                      decision: "SOFT+",
+                      scheduler_decision: "execute",
+                      row_version: 1,
+                      native_messages: structuredClone(messages),
+                  }
+                : { ok: true },
+    };
+    const runner = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+    const meta = makeMeta(db, sid);
+    recordDetectedContextLimit(db, sid, 16000, "test-provider/test-model");
+    await expect(runner.run(sid, messages, { messages: [...messages] }, meta)).rejects.toThrow(
+        "after reclaim",
+    );
+});
+
+it("Rust-mode typed protected overflow cannot become passthrough or LKG replay", async () => {
+    const sid = "rust-mode-native-protected-refusal";
+    sessions.push(sid);
+    installRawProvider(sid);
+    installAvailabilityDb(sid);
+    const db = makeDb();
+    const moduleClient: RustModeModuleClient = {
+        call: async ({ method }) => {
+            if (method === "transform")
+                throw Object.assign(new Error("module refusal"), {
+                    code: "protected_tool_results_over_limit",
+                });
+            return { ok: true };
+        },
+    };
+    const runner = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+    const messages = makeMessages(sid);
+    await expect(
+        runner.run(sid, messages, { messages: [...messages] }, makeMeta(db, sid)),
+    ).rejects.toMatchObject({
+        code: "protected_tool_results_over_limit",
+        message:
+            "The tool results kept by protected_tools are larger than this model's context window, so this turn was not sent. Lower the protected_tools counts.",
+    });
 });

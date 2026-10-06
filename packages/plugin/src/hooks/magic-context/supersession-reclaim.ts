@@ -1,4 +1,7 @@
-import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
+import {
+    normalizeProtectedToolName,
+    protectedToolTagNumbers,
+} from "../../features/magic-context/reclaim-protection";
 import { type ContextDatabase, getActiveTagsBySession } from "../../features/magic-context/storage";
 import { getRecentTagOwnerMessageIds } from "../../features/magic-context/storage-tags";
 import type { PendingOp } from "../../features/magic-context/types";
@@ -11,12 +14,7 @@ import type { TagTarget } from "./tag-messages";
 // the caller only ACTS on the result inside the existing
 // execute + already-mutating gate, so this never originates a cache bust.
 //
-// Keep-counts are fixed constants (no config sub-knobs):
-//   - todowrite: keep newest 1 (the live plan is the synthetic todowrite we
-//     inject + protect every pass; real ones are older snapshots).
-//   - ctx_reduce: keep the shared newest-K housekeeping exemplars.
-//   - zero-value meta: keep 0 (worthless once executed).
-const TODOWRITE_KEEP = 1;
+// The shared protected-tools snapshot supplies all keep-counts.
 
 /** Preserve tool entries owned by the newest 20 messages as continuation context. */
 export const SUPERSESSION_RECENT_MESSAGE_WINDOW = 20;
@@ -51,6 +49,8 @@ export function buildSupersessionReclaimOps(input: {
     sessionId: string;
     targets: Map<number, TagTarget>;
     pendingOps?: readonly PendingOp[];
+    protectedTools?: Readonly<Record<string, number>>;
+    protectedToolTags?: ReadonlySet<number>;
     recentMessageIds?: ReadonlySet<string>;
     /**
      * Union projection form: protectedTagNumbers (tag-number set form).
@@ -69,23 +69,19 @@ export function buildSupersessionReclaimOps(input: {
         .sort((left, right) => right.tagNumber - left.tagNumber);
 
     const dropTagIds: number[] = [];
-    let todowriteSeen = 0;
-    let ctxReduceSeen = 0;
+    const protectedTags =
+        input.protectedToolTags ?? protectedToolTagNumbers(toolTags, input.protectedTools);
 
     for (const tag of toolTags) {
         if (input.protectedTagNumbers?.has(tag.tagNumber)) {
             continue;
         }
-        const name = tag.toolName;
+        const name = normalizeProtectedToolName(tag.toolName);
         if (!name) continue;
 
         let isTarget = false;
-        if (name === "todowrite") {
-            todowriteSeen += 1;
-            isTarget = todowriteSeen > TODOWRITE_KEEP;
-        } else if (name === "ctx_reduce") {
-            ctxReduceSeen += 1;
-            isTarget = ctxReduceSeen > CTX_REDUCE_KEEP;
+        if (name === "todowrite" || name === "ctx_reduce") {
+            isTarget = true;
         } else if (ZERO_VALUE_META_TOOLS.has(name)) {
             isTarget = true;
         } else if (name === "ctx_note") {
@@ -106,6 +102,7 @@ export function buildSupersessionReclaimOps(input: {
     const synthetic: PendingOp[] = [];
     for (const tagId of dropTagIds) {
         if (realPendingTagIds.has(tagId)) continue;
+        if (protectedTags.has(tagId)) continue;
         if (input.targets.get(tagId)?.canDrop?.() !== true) continue;
         synthetic.push({
             id: 0,
@@ -133,6 +130,8 @@ export function buildEditSupersessionReclaim(input: {
     sessionId: string;
     targets: Map<number, TagTarget>;
     pendingOps?: readonly PendingOp[];
+    protectedTools?: Readonly<Record<string, number>>;
+    protectedToolTags?: ReadonlySet<number>;
     recentMessageIds?: ReadonlySet<string>;
     /**
      * Union projection form: protectedTagNumbers (tag-number set form).
@@ -152,6 +151,8 @@ export function buildEditSupersessionReclaim(input: {
     const seenFile = new Set<string>();
     const ops: PendingOp[] = [];
     const editMarkerTagIds = new Set<number>();
+    const protectedTags =
+        input.protectedToolTags ?? protectedToolTagNumbers(tags, input.protectedTools);
 
     for (const tag of editTags) {
         if (input.protectedTagNumbers?.has(tag.tagNumber)) {
@@ -174,6 +175,7 @@ export function buildEditSupersessionReclaim(input: {
             continue;
         }
         if (realPendingTagIds.has(tag.tagNumber)) continue;
+        if (protectedTags.has(tag.tagNumber)) continue;
         if (input.targets.get(tag.tagNumber)?.canDrop?.() !== true) continue;
         editMarkerTagIds.add(tag.tagNumber);
         ops.push({

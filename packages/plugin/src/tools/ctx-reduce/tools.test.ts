@@ -429,6 +429,23 @@ describe("createCtxReduceTools", () => {
             expect(calls[2]?.commandId).not.toBe(calls[0]?.commandId);
         });
 
+        it("uses the module's protected set acknowledgement for held Rust drops", async () => {
+            const rustTools = createCtxReduceTools({
+                db,
+                rustToolBackends: {
+                    reduce: async () => ({
+                        ok: true,
+                        queued: 2,
+                        held_tag_numbers: [9],
+                        immediate_tag_numbers: [1],
+                    }),
+                },
+            });
+            expect(await rustTools.ctx_reduce.execute({ drop: "1,9" }, toolContext())).toBe(
+                "Queued: drop §1§. Held: §9 is inside the protected working set; it applies once newer work displaces it.",
+            );
+        });
+
         it("returns capability copy when the engine rejects a drop", async () => {
             const tools = createCtxReduceTools({
                 db,

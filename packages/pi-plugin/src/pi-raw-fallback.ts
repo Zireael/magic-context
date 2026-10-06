@@ -77,6 +77,49 @@ export interface PiFitEnvelope {
 	calibration?: DecisionCalibration;
 }
 
+/** A complete final envelope is required; missing metadata must not reject a healthy pass. */
+export function estimatePiOutgoingInputTokens(
+	messages: readonly unknown[],
+	observed?: PiFitEnvelope,
+): { tokens: number; trusted: boolean } {
+	if (
+		!observed ||
+		!Number.isFinite(observed.systemTokens) ||
+		observed.systemTokens <= 0 ||
+		!Number.isFinite(observed.toolDefinitionTokens) ||
+		observed.toolDefinitionTokens < 0 ||
+		!hasTokenizerForFit()
+	)
+		return { tokens: 0, trusted: false };
+	const complete = messages.every((message) => {
+		if (!message || typeof message !== "object") return false;
+		const m = message as { role?: string; content?: unknown };
+		return (
+			["user", "assistant", "toolResult"].includes(m.role ?? "") &&
+			(typeof m.content === "string" ||
+				(Array.isArray(m.content) &&
+					m.content.every(
+						(p) =>
+							p &&
+							typeof p === "object" &&
+							["text", "thinking", "toolCall"].includes(String(p.type)),
+					)))
+		);
+	});
+	if (!complete) return { tokens: 0, trusted: false };
+	const raw = tokenizePiMessages([...messages]);
+	const tokens = providerMass(
+		{
+			system: observed.systemTokens,
+			tools: observed.toolDefinitionTokens + raw.toolCall,
+			prose: raw.conversation,
+		},
+		observed.calibration ?? calibrationForModelKey(observed.modelKey),
+		true,
+	);
+	return { tokens, trusted: Number.isFinite(tokens) };
+}
+
 export interface PiMeasuredPrefixFit {
 	modelKey: string;
 	envelopeSignature: string;

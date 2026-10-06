@@ -33,6 +33,7 @@ fn context() -> ProducerContext<'static> {
         protected_tokens_provenance: "derived",
         compaction_enabled: true,
         smart_drops: false,
+        protected_tools: [("todowrite".to_string(), 1), ("ctx_reduce".to_string(), 3)].into(),
         cache_ttl: "5m".into(),
         cache_ttl_provenance: CacheTtlProvenance::Default,
         model_key: None,
