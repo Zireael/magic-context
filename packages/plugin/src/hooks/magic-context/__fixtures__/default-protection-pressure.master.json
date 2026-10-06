@@ -1,5 +1,5 @@
 {
-  "source": "9de884724d (pre-protected_tools master); production injectM0M1, runPostTransformPhase and evaluateEmergencyFailClosed; frozen Date.now=1700000000000",
+  "source": "99ae86b1eb (current master after protected_tools revert and issue 624); production injectM0M1, runPostTransformPhase and evaluateEmergencyFailClosed; frozen Date.now=1700000000000",
   "passes": [
     {
       "stage": "pressure",

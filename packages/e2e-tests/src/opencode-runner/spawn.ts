@@ -706,6 +706,9 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         // OpenCode also scans ~/.opencode outside the XDG config tree. Keep that
         // lookup in the fixture, not in the operator's home directory.
         childEnv.HOME = dirname(env.dataDir);
+        // Foundation's HTTP cache on macOS ignores HOME/XDG unless its user home
+        // is overridden too. Keep that SQLite cache in the same private fixture.
+        childEnv.CFFIXED_USER_HOME = childEnv.HOME;
         childEnv.OPENCODE_CONFIG_DIR = env.configDir;
         childEnv.XDG_CONFIG_HOME = env.configDir;
         childEnv.XDG_DATA_HOME = env.dataDir;

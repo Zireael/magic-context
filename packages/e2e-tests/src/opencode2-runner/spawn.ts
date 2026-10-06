@@ -111,6 +111,8 @@ export function isolation(): OpenCode2Isolation {
 		mkdirSync(env[key]);
 	}
 	const cwd = join(root, "work");
+	// Foundation's HTTP cache uses this home instead of HOME/XDG on macOS.
+	env.CFFIXED_USER_HOME = env.HOME;
 	mkdirSync(cwd);
 	env.MAGIC_CONTEXT_STORAGE_DIR = join(env.XDG_DATA_HOME!, "cortexkit", "magic-context");
 	// Magic Context writes its diagnostics to this file and never to the host's
