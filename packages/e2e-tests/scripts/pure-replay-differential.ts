@@ -149,13 +149,10 @@ async function createReplayHarness() {
 			config.small_model = config.model;
 			config.enabled_providers = [options.providerID];
 			writeFileSync(path, JSON.stringify(config, null, 2));
-			const canonicalConfig = join(
+			const userConfig = join(
 				harness.opencode.env.configDir,
 				"cortexkit/magic-context.jsonc",
 			);
-			const userConfig = existsSync(canonicalConfig)
-				? canonicalConfig
-				: join(harness.opencode.env.configDir, "opencode/magic-context.jsonc");
 			writeFileSync(
 				userConfig,
 				readFileSync(userConfig, "utf8").replaceAll(
