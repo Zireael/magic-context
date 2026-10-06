@@ -38,6 +38,22 @@ it admits no more notes after that. Caller/lease cancellation still interrupts a
 active check. External cancellation leaves note health unchanged unless running
 JavaScript has already exhausted its CPU budget, which remains a logic failure.
 
+The shared sandbox module load has its own 10-second infrastructure deadline,
+independent of the guest's CPU/HTTP budget and any caller's cancellation. A stalled
+load returns **not run** (a cancelled result), spends no note-health strike, and
+evicts the cached attempt so the next sweep can retry. A caller may still give up
+earlier at its admission or lease deadline without cancelling other callers' load.
+Late load completion/rejection is consumed but cannot publish a module over a
+replacement attempt or execute a check that already returned not run.
+
+Every check explicitly owns its QuickJS runtime and context. Evaluation uses a
+local scope; cleanup first detaches the private native capability functions and
+releases their final object handle, while HostRef callbacks are still registered.
+It then disposes the context and runtime in nested finally blocks. Retaining a
+guest wrapper in a global, prototype or pending job cannot retain a native host
+function. Cleanup removes exhausted heap/interrupt limits only after evaluation
+has settled, so memory or CPU failures cannot prevent releasing those handles.
+
 Every host capability await is bounded at the VM bridge by the run's abort signal,
 not just by the transport's cooperation. A promise that never settles cannot keep
 the VM or serialization lock suspended beyond the check deadline (plus event-loop
