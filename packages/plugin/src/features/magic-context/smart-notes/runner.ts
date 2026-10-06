@@ -2,7 +2,7 @@ import type { Database } from "../../../shared/sqlite";
 import { getLeaseHolder, peekLeaseHolderAndExpiry } from "../dreamer/lease";
 import { leaseKeyFor } from "../dreamer/task-registry";
 import { markNoteReady } from "../storage-notes";
-import { createSmartNoteCapabilities } from "./capabilities";
+import { createSmartNoteCapabilities, readSmartNoteGithubToken } from "./capabilities";
 import { runCompiledSmartNoteCheck, SMART_NOTE_CHECK_TIMEOUT_MS } from "./sandbox-runner";
 import { nextSmartNoteCheckDueAt } from "./schedule";
 import {
@@ -26,6 +26,7 @@ export interface RunDueCompiledSmartNoteChecksArgs {
     leaseHeld?: () => boolean;
     signal?: AbortSignal;
     retinaHandoff?: boolean;
+    githubToken?: string | null;
 }
 
 export interface RunDueCompiledSmartNoteChecksResult {
@@ -71,6 +72,8 @@ export async function runDueCompiledSmartNoteChecks(
     let networkFailed = 0;
     const leaseHeld =
         args.leaseHeld ?? inferEvaluateSmartNotesLeaseHeld(args.db, args.projectIdentity);
+    const githubToken =
+        args.githubToken === undefined ? await readSmartNoteGithubToken() : args.githubToken;
 
     for (const note of due) {
         const remaining =
@@ -98,6 +101,7 @@ export async function runDueCompiledSmartNoteChecks(
                     createSmartNoteCapabilities({
                         projectRoot: args.projectRoot,
                         signal,
+                        githubToken,
                     }),
                 signal: controller.signal,
                 // Treat the sweep deadline as an admission/queue deadline, not

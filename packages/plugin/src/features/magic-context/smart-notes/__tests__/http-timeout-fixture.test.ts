@@ -48,9 +48,10 @@ export async function withLocalHttpServer<T>(
 
 /** Run the real HTTP stream lifecycle without opening public sockets or doing DNS. */
 export async function localSmartNoteHttpTransport(
-    hostname: string,
+    hostnames: string | readonly string[],
     respond: (request: http.IncomingMessage, response: http.ServerResponse) => void,
 ): Promise<{ paths: string[]; dispose: () => Promise<void> }> {
+    const allowedHostnames = new Set(typeof hostnames === "string" ? [hostnames] : hostnames);
     const paths: string[] = [];
     const server = http.createServer((request, response) => {
         paths.push(request.url ?? "");
@@ -60,14 +61,14 @@ export async function localSmartNoteHttpTransport(
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("missing test server address");
     const lookup = spyOn(dns, "lookup").mockImplementation((async (target: string) => {
-        if (target !== hostname) throw new Error(`unexpected DNS: ${target}`);
+        if (!allowedHostnames.has(target)) throw new Error(`unexpected DNS: ${target}`);
         return [{ address: "1.1.1.1", family: 4 }];
     }) as typeof dns.lookup);
     const request = spyOn(https, "request").mockImplementation(((
         options: https.RequestOptions,
         callback: (response: http.IncomingMessage) => void,
     ) => {
-        if (options.hostname !== hostname)
+        if (!allowedHostnames.has(String(options.hostname)))
             throw new Error(`unexpected network destination: ${options.hostname}`);
         // SSRF policy stays production-strict. Only this test connector may reach
         // loopback, and no DNS, TLS or socket is opened against a public service.

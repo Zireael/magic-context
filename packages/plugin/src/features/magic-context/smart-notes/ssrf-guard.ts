@@ -41,7 +41,12 @@ interface SmartNoteAddressResponse {
 type SmartNoteAddressRequest = (
     validation: SmartNoteUrlValidation,
     candidate: ResolvedSmartNoteAddress,
-    options: { signal: AbortSignal; timeoutMs: number; bodyLimitBytes: number },
+    options: {
+        signal: AbortSignal;
+        timeoutMs: number;
+        bodyLimitBytes: number;
+        headers?: Record<string, string>;
+    },
 ) => Promise<SmartNoteAddressResponse>;
 
 export interface GuardedSmartNoteHttpGetOptions {
@@ -50,6 +55,7 @@ export interface GuardedSmartNoteHttpGetOptions {
     timeoutMs?: number;
     bodyLimitBytes?: number;
     requestAddress?: SmartNoteAddressRequest;
+    githubToken?: string | null;
 }
 
 const DNS_TIMEOUT_MS = 3_000;
@@ -161,6 +167,10 @@ export async function guardedSmartNoteHttpGet(
                         signal: controller.signal,
                         timeoutMs: Math.max(1, deadline - performance.now()),
                         bodyLimitBytes: remainingBytes,
+                        // Re-check each redirect target so the credential never travels to another host.
+                        ...(options.githubToken && validation.url.host === "api.github.com"
+                            ? { headers: { Authorization: `Bearer ${options.githubToken}` } }
+                            : {}),
                     });
                     break;
                 } catch (error) {
@@ -175,7 +185,12 @@ export async function guardedSmartNoteHttpGet(
                 }
             }
             if (!response) throw toNetworkError(lastError, "all validated addresses failed");
-            remainingBytes -= response.bytesRead ?? Buffer.byteLength(response.body);
+            const responseBytes = response.bytesRead ?? Buffer.byteLength(response.body);
+            if (options.githubToken) {
+                // HTTP response bodies are guest-visible and must not reflect the credential.
+                response.body = response.body.split(options.githubToken).join("[redacted]");
+            }
+            remainingBytes -= responseBytes;
             if (remainingBytes < 0) {
                 throw new SmartNoteNetworkError(
                     `SMART_NOTE_NETWORK: response body too large at ${validation.url.href} (received at least ${bodyLimitBytes - remainingBytes} bytes; limit ${bodyLimitBytes})`,
@@ -238,7 +253,9 @@ export async function guardedSmartNoteHttpGet(
                     controller.abort();
                 }, timeoutMs);
             }),
-        ]);
+        ]).catch((error: unknown) => {
+            throw redactGithubTokenFromError(error, options.githubToken);
+        });
     } finally {
         if (timer) clearTimeout(timer);
         options.signal.removeEventListener("abort", onAbort);
@@ -409,7 +426,12 @@ export function createPinnedLookup(candidate: { address: string; family: 4 | 6 }
 export function requestValidatedAddress(
     validation: SmartNoteUrlValidation,
     candidate: ResolvedSmartNoteAddress,
-    options: { signal: AbortSignal; timeoutMs: number; bodyLimitBytes: number },
+    options: {
+        signal: AbortSignal;
+        timeoutMs: number;
+        bodyLimitBytes: number;
+        headers?: Record<string, string>;
+    },
 ): Promise<SmartNoteAddressResponse> {
     // A request-local agent prevents global keep-alive or proxying agents from
     // reusing a socket that was not opened through the pinned lookup below.
@@ -429,6 +451,7 @@ export function requestValidatedAddress(
                     Host: hostHeader,
                     "User-Agent": "magic-context-smart-note-check/1",
                     Accept: "text/plain, application/json;q=0.9, */*;q=0.1",
+                    ...options.headers,
                 },
                 // Anti-rebinding: DNS was resolved and classified above; the
                 // connector is pinned to that exact pre-validated IP while TLS
@@ -509,6 +532,23 @@ export function requestValidatedAddress(
         request.on("close", () => options.signal.removeEventListener("abort", onAbort));
         request.end();
     }).finally(() => agent.destroy());
+}
+
+function redactGithubTokenFromError(error: unknown, token: string | null | undefined): unknown {
+    if (!token) return error;
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes(token)) return error;
+    const redacted = message.split(token).join("[redacted]");
+    if (error instanceof SmartNoteNetworkError) {
+        return new SmartNoteNetworkError(redacted, {
+            terminal: error.terminal,
+            persistent: error.persistent,
+            uncheckable: error.uncheckable,
+            retryAt: error.retryAt,
+        });
+    }
+    if (error instanceof SmartNoteSecurityError) return new SmartNoteSecurityError(redacted);
+    return new Error(redacted);
 }
 
 export function createSmartNoteRequestAgent(): https.Agent {
