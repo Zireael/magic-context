@@ -827,6 +827,12 @@ CREATE TABLE task_schedule_state (
       retry_count   INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (project_path, task)
     );
+CREATE TABLE temporal_decisions (
+    session_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    marker TEXT,
+    PRIMARY KEY (session_id, message_id)
+) WITHOUT ROWID;
 CREATE TABLE tool_definition_measurements (
                     provider_id TEXT NOT NULL,
                     model_id TEXT NOT NULL,

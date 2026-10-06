@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import * as logger from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { enforceProjectCap, upsertCommits } from "./git-commits/storage-git-commits";
 import {
@@ -11,10 +12,12 @@ import { MIGRATIONS, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { getOrCreateSessionMeta, updateSessionMeta } from "./storage-meta-session";
 import { insertTag, markTagsCompactedByMessageIds, updateTagStatus } from "./storage-tags";
+import { getTemporalDecisions } from "./temporal-decisions";
 
 function v94(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
+    db.exec("DROP TABLE IF EXISTS temporal_decisions");
     for (const name of [
         "idx_message_fts_rowid_map_session_rowid",
         "idx_transform_decisions_retention",
@@ -64,6 +67,122 @@ const identities = (db: Database) =>
     db.prepare("SELECT rowid,sha FROM git_commits_fts ORDER BY rowid").all();
 
 describe("migration 95", () => {
+    test.each([
+        ["malformed JSON", '["temporal-message-v1:'],
+        ["non-array JSON", '{"unrelated":"temporal-message-v1:"}'],
+    ])("v95 tolerates %s in the miscellaneous legacy blob", (_label, blob) => {
+        const db = v94();
+        const diagnostic = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            getOrCreateSessionMeta(db, "legacy");
+            db.prepare(
+                "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id='legacy'",
+            ).run(blob);
+            expect(() => runMigrations(db)).not.toThrow();
+            expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
+                v: 95,
+            });
+            expect(
+                db
+                    .prepare(
+                        "SELECT merged_reasoning_stripped_ids AS entries FROM session_meta WHERE session_id='legacy'",
+                    )
+                    .get(),
+            ).toEqual({ entries: blob });
+            expect(getTemporalDecisions(db, "legacy").size).toBe(0);
+            expect(
+                diagnostic.mock.calls.filter(
+                    (args) =>
+                        args[0] === "legacy" && String(args[1]).includes("v95 temporal metadata"),
+                ),
+            ).toHaveLength(1);
+            installV95PerfSchema(db);
+            expect(
+                diagnostic.mock.calls.filter(
+                    (args) =>
+                        args[0] === "legacy" && String(args[1]).includes("v95 temporal metadata"),
+                ),
+            ).toHaveLength(1);
+        } finally {
+            diagnostic.mockRestore();
+            db.close();
+        }
+    });
+
+    test("control: v95 skips odd individual entries and preserves unrelated blob values", () => {
+        const db = v94();
+        try {
+            getOrCreateSessionMeta(db, "legacy");
+            const kept = [
+                null,
+                17,
+                {},
+                "assistant",
+                "temporal-message-v1:broken",
+                'temporal-message-v1:["",""]',
+            ];
+            const entries = [...kept, 'temporal-message-v1:["user","<!-- +5m -->\\n"]'];
+            db.prepare(
+                "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id='legacy'",
+            ).run(JSON.stringify(entries));
+            runMigrations(db);
+            expect(getTemporalDecisions(db, "legacy")).toEqual(
+                new Map([["user", "<!-- +5m -->\n"]]),
+            );
+            expect(
+                db
+                    .prepare(
+                        "SELECT merged_reasoning_stripped_ids AS entries FROM session_meta WHERE session_id='legacy'",
+                    )
+                    .get(),
+            ).toEqual({ entries: JSON.stringify(kept) });
+        } finally {
+            db.close();
+        }
+    });
+    test("v95 installs indexed temporal decisions and extracts only prerelease temporal entries", () => {
+        const db = v94();
+        try {
+            getOrCreateSessionMeta(db, "temporal");
+            const entries = [
+                "assistant-reasoning",
+                'temporal-message-v1:["user","<!-- +5m -->\\n"]',
+                'temporal-message-v1:["none",""]',
+            ];
+            db.prepare(
+                "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id=?",
+            ).run(JSON.stringify(entries), "temporal");
+            runMigrations(db);
+            expect(
+                db
+                    .prepare(
+                        "SELECT message_id,marker FROM temporal_decisions WHERE session_id=? ORDER BY message_id",
+                    )
+                    .all("temporal"),
+            ).toEqual([
+                { message_id: "none", marker: "" },
+                { message_id: "user", marker: "<!-- +5m -->\n" },
+            ]);
+            expect(
+                db
+                    .prepare(
+                        "SELECT merged_reasoning_stripped_ids AS entries FROM session_meta WHERE session_id=?",
+                    )
+                    .get("temporal"),
+            ).toEqual({ entries: JSON.stringify(["assistant-reasoning"]) });
+            const plan = db
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT marker FROM temporal_decisions WHERE session_id=? AND message_id=?",
+                )
+                .all("temporal", "user") as Array<{ detail: string }>;
+            expect(plan.some((row) => row.detail.includes("PRIMARY KEY"))).toBe(true);
+            const changes = db.prepare("SELECT total_changes() AS n").get();
+            installV95PerfSchema(db);
+            expect(db.prepare("SELECT total_changes() AS n").get()).toEqual(changes);
+        } finally {
+            db.close();
+        }
+    });
     test("populated v94 preserves metadata, tags and ordered FTS bytes through v95", () => {
         const db = v94();
         try {

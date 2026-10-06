@@ -1,5 +1,16 @@
+import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { isKnownAutocommit } from "../../shared/sqlite-helpers";
+import { decodeTemporalDecision } from "./temporal-decisions";
+
+// NULL records a message first observed on a defer without a served marker. It
+// may be decided on a rebuild; an empty string is a final no-marker decision.
+export const TEMPORAL_DECISIONS_DDL = `CREATE TABLE temporal_decisions (
+    session_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    marker TEXT,
+    PRIMARY KEY (session_id, message_id)
+) WITHOUT ROWID`;
 
 const indexes = [
     ["message_fts_rowid_map", "idx_message_fts_rowid_map_session_rowid", "session_id, fts_rowid"],
@@ -79,6 +90,51 @@ export function installV95PerfSchema(
             }>
         ).map((row) => [row.name, row.sql]),
     );
+    if (!schema.has("temporal_decisions")) {
+        db.exec(TEMPORAL_DECISIONS_DDL);
+        // Carry decisions made by prerelease builds into indexed storage once.
+        // Preserve unrelated replay entries, and never parse the blob on an
+        // ordinary open after the table has been installed.
+        if (schema.has("session_meta")) {
+            const rows = db
+                .prepare(
+                    "SELECT session_id, merged_reasoning_stripped_ids AS entries FROM session_meta WHERE merged_reasoning_stripped_ids LIKE '%temporal-message-v1:%'",
+                )
+                .all() as Array<{ session_id: string; entries: string }>;
+            const insert = db.prepare(
+                "INSERT OR IGNORE INTO temporal_decisions(session_id,message_id,marker) VALUES (?,?,?)",
+            );
+            for (const row of rows) {
+                let entries: unknown;
+                try {
+                    entries = JSON.parse(row.entries);
+                } catch {
+                    sessionLog(
+                        row.session_id,
+                        "v95 temporal metadata: malformed JSON skipped; original blob retained",
+                    );
+                    continue;
+                }
+                if (!Array.isArray(entries)) {
+                    sessionLog(
+                        row.session_id,
+                        "v95 temporal metadata: non-array JSON skipped; original blob retained",
+                    );
+                    continue;
+                }
+                const kept: unknown[] = [];
+                for (const entry of entries) {
+                    const decision =
+                        typeof entry === "string" ? decodeTemporalDecision(entry) : null;
+                    if (decision) insert.run(row.session_id, ...decision);
+                    else kept.push(entry);
+                }
+                db.prepare(
+                    "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id=?",
+                ).run(JSON.stringify(kept), row.session_id);
+            }
+        }
+    }
     for (const [table, name, columns] of indexes) {
         if (schema.has(table) && !schema.has(name))
             db.exec(`CREATE INDEX ${name} ON ${table}(${columns})`);

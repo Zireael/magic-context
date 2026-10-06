@@ -38,6 +38,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { clearSession } from "../../features/magic-context/storage-meta-session";
 import type { Tagger } from "../../features/magic-context/tagger";
+import { deleteTemporalDecision } from "../../features/magic-context/temporal-decisions";
 import {
     clearTransformDecisionSession,
     scheduleOpenCodeTransformDecisionWrite,
@@ -209,6 +210,7 @@ function cleanupRemovedMessageState(
     return deps.db
         .transaction(() => {
             const removedTagNumbers = deleteTagsByMessageId(deps.db, sessionId, messageId);
+            deleteTemporalDecision(deps.db, sessionId, messageId);
             sessionLog(
                 sessionId,
                 `event message.removed: deleted ${removedTagNumbers.length} tag(s) for message ${messageId}`,
