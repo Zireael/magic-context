@@ -1,12 +1,13 @@
 import { expect, spyOn } from "bun:test";
 import { execFileSync } from "node:child_process";
 import * as dns from "node:dns/promises";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { realpathSync, rmSync } from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { Database } from "../../../../shared/sqlite";
+import { createTestTempDirFromPath } from "../../../../shared/test-temp-dir";
 import { runMigrations } from "../../migrations";
 import { initializeDatabase } from "../../storage-db";
 
@@ -84,7 +85,7 @@ export function timeoutTestDatabase(): { db: Database; dispose: () => void } {
     const root = realpathSync(configuredRoot);
     if (relative(realpathSync(tmpdir()), root).startsWith(".."))
         throw new Error("test preload must isolate storage below the temp directory");
-    const directory = mkdtempSync(join(root, "smart-note-http-"));
+    const directory = createTestTempDirFromPath(join(root, "smart-note-http-"));
     const path = join(directory, "timeout.db");
     const db = new Database(path);
     initializeDatabase(db);
