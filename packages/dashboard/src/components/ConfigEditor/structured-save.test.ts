@@ -19,6 +19,25 @@ const commentedConfig = `{
 `;
 
 describe("structured config form save", () => {
+  it("adding an override preserves every existing byte, including trailing commas and unusual spacing", () => {
+    const source =
+      '{\r\n\t// Keep the operator comment.\r\n\t"future" : { "spacing" :  42, },\r\n}\r\n';
+    expect(structuredConfigSaveContent(source, { ...parseJsonc(source), language: "tr" })).toBe(
+      source.replace("\r\n}\r\n", '\r\n\t"language": "tr",\r\n}\r\n'),
+    );
+    const inline = '{ /* keep */ "unknown" :  1, }';
+    expect(structuredConfigSaveContent(inline, { ...parseJsonc(inline), enabled: true })).toBe(
+      '{ /* keep */ "unknown" :  1, "enabled": true, }',
+    );
+    const noComma = '{"a":1 // keep this comment with a\n}\n';
+    expect(structuredConfigSaveContent(noComma, { ...parseJsonc(noComma), language: "tr" })).toBe(
+      '{"a":1, // keep this comment with a\n  "language": "tr"\n}\n',
+    );
+    const inlineComment = '{"a":1 /* keep */ }';
+    expect(
+      structuredConfigSaveContent(inlineComment, { ...parseJsonc(inlineComment), language: "tr" }),
+    ).toBe('{"a":1, /* keep */ "language": "tr" }');
+  });
   // The save path is a pure string transform, so the round trip needs no file:
   // CRLF, tabs, comments and the trailing comma must all survive untouched.
   it("round-trips JSONC text byte-for-byte except changed value tokens", () => {
