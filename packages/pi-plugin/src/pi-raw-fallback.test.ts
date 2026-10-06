@@ -1,16 +1,16 @@
 import { expect, it } from "bun:test";
+import { protectedToolTokenCount } from "@magic-context/core/features/magic-context/reclaim-protection";
+import type { TagEntry } from "@magic-context/core/features/magic-context/types";
+import { resolveDecisionCalibration } from "@magic-context/core/hooks/magic-context/decision-calibration";
 import {
 	outgoingContextRefusal,
 	PROTECTED_TOOL_RESULTS_OVER_LIMIT,
 } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
+import { readPiLkgFitEnvelope } from "./pi-lkg-fit-envelope";
 import {
 	assertPiRawFallbackFits,
 	estimatePiOutgoingInputTokens,
 } from "./pi-raw-fallback";
-import { resolveDecisionCalibration } from "@magic-context/core/hooks/magic-context/decision-calibration";
-import { protectedToolTokenCount } from "@magic-context/core/features/magic-context/reclaim-protection";
-import type { TagEntry } from "@magic-context/core/features/magic-context/types";
-import { readPiLkgFitEnvelope } from "./pi-lkg-fit-envelope";
 import { tokenizePiMessages } from "./tokenize-pi-messages";
 
 it("re-review: Pi must not refuse a fitting uncalibrated request on the unknown-model upper envelope", () => {

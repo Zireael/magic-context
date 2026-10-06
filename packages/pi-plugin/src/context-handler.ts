@@ -62,7 +62,10 @@ import {
 	computeProtectionWindow,
 	getProtectionWindowForSession,
 } from "@magic-context/core/features/magic-context/protection-window";
-import { protectedToolTagNumbers } from "@magic-context/core/features/magic-context/reclaim-protection";
+import {
+	protectedToolTagNumbers,
+	protectedToolTokenCount,
+} from "@magic-context/core/features/magic-context/reclaim-protection";
 import {
 	createScheduler,
 	parseCacheTtl,
@@ -158,12 +161,17 @@ import {
 } from "@magic-context/core/hooks/magic-context/channel2-cycle";
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { evaluateChannel2 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
+import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import {
 	type DroppedTokenReduction,
 	estimateDroppedTokensFromTagReductions,
 } from "@magic-context/core/hooks/magic-context/dropped-token-estimate";
-import { EmergencyFailClosedError } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
+import {
+	contextRefusalError,
+	EmergencyFailClosedError,
+	outgoingContextRefusal,
+} from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import {
 	DEFAULT_CONTEXT_LIMIT,
 	historyBudgetPolicyIdentity,
@@ -301,6 +309,7 @@ import {
 import { resolvePiProvenInputFloor } from "./pi-proven-floor";
 import {
 	assertPiRawFallbackFits,
+	estimatePiOutgoingInputTokens,
 	PiDegradedPassError,
 	PiStorageBusyError,
 } from "./pi-raw-fallback";
@@ -8046,11 +8055,3 @@ function runPersistedReplayStage<T>(
 		throw new PiDegradedPassError(site, { cause: error });
 	}
 }
-
-import { protectedToolTokenCount } from "@magic-context/core/features/magic-context/reclaim-protection";
-import {
-	contextRefusalError,
-	outgoingContextRefusal,
-} from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
-import { estimatePiOutgoingInputTokens } from "./pi-raw-fallback";
-import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";

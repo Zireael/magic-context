@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
+import { outgoingContextRefusal } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { Database } from "@magic-context/core/shared/sqlite";
 import {
@@ -14,7 +15,6 @@ import {
 	assertPiRawFallbackFits,
 	estimatePiOutgoingInputTokens,
 } from "./pi-raw-fallback";
-import { outgoingContextRefusal } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 
 const key = "openai-codex/gpt-5.6-sol";
 const databases: Database[] = [];
