@@ -77,8 +77,8 @@ export async function runDueCompiledSmartNoteChecks(
             (args.sweepBudgetMs ?? DEFAULT_SWEEP_BUDGET_MS) - (Date.now() - startedAt);
         if (remaining <= 0) break;
         // Admit fewer notes rather than shorten their network deadline. The first
-        // attempt still supports explicitly small test/caller budgets; the outer
-        // signal also bounds module acquisition and time queued for the shared VM.
+        // attempt still supports explicitly small test/caller budgets. Loading
+        // and VM queuing must finish within the sweep's remaining budget.
         if (ran > 0 && remaining < SMART_NOTE_CHECK_TIMEOUT_MS) break;
         if (!note.compiledCheck) continue;
         const compiledCheck = note.compiledCheck;
@@ -100,6 +100,21 @@ export async function runDueCompiledSmartNoteChecks(
                         signal,
                     }),
                 signal: controller.signal,
+                // Treat the sweep deadline as an admission/queue deadline, not
+                // an execution deadline: a check that starts in time gets its
+                // full CPU and HTTP budgets even after a slow VM load. The VM's
+                // own deadline caps overrun at one check (6s), and no later note
+                // is admitted once the sweep budget is spent. Caller/lease
+                // cancellation still interrupts an active check immediately.
+                onExecutionStart: () => {
+                    clearTimeout(timer);
+                    // Loading can block the host event loop past an eligible
+                    // timer. Do not admit execution merely because its callback
+                    // has not been delivered yet.
+                    if (Date.now() - startedAt >= (args.sweepBudgetMs ?? DEFAULT_SWEEP_BUDGET_MS)) {
+                        controller.abort(new Error("smart-note sweep budget exhausted"));
+                    }
+                },
             });
             const runFinishedAt = Date.now();
             const expected = {

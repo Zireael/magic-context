@@ -134,24 +134,31 @@ function withSandboxLock<T>(
     signal?: AbortSignal,
     cancelled?: () => T,
 ): Promise<T> {
-    const start = () => (signal?.aborted && cancelled ? cancelled() : fn());
+    let started = false;
+    const start = () => {
+        started = true;
+        return signal?.aborted && cancelled ? cancelled() : fn();
+    };
     const run = sandboxRunChain.then(start, start);
     sandboxRunChain = run.then(
         () => undefined,
         () => undefined,
     );
-    return resolveBeforeAbort(run, signal, cancelled);
+    // Once running, the VM must classify its own interruption. A promise race
+    // returning cancellation here would hide an already-exhausted CPU budget.
+    return resolveBeforeAbort(run, signal, cancelled, () => !started);
 }
 
 /**
- * A sweep's deadline includes waiting for an earlier sandbox run. The lock entry
- * remains in the chain after its caller gives up, but the caller must not wait
- * for an unrelated suspended check before it can report cancellation.
+ * A sweep's deadline includes waiting for an earlier sandbox run. Only queued
+ * callers may give up without waiting for that unrelated suspended check; an
+ * active run owns abort cleanup and classification before releasing the lock.
  */
 function resolveBeforeAbort<T>(
     run: Promise<T>,
     signal: AbortSignal | undefined,
     cancelled: (() => T) | undefined,
+    canCancel: () => boolean,
 ): Promise<T> {
     if (!signal || !cancelled) return run;
     if (signal.aborted) return Promise.resolve(cancelled());
@@ -159,6 +166,7 @@ function resolveBeforeAbort<T>(
     return new Promise((resolve, reject) => {
         const cleanup = () => signal.removeEventListener("abort", abort);
         const abort = () => {
+            if (!canCancel()) return;
             cleanup();
             resolve(cancelled());
         };
@@ -182,6 +190,8 @@ export interface RunCompiledSmartNoteCheckOptions {
     capabilityFactory?: SmartNoteCapabilityFactory;
     signal?: AbortSignal;
     timeoutMs?: number;
+    /** Called with the execution deadline armed, after loading and VM queuing. */
+    onExecutionStart?: () => void;
     heapLimitBytes?: number;
     stackLimitBytes?: number;
 }
@@ -287,6 +297,7 @@ async function runCompiledSmartNoteCheckLocked(
     const controller = new AbortController();
     let externallyCancelled = false;
     let executionTimedOut = false;
+    let cpuTimedOut = false;
     let persistentNetworkFailure = false;
     let uncheckableNetworkFailure = false;
     let missingResource = false;
@@ -294,7 +305,16 @@ async function runCompiledSmartNoteCheckLocked(
     let httpRetryAt: number | undefined;
     let waitingOnHttp = false;
     let httpWaitMs = 0;
+    let startedAt: number | undefined;
+    const cpuBudgetExceeded = (now: number) =>
+        startedAt !== undefined && !waitingOnHttp && now - startedAt - httpWaitMs >= cpuBudgetMs;
     const externalAbort = () => {
+        // Lease/sweep cancellation is not a pardon for JavaScript that has
+        // already spent its CPU budget. Suspended HTTP never spends that budget.
+        if (cpuBudgetExceeded(performance.now())) {
+            cpuTimedOut = true;
+            executionTimedOut = true;
+        }
         externallyCancelled = true;
         controller.abort(options.signal?.reason);
     };
@@ -312,15 +332,22 @@ async function runCompiledSmartNoteCheckLocked(
     try {
         throwIfRunAborted(controller.signal);
         const capabilities = resolveCapabilitiesForRun(options, controller.signal);
-        const startedAt = performance.now();
+        startedAt = performance.now();
         const deadline = startedAt + timeoutMs;
+        options.onExecutionStart?.();
+        throwIfRunAborted(controller.signal);
         const context = quickjs.newContext();
         try {
             context.runtime.setMemoryLimit(options.heapLimitBytes ?? DEFAULT_HEAP_LIMIT_BYTES);
             context.runtime.setMaxStackSize(options.stackLimitBytes ?? DEFAULT_STACK_LIMIT_BYTES);
             context.runtime.setInterruptHandler(() => {
                 const now = performance.now();
-                if (now > deadline || now - startedAt - httpWaitMs > cpuBudgetMs) {
+                if (cpuBudgetExceeded(now)) {
+                    cpuTimedOut = true;
+                    executionTimedOut = true;
+                    return true;
+                }
+                if (now >= deadline) {
                     executionTimedOut = true;
                     return true;
                 }
@@ -356,6 +383,7 @@ async function runCompiledSmartNoteCheckLocked(
             });
             disableAmbientDynamicCode(context);
             const result = await evalCheck(context, options.compiledCheck);
+            throwIfRunAborted(controller.signal);
             // Accept a returned {met} verdict: HTTP 404/410 can prove deletion.
             // Fetch failures (access, rate limit, size or timeout) still fail the
             // check, even if its JavaScript caught the error and returned a verdict.
@@ -369,6 +397,9 @@ async function runCompiledSmartNoteCheckLocked(
             context.dispose();
         }
     } catch (error) {
+        // A previously caught network error must not relabel a subsequent busy
+        // loop as transient. CPU exhaustion is independently a logic failure.
+        if (cpuTimedOut) return failureResult("smart-note check exceeded CPU budget", false);
         // Queue deadlines and lease loss are control flow, not evidence that a
         // healthy compiled check is failing. Only this run's own timeout counts.
         if (externallyCancelled && !executionTimedOut) return cancelledResult(error);
