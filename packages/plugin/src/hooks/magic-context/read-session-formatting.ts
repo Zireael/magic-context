@@ -396,7 +396,7 @@ export function hasTokenizerForFit(): boolean {
 
 /** BPE can be quadratic on a long unbroken word. Keep individual encodes bounded. */
 export function tokenCountUsesByteBound(text: string): boolean {
-    return text.length > 1024 * 1024 || /[\p{L}\p{N}]{16385}/u.test(text);
+    return text.length > 8 * 1024 * 1024 || /[\p{L}\p{N}]{16385}/u.test(text);
 }
 
 export function estimateTokens(text: string): number {
@@ -409,7 +409,21 @@ export function estimateTokens(text: string): number {
     try {
         // Encode with allowedSpecial="all" so literal special-token strings (e.g.
         // `<EOT>` in tool output) are counted as text instead of throwing.
-        return activeTokenizer.encode(text, "all").length;
+        if (text.length <= 4 * 1024) return activeTokenizer.encode(text, "all").length;
+        let tokens = 0;
+        for (let start = 0; start < text.length; ) {
+            let end = Math.min(text.length, start + 4 * 1024);
+            if (end < text.length) {
+                // Split before whitespace so the next chunk keeps its leading
+                // separator. Ordinary prose retains its measured token mass.
+                let boundary = end;
+                while (boundary > start && !/\s/.test(text[boundary])) boundary--;
+                if (boundary > start) end = boundary;
+            }
+            tokens += activeTokenizer.encode(text.slice(start, end), "all").length;
+            start = end;
+        }
+        return tokens;
     } catch (error) {
         // Estimation must not fail a prompt. Latch the deterministic fallback for
         // the rest of this process so identical text does not alternate between
