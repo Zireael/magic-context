@@ -18,7 +18,10 @@ it("ordinary long repository texts retain exact whole-text BPE counts", () => {
         "packages/pi-plugin/src/context-handler.ts",
     ];
     for (const path of paths) {
-        const text = readFileSync(fileURLToPath(new URL(`../../../../../${path}`, import.meta.url)), "utf8");
+        const text = readFileSync(
+            fileURLToPath(new URL(`../../../../../${path}`, import.meta.url)),
+            "utf8",
+        );
         expect(text.length, path).toBeGreaterThan(4096);
         expect(text.length, path).toBeLessThanOrEqual(1024 * 1024);
         expect(tokenCountUsesByteBound(text), path).toBe(false);

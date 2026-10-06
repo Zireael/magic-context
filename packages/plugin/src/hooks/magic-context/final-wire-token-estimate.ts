@@ -66,8 +66,9 @@ function serializedText(value: unknown): string {
 
 const wireTextTokens = createTokenCountMemo(100_000, 128 * 1024 * 1024);
 
-function serializedTokens(value: unknown): number {
+function serializedTokens(value: unknown, bounded = false): number {
     const serialized = serializedText(value);
+    if (bounded && tokenCountUsesByteBound(serialized)) return Buffer.byteLength(serialized);
     return serialized ? wireTextTokens(serialized) : 0;
 }
 
@@ -166,11 +167,11 @@ function visitWireContent(
 }
 
 /** Count the token-bearing fields in the message representation sent to OpenCode. */
-export function estimateMessageTokens(message: MessageLike): MessageTokenEstimate {
+export function estimateMessageTokens(message: MessageLike, bounded = false): MessageTokenEstimate {
     const total: MessageTokenEstimate = { conversation: 0, toolCall: 0 };
     visitWireContent(message, {
         text: (bucket, value) => {
-            total[bucket] += serializedTokens(value);
+            total[bucket] += serializedTokens(value, bounded);
         },
         image: (bucket, tokens) => {
             total[bucket] += tokens;
@@ -217,6 +218,8 @@ export interface FinalWireTokenEstimateInput {
     modelID: string | undefined;
     agentName: string | undefined;
     systemPromptHash?: string;
+    /** Only healthy refusal's uncertain band may substitute pathological byte bounds. */
+    boundedTokenization?: boolean;
     /** A correlated preceding provider request; callers must prove prefix reuse. */
     measuredPrefix?: { inputTokens: number; appendedMessages: readonly MessageLike[] };
 }
@@ -413,7 +416,7 @@ export function estimateOutgoingWireForRefusal(
             }
         }
     }
-    return estimateFinalWireInputTokens(input);
+    return estimateFinalWireInputTokens({ ...input, boundedTokenization: true });
 }
 
 export function estimateFinalWireInputTokens(
@@ -421,7 +424,7 @@ export function estimateFinalWireInputTokens(
 ): FinalWireTokenEstimate {
     const messageTokens = input.messages.reduce<MessageTokenEstimate>(
         (total, message) => {
-            const next = estimateMessageTokens(message);
+            const next = estimateMessageTokens(message, input.boundedTokenization);
             total.conversation += next.conversation;
             total.toolCall += next.toolCall;
             return total;
@@ -477,7 +480,7 @@ export function estimateFinalWireInputTokens(
     const tail = useMeasured
         ? measured.appendedMessages.reduce<MessageTokenEstimate>(
               (sum, message) => {
-                  const next = estimateMessageTokens(message);
+                  const next = estimateMessageTokens(message, input.boundedTokenization);
                   return {
                       conversation: sum.conversation + next.conversation,
                       toolCall: sum.toolCall + next.toolCall,

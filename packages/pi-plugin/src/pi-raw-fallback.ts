@@ -199,6 +199,40 @@ export function estimatePiOutgoingInputTokens(
 				refusalBasis: "byte-bound",
 			};
 	}
+	const bounded = messages.some((rawMessage) => {
+		const content = (rawMessage as { content: unknown }).content;
+		if (typeof content === "string") return tokenCountUsesByteBound(content);
+		return (content as Array<Record<string, unknown>>).some((part) =>
+			[
+				part.text,
+				part.thinking,
+				part.thinkingSignature,
+				part.textSignature,
+				part.name,
+				part.arguments === undefined
+					? undefined
+					: JSON.stringify(part.arguments),
+			].some(
+				(value) => typeof value === "string" && tokenCountUsesByteBound(value),
+			),
+		);
+	});
+	if (bounded)
+		return {
+			tokens: providerMass(
+				{
+					system: observed.systemTokens,
+					tools:
+						observed.toolDefinitionTokens +
+						Buffer.byteLength(JSON.stringify(messages)),
+				},
+				observed.calibration ?? calibrationForModelKey(observed.modelKey),
+				true,
+			),
+			trusted: true,
+			refusalGrade: false,
+			refusalBasis: "byte-bound",
+		};
 	const raw = tokenizePiMessages([...messages]);
 	const calibration =
 		observed.calibration ?? calibrationForModelKey(observed.modelKey);

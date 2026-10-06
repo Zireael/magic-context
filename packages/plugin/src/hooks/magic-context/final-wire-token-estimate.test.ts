@@ -41,11 +41,17 @@ it("healthy refusal settles over and under byte bounds without token counts", ()
     expect(small.messageTokens).toEqual({ conversation: 0, toolCall: 0 });
 });
 
-it("pathological text uses a bounded byte count without disabling ordinary tokenization", () => {
+it("uncertain refusal bounds pathological text without changing shared tokenization", () => {
     const ordinary = estimateTokens("ordinary words");
-    const text = "x".repeat(12 * 1024 * 1024);
+    recordToolDefinition(MODEL.providerID, MODEL.modelID, MODEL.agentName, "read", "Read", {});
+    const text = "x".repeat(16385);
     const startedAt = performance.now();
-    expect(estimateTokens(text)).toBe(Buffer.byteLength(text));
+    const result = estimateOutgoingWireForRefusal(
+        { messages: [toolMessage(text)], systemPromptTokens: 100, ...MODEL },
+        10000,
+    );
+    expect(result.messageTokens.toolCall).toBeGreaterThanOrEqual(Buffer.byteLength(text));
+    expect(result.refusalGrade).toBe(false);
     expect(performance.now() - startedAt).toBeLessThan(1000);
     expect(estimateTokens("ordinary words")).toBe(ordinary);
 });

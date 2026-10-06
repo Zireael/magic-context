@@ -394,16 +394,13 @@ export function hasTokenizerForFit(): boolean {
     return getTokenizer() !== undefined;
 }
 
-/** Only pathological inputs leave the exact whole-text BPE contract. */
+/** Cost fence for refusal-only counting; shared estimates retain master's BPE. */
 export function tokenCountUsesByteBound(text: string): boolean {
     return text.length > 1024 * 1024 || /[\p{L}\p{N}]{16385}/u.test(text);
 }
 
 export function estimateTokens(text: string): number {
     if (!text) return 0;
-    // One token per UTF-8 byte is an upper bound, not a calibrated measurement.
-    // Do not disable the tokenizer: subsequent ordinary parts still count exactly.
-    if (tokenCountUsesByteBound(text)) return Buffer.byteLength(text);
     const activeTokenizer = getTokenizer();
     if (!activeTokenizer) return estimateTokensHeuristically(text);
     try {
