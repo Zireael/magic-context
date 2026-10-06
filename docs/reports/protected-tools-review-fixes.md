@@ -287,3 +287,16 @@ above 16,000. Neutralizing protected-subset calibration reddened only
 the unknown-model reviewer regression remained green. Restoring the staged bytes
 and rerunning the two suites passed. This defends calibration itself, not just a
 specimen whose unscaled mass was already over the limit.
+
+### Post-checkpoint Pi verification
+
+After the TypeScript verification commit, the targeted Pi refusal, provider-usage
+and fit-envelope suites passed 23 tests and 109 assertions (Bun 1.4.2, 120-second
+bound). Pi's calibrated positive likewise has local protected mass below 16,000
+and calibrated protected mass above it. Neutralizing subset calibration reddened
+only `Pi refuses a complete protected over-limit final envelope but not untrusted counts`;
+the Pi unknown-model reviewer regression stayed green. Restored suites passed.
+
+These short final runs include the strengthened calibration-boundary assertions;
+the larger suite counts above record the earlier production-code verification.
+No production change was needed after the coherent checkpoint commit.
