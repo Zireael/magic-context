@@ -8,9 +8,12 @@ function fixture(): Database {
     const db = new Database(":memory:");
     db.exec(`CREATE TABLE tags (
         id INTEGER PRIMARY KEY, session_id TEXT, message_id TEXT,
-        tool_owner_message_id TEXT, status TEXT);
+        tool_owner_message_id TEXT, status TEXT,
+        tag_number INTEGER GENERATED ALWAYS AS (id) VIRTUAL);
         CREATE INDEX idx_tags_session_message_id ON tags(session_id, message_id);
-        CREATE INDEX idx_tags_session_tag_number ON tags(session_id, id);`);
+        CREATE INDEX idx_tags_session_tag_number ON tags(session_id, tag_number);
+        CREATE TABLE pending_ops (session_id TEXT, tag_id INTEGER);
+        CREATE INDEX idx_pending_ops_session_tag ON pending_ops(session_id, tag_id);`);
     return db;
 }
 

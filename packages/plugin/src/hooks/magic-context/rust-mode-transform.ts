@@ -86,7 +86,10 @@ import {
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
-import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
+import {
+    createFinalWireUsageTracker,
+    estimateFinalWireInputTokens,
+} from "./final-wire-token-estimate";
 import { createHistorianHostRunner } from "./historian-host-runner";
 import {
     claimLkgRequestIdentity,
@@ -1640,6 +1643,7 @@ export function createRustModeTransform(
     replayParticipant: RustLkgReplayParticipant;
 } {
     const states = new Map<string, RustSessionState>();
+    const finalWireUsage = createFinalWireUsageTracker();
     const clock = options.clockForTests ?? { setTimeout, clearTimeout, now: Date.now };
     // The model this pass resolves when the messages carry none. OpenCode 1 reads it
     // back out of the host's own database; hosts that keep no such database supply
@@ -3479,8 +3483,9 @@ export function createRustModeTransform(
                 passInputs,
                 usage: {
                     ...passUsage(usage, contextLimit),
-                    final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
-                    final_wire_trusted: finalWireEstimate?.trusted === true,
+                    // Native non-fit guards require refusal evidence, not fit admission.
+                    final_wire_input_tokens: finalWireEstimate?.refusalTokens ?? 0,
+                    final_wire_trusted: finalWireEstimate?.refusalGrade === true,
                 },
                 geometry: transformGeometry,
                 ...renderIdentityFields,
@@ -3798,8 +3803,8 @@ export function createRustModeTransform(
                         passInputs,
                         usage: {
                             ...passUsage(usage, contextLimit),
-                            final_wire_input_tokens: finalWireEstimate?.tokens ?? 0,
-                            final_wire_trusted: finalWireEstimate?.trusted === true,
+                            final_wire_input_tokens: finalWireEstimate?.refusalTokens ?? 0,
+                            final_wire_trusted: finalWireEstimate?.refusalGrade === true,
                         },
                         geometry: transformGeometry,
                         ...renderIdentityFields,
@@ -4173,14 +4178,45 @@ export function createRustModeTransform(
                         cacheBustingPass,
                     });
                 }
-                if (passInputs.emergency_recovery_armed === true) {
-                    servedFinalWireEstimate = estimateFinalWireInputTokens({
-                        messages: appliedMessages as MessageLike[],
-                        systemPromptTokens: sessionMeta.systemPromptTokens,
-                        providerID: model?.providerID,
-                        modelID: model?.modelID,
-                        agentName: deps.getNotificationParams?.(sessionId)?.agent,
-                    });
+                if (
+                    passInputs.emergency_recovery_armed === true ||
+                    cacheBustingPass ||
+                    response.scheduler_decision === "execute"
+                ) {
+                    servedFinalWireEstimate = finalWireUsage.estimate(
+                        sessionId,
+                        {
+                            messages: appliedMessages as MessageLike[],
+                            systemPromptTokens: sessionMeta.systemPromptTokens,
+                            providerID: model?.providerID,
+                            modelID: model?.modelID,
+                            agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                            systemPromptHash: sessionMeta.systemPromptHash,
+                        },
+                        resolvedWindowGeometry?.usableHard ?? resolvedContextLimit,
+                    );
+                    const refusal = outgoingContextRefusal(
+                        servedFinalWireEstimate,
+                        resolvedWindowGeometry?.usableHard ?? resolvedContextLimit,
+                        protectedToolTokenCount(
+                            getActiveTagsBySession(deps.db, sessionId),
+                            deps.protectedTools,
+                            resolveDecisionCalibration(model?.providerID, model?.modelID),
+                        ),
+                    );
+                    if (refusal) {
+                        // A priced module replacement invalidates its prior durable
+                        // snapshot even when final admission refuses before installation.
+                        if (cacheBustingPass) {
+                            dropSlot(sessionId, "lkg_over_limit_replacement");
+                            state.lkgAcceptedCapture = undefined;
+                        }
+                        const error = contextRefusalError(refusal);
+                        // The module returned an unservable array, not a typed
+                        // native refusal. Repeated invalid outputs must park it.
+                        markFailure(sessionId, state, error);
+                        throw error;
+                    }
                 }
                 logStage(sessionId, "apply", applyStartedAt, timings);
                 // output.messages commonly aliases the raw input array, so preserve the entry ids
@@ -4442,6 +4478,14 @@ export function createRustModeTransform(
             }).catch((error) => {
                 sessionLog(sessionId, "single-store embedding drain failed (ignored):", error);
             });
+            finalWireUsage.capture(sessionId, {
+                messages: output.messages as MessageLike[],
+                systemPromptTokens: sessionMeta.systemPromptTokens,
+                providerID: model?.providerID,
+                modelID: model?.modelID,
+                agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                systemPromptHash: sessionMeta.systemPromptHash,
+            });
             finishPass(true);
             // Validation, message replacement, synchronous LKG persistence and
             // bookkeeping have finished. Clear the persisted replay block last; if
@@ -4541,6 +4585,13 @@ export function createRustModeTransform(
                 throw new EmergencyFailClosedError(error.message, { cause: error });
             }
             const migration = singleStoreMigrationRequiredFailure(error);
+            const protectedRefusal = protectedToolRefusal(error);
+            if (protectedRefusal || error instanceof EmergencyFailClosedError) {
+                decision = "error";
+                servedFrom = "refused";
+                finishPass(false, false);
+                throw protectedRefusal ?? error;
+            }
             if (migration) {
                 decision = "error";
                 materializeReason = migration.code;
@@ -4769,3 +4820,12 @@ export const __rustModeTransformTest = {
     createRustModeTransform,
     directiveTextOf,
 };
+
+import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
+import { getActiveTagsBySession } from "../../features/magic-context/storage";
+import { resolveDecisionCalibration } from "./decision-calibration";
+import {
+    contextRefusalError,
+    outgoingContextRefusal,
+    protectedToolRefusal,
+} from "./emergency-fail-closed";

@@ -394,6 +394,11 @@ export function hasTokenizerForFit(): boolean {
     return getTokenizer() !== undefined;
 }
 
+/** Cost fence for refusal-only counting; shared estimates retain master's BPE. */
+export function tokenCountUsesByteBound(text: string): boolean {
+    return text.length > 1024 * 1024 || /[\p{L}\p{N}]{16385}/u.test(text);
+}
+
 export function estimateTokens(text: string): number {
     if (!text) return 0;
     const activeTokenizer = getTokenizer();

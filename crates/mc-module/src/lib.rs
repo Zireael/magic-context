@@ -4784,6 +4784,7 @@ impl McHandler {
                 temporal_awareness: true,
                 prompt_surface_guidance_override: None,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
             },
         )
@@ -7748,6 +7749,15 @@ impl McHandler {
             };
         }
 
+        let protected_tool_snapshot = match store.load_meta(session_id) {
+            Ok(snapshot) => snapshot.meta.protected_tool_block_ids,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_write_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
         match store.append_pending_agent_drops_with_command(
             session_id,
             Some(&command_id),
@@ -7766,6 +7776,18 @@ impl McHandler {
             }
             Ok(outcome) => {
                 let mut resp = json!({ "ok": true, "queued": outcome.queued });
+                let (held, immediate): (Vec<_>, Vec<_>) = tags
+                    .iter()
+                    .filter(|tag| drop_ids.contains(&tag.block_id))
+                    .partition(|tag| protected_tool_snapshot.contains(&tag.block_id));
+                if !held.is_empty() {
+                    resp["held_tag_numbers"] =
+                        json!(held.iter().map(|tag| tag.tag_number).collect::<Vec<_>>());
+                    resp["immediate_tag_numbers"] = json!(immediate
+                        .iter()
+                        .map(|tag| tag.tag_number)
+                        .collect::<Vec<_>>());
+                }
                 if let Some(disposition) = &outcome.disposition {
                     resp["disposition"] = json!(disposition);
                 }
@@ -10375,6 +10397,7 @@ impl McHandler {
                 // additive-only memory/docs transform for every consumer profile.
                 compaction_enabled: binding.config.compaction_enabled,
                 smart_drops: binding.config.smart_drops,
+                protected_tools: binding.config.protected_tools.clone(),
                 // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the
                 // request's model while retaining whether the walk actually matched an entry.
                 cache_ttl: resolved_cache_ttl.value,
@@ -10416,6 +10439,11 @@ impl McHandler {
         let reject_transform = |e: crate::transform::TransformError| {
             let code = if matches!(e, crate::transform::TransformError::AssistantTerminalRetry) {
                 "assistant_terminal_retry"
+            } else if matches!(
+                e,
+                crate::transform::TransformError::ProtectedToolResultsOverLimit
+            ) {
+                crate::transform::PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE
             } else {
                 "transform_failed"
             };
@@ -13011,6 +13039,9 @@ impl McHandler {
                     .tag_numbers
                     .tag_numbers
                     .contains(&protection_window::TagNumber(*number as i64))
+                    || by_number.get(number).is_some_and(|tag| {
+                        loaded.meta.protected_tool_block_ids.contains(&tag.block_id)
+                    })
             });
         let mut details = Vec::new();
         if !immediate.is_empty() {
@@ -21781,6 +21812,7 @@ mod tests {
             temporal_awareness: true,
             prompt_surface_guidance_override: None,
             smart_drops: false,
+            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
         }
     }
@@ -27615,6 +27647,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_protected_results_over_limit_is_a_typed_refusal_not_passthrough() {
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.protected_tools.insert("bash".into(), 8);
+        let (handler, store, _dir, project) = handler_with_store(producer, config.clone());
+        let mut route = binding_with_harness(project.to_str().unwrap(), "claude-code", "ses");
+        route.config = config;
+        handler.bind_route(7, route);
+        let mut messages = vec![];
+        for n in 0..8 {
+            messages.push(assistant_tool_call(&format!("call-{n}"), n * 2 + 1));
+            messages.push(tool_result(
+                &format!("result-{n}"),
+                n * 2 + 2,
+                &"word ".repeat(20000),
+            ));
+        }
+        let mut request = request_with_usage(messages, 200000, 50000);
+        request["serializer_profile"] = json!("claude-code-anthropic");
+        request["usage"]["final_wire_trusted"] = json!(true);
+        request["usage"]["final_wire_input_tokens"] = json!(200000);
+        let before = store.load("ses").unwrap().row_version;
+        let (code, message) = error_frame(call_transform_outcome(&handler, request.clone()).await);
+        let golden: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/protected-tool-refusal.json"
+        ))
+        .unwrap();
+        assert_eq!(code, golden["code"].as_str().unwrap());
+        assert_eq!(message, golden["message"].as_str().unwrap());
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+        request["usage"]["final_wire_trusted"] = json!(false);
+        assert!(matches!(
+            call_transform_outcome(&handler, request).await,
+            HandlerOutcome::Response(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn transform_success_records_received_and_completed_trace() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -30524,6 +30594,149 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_agent_self_stamp_shared_fixture() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            label: String,
+            tools: Vec<String>,
+            drop: usize,
+            protected_tools: std::collections::BTreeMap<String, usize>,
+            #[serde(default)]
+            agent_self_stamp: bool,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/protected-tool-holds.json"))
+                .unwrap();
+        for case in cases.into_iter().filter(|case| case.agent_self_stamp) {
+            let resolver =
+                FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+            let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+                Arc::new(ProducerState::default()),
+                default_test_config(),
+                resolver,
+            );
+            let mut tags = case
+                .tools
+                .iter()
+                .enumerate()
+                .map(|(i, _)| TagMintInput {
+                    block_id: format!("m{}#0", i + 1),
+                    kind: "tool_result".to_string(),
+                    token_count: 10,
+                    source_bytes: b"result".to_vec(),
+                })
+                .collect::<Vec<_>>();
+            for i in 100..103 {
+                tags.push(TagMintInput {
+                    block_id: format!("m{i}#0"),
+                    kind: "tool_result".to_string(),
+                    token_count: 8000,
+                    source_bytes: b"padding".to_vec(),
+                });
+            }
+            store.seed_tags_for_test("ses", &tags, 1000).unwrap();
+            let mut loaded = store.load("ses").unwrap();
+            loaded.meta.protected_tokens_effective = Some(8000);
+            if case.protected_tools.get("ctx_reduce").copied().unwrap_or(3) > 0 {
+                loaded
+                    .meta
+                    .protected_tool_block_ids
+                    .insert(format!("m{}#0", case.drop));
+            }
+            store
+                .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+            cache_last_served_test_messages(
+                &handler,
+                "ses",
+                case.tools
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| cached_tool_result(&format!("m{}", i + 1), name))
+                    .collect(),
+            );
+            let ack = tool_text(
+                call_facade(
+                    &handler,
+                    "ctx_reduce",
+                    json!({"drop":case.drop.to_string()}),
+                )
+                .await,
+            );
+            assert_eq!(
+                ack,
+                ctx_reduce_self_stamp_message(case.drop as u64),
+                "{}",
+                case.label
+            );
+            let delivered = tool_body(handler.handle_agent_drops_value(
+                7,
+                json!({
+                    "method":"agent_drops.append", "session_id":"ses", "drop":case.drop.to_string(),
+                    "command_id":case.label,
+                }),
+            ));
+            assert_eq!(delivered["queued"], json!(0));
+            assert_eq!(delivered["ctx_reduce_self_stamps"], json!([case.drop]));
+            assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_mixed_reply_orders_free_held_and_self_stamp() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let tags = (1..=6)
+            .map(|i| TagMintInput {
+                block_id: format!("m{i}#0"),
+                kind: "tool_result".to_string(),
+                token_count: if i > 3 { 8000 } else { 10 },
+                source_bytes: b"result".to_vec(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &tags, 1000).unwrap();
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.protected_tokens_effective = Some(8000);
+        loaded
+            .meta
+            .protected_tool_block_ids
+            .insert("m1#0".to_string());
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        cache_last_served_test_messages(
+            &handler,
+            "ses",
+            vec![
+                cached_tool_result("m1", "custom"),
+                cached_tool_result("m2", "ctx_reduce"),
+                cached_tool_result("m3", "read"),
+            ],
+        );
+        let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({"drop":"2,1,3"})).await);
+        assert_eq!(ack, "Queued: drop §3§. Held: §1§ is inside the protected working set; it applies once newer work displaces it. Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later. §2§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.");
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+        let delivered = tool_body(handler.handle_agent_drops_value(7, json!({
+            "method":"agent_drops.append", "session_id":"ses", "drop":"2,1,3", "command_id":"mixed-reply",
+        })));
+        assert_eq!(delivered["ctx_reduce_self_stamps"], json!([2]));
+        assert_eq!(delivered["ctx_reduce_queued_tags"], json!([1, 3]));
+        assert_eq!(
+            store
+                .load_pending_agent_drops("ses")
+                .unwrap()
+                .into_iter()
+                .map(|drop| drop.target_id)
+                .collect::<Vec<_>>(),
+            vec!["m1#0", "m3#0"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn facade_ctx_reduce_ack_validates_unknown_queued_and_protected_tags_without_committing()
     {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
@@ -30704,6 +30917,45 @@ mod tests {
             assert!(!properties.contains_key("reduced"));
             assert!(!properties.contains_key("summary"));
         }
+    }
+
+    #[tokio::test]
+    async fn protected_tool_ctx_reduce_ack_reuses_selection_snapshot() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let tags = (1..=6)
+            .map(|number| TagMintInput {
+                block_id: format!("m{number}#0"),
+                kind: "tool_result".to_string(),
+                token_count: 8000,
+                source_bytes: b"output".to_vec(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &tags, 1000).unwrap();
+        let mut loaded = store.load("ses").unwrap();
+        loaded
+            .meta
+            .protected_tool_block_ids
+            .insert("m2#0".to_string());
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({"drop":"2"})).await);
+        assert!(
+            ack.contains("Held: §2§ is inside the protected working set"),
+            "{ack}"
+        );
+        let delivery = tool_body(handler.handle_agent_drops_value(
+            7,
+            json!({"session_id":"ses", "drop":"2", "command_id":"held-tool-command"}),
+        ));
+        assert_eq!(delivery["held_tag_numbers"], json!([2]));
+        assert_eq!(delivery["queued"], 1);
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
     }
 
     #[test]
@@ -36678,6 +36930,7 @@ mod tests {
                 protected_tokens_provenance: "derived",
                 compaction_enabled: true,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,
@@ -37661,6 +37914,7 @@ mod tests {
                 protected_tokens_provenance: "derived",
                 compaction_enabled: true,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
                 model_key: None,
