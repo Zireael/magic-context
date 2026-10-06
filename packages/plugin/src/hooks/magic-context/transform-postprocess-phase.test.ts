@@ -42,6 +42,7 @@ import {
     armThinkingBindingRecovery,
     clearThinkingBindingRecoveryIf,
     getCompactionMarkerHealth,
+    getDeferredClearedCompactionMarkerState,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
     getPersistedTodoPermissionDenied,
@@ -99,6 +100,7 @@ import * as operations from "./transform-operations";
 import { applyFlushedStatuses } from "./transform-operations";
 import {
     abortSessionFailClosed,
+    applyRustModeDeferredCompactionMarker,
     checkM0MutationDriftAndSignal,
     clearPendingCompactionMarkerAfterSuccessfulDrain,
     evaluateEmergencyFailClosed,
@@ -1713,6 +1715,119 @@ describe("deferred compaction marker representation", () => {
         expect(JSON.stringify(replay)).toBe(firstBytes);
     });
 
+    it("newer pending publication waits until consumed by the served response", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-rust-consumed-coverage";
+        createOpenCodeDbWithoutMessages("rust-consumed-coverage-");
+        const oc = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        for (const ordinal of [1, 10, 11, 20]) {
+            oc.prepare("INSERT INTO message VALUES (?, ?, ?, ?, ?)").run(
+                `m${ordinal}`,
+                sessionId,
+                ordinal,
+                ordinal,
+                JSON.stringify({ role: "user" }),
+            );
+        }
+        oc.close();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 10,
+                startMessageId: "m1",
+                endMessageId: "m10",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "first",
+                content: "first",
+            },
+            {
+                sequence: 1,
+                startMessage: 11,
+                endMessage: 20,
+                startMessageId: "m11",
+                endMessageId: "m20",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "later",
+                content: "later",
+            },
+        ]);
+        const pending = {
+            ordinal: 20,
+            endMessageId: "m20",
+            publishedAt: 2,
+            injectAttempts: 3,
+            firstInjectFailedAt: 1,
+            lastInjectError: "writer busy",
+        };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        for (const committed of [true, false]) {
+            applyRustModeDeferredCompactionMarker({
+                db,
+                sessionId,
+                cacheBustingPass: true,
+                admissionProven: true,
+                ...(committed
+                    ? { boundary: { rowVersion: 7, ordinal: 10, endMessageId: "m10" } }
+                    : {}),
+                consumedBoundary: { rowVersion: 7, ordinal: 10, endMessageId: "m10" },
+            });
+            expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(getCompactionMarkerHealth(db, sessionId).attempts).toBe(3);
+        }
+        // A noncommitting response can retry, but only with its own consumed coverage.
+        applyRustModeDeferredCompactionMarker({
+            db,
+            sessionId,
+            cacheBustingPass: true,
+            admissionProven: true,
+            consumedBoundary: { rowVersion: 8, ordinal: 20, endMessageId: "m20" },
+        });
+        expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryOrdinal).toBe(20);
+        expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
+    });
+
+    it("genuine rebuild without fresh coordinates retires the cleared marker in the same cycle", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-rust-cleared-marker";
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryMessageId: "m10",
+            targetEndMessageId: "m10",
+            boundaryOrdinal: 10,
+            summaryMessageId: "summary",
+            summaryPartId: "summary-part",
+            compactionPartId: "compaction",
+        });
+        setPersistedCompactionMarkerState(db, sessionId, null);
+        const serve = (cacheBustingPass: boolean) => {
+            const messages = [
+                {
+                    info: { id: "tail", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "tail" }],
+                },
+            ] as MessageLike[];
+            runRustModePostprocess({
+                db: db!,
+                sessionId,
+                messages,
+                cacheBustingPass,
+                fullFeatureMode: true,
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: false, frozen: true },
+            });
+            return messages;
+        };
+        expect(serve(false).some((message) => message.info.summary === true)).toBe(true);
+        expect(getDeferredClearedCompactionMarkerState(db, sessionId)).not.toBeNull();
+        expect(serve(true).some((message) => message.info.summary === true)).toBe(false);
+        expect(getDeferredClearedCompactionMarkerState(db, sessionId)).toBeNull();
+    });
+
     it("committed scheduler-execute boundary metadata cannot drain a marker without served bust permission", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -1821,6 +1936,7 @@ describe("deferred compaction marker representation", () => {
                 sessionId,
                 messages,
                 cacheBustingPass,
+                consumedBoundary: { rowVersion: 7, ordinal: 10, endMessageId: "msg-partial" },
                 fullFeatureMode: true,
                 tagger: createTagger(),
                 ctxReduceAvailability: { callable: false, frozen: true },
@@ -1890,6 +2006,7 @@ describe("deferred compaction marker representation", () => {
                 messages,
                 sessionDirectory: dataHome,
                 cacheBustingPass: true,
+                consumedBoundary: { rowVersion: 7, ordinal: 10, endMessageId: "msg-boundary" },
                 fullFeatureMode: true,
                 tagger: createTagger(),
                 ctxReduceAvailability: { callable: false, frozen: true },
@@ -1966,6 +2083,7 @@ describe("deferred compaction marker representation", () => {
                 messages: served,
                 sessionDirectory: dataHome,
                 cacheBustingPass,
+                consumedBoundary: { rowVersion: 7, ordinal: 10, endMessageId: "msg-boundary" },
                 fullFeatureMode: true,
                 tagger: createTagger(),
                 ctxReduceAvailability: { callable: false, frozen: true },

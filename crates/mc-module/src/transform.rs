@@ -23318,6 +23318,7 @@ pub(crate) mod tests {
             .unwrap();
         ctx.historian_active = true;
         let pass_n = transform(&s, &with_usage(raw.clone(), 75, 100), &ctx).unwrap();
+        assert!(pass_n.prefix_bust_permitted);
         assert!(m1_bytes(&pass_n).contains("PUBLISHED_A"));
         assert!(frozen_red_payload(&s.load("ride").unwrap().core, "old-result#0").is_some());
         ctx.historian_active = false;
@@ -23326,6 +23327,7 @@ pub(crate) mod tests {
         let replay = transform(&s, &with_usage(raw.clone(), 10, 100), &ctx).unwrap();
         assert_eq!(replay.action, "SOFT+");
         assert_eq!(replay.messages(), pass_n.messages());
+        assert!(!replay.prefix_bust_permitted);
         let next = transform(&s, &with_usage(raw, 75, 100), &ctx).unwrap();
         assert!(m1_bytes(&next).contains("PUBLISHED_B"));
     }

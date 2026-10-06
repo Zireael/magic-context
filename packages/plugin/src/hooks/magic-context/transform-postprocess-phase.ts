@@ -782,6 +782,8 @@ export function applyRustModeDeferredCompactionMarker(args: {
     db: ContextDatabase;
     sessionId: string;
     boundary?: RustMaterializedCompactionBoundary;
+    /** Coverage rendered by this response, even when it did not commit a fresh target. */
+    consumedBoundary?: RustMaterializedCompactionBoundary;
     sessionDirectory?: string;
     /**
      * How this host applies the boundary. The default writes a compaction row into
@@ -858,6 +860,22 @@ export function applyRustModeDeferredCompactionMarker(args: {
 
     const pending = getPendingCompactionMarkerState(args.db, args.sessionId);
     if (!pending) return;
+    // A later publisher may have won while this response was rendering. Keep its
+    // complete retry state untouched until a response actually consumes that work.
+    // Skip the cut entirely rather than replacing the newer pending blob with an
+    // older response target. Equal ordinals also require the exact end anchor.
+    const consumed = args.consumedBoundary ?? boundary;
+    if (
+        !consumed ||
+        pending.ordinal > consumed.ordinal ||
+        (pending.ordinal === consumed.ordinal && pending.endMessageId !== consumed.endMessageId)
+    ) {
+        sessionLog(
+            args.sessionId,
+            "rust compaction-marker drain: pending target not covered by served response; retaining retry state",
+        );
+        return;
+    }
     // Record the latest target above even when this pass cannot prove the cut safe.
     // Deferral does not spend retry attempts or arm the post-cut replay fence.
     if (args.admissionProven === false) return;
@@ -1026,6 +1044,7 @@ export function runRustModePostprocess(args: {
     projectPath?: string;
     sessionDirectory?: string;
     materializedBoundary?: RustMaterializedCompactionBoundary;
+    consumedBoundary?: RustMaterializedCompactionBoundary;
     markerAdmissionProven?: boolean;
     beforeMarkerApply?: () => void;
     afterMarkerApply?: (outcome: MarkerUpdateOutcome) => void;
@@ -1035,9 +1054,9 @@ export function runRustModePostprocess(args: {
     resolvedProviderID?: string;
     thinkingBindingRecoveryEnabledForModel?: boolean;
     /**
-     * The module's decision busts the cache on this pass (HARD, MIGRATE_HARD,
-     * EXECUTE, or SOFT). Such a pass rewrites the prompt from its start, so it
-     * may freeze every thinking block its own edit invalidated.
+     * The module's response-local prefix_bust_permitted is exactly true.
+     * Neither the decision label nor local frozen-release pricing grants this
+     * authority. A permitted pass may freeze thinking invalidated by its edit.
      */
     cacheBustingPass?: boolean;
     /**
@@ -1113,6 +1132,7 @@ export function runRustModePostprocess(args: {
             db: args.db,
             sessionId: args.sessionId,
             boundary: args.materializedBoundary,
+            consumedBoundary: args.consumedBoundary,
             sessionDirectory: args.sessionDirectory,
         });
     }
@@ -1124,7 +1144,7 @@ export function runRustModePostprocess(args: {
             sessionId: args.sessionId,
             tagger: args.tagger,
             ctxReduceAvailability: args.ctxReduceAvailability,
-            isCacheBustingPass: args.materializedBoundary != null,
+            isCacheBustingPass: args.cacheBustingPass === true,
         },
     );
     for (const anchor of getNoteNudgeAnchors(args.db, args.sessionId)) {
@@ -1156,7 +1176,7 @@ export function runRustModePostprocess(args: {
                 trailingBlankDecisions,
                 { sourceDecisions: args.trailingBlankSourceDecisions },
             ).filter(([id]) => id === args.trailingBlankNewestAssistantId);
-            if (candidates.length > 0) {
+            if (args.cacheBustingPass === true && candidates.length > 0) {
                 const persisted = addTrailingBlankDecisions(args.db, args.sessionId, candidates, {
                     overwriteMessageId: args.trailingBlankNewestAssistantId,
                 });
