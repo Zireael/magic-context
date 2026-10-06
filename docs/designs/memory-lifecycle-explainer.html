@@ -3,12 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light dark">
+  <meta name="color-scheme" content="light">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'">
   <title>Project memory: from accumulated facts to current claims · Magic Context</title>
   <style>
     :root { color-scheme: light; --bg: #f7f8fa; --paper: #fff; --ink: #202d3a; --muted: #536273; --line: #d5dde5; --accent: #125e70; --tint: #edf6f7; --warn: #805013; --warn-bg: #fff6e7; --old: #717d8a; --shadow: 0 8px 30px #1c344509; }
-    @media (prefers-color-scheme: dark) { :root { color-scheme: dark; --bg: #131c24; --paper: #1a2631; --ink: #edf3f8; --muted: #b5c3cf; --line: #3c4d5c; --accent: #82d3df; --tint: #213b44; --warn: #f1c37e; --warn-bg: #362d22; --old: #a2b2c0; --shadow: none; } }
     * { box-sizing: border-box; }
     html { scroll-behavior: smooth; scroll-padding-top: 24px; }
     body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.65 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -120,7 +119,7 @@
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">Magic Context</div>
-      <p>Project memory, explained<br>For Ufuk · design proposal</p>
+      <p>Project memory, explained<br>Design r2 · proposal</p>
       <nav aria-label="Section index">
         <ol>
           <li><a href="#overview"><span>01</span> The one-minute version</a></li>
@@ -131,7 +130,8 @@
           <li><a href="#sweeps"><span>06</span> Sweeps &amp; history repair</a></li>
           <li><a href="#cache"><span>07</span> Cache safety</a></li>
           <li><a href="#comparison"><span>08</span> Side by side</a></li>
-          <li><a href="#rollout"><span>09</span> Open questions &amp; rollout</a></li>
+          <li><a href="#rollout"><span>09</span> First release &amp; gates</a></li>
+          <li><a href="#review"><span>10</span> What the review changed</a></li>
         </ol>
       </nav>
       <a class="source-link" href="#sources">Sources &amp; evidence limits ↓</a>
@@ -140,8 +140,8 @@
       <header>
         <div class="eyebrow">A current claim set, not another event log</div>
         <h1>Remember what matters.<br>Keep the evidence of what changed.</h1>
-        <p class="lede">Today, project memory accumulates facts. The proposed lifecycle separates what happened from what is still useful, gives each claim an evidence trail, and spends prompt attention without disturbing a warm cache.</p>
-        <span class="badge">Proposed · not implemented</span>
+        <p class="lede">Today, project memory accumulates facts. R2 starts smaller: keep evidence and candidates durable, make every writer accountable, and give the operator one usable approval inbox. Attention changes and bulk history repair come later.</p>
+        <span class="badge">R2 · proposed, not implemented</span>
         <span class="badge">Local, self-contained explainer</span>
         <p class="small">Source of truth: <a href="memory-lifecycle.md">Project memory lifecycle</a>. “Today” means the implementation described by that design, not a new audit of your live store. The trials used copied stores and did not change memories.</p>
       </header>
@@ -151,11 +151,12 @@
         <h2 id="overview-title">Less prompt baggage. More accountable knowledge.</h2>
         <ul class="summary">
           <li><strong>Keep episodes in compartments; keep reusable claims in memory.</strong> A <em>compartment</em> is a saved, dated episode summary. Its fullest narrative is P1; P2–P4 are progressively shorter versions. It remains the source of evidence, not a second memory row.</li>
-          <li><strong>Extract first, reconcile second.</strong> The historian reads the new transcript without a project-memory block, then compares candidate facts with relevant claims from the whole eligible owned project pool.</li>
-          <li><strong>Separate importance from freshness.</strong> Importance is the consequence and breadth of not knowing a claim. Freshness measures reinforcement and age. Their product chooses attention; age alone never proves a claim false.</li>
+          <li><strong>First release: foundations, not the whole lifecycle.</strong> Verification reaches the memory row; anchored candidates survive in a pending queue; all writers share one revision/evidence applier; extraction omits the memory block and reconciliation records shadow <code>new / covered / abstain</code> decisions; a fleet inbox makes review usable.</li>
+          <li><strong>Project activity, not calendar aging.</strong> Count distinct compartment publications since accepted reinforcement. A project idle for three weeks loses nothing. Importance × activity freshness stays in shadow until replay beats importance-only selection.</li>
           <li><strong>Revise without erasing.</strong> Keep previous prose, metadata and evidence in history. Superseded rows leave ordinary search, but deliberate history lookup and audited restore remain available.</li>
-          <li><strong>Keep background work off the cache clock.</strong> Reweight only at a rebuild already needed for another reason. Bulk repair and its undo wait for that rebuild before entering the primary prompt.</li>
-          <li><strong>Earn automation in stages.</strong> Start with shadow decisions—recorded but not applied—and operator-approved transitions. The trials support a better reconciliation prompt, not autonomous rewriting or retirement.</li>
+          <li><strong>Keep background work off the cache clock.</strong> Preserve the applied revision snapshot, text, delta and image. Requested current search can appear in the tail; it does not rewrite the frozen automatic head. Bulk backfill is deferred unless its full barrier is proven.</li>
+          <li><strong>One inbox across projects, not interruptions.</strong> Scheduled topic-grouped digests lead to full before/after claims and dated evidence. Approval binds exact revisions. Keep, reject and snooze remember decisions; an Ask-style phone alert is one digest pointer, not one per proposal.</li>
+          <li><strong>No autonomous semantic transitions.</strong> Rewrites, merges, replacements, retirements, restore conflicts and standing-rule promotion need revision-bound approval. Keep the pending queue, journal and cache projection; defer usage freshness, rescoring, weighted mural and broad event repair behind their own measurements.</li>
         </ul>
         <p class="sources"><a href="memory-lifecycle.md" class="ref">Design: decision, vocabulary, goals</a></p>
       </section>
@@ -203,24 +204,24 @@
       <section id="model" aria-labelledby="model-title">
         <div class="section-label">03 / The new model · proposed</div>
         <h2 id="model-title">A memory is a claim with a reason to remain useful.</h2>
-        <p>Each live claim gains a decay class, distinct evidence records, a proof count, a last-reinforced time and append-only history. Citations identify the project, conversation and harness, compartment and message range. Evidence must still be resolvable; an import timestamp is not a proved occurrence date.</p>
+        <p>Each live claim gains a revision and distinct evidence records. One immutable journal owns history; proof totals derive from claim-specific observations. Keep last-observed, last-verified and last-used separate. Citations identify the project, conversation, harness, compartment and original message lineage. An import timestamp is not a proved occurrence date.</p>
         <div class="grid">
           <article class="card">
             <div class="tag">Constant freshness</div>
             <h3>Standing rule</h3>
-            <p>An explicit user instruction or an explicitly saved operating rule, with the original instruction/save evidence.</p>
+            <p>An explicit user instruction or saved operating rule, with original evidence and revision-bound promotion approval. An agent save only proposes standing status.</p>
             <p class="small">Example: the user-stated process-termination prohibition in the rescore trial. Inferred imperative wording does not qualify.</p>
             <p><strong>Exit:</strong> an explicit, evidenced revocation or replacement. Silence or a code change cannot revoke it.</p>
           </article>
           <article class="card">
-            <div class="tag">Slow decay · months</div>
+            <div class="tag">Longer activity half-life · shadow</div>
             <h3>Structural fact</h3>
             <p>Architecture, configuration semantics, an external limit, a naming decision or a mechanism with continuing consequence.</p>
             <p class="small">Example: the shared Transcript abstraction described in the rescore trial—a mechanism reused across message representations.</p>
             <p><strong>Refresh:</strong> a new observation or genuine confirmation restores freshness.</p>
           </article>
           <article class="card">
-            <div class="tag">Fast decay · days to weeks</div>
+            <div class="tag">Shorter activity half-life · shadow</div>
             <h3>Situational fact</h3>
             <p>Current, changeable state that matters for continuing work: a temporary environment constraint, open operational state or provisional configuration.</p>
             <p class="small">Example: the temporary fleet hold in the rescore trial. Preserve its uncertainty; a plan is not an accomplished result.</p>
@@ -234,16 +235,16 @@
             <p><strong>Keep:</strong> the compartment narrative. Archive legacy episode-memories only after reviewed backfill.</p>
           </article>
         </div>
-        <p class="small">Examples illustrate the proposed class definitions, not existing class labels on trial rows. Classes are separate from content categories and permanent status. Split mixed rule/state claims rather than averaging their decay. <a class="ref" href="memory-lifecycle.md#four-classes">Design §3</a> · <a class="ref" href="../reports/compartment-rescore-trial.md#25-examples-and-rubric-judgment">Rescore examples</a></p>
+        <p class="small">This is provisional vocabulary, not a validated truth/decay model. Episode is an admission disposition, standing rule an authority policy, and structural/situational are volatility assumptions. Split mixed claims only with approval. <a class="ref" href="memory-lifecycle.md#four-classes">Design §3</a> · <a class="ref" href="../reports/compartment-rescore-trial.md#25-examples-and-rubric-judgment">Rescore examples</a></p>
 
         <h3>Importance × freshness</h3>
-        <p><strong>Importance</strong> reflects consequence of not knowing and breadth of applicability, mapped by a reviewed rubric to the existing integer scale. It is stable between reviews; repetition does not increase it. <strong>Freshness</strong> handles elapsed time since accepted reinforcement.</p>
+        <p><strong>Importance</strong> reflects consequence of not knowing and breadth of applicability. It is stable between reviews; repetition does not increase it. <strong>Shadow freshness</strong> uses project activity since evidence supporting the whole claim—not calendar days or agent recitation.</p>
         <code class="formula">weight = importance × freshness</code>
-        <p class="small">Standing rules: freshness = 1. Other live classes: freshness = 2<sup>−age / class half-life</sup>. Capture one clock and policy at a natural rebuild. This is not a live decay timer and not the compartment algorithm, which uses distance from the newest compartment.</p>
+        <p class="small">Standing rules: shadow freshness = 1. Other live classes: freshness = 2<sup>−publication age / class half-life</sup>. Count genuinely new compartment publications across the canonical project, not tool-heavy message chatter or session-local counters. Recomp, retries, restore and repair do not add activity. Capture one ordinal/policy; unknown legacy evidence stays unknown. The first release does not activate this weight or change the mural policy.</p>
         <div class="widget" id="decay-widget">
-          <h3>Explore the shape—not a chosen policy</h3>
+          <h3>Explore the shadow shape—not a chosen policy</h3>
           <span class="badge open">Half-lives not yet chosen</span>
-          <p class="small" id="chart-help">The horizontal axis is elapsed <em>class half-lives</em>, not days. The structural and situational curves have the same normalized shape; their calendar timescales would differ. All plotted weights are illustrative arithmetic from the design’s formula, not trial measurements or proposed tier cutoffs.</p>
+          <p class="small" id="chart-help">The horizontal axis is <em>activity half-lives</em>, measured in compartment publications, not days. Structural and situational curves have the same normalized shape; their publication-count half-lives may differ. Three idle weeks do not move the curve. These are illustrative numbers, not fitted parameters or active tier cutoffs.</p>
           <div class="controls">
             <div>
               <label for="decay-class">Decay class</label>
@@ -274,7 +275,7 @@
             <text x="55" y="237" text-anchor="middle">0</text>
             <text x="350" y="237" text-anchor="middle">1</text>
             <text x="645" y="237" text-anchor="middle">2</text>
-            <text x="350" y="261" text-anchor="middle">Elapsed class half-lives (not calendar time)</text>
+            <text x="350" y="261" text-anchor="middle">Activity half-lives (compartment publications)</text>
             <path class="base" id="baseline-curve" d="M 55 125 L 350 170 L 645 192.5"/>
             <line class="reinforcement" id="reinforcement-line" x1="350" y1="35" x2="350" y2="215"/>
             <path class="curve" id="weight-curve" d="M 55 125 L 350 170 L 350 125 L 645 170"/>
@@ -285,15 +286,15 @@
           <noscript><p>The controls require JavaScript. The diagram still illustrates the default structural claim: importance 50, weight 25 after one half-life, reset to 50 by reinforcement, then 25 after another half-life.</p></noscript>
         </div>
 
-        <h3>Reinforcement signals, strongest first</h3>
+        <h3>Three separate signals—not one self-reinforcing heartbeat</h3>
         <ol>
-          <li><strong>“Covered by #N” in reconciliation.</strong> Real work re-observes a fact fully covered by that target. Attach the new compartment evidence, even if the target was not in the primary prompt.</li>
-          <li><strong>Verify confirms the current claim against code.</strong> Save backing files, checked commit and result on the row. Mapping a file, skipping a check or refusing a rewrite is not confirmation.</li>
-          <li><strong>Actual agent use.</strong> A scoped citation in the answer or explicit consumption/expansion of a search hit can refresh attention. Merely returning a search result cannot.</li>
+          <li><strong>Last-observed.</strong> Shadow “covered by #N” maps the new fact to specific target claims. A narrow repeat cannot refresh unrelated clauses of a compound memory. Keep the candidate until its coverage is actually reviewed.</li>
+          <li><strong>Last-verified.</strong> Save backing files, checked commit and actual confirmation on the current revision. Mapping, skipping, a refusal or an unchanged fallback is not confirmation.</li>
+          <li><strong>Last-used.</strong> Scoped citation/consumption telemetry is separate from truth evidence. Usage-driven freshness is deferred; an agent quoting injected memory is not independent corroboration.</li>
         </ol>
         <p class="small">Distinct grounded observations count as proofs; usage alone does not prove truth. Retries, prompt copies, duplicate citations, classify and cue compression add no reinforcement. Old backfilled evidence keeps its old observation time; repair time is not new evidence. Search counts are telemetry, not permanent promotion. <a class="ref" href="memory-lifecycle.md#reinforcement">Design §3</a></p>
 
-        <h3>Attention is tiered; knowledge is not discarded.</h3>
+        <h3>Later measured attention policy; knowledge is not discarded.</h3>
         <ul class="tiers">
           <li><strong>Prompt text:</strong> protected standing rules first, then highest-weight whole claims within the text budget.</li>
           <li><strong>Mural cue:</strong> remaining cue-worthy claims with current cues, within the image budget, on a vision-capable model.</li>
@@ -310,7 +311,7 @@
           <ol class="flow" aria-label="Proposed historian write path">
             <li><h3>Turn one → extract, without project memory</h3><p>Keep transcript guards, examples, continuity, compartment tiers and boundary validation. Emit anchored candidate facts with observed origin, or an explicit “episode; no memory” disposition. Do not change chunk size or force a compartment count.</p></li>
             <li><h3>Candidate lookup → the whole eligible owned project pool</h3><p>Use compatible embeddings plus a reserved distinct lexical candidate slot for names, paths and long rules. Show complete candidate text; similarity is a retrieval aid, never a verdict. Shared foreign claims may give context but are not mutable owner-local targets.</p></li>
-            <li><h3>Turn two → reconcile in the same hidden conversation</h3><p>Retain the first prompt and answer. For each fact, inventory exact old clauses before writing new prose. Decide <code>new</code>, <code>covered</code>, <code>merge</code>, <code>update</code> or <code>replaces</code>. No extracted candidate facts means no second-turn inference.</p></li>
+            <li><h3>Turn two → shadow reconcile in the same hidden conversation</h3><p>Retain the first prompt and answer. Map exact claims and decide <code>new</code>, <code>covered</code> or <code>abstain</code>, without applying semantic decisions. No candidate facts means no second inference. Each stage has its own durable send/run ID so turn two cannot replay turn one.</p></li>
             <li><h3>Code-side gate → validate, then seek approval for transitions</h3><p>Check per-fact identity, target scope, exact transcript evidence and preservation of concrete tokens. Recheck the target’s content revision before applying. If it changed during inference, retrieve and reconcile again. A gate pass is not permission to discard a claim.</p></li>
             <li><h3>Short apply transaction → current row + evidence + history</h3><p>Use the actual project memory owner, an exclusive project lease and compare-and-swap against the revision read. Append history before changing prose. Durable pending facts survive model failure, rejected rewrites or unavailable authority; validated compartments publish with all unresolved fact records.</p></li>
           </ol>
@@ -318,14 +319,15 @@
         </figure>
         <div class="table-wrap">
           <table>
-            <caption>What each reconciliation action means</caption>
+            <caption>Shadow reconcile actions, then approval-only shared applier actions</caption>
             <thead><tr><th scope="col">Action</th><th scope="col">Durable effect</th></tr></thead>
             <tbody>
-              <tr><th scope="row">New</th><td>Create an independently useful claim with origin, evidence, proposed class and provisional importance awaiting review.</td></tr>
-              <tr><th scope="row">Covered by #N</th><td>The target alone covers every claim. Keep prose and importance; attach distinct evidence and reinforce. Joint coverage needs explicit mapping or review.</td></tr>
+              <tr><th scope="row">New</th><td>Shadow candidate with origin and evidence. Creating a row needs review, or a later separately measured opt-in admission gate.</td></tr>
+              <tr><th scope="row">Covered by #N</th><td>Shadow claim mapping. Accepted evidence applies only to supported clauses, not the whole compound row. Recitations are not fresh proofs.</td></tr>
+              <tr><th scope="row">Abstain</th><td>Keep the fact and reason in the durable queue. Uncertainty or malformed output is not automatic admission.</td></tr>
               <tr><th scope="row">Merge</th><td>Refine a coherent facet, preserving all still-valid claims. Keep the survivor ID; archive other source rows with successor links and their histories.</td></tr>
               <tr><th scope="row">Update</th><td>Revise the same property on the same ID. Preserve unrelated claims and append state-update history.</td></tr>
-              <tr><th scope="row">Replaces</th><td>An evidenced contradiction or revocation creates a successor revision/row and archives the predecessor. Revocation with no surviving claim is an audited archive, not an empty live row.</td></tr>
+              <tr><th scope="row">Replaces</th><td>Approval of an evidenced contradiction creates a new successor ID and archives the predecessor. Revocation with no surviving claim is an audited archive, not an empty live row.</td></tr>
             </tbody>
           </table>
         </div>
@@ -374,42 +376,49 @@
         <ul>
           <li><strong>Update:</strong> the old revision leaves ordinary search; the current row remains. History preserves the full earlier prose and metadata.</li>
           <li><strong>Merge or replacement:</strong> archived source/predecessor rows leave semantic, full-text and explicit-ID memory search, and future cue selection. Successor links lead to current knowledge.</li>
-          <li><strong>Restore:</strong> a deliberate, conflict-checked new revision. Undo restores metadata as well as prose, without deleting intervening history.</li>
+          <li><strong>Restore:</strong> a new audited revision on the original ID. Active successors or same-hash rows require a reviewed conflict decision with all-source revision checks. Keep intervening history; do not restore old sharing permissions or use eager unarchive epochs.</li>
         </ul>
         <p class="small">Already-served text and images remain frozen until an independently authorized correction/fold. Ordinary restore waits for a natural fold; bulk repair and its undo have the stronger barrier described below. <a class="ref" href="memory-lifecycle.md#non-destructive-transitions-and-repair">Design §4</a></p>
       </section>
 
       <section id="sweeps" aria-labelledby="sweeps-title">
-        <div class="section-label">06 / Sweeps &amp; the one-time fix-history backfill</div>
-        <h2 id="sweeps-title">Maintain the live set. Repair the past with consent.</h2>
+        <div class="section-label">06 / Verification, the inbox &amp; later repair</div>
+        <h2 id="sweeps-title">Finish the accounting. Make review usable.</h2>
         <div class="grid">
           <div class="card"><h4>Verify: finish the accounting</h4><p>Write confirmation, complete file mappings, checked commit, evidence and reinforcement together on the correct revision. Audit legacy mismatches on a copied store; uncertain matches need a new check. Do not reset reinforcement to repair time.</p></div>
-          <div class="card"><h4>Classify: break score anchoring</h4><p>Hide the candidate’s current score. Use a versioned consequence/breadth rubric and fixed human-scored anchors. Review class eligibility against origin evidence, then rotate an overdue cohort—no forced histogram or every-run rescore.</p></div>
-          <div class="card"><h4>Stale review: propose, do not presume</h4><p>Low weight and long silence select a bounded backlog. Retrieve newer same-facet evidence and current code with caller context. Preserve uncertain or partly true entries; retire only with operator approval.</p></div>
-          <div class="card"><h4>Events: repair optional provenance</h4><p>Re-anchor useful causal/correction events and copy essential evidence into history. A trajectory change caused by a test or self-review is not a user instruction. Keep events initially; evaluate their additional value before retiring unused kinds.</p></div>
+          <div class="card"><h4>Every writer: the same boundary</h4><p>Historian, verify, curate, tools, dashboard and later backfill submit the same revision/evidence envelope. No alternate SQL writer bypasses approval. Unchanged checks may automate; semantic changes may not.</p></div>
+          <div class="card"><h4>Classify and attention: measured later</h4><p>Blind memory-specific calibration precedes periodic rescoring. Activity freshness must beat importance-only replay. Weighted mural policy needs its own usefulness test; no forced histogram.</p></div>
+          <div class="card"><h4>Events: keep existing evidence</h4><p>Repair only references needed by accepted evidence. Broad re-anchoring is deferred until its added value is measured. A trajectory change from a test or self-review is not a user instruction.</p></div>
         </div>
         <div class="warning">
-          <strong>The earlier stale-retirement trial is complete. The next stale-reconcile variant is open.</strong>
-          <p>Evidence-supplied curate retired 6/21 labelled stale memories but also one labelled true memory. Text-only wrongly retired a still-binding rule outside that set. More citations did not establish contradiction. The next trial must measure caller coverage, false rule retirements, preservation and repeat variance; it has no results yet.</p>
-          <p class="small"><a href="../reports/curate-stale-retirement-trial.md">Completed trial</a> · <a href="memory-lifecycle.md#stale-check-and-curate">Design §5: next trial placeholder</a></p>
+          <strong>Both stale-retirement and reconcile-check trials are complete.</strong>
+          <p>Reconcile-check’s reviewed action precision was <strong>60% (6/10 known)</strong>, with four wrong accepted actions in each pass. Labelled stale detection changed from 6/21 to 4/21. A real quote from an erroneous SQLite comment supported a false retirement. Quotes establish provenance, not contradiction; an unchanged fallback is not positive verification.</p>
+          <p class="small"><a href="../reports/curate-stale-retirement-trial.md">Curate trial</a> · <a href="../reports/memory-reconcile-check-trial.md">Completed reconcile-check</a></p>
         </div>
-        <h3>One-time project repair, after the live path works</h3>
+        <h3>One fleet inbox, across projects</h3>
+        <p>Topic-grouped, risk-aware cards show complete before/after text, removed and kept claims, exact revisions, dated evidence and its authority, source/caller links, dependencies and pending prompt adoption. Approvals bind that exact decision; stale cards return to review. Grouping is not blanket approval of a model batch.</p>
+        <ul>
+          <li><strong>Keep / reject / snooze:</strong> preserve current knowledge, remember rejection until genuinely new evidence, or postpone to a later digest. Cosmetic rewrites and retry IDs are not new evidence. Pending facts do not silently disappear.</li>
+          <li><strong>Scheduled digests:</strong> review when convenient, not per-turn prompts. An Ask-style phone notification points to the digest, never to each proposal.</li>
+          <li><strong>Backlog telemetry:</strong> count, oldest age, arrivals versus decisions, review minutes and per-stage token/spend. Paid retries slow down when review cannot keep up; episodic publication and candidate capture continue.</li>
+        </ul>
+        <h3>Later one-time repair—deferred, not a first-release job</h3>
         <ol class="phase-list">
           <li><strong>Inventory and preview.</strong> Freeze eligible IDs, source revisions, registered histories and missing evidence. Show workload, calls/tokens/embeddings and a provider-based cost envelope; disclose unknown billing. Confirm project, budget and model profiles before paid work.</li>
-          <li><strong>Trace evidence.</strong> Match memory to compartments with compatible embeddings and lexical fallback. Check complete P1 and expand source when needed. Record first occurrence, distinct observations, latest reinforcement and cited transition proposals; similarity alone changes nothing.</li>
+          <li><strong>Trace evidence.</strong> Prefer original publication/range links, then compatible retrieval. Check P1 and expand raw source when needed. Top-k matches prove earliest located evidence and lower-bound observations—not first occurrence or complete proof counts.</li>
           <li><strong>Classify.</strong> Blind-score with the new rubric and origin evidence. Flag episodes and possible rules lacking explicit origins.</li>
           <li><strong>Resolve transitions.</strong> Order evidence by occurrence time, preserve valid claims and use the same approval-gated, revision-checked history applier. Newer does not automatically mean truer.</li>
           <li><strong>Archive episodes.</strong> Only after evidence is recoverable and classification approved. Keep the compartment record and old memory audit.</li>
-          <li><strong>Rescore compartments.</strong> Prefer title + episode type + P1. Write score overlays, not base-row updates. Do not rewrite summaries, raw ranges or original messages; emit no new facts.</li>
-          <li><strong>Review and adopt.</strong> Show proposed, approved, applied, failed and stale items with before/after metadata. Search can reflect approved state now; primary prompts wait for each conversation’s next independently required baseline rebuild.</li>
+          <li><strong>Optionally rescore compartments.</strong> An independent confirmed overlay subjob, not a prerequisite for memory repair. Leave base summaries, ranges and messages untouched; emit no new facts.</li>
+          <li><strong>Review final survivors and adopt.</strong> Revalidate evidence/class/importance against the post-transition revision. Current requested search can appear in the tail; automatic head adoption waits for independent HARD. Bulk repair cannot ship without the complete projection barrier.</li>
         </ol>
         <p class="small">P1-only rescoring is the recommended arm, not an exact-score oracle: an unchanged rerun crossed bands for 10/60 compartments, with mean absolute change 4.33. Extra P2/recent titles showed no quality advantage. The wording trial’s intervention change 4.34 was below repeat noise 4.62. These compartment trials do not validate memory importance or half-lives. <a class="ref" href="../reports/compartment-rescore-trial.md">Rescore trial</a> · <a class="ref" href="../reports/historian-scoring-prompt-trial.md">Wording trial</a></p>
         <div class="note">
-          <strong>What you see: preview → confirm → progress → review → pending prompt adoption.</strong>
+          <strong>Later jobs: preview → confirm → progress → inbox review → pending head adoption.</strong>
           <p>Pause/resume/cancel and audited undo belong to the same durable project job. Completion is per item; resume keeps the frozen input set. Reattach an admitted model run after disconnect rather than paying again while its outcome is unknown. Changed inputs become stale for a new preview.</p>
-          <p>Start with the proposed <code>/ctx-memory-repair</code> surface and shared score subjobs from <code>/ctx-rescore</code>. Doctor is read-only first; dreamer becomes a later opt-in executor of the same confirmed job. Nothing runs as paid inference during startup or migration.</p>
+          <p>The fleet inbox is the approval surface, not <code>/ctx-memory-repair</code> or per-turn prompts. Doctor stays read-only; later dreamer reuses confirmed jobs. Nothing runs as paid inference during startup or migration.</p>
         </div>
-        <p class="sources"><a class="ref" href="memory-lifecycle.md#6-one-time-fix-history-backfill">Design §6</a> · <a class="ref" href="compartment-rescore.md">Compartment rescore design</a></p>
+        <p class="sources"><a class="ref" href="memory-lifecycle.md#6-later-one-time-fix-history-backfill--deferred">Design §6</a> · <a class="ref" href="compartment-rescore.md">Compartment rescore design</a></p>
       </section>
 
       <section id="cache" aria-labelledby="cache-title">
@@ -422,7 +431,7 @@
             <div class="card"><h4>Warm provider-visible prefix</h4><p><code>m[0] text + mural</code><br><code>m[1] saved delta</code></p><p class="small"><strong>Defer:</strong> identical bytes, including after restart. Background completion cannot cross this boundary.</p></div>
           </div>
           <div class="arrow-label">↓ Only an independently required natural HARD opens adoption ↓</div>
-          <div class="card"><h4>Cold recovery / identity or cache expiry / necessary content, pressure or coverage work</h4><p>Capture one clock, policy and eligible revision snapshot → adopt approved bulk/score revisions → compute weights → select text and mural together → save bytes, IDs and applied revision markers atomically.</p></div>
+            <div class="card"><h4>Cold recovery / identity or cache expiry / necessary content, pressure or coverage work</h4><p>Capture one activity/expiry clock, policy, revision pool and cue state → select text and mural together → save bytes, image, revision manifest, admission ledger and correction receipts atomically. Existing attention policy stays in the first release.</p></div>
           <figcaption>A “natural” rebuild is already necessary without background memory work. A job finishing, a timestamp aging or a score overlay appearing is not such a reason.</figcaption>
         </figure>
         <div class="table-wrap">
@@ -437,9 +446,11 @@
             </tbody>
           </table>
         </div>
-        <p><strong>The stronger backfill barrier needs a versioned prompt loader.</strong> Ordinary search sees approved canonical active claims. Rendering reconstructs the revision adopted by that conversation. Suppressing a mutation log is not enough: a later SOFT can reread changed rows and leak bulk repair through the delta.</p>
+        <p><strong>SOFT must pin membership and revisions, not just an ID watermark.</strong> Persist each admitted delta claim’s revision and creation-time priority; new admissions cannot displace old ones. Apply the projection before eligibility, successor chains, forced IDs or budgets. For applied A1 → deferred repair A2 → live A3 based on A2, withhold A3 until HARD. Withheld operations stay pending. Pending lifecycle count or size cannot manufacture pressure/HARD permission; oversized groups wait instead.</p>
+        <p><strong>One text / cue / correction manifest.</strong> If a memory was only a frozen image cue, its eligible live correction must still override that cue on independent SOFT, without changing image bytes. Current full-text search stays available when only an older revision or a cue is visible.</p>
         <p><strong>Score repair needs render-only overlays.</strong> A bare compartment importance update can request an early HARD in Rust and invalidate full-row boundary identities. Leave base rows untouched; join effective scores only after a natural HARD is selected.</p>
-        <p><strong>A marker-only Rust probe stays pinned.</strong> When checking whether a nominal fold would change bytes, use the last-applied scores, lifecycle revisions and clock—not pending repair. Otherwise repair itself could create the cache loss that appears to authorize it.</p>
+        <p><strong>Permission is counterfactual.</strong> Would this pass change the served prefix or lose its cache without pending lifecycle work? Pin both the Rust marker probe and marker-only commit to applied revisions, scores, clocks and image. Dashboard approvals must not call eager epoch setters. Background cue compression does not change Rust’s persisted mural hash: it reads the frozen applied image, not the live cues.</p>
+        <p><strong>Ownership is decided.</strong> Canonical evidence/revisions live in <code>context.db</code>. TS/Pi applied tuples live beside their frozen caches there; Rust’s tuple lives with its cache in <code>store.db</code>. Handoff and paired backup must preserve complete tuples, never mix old images with new text.</p>
         <div class="warning"><strong>Privacy is not decay.</strong> Existing ownership, visibility and explicit privacy revocations keep their stronger invalidation paths. “Background work never busts the cache” must not suppress those safety actions.</div>
         <p class="sources">This is a required implementation contract, not an invariant proved by the model trials. Shipping tests must compare actual served text/image/boundary bytes through defer, SOFT, HARD, restart and undo, with deliberate negative controls. <a class="ref" href="memory-lifecycle.md#7-cache-safety-analysis">Design §7</a> · <a class="ref" href="compartment-rescore.md#proposed-score-sidecar-no-invalidation-on-publication">Rescore cache contract</a></p>
       </section>
@@ -452,9 +463,9 @@
             <caption>Current implementation described by the design vs proposed lifecycle</caption>
             <thead><tr><th scope="col">Concern</th><th scope="col">Today</th><th scope="col">Proposed</th></tr></thead>
             <tbody>
-              <tr><th scope="row">Historian input size</th><td>Full project-memory block, trimmed by the fitter; dominates the measured input.</td><td>No block in extraction; a retrieved, full-text candidate set in reconciliation. Savings and recall still need a fresh paired control.</td></tr>
-              <tr><th scope="row">Deduplication / admission</th><td>Exact-repeat contracts differ by writer; no semantic reconcile turn.</td><td>Claim-level new/covered/merge/update/replaces, lexical reservation, per-fact validation and durable pending. Rewrites remain approval-gated.</td></tr>
-              <tr><th scope="row">Scoring / attention</th><td>Current score shown to classify; permanent/importance/recency selection, mural overflow.</td><td>Blind calibrated importance and reviewed classes. Weight = importance × freshness; one deterministic text/cue/search selection at HARD.</td></tr>
+              <tr><th scope="row">Historian input size</th><td>Full project-memory block, trimmed by the fitter; dominates measured input.</td><td>Remove it in extraction; shadow reconciliation gets full-text candidates. Paired control is complete: 86 versus 139/133 facts, about 18% known stripped re-emission; recall and full-flow billing remain unproved.</td></tr>
+              <tr><th scope="row">Deduplication / admission</th><td>Exact-repeat contracts differ by writer; no semantic reconcile turn.</td><td>Shadow new/covered/abstain, lexical reservation and durable pending. One applier enforces revision-bound approval across every writer.</td></tr>
+              <tr><th scope="row">Scoring / attention</th><td>Current score shown to classify; permanent/importance/recency selection, mural overflow.</td><td>Keep selection in first release. Project-publication freshness stays shadow; rescoring and weighted mural each need their own measurement.</td></tr>
               <tr><th scope="row">Staleness / verification</th><td>Curate leaves standalone stale claims; TypeScript checks may not reach row status.</td><td>Atomic row confirmation/evidence; bounded stale proposals with exact contradiction and preservation checks. Age alone never retires.</td></tr>
               <tr><th scope="row">Provenance</th><td>Seen/retrieval fields, file checks and optional event corroboration; no full claim evidence/revision journal.</td><td>Recoverable scoped source ranges, distinct observation keys, checked commits, auditable proof counts and occurrence times.</td></tr>
               <tr><th scope="row">Undo / search</th><td>Rewrites do not retain prior prose; prompt mutation log is not complete history. Archived explicit-ID search remains possible.</td><td>Append old prose and metadata transactionally; history-only predecessors and conflict-checked audited restore. No archived ordinary-ID hits.</td></tr>
@@ -466,22 +477,22 @@
       </section>
 
       <section id="rollout" aria-labelledby="rollout-title">
-        <div class="section-label">09 / Open questions &amp; rollout</div>
-        <h2 id="rollout-title">Recommendations, not hidden defaults.</h2>
+        <div class="section-label">09 / First release &amp; gates</div>
+        <h2 id="rollout-title">A smaller first release. Explicit exits before implementation.</h2>
         <div class="table-wrap">
           <table>
             <caption>Open decisions from the lifecycle design</caption>
             <thead><tr><th scope="col">Question</th><th scope="col">Recommendation</th></tr></thead>
             <tbody>
-              <tr><th scope="row">Half-lives and tier floors?</th><td><span class="badge open">Open calibration</span><br>Replay fixed claims through folds and retrieval. Months versus days/weeks is direction, not fitted policy. Do not enable arbitrary numbers.</td></tr>
+              <tr><th scope="row">Half-lives and tier floors?</th><td><span class="badge open">Shadow calibration</span><br>Publication-count units, not months or days. Beat importance-only replay without losing dormant/negative constraints before activation. Weighted mural has a separate gate.</td></tr>
               <tr><th scope="row">Can a token gate authorize rewrites?</th><td>No. Keep approval; investigate independent claim-preservation/contradiction review. Preserve pending facts on abstention.</td></tr>
               <tr><th scope="row">Hybrid context and lexical capacity?</th><td>Reserve a distinct lexical candidate first. Ablate capacity with the long procedural rule; the top-eight experiment is not a production recommendation.</td></tr>
-              <tr><th scope="row">Which proofs count?</th><td>Unique grounded observations, not attempts or prompt exposure. Separate correlated real work, code confirmation and use in diagnostics; use refreshes but does not prove.</td></tr>
+              <tr><th scope="row">Which proofs count?</th><td>Claim-specific grounded lineage, not attempts or prompt exposure. Separate observed, verified and used. Partial coverage cannot refresh a compound claim; usage freshness is deferred.</td></tr>
               <tr><th scope="row">Unknown-origin permanent rules?</th><td>Review origins. Preserve instructions during shadow rollout; neither silently demote nor grant standing eligibility.</td></tr>
               <tr><th scope="row">“Out of prompt” after archive?</th><td>No future rendering of the retired row. Already-served bytes persist until independent correction/fold; show pending adoption. Privacy revocations remain stronger.</td></tr>
-              <tr><th scope="row">Is the versioned prompt loader worth it?</th><td>Yes, if bulk repair must wait for HARD. Build it before backfill; otherwise explicitly renegotiate that promise.</td></tr>
-              <tr><th scope="row">Keep events?</th><td>Repair optional grounded provenance first. Do not promote test/self-review pivots to standing rules; evaluate additional evidence value before removal.</td></tr>
-              <tr><th scope="row">Previous auto-promotion opt-outs?</th><td>Require an explicit configuration choice before reconcile admissions. Preserve memory-off. Retire auto-promote and the unused retrieval promotion threshold only after the replacement path is available.</td></tr>
+              <tr><th scope="row">Is the versioned prompt loader worth it?</th><td>Keep the projection. Bulk backfill is deferred unless its complete barrier is specified and tested; staging alone does not define safe canonical promotion.</td></tr>
+              <tr><th scope="row">Keep events?</th><td>Retain existing events and repair only references needed by accepted evidence. Broad re-anchoring awaits measured value; test/self-review pivots are not standing rules.</td></tr>
+              <tr><th scope="row">Previous auto-promotion opt-outs?</th><td>Preserve them and memory-off. Shadow reconciliation is not admission consent; configuration retirement is later.</td></tr>
               <tr><th scope="row">Can doctor run paid work?</th><td>Read-only first. An authenticated project-bound broker is a separate executor decision; no ad hoc credentials or silent model choice.</td></tr>
               <tr><th scope="row">Multiple registered histories?</th><td>Preview all histories in the canonical project/scope and disclose missing/imported evidence. One long-lived conversation is an operating assumption, not a storage constraint.</td></tr>
             </tbody>
@@ -490,30 +501,29 @@
         <div class="note">
           <strong>Trials still open before activation</strong>
           <ul>
-            <li><strong>Fresh paired control:</strong> identical full-memory and stripped first-turn arms, judged durable-fact recall and omissions, actual cache/billing counters. Earlier historical-answer comparisons are not that control.</li>
-            <li><strong>Next stale-reconcile trial:</strong> frozen true/stale/unsure labels, explicit preservation and caller evidence, false rule retirement, independent review and repeat variance. The completed curate result remains the failure baseline.</li>
-            <li><strong>Other shipping evidence:</strong> lexical-slot/per-fact ablations, blinded memory class/importance calibration, copied-store verification/event audits, backfill evidence quality, job cost/retry behavior and runtime attention/cache replay.</li>
+            <li><strong>Extraction omissions:</strong> the paired control is complete, but durable-fact recall and full-memory variance are not. Use its full-memory-only families as regression controls, not assume stripping preserves every useful fact.</li>
+            <li><strong>Safety and operator capacity:</strong> cache/authority parity across OpenCode 1/2, Pi and both Rust transports; reviewed semantic preservation beyond reconcile-check’s errors; measured fleet inbox minutes, arrivals and backlog age.</li>
+            <li><strong>Later experiments:</strong> lexical-slot/per-fact ablations, blind memory scoring, activity freshness versus importance-only, weighted mural, evidence tracing and bounded bulk-job cost. No model trial proves served-byte safety.</li>
           </ul>
         </div>
         <h3>Release order: earn each step</h3>
         <ol class="phase-list">
-          <li>Repair verification accounting first; no mass live repair.</li>
-          <li>Shadow both-turn reconciliation and record what it would do.</li>
-          <li>Enable operator-approved transitions with a durable pending queue.</li>
-          <li>Blind classification and shadow attention tiers.</li>
-          <li>Opt in to safe new admissions and reinforcements.</li>
-          <li>Adopt cache-safe tiers after authority and runtime parity gates.</li>
-          <li>Only then offer confirmed, reversible backfill. Autonomous transitions and retirement need a separate release decision.</li>
+          <li>Agree the applied snapshot, evidence, approval and storage contracts; name tests and negative controls before implementation.</li>
+          <li>Capture durable anchored candidates and repair unchanged verification accounting; no mass live stamping.</li>
+          <li>Run extraction without the memory block and shadow new/covered/abstain continuation. Keep pending candidates on failure or uncertainty.</li>
+          <li>Route every writer through the shared applier; pass revision, cache and runtime parity tests before inbox approvals apply.</li>
+          <li>Pilot one fleet inbox and scheduled digests; bound paid work by real review capacity, not silent fact eviction.</li>
+          <li>Stop there for the first release. Automated transitions, usage freshness, periodic rescoring, weighted mural, event re-anchoring and bulk backfill need separate measured gates.</li>
         </ol>
         <h3>Bounded implementation slices</h3>
-        <p class="small">All slices below come from the design’s rollout table. Expand a group for its deliverables. Feature activation stays off until cache and memory-owner parity pass across TypeScript OpenCode, Pi and Rust’s host/Broca completion paths.</p>
+        <p class="small">Each design slice fits one small mason PR; split by runtime/authority instead of assigning a fleet refactor. A spec-exit gate approves the state machine, independent expected values and named red/green controls before implementation. Product tests and activation gates remain separate.</p>
         <details open>
           <summary>Storage, correctness and admission contracts</summary>
           <ul>
             <li><strong>Verification contract repair:</strong> row status, complete files, checked commit and reinforcement across writers.</li>
-            <li><strong>Lifecycle schema and journal:</strong> evidence, pending facts, revisions, jobs, cleanup/export and writer/schema fingerprints.</li>
-            <li><strong>Non-destructive applier:</strong> revision-checked, idempotent transitions/restore, metadata undo and archived-ID search exclusion.</li>
-            <li><strong>Reconcile prompt and validator:</strong> anchored facts, readable inventory, reserved lexical slot and per-fact gates; shared TypeScript/Rust fixtures.</li>
+            <li><strong>Schema/journal/pending publication:</strong> spec exit settles ownership, original lineage, transaction/crash behavior and fresh/incremental schemas; no deferred bulk job payload.</li>
+            <li><strong>Applier and writer routing:</strong> spec exit approves the all-source revision/approval matrix, restore/hash/successor cases and exact-repeat rules. Denial tests cover every writer.</li>
+            <li><strong>Shadow reconcile:</strong> spec exit accepts anchored new/covered/abstain goldens, claim-specific coverage/recitation and full-memory-only controls.</li>
           </ul>
         </details>
         <details open>
@@ -526,24 +536,38 @@
           </ul>
         </details>
         <details open>
-          <summary>Attention and background review</summary>
+          <summary>Cache projection and current search—not new attention weights</summary>
           <ul>
-            <li><strong>Classification calibration:</strong> blind scoring, fixed anchors, origin/class output and repeat/privacy controls.</li>
-            <li><strong>Memory attention projection:</strong> captured weight/time/revisions, shared text/mural selection and served-byte parity.</li>
-            <li><strong>Bulk prompt adoption barrier:</strong> versioned loader, applied markers, pinned SOFT and marker-only probes; prerequisite to repair UI.</li>
-            <li><strong>Stale/event sweeps:</strong> grounded proposals, event re-anchoring, preservation review and visible backlog; no automatic retirement.</li>
+            <li><strong>Applied snapshot:</strong> spec exit fixes tuple placement, atomicity, handoff and backup; expected text/image/manifest bytes are independently specified.</li>
+            <li><strong>Materializers:</strong> one worker per TS/Pi/Rust. Spec exit maps every branch to pinned marker probe/commit, SOFT membership, A1/A2/A3 and cue-only correction tests.</li>
+            <li><strong>Search:</strong> spec exit approves current-versus-frozen revision/representation cases for semantic, FTS and ID lookup, including history-only tombstones.</li>
           </ul>
         </details>
         <details open>
-          <summary>Confirmed jobs, operator surfaces and configuration</summary>
+          <summary>Fleet inbox backend, UI and throughput pilot</summary>
           <ul>
-            <li><strong>Repair/score job engine:</strong> frozen inputs, overlays, costs, leases, source-revision checks and rollback.</li>
-            <li><strong>Operator surfaces:</strong> slash preview/confirm/status/resume/undo; read-only doctor; later opt-in dreamer. Rehearse on a copied project first.</li>
-            <li><strong>Configuration retirement:</strong> remove obsolete auto-promote and unused retrieval threshold across readers and interfaces, with explicit prior-opt-out handling.</li>
+            <li><strong>Backend:</strong> spec exit fixes exact decision tokens, rejection/snooze/new-evidence policy, digest identity and publication-preserving backpressure. No eager dashboard setters.</li>
+            <li><strong>UI:</strong> spec exit approves full-text/claim/evidence cards, stale/conflict handling and accessible digest flows. One decision per exact proposal, even in a grouped view.</li>
+            <li><strong>Pilot:</strong> measure 25-project arrivals, review minutes, throughput, age and spend before enabling fleet-wide proposals. Preserve existing opt-outs.</li>
           </ul>
         </details>
-        <p><strong>Migration recommendation:</strong> land and rehearse the unreleased v95 performance/Pi marker batch first; the lifecycle migration is v96 at the earliest, with the actual version confirmed at merge. One context-database migration, no paid backfill inside it, and no weakening of old-writer authority guards.</p>
+        <p><strong>Migration dependency:</strong> rebase on the final preceding performance/Pi-marker release, then allocate actual context/store versions and fingerprints. The expected v95→v96 order is not verified allocation. Context holds canonical records; Rust also needs its cache migration. No paid backfill or weakening of old-writer guards.</p>
         <p class="sources"><a class="ref" href="memory-lifecycle.md#9-migration-and-release-ordering">Design §9</a> · <a class="ref" href="memory-lifecycle.md#10-rollout-and-implementation-slices">Design §10</a> · <a class="ref" href="memory-lifecycle.md#11-open-questions-with-recommendations">Design §11</a> · <a class="ref" href="memory-lifecycle.md#12-what-the-trials-still-need-to-tell-us">Design §12</a></p>
+      </section>
+
+      <section id="review" aria-labelledby="review-title">
+        <div class="section-label">10 / What the review changed</div>
+        <h2 id="review-title">Stronger contracts. Less unearned automation.</h2>
+        <p>Only two of five requested Athena seats ran: gpt-6-astra and gemini-3.8-flash. This is not measured panel consensus. R2 takes Astra’s blockers as the stronger reading and checks factual claims against source.</p>
+        <ul>
+          <li><strong>Cut the first release:</strong> verify accounting, durable candidates, shared applier, shadow reconcile and a fleet inbox. Keep history and cache projection; defer broad lifecycle activation.</li>
+          <li><strong>Correct the evidence ledger:</strong> paired full memory emitted 86 facts versus stripped 139/133, with about 18% known stripped re-emission. Eighteen rule families in thirteen cases appeared only in full memory—including no-copy policy and reasoning budget—so stripping is not just a token optimization or proved recall improvement.</li>
+          <li><strong>Reject quote-based authority:</strong> reconcile-check reached 60% reviewed action precision, not safe autonomous repair. Partial coverage cannot refresh whole compound claims; injected recitations are not independent evidence.</li>
+          <li><strong>Resolve the cache details:</strong> pin probe and commit, persist admitted revisions, withhold dependent A3, share text/cue/correction manifests, and allow requested current search in the tail.</li>
+          <li><strong>Reject one source-refuted allegation:</strong> Rust’s persisted mural hash comes from the frozen applied mural, not background cue compression. The separate speculative-composition risk still needs protection.</li>
+          <li><strong>Decide the clock and review product:</strong> publication-count freshness in shadow; one cross-project inbox with scheduled digests, exact approvals and remembered rejections. No calendar rot, slash-command approval workflow or notification storm.</li>
+        </ul>
+        <p class="sources"><a href="memory-lifecycle.md#13-review-response">Full point-by-point review response</a> · <a href="../reports/historian-memory-block-paired-control.md">Paired control</a> · <a href="../reports/memory-reconcile-check-trial.md">Reconcile-check</a></p>
       </section>
 
       <footer id="sources">
@@ -556,6 +580,8 @@
           <li><a href="../reports/compartment-rescore-trial.md">Compartment rescore trial</a></li>
           <li><a href="../reports/historian-merge-turn-trial.md">First historian merge-turn trial</a></li>
           <li><a href="../reports/historian-merge-turn-trial-v2.md">Revised historian merge-turn trial</a></li>
+          <li><a href="../reports/historian-memory-block-paired-control.md">Fresh memory-block paired control</a></li>
+          <li><a href="../reports/memory-reconcile-check-trial.md">Completed memory reconcile-check</a></li>
           <li><a href="../reports/curate-stale-retirement-trial.md">Curate stale-retirement trial</a></li>
           <li><a href="compartment-rescore.md">Compartment rescore design</a></li>
         </ul>
@@ -608,9 +634,9 @@
         } else if (standing) {
           summary.textContent = `Standing rule: freshness stays at 1 and weight stays at ${importance}. Only an explicit evidenced revocation or replacement ends the rule; time and silence do not.`;
         } else {
-          const timescale = decayClass === 'structural' ? 'months' : 'days to weeks';
+          const timescale = decayClass === 'structural' ? 'a longer publication-count half-life' : 'a shorter publication-count half-life';
           const finalWeight = weightAt(reinforced ? 1 : 2);
-          summary.textContent = `Importance ${importance}: weight ${display(weightAt(1))} just before one half-life${reinforced ? `, reinforced back to ${importance}` : ''}; weight ${display(finalWeight)} at two half-lives. ${decayClass === 'structural' ? 'Structural' : 'Situational'} direction: ${timescale}; exact half-life open. Reinforcement changes freshness, not importance.`;
+          summary.textContent = `Shadow importance ${importance}: weight ${display(weightAt(1))} just before one activity half-life${reinforced ? `, reinforced back to ${importance}` : ''}; weight ${display(finalWeight)} at two activity half-lives. ${decayClass === 'structural' ? 'Structural' : 'Situational'} candidate: ${timescale}; exact value open. Idle weeks do not advance activity. Reinforcement changes freshness, not importance.`;
         }
         description.textContent = summary.textContent;
       }
