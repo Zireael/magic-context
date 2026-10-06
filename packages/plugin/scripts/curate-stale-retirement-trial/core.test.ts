@@ -21,12 +21,12 @@ describe("curate stale retirement trial", () => {
         const rows = [memory(1), memory(2, "A", "ARCHITECTURE"), memory(3, "B", "NAMING")];
         expect(batches(rows).map(b => [b.category, b.memories.map(m => m.id)])).toEqual([["PROJECT_RULES", [1]], ["ARCHITECTURE", [2]], ["NAMING", [3]]]);
     });
-    test("both arms share retirement rules, with repository access only in code arm", () => {
+    test("all arms share retirement rules; only evidence arm gets repository excerpts", () => {
         const batch = batches([memory(1)])[0]!;
         expect(prompt(batch, "text")).toContain("no repository access");
         expect(prompt(batch, "text")).not.toContain('"reads"');
-        expect(prompt(batch, "code")).toContain('"reads"');
-        for (const arm of ["text", "code"] as const) expect(prompt(batch, arm)).toContain("Low value alone is not a retirement reason");
+        expect(prompt(batch, "evidence")).toContain("REAL read-only git grep excerpts");
+        for (const arm of ["text", "evidence", "topic"] as const) expect(prompt(batch, arm)).toContain("Low value alone is not a retirement reason");
     });
     test("terminal parsing refuses mixed operations and source requests", () => {
         expect(parseDraft('```json\n{"operations":[]}\n```')).toEqual({ operations: [] });
@@ -50,6 +50,10 @@ describe("curate stale retirement trial", () => {
         expect(result.trueRetired).toEqual([3]);
         expect(result.unsureRetired).toEqual([4]);
         expect(metrics(labels, new Set()).precision).toBeNull();
+    });
+    test("topic batches cannot consolidate across categories", () => {
+        expect(() => validateOperations([{action: "merge", ids: [1, 2]}], new Set([1, 2]), new Map([[1, "NAMING"], [2, "ARCHITECTURE"]]))).toThrow("Cross-category");
+        expect(() => validateOperations([{action: "archive", ids: [1], superseded_by: 2}], new Set([1, 2]), new Map([[1, "NAMING"], [2, "ARCHITECTURE"]]))).toThrow("Cross-category");
     });
     test("repository read fence rejects traversal, trial artifacts and credentials", () => {
         expect(safeRepoPath("/repo", "packages/a.ts")).toBe("/repo/packages/a.ts");
