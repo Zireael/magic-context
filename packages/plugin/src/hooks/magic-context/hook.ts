@@ -146,7 +146,8 @@ export interface MagicContextDeps {
         /** User-level setting that lets a session started exactly in the canonical home directory use it as the project. */
         allow_home_project?: boolean;
         language?: string;
-        smart_drops?: boolean;
+        smart_drops?: unknown;
+        protected_tools?: Readonly<Record<string, number>>;
         toast_duration_ms?: number;
         clear_reasoning_age?: number;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
@@ -728,7 +729,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         channel2DirectiveTextBySession,
         protectedTokens: deps.config.protected_tokens,
         protectedTokenTierOverrides: deps.config.protectedTokenTierOverrides,
-        smartDrops: deps.config.smart_drops === true,
+        protectedTools: deps.config.protected_tools,
         clearReasoningAge: deps.config.clear_reasoning_age ?? 50,
         commitClusterTrigger: bootHistorian.commitClusterTrigger,
         historyRefreshSessions,

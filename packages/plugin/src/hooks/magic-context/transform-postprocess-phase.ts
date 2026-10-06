@@ -1,5 +1,9 @@
 import { compareOpenCodeMessagesByCanonicalOrder } from "../../features/magic-context/compaction-marker";
-import { newestCtxReduceTagNumbers } from "../../features/magic-context/reclaim-protection";
+import {
+    mergeProtectedTools,
+    normalizeProtectedToolName,
+    protectedToolTagNumbers,
+} from "../../features/magic-context/reclaim-protection";
 import {
     HYGIENE_PROVIDER_UNITS_VERSION,
     sessionDecisionCalibration,
@@ -23,7 +27,6 @@ import {
     getPendingOpsCount,
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
-    getTagsBySession,
     type PendingCompactionMarker,
     pruneAutoSearchHintDecisions,
     pruneNoteNudgeAnchors,
@@ -112,7 +115,7 @@ import {
     type DroppedTokenReduction,
     estimateDroppedTokensFromTagReductions,
 } from "./dropped-token-estimate";
-import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { EmergencyFailClosedError, outgoingContextRefusal } from "./emergency-fail-closed";
 import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
@@ -1567,14 +1570,9 @@ interface RunPostTransformPhaseArgs {
         /** From the user-level `language` setting; English word rules when absent. */
         wordRules?: CavemanWordRules;
     };
-    /**
-     * Smart-drops (experimental, default off): content-aware reclaim of tool
-     * output that a later call supersedes. Runs alongside the age-based
-     * auto-drop, only inside an execute pass that is already mutating, so it
-     * never causes a cache bust on its own. Off → the messages sent to the model
-     * are byte-identical to the age-based-only behavior.
-     */
+    /** Deprecated input retained for older callers; supersession runs only on cache-rebuilding passes. */
     smartDrops?: boolean;
+    protectedTools?: Readonly<Record<string, number>>;
     /**
      * Provider resolved once by the main transform for this pass. Used for every
      * empty-sentinel gate and whole-message placeholder choice so postprocess
@@ -1672,9 +1670,11 @@ export interface EmergencyFailClosedDecision {
         | "below-emergency-band"
         | "provider-overflow-abort"
         | "proceed"
+        | "refusal-grade-final-wire-over-limit"
         | "trusted-final-wire-disarm";
     /** Trusted current-pass wire evidence that lets the caller clear its durable latch. */
     disarm?: { finalWireTokens: number; provenLimitTokens: number };
+    refusalMessage?: string;
 }
 
 export function evaluateEmergencyFailClosed(input: {
@@ -1682,12 +1682,27 @@ export function evaluateEmergencyFailClosed(input: {
     emergencyRecoveryArmed: boolean;
     emergencyRecoveryOrigin: "provider_overflow" | "proactive_model_shrink" | null;
     foldMaterializedThisPass: boolean;
-    finalWireEstimate?: { tokens: number; trusted: boolean };
+    finalWireEstimate?: {
+        tokens: number;
+        trusted: boolean;
+        refusalGrade?: boolean;
+        refusalTokens?: number;
+    };
     /** A current-model limit parsed from a provider overflow response, never a catalog fallback. */
     providerProvenLimitTokens?: number;
+    contextLimitTokens?: number;
+    protectedToolTokens?: number;
 }): EmergencyFailClosedDecision {
     const estimate = input.finalWireEstimate;
     const limit = input.providerProvenLimitTokens;
+    const refusalMessage = outgoingContextRefusal(
+        estimate,
+        input.contextLimitTokens ?? limit,
+        input.protectedToolTokens,
+    );
+    if (refusalMessage) {
+        return { shouldAbort: true, reason: "refusal-grade-final-wire-over-limit", refusalMessage };
+    }
     if (
         input.emergencyRecoveryArmed &&
         estimate?.trusted === true &&
@@ -1707,9 +1722,9 @@ export function evaluateEmergencyFailClosed(input: {
     if (input.usagePercentage < 95) {
         return { shouldAbort: false, reason: "below-emergency-band" };
     }
-    // Inside messages.transform, only the provider's own rejection proves that
-    // this turn shape overflows. Local numeric estimates remain telemetry until
-    // module-side accounting can reproduce provider-accurate framing.
+    // Without route-specific proof that the final request does not fit, retain
+    // the existing rule based on a provider-reported overflow. A conservative
+    // estimate used to decide whether to send is not enough to refuse.
     const shouldAbort =
         input.emergencyRecoveryArmed &&
         input.emergencyRecoveryOrigin === "provider_overflow" &&
@@ -2262,6 +2277,7 @@ export async function runPostTransformPhase(
     let explicitMaterializedSuccessfully = false;
     let deferredMaterializedSuccessfully = false;
     let pendingOpsDidMutate = false;
+    const protectedToolTags = protectedToolTagNumbers(args.tags, args.protectedTools);
     // First application is an edit; restoring the same frozen choice from raw
     // history is replay. Telemetry and signed-thinking invalidation consume the
     // same edit record so a strip cannot silently escape either accounting lane.
@@ -2337,9 +2353,10 @@ export async function runPostTransformPhase(
                 args.sessionId,
                 args.db,
                 args.targets,
-                args.contextUsage.percentage >= 95
-                    ? newestCtxReduceTagNumbers(getTagsBySession(args.db, args.sessionId))
-                    : args.protectedTagIds,
+                new Set([
+                    ...(args.contextUsage.percentage >= 95 ? [] : args.protectedTagIds),
+                    ...protectedToolTags,
+                ]),
                 undefined,
                 pendingOps,
                 [],
@@ -2416,6 +2433,7 @@ export async function runPostTransformPhase(
                 {
                     protectedTagNumbers: args.protectedTagNumbers,
                     protectedCutoff: args.protectedCutoff,
+                    protectedToolTags,
                     // Tiered emergency drop fires only at the derived force band (both primary and
                     // subagent) AND only when the ceiling is known. Undefined
                     // ceiling (cold start) or below-threshold usage → no
@@ -2449,6 +2467,7 @@ export async function runPostTransformPhase(
                     {
                         protectedTagNumbers: args.protectedTagNumbers,
                         protectedCutoff: args.protectedCutoff,
+                        protectedToolTags,
                         routine: true,
                         caveman: cavemanConfig,
                     },
@@ -2681,6 +2700,7 @@ export async function runPostTransformPhase(
                 sessionId: args.sessionId,
                 targets: args.targets,
                 watermark: args.sessionMeta.toolReclaimWatermark ?? 0,
+                protectedToolTags,
                 pendingOps,
             });
             // Smart-drops: reclaim spent control-plane outputs that a later
@@ -2691,7 +2711,7 @@ export async function runPostTransformPhase(
             // The newest 20 owner messages remain untouched, matching the module
             // lane's continuation floor independently of the token-mass protection window.
             const editMarkerTagIds = new Set<number>();
-            if (args.smartDrops) {
+            {
                 const recentMessageIds = recentSupersessionOwnerMessageIds(args.db, args.sessionId);
                 const selectedIds = new Set(syntheticPendingOps.map((op) => op.tagId));
                 const supersessionOps = buildSupersessionReclaimOps({
@@ -2701,6 +2721,7 @@ export async function runPostTransformPhase(
                     pendingOps,
                     recentMessageIds,
                     protectedTagNumbers: args.protectedTagNumbers,
+                    protectedToolTags,
                 });
                 for (const op of supersessionOps) {
                     if (!selectedIds.has(op.tagId)) {
@@ -2715,6 +2736,7 @@ export async function runPostTransformPhase(
                     pendingOps,
                     recentMessageIds,
                     protectedTagNumbers: args.protectedTagNumbers,
+                    protectedToolTags,
                 });
                 for (const op of editReclaim.ops) {
                     // A superseded edit only compresses if no earlier rule already
@@ -2826,6 +2848,11 @@ export async function runPostTransformPhase(
             const staleReduceResult = dropStaleReduceCalls(args.messages, frozenStaleReduceIds, {
                 detect: isCacheBustingPass,
                 protectedCount: args.protectedCount,
+                protectedCallIds: new Set(
+                    args.tags
+                        .filter((tag) => protectedToolTags.has(tag.tagNumber))
+                        .map((tag) => tag.messageId),
+                ),
                 onFirstApplication: recordFirstApplicationAt,
             });
             if (isCacheBustingPass && staleReduceResult.newlyStrippedIds.length > 0) {
@@ -2879,6 +2906,7 @@ export async function runPostTransformPhase(
         }
         const tInjectM0M1 = performance.now();
         try {
+            const messagesBeforeInjection = args.messages.slice();
             const result = injectM0M1({
                 db: args.db,
                 sessionId: args.sessionId,
@@ -2904,6 +2932,45 @@ export async function runPostTransformPhase(
                 compactionOff,
             });
             deliveredPrefix = result;
+            if (result.prefixTrimStatus === "applied") {
+                // Preparation can summarize history without removing messages from
+                // the request. Retire only source rows omitted from the delivered
+                // prefix, including rows held until this later trim.
+                const retainedMessages = new Set(args.messages);
+                const trimmedMessageIds = messagesBeforeInjection
+                    .filter((message) => !retainedMessages.has(message))
+                    .map((message) => message.info.id)
+                    .filter((id): id is string => typeof id === "string");
+                // This additional delivery-time retirement exists for result
+                // protection. Ordinary message/tool metadata keeps its existing
+                // lifecycle, including agent drops of summarized message tags.
+                // Retire every folded result of an adopted protected tool, not
+                // just its newest N, so older folded results cannot re-enter N
+                // when newer results or keep counts rotate. Include the previous
+                // policy when a rebuilding pass disables a tool's protection.
+                const currentPolicy = mergeProtectedTools(args.protectedTools);
+                const previousPolicy = args.channel1StateBySession?.get(
+                    args.sessionId,
+                )?.protectedToolsPolicy;
+                const eligibleTagNumbers = new Set(
+                    args.tags
+                        .filter(
+                            (tag) =>
+                                tag.type === "tool" &&
+                                ((currentPolicy[normalizeProtectedToolName(tag.toolName)] ?? 0) >
+                                    0 ||
+                                    (previousPolicy?.[normalizeProtectedToolName(tag.toolName)] ??
+                                        0) > 0),
+                        )
+                        .map((tag) => tag.tagNumber),
+                );
+                markTagsCompactedByMessageIds(
+                    args.db,
+                    args.sessionId,
+                    trimmedMessageIds,
+                    eligibleTagNumbers,
+                );
+            }
             if (result.injected) {
                 m0M1InjectedThisPass = true;
                 prependedMessageCount += result.prependedMessageCount;
@@ -3969,6 +4036,8 @@ export async function runPostTransformPhase(
                     messages: args.messages,
                     tags,
                     protectedTagNumbers: args.protectedTagNumbers,
+                    protectedToolTags,
+                    protectedTools: args.protectedTools,
                     pendingDropTagNumbers,
                     cacheBusting: bustedThisPass,
                     previous,
@@ -4031,6 +4100,8 @@ export async function runPostTransformPhase(
                         db: args.db,
                         sessionId: args.sessionId,
                         baseline,
+                        rebuilding: bustedThisPass,
+                        previous,
                     });
                 } catch (error) {
                     sessionLog(

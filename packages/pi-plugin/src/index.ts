@@ -1534,7 +1534,7 @@ async function startPiMagicContextRuntime(
 		db: database,
 		cacheTtlConfig: cfg.cache_ttl,
 		cacheTtlConfigured: cfg.cacheTtlConfigured,
-		smartDrops: cfg.smart_drops === true,
+		protectedTools: cfg.protected_tools,
 		protectedTokens: cfg.protected_tokens,
 		protectedTokenTierOverrides: getProtectedTokensTierOverrides(cfg) ?? {},
 		protectedTags: cfg.protected_tags ?? 20,
@@ -1834,6 +1834,9 @@ async function startPiMagicContextRuntime(
 		// Dreamer tasks, a separate security concern.)
 		memoryToolEnabled: true,
 		protectedTags: config.protected_tags ?? 20,
+		protectedTools: config.protected_tools,
+		resolveProtectedTools: (ctx) =>
+			resolveCurrentProjectDeps(ctx).config.protected_tools,
 		resolveProtectedTags: (ctx) =>
 			resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
 		resolveProjectIdentity: (ctx) =>
