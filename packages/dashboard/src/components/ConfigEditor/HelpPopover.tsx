@@ -1,4 +1,5 @@
 import { createSignal, Show } from "solid-js";
+import { openExternal } from "../../lib/open-external";
 import { CONFIG_HELP, docsUrl } from "./config-help";
 import FloatingLayer from "./FloatingLayer";
 
@@ -26,8 +27,12 @@ export default function HelpPopover(props: { topic: keyof typeof CONFIG_HELP; la
             <a
               ref={(link) => requestAnimationFrame(() => link.focus())}
               href={docsUrl(CONFIG_HELP[props.topic].page)}
-              target="_blank"
-              rel="noreferrer"
+              onClick={(event) => {
+                event.preventDefault();
+                void openExternal(docsUrl(CONFIG_HELP[props.topic].page))
+                  .catch((error: unknown) => console.error("Could not open external link", error))
+                  .finally(() => setOpen(false));
+              }}
             >
               Read more ↗
             </a>
