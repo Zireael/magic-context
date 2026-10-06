@@ -14,8 +14,10 @@ that Claude Code could interpret as an instruction to compact.
 Healthy send paths require refusal-grade evidence after reclaim, including
 successful no-op reclaim: complete counts, a measured model seed and this route's
 measured tool definitions. Conservative fit envelopes remain admission-only.
-The protected-results message requires the calibrated protected subset alone to
-exceed the limit; otherwise proven non-fit takes the generic post-reclaim path.
+The new refusal requires the calibrated protected subset alone to exceed the
+limit. A missing or fitting subset takes the existing send, fold and provider-
+overflow handling path, even when the full-request estimate exceeds the window.
+There is no new generic healthy pre-send refusal.
 
 The Rust-mode OpenCode adapter checks its final returned array, not the module's
 ingress estimate, before installation/LKG capture. Typed native protected-tool
@@ -235,6 +237,12 @@ prove both directions: a small provider measurement prevents a false refusal
 from a much larger full-prefix estimate, and a large provider measurement proves
 generic overflow despite a small local full-array estimate. Mismatched metadata,
 parentage and rewritten prefixes cannot borrow the old count.
+
+The earlier generic healthy-refusal assertions described above were broader than
+the design and have been corrected: full-prefix overflow evidence is useful for
+admission and telemetry, but cannot originate this refusal when protected results
+fit. The provider-overflow refusal path is unchanged. Claude Code's gateway mapping
+above remains only for the specific protected-results code, not generic pressure.
 
 ### Mutation and final verification
 

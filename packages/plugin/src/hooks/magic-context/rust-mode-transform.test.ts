@@ -8477,7 +8477,7 @@ it("rechecks mural candidates on bootstrap, pressure and flush but not ordinary 
     expect(resolutions).toBe(3);
     expect(muralHashes.at(-1)).toBe("c");
 });
-it("Rust-mode final outgoing wire refuses successful no-op reclaim without LKG fallback", async () => {
+it("Rust-mode final outgoing wire preserves successful no-op reclaim with no protected mass", async () => {
     const sid = "rust-mode-final-over-limit";
     sessions.push(sid);
     installRawProvider(sid);
@@ -8506,9 +8506,9 @@ it("Rust-mode final outgoing wire refuses successful no-op reclaim without LKG f
     const meta = makeMeta(db, sid);
     recordToolDefinition(model.providerID, model.modelID, undefined, "read", "read fixture", {});
     recordDetectedContextLimit(db, sid, 16000, "anthropic/claude-fable-5-1");
-    await expect(runner.run(sid, messages, { messages: [...messages] }, meta)).rejects.toThrow(
-        "after reclaim",
-    );
+    const output = { messages: [...messages] };
+    await runner.run(sid, messages, output, meta);
+    expect(output.messages).toEqual(messages);
 });
 
 it("Rust-mode final outgoing wire admits an uncalibrated healthy request despite a complete upper envelope", async () => {

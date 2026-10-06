@@ -105,8 +105,8 @@ it("calibrated measured protected results still refuse with the protected-result
     const refusal = outgoingContextRefusal(estimate, 16000, protectedToolTokens);
     expect(refusal).toBe(golden.message);
     expect(contextRefusalError(refusal!).code).toBe(golden.code);
-    // When unprotected content causes the overflow, do not blame protected results.
-    expect(outgoingContextRefusal(estimate, 16000, 100)).toContain("after reclaim");
+    // Unprotected pressure must still reach the provider's existing overflow handling.
+    expect(outgoingContextRefusal(estimate, 16000, 100)).toBeUndefined();
 });
 
 it("protected overflow refusal matches the cross-language public contract", () => {
@@ -144,5 +144,5 @@ it("partial estimates and fitting reclaimed requests do not cause a new refusal"
             { tokens: 96000, trusted: true, refusalGrade: true, refusalTokens: 96000 },
             16000,
         ),
-    ).toContain("after reclaim");
+    ).toBeUndefined();
 });

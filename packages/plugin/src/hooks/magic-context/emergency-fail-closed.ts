@@ -43,8 +43,10 @@ export interface ContextRefusalEstimate {
     refusalTokens?: number;
 }
 
-/** An estimate used for admission (deciding whether to send) cannot alone justify
- * refusing a healthy request. */
+/** Only protected results that cannot fit by themselves justify a new healthy
+ * refusal. Other pressure keeps the provider-overflow and fold behavior: a
+ * complete estimate, or even usage from an accepted reply, is not a new reason
+ * to stop a turn whose protected results fit. */
 export function outgoingContextRefusal(
     estimate: ContextRefusalEstimate | undefined,
     limit: number | undefined,
@@ -57,12 +59,12 @@ export function outgoingContextRefusal(
         !limit ||
         !Number.isFinite(limit) ||
         limit <= 0 ||
-        estimate.refusalTokens <= limit
+        estimate.refusalTokens <= limit ||
+        !Number.isFinite(protectedToolTokens) ||
+        protectedToolTokens <= limit
     )
         return undefined;
-    return Number.isFinite(protectedToolTokens) && protectedToolTokens > limit
-        ? PROTECTED_TOOL_RESULTS_OVER_LIMIT
-        : "the outgoing request still exceeds the context window after reclaim; reduce the retained context";
+    return PROTECTED_TOOL_RESULTS_OVER_LIMIT;
 }
 
 export class EmergencyFailClosedError extends Error {

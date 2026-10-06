@@ -11044,6 +11044,7 @@ it("impossible protected reclaim refuses an over-limit wire before provider reje
                 refusalTokens: total,
             },
             providerProvenLimitTokens: 16000,
+            protectedToolTokens: total,
         }).shouldAbort,
     ).toBe(true);
 });

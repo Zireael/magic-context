@@ -41,6 +41,8 @@ Agent-directed and non-tool policies:
 
 Today the protected tail and the tier reserve stop protecting at 95%. Protected tools keep holding, like user answers and the newest `ctx_reduce` results do now: the user asked for them explicitly, and N bounds how much they can pin. The cost is that protecting a tool with large outputs can bring a session to the 95% refusal sooner. The setting's description says so. There is no byte cap.
 
+The new pre-send refusal applies only when refusal-grade evidence proves that the calibrated protected results alone exceed the model's window after reclaim. If that subset is absent or fits, every existing fold, send and provider-overflow refusal decision stays unchanged. An over-limit full-request estimate or usage from an accepted reply must not prevent the provider from receiving a turn, reporting overflow and letting Magic Context learn the limit and fold. Default configuration must preserve the existing wire bytes and decisions except where its protected counts deliberately change result eligibility.
+
 ## Cache safety
 
 - Protection only changes which candidates a lane may select, and lanes select only on passes that already rebuild the cache. No pass busts because of it.

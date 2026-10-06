@@ -143,7 +143,7 @@ it("OpenCode correlated provider usage wins over full-prefix estimates and rejec
     expect(tracker.estimate("session", { messages, ...envelope }).refusalBasis).toBe("calibrated");
 });
 
-it("OpenCode measured preceding usage plus only the new tail can prove generic overflow", () => {
+it("OpenCode measured preceding overflow does not refuse a fitting protected subset", () => {
     const route = { providerID: "anthropic", modelID: "claude-fable-5-1", agentName: "build" };
     recordToolDefinition(route.providerID, route.modelID, route.agentName, "probe", "A probe", {});
     const tracker = createFinalWireUsageTracker();
@@ -167,7 +167,8 @@ it("OpenCode measured preceding usage plus only the new tail can prove generic o
     const estimate = tracker.estimate("session", { messages: [...prefix, reply], ...envelope });
     expect(estimate.tokens).toBeLessThan(1000);
     expect(estimate.refusalTokens).toBeGreaterThan(16000);
-    expect(outgoingContextRefusal(estimate, 16000, 10)).toContain("after reclaim");
+    expect(outgoingContextRefusal(estimate, 16000, 0)).toBeUndefined();
+    expect(outgoingContextRefusal(estimate, 16000, 10)).toBeUndefined();
 });
 
 function estimate(messages: MessageLike[]): FinalWireTokenEstimate {

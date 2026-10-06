@@ -167,7 +167,7 @@ test("Pi healthy refusal prefers correlated provider usage and prices only the n
 	expect(mismatched.refusalBasis).toBe("calibrated");
 });
 
-test("Pi measured preceding usage can prove generic overflow without blaming a fitting protected subset", () => {
+test("Pi measured preceding overflow does not refuse a fitting protected subset", () => {
 	const h = harness("anthropic/claude-fable-5-1", [
 		{ role: "user", content: "hello" },
 	]);
@@ -181,9 +181,8 @@ test("Pi measured preceding usage can prove generic overflow without blaming a f
 	);
 	expect(estimate.tokens).toBeLessThan(1000);
 	expect(estimate.refusalTokens).toBeGreaterThan(16000);
-	expect(outgoingContextRefusal(estimate, 16000, 10)).toContain(
-		"after reclaim",
-	);
+	expect(outgoingContextRefusal(estimate, 16000, 0)).toBeUndefined();
+	expect(outgoingContextRefusal(estimate, 16000, 10)).toBeUndefined();
 });
 
 test("correlated provider input includes cached tokens and prices only the appended reply and new tail", () => {
