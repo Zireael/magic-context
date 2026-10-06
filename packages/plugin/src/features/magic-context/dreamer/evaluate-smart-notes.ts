@@ -356,7 +356,6 @@ async function runLivenessCheck(
         compiledCheck,
         capabilityFactory: (signal) => createSmartNoteCapabilities({ projectRoot, signal }),
         signal: leaseSignal,
-        timeoutMs: 2_000,
     });
     if (!result.ok && result.cancelled) return false;
 

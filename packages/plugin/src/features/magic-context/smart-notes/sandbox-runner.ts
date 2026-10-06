@@ -21,7 +21,13 @@ import type {
 } from "quickjs-emscripten";
 import { classifyStalePluginBuild, importPluginModule } from "../../../shared/stale-plugin-build";
 import type { SmartNoteCapabilityApi, SmartNoteCapabilityFactory } from "./capabilities";
-import { isSmartNoteNetworkError, type SmartNoteCheckResult, SmartNoteNetworkError } from "./types";
+import { SMART_NOTE_HTTP_TIMEOUT_MS } from "./ssrf-guard";
+import {
+    isSmartNoteNetworkError,
+    type SmartNoteCheckResult,
+    SmartNoteNetworkError,
+    smartNoteNetworkTimeout,
+} from "./types";
 
 /**
  * The WASM module is expensive to instantiate (~1MB compile) but reusable across
@@ -194,7 +200,9 @@ export type RunCompiledSmartNoteCheckResult =
     | RunCompiledSmartNoteCheckFailure
     | RunCompiledSmartNoteCheckCancelled;
 
-const DEFAULT_TIMEOUT_MS = 2_000;
+// Give one guarded request its full deadline, plus time to enter/resume the VM.
+export const SMART_NOTE_CHECK_TIMEOUT_MS = SMART_NOTE_HTTP_TIMEOUT_MS + 1_000;
+const CPU_BUDGET_MS = 2_000;
 const DEFAULT_HEAP_LIMIT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_STACK_LIMIT_BYTES = 512 * 1024;
 const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
@@ -261,7 +269,8 @@ async function runCompiledSmartNoteCheckLocked(
     quickjs: QuickJSAsyncWASMModule,
 ): Promise<RunCompiledSmartNoteCheckResult> {
     if (options.signal?.aborted) return cancelledResult(options.signal.reason);
-    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const timeoutMs = options.timeoutMs ?? SMART_NOTE_CHECK_TIMEOUT_MS;
+    const cpuBudgetMs = Math.min(CPU_BUDGET_MS, timeoutMs);
     const controller = new AbortController();
     let externallyCancelled = false;
     let executionTimedOut = false;
@@ -270,6 +279,8 @@ async function runCompiledSmartNoteCheckLocked(
     let missingResource = false;
     let httpFailure: SmartNoteNetworkError | undefined;
     let httpRetryAt: number | undefined;
+    let waitingOnHttp = false;
+    let httpWaitMs = 0;
     const externalAbort = () => {
         externallyCancelled = true;
         controller.abort(options.signal?.reason);
@@ -277,22 +288,36 @@ async function runCompiledSmartNoteCheckLocked(
     options.signal?.addEventListener("abort", externalAbort, { once: true });
     const timer = setTimeout(() => {
         executionTimedOut = true;
+        if (waitingOnHttp) {
+            httpFailure = smartNoteNetworkTimeout(
+                "SMART_NOTE_NETWORK: check timed out waiting on HTTP",
+            );
+            httpRetryAt = Math.max(httpRetryAt ?? 0, httpFailure.retryAt ?? 0);
+        }
         controller.abort(new Error("smart-note check timed out"));
     }, timeoutMs);
     try {
         throwIfRunAborted(controller.signal);
         const capabilities = resolveCapabilitiesForRun(options, controller.signal);
-        const deadline = Date.now() + timeoutMs;
+        const startedAt = performance.now();
+        const deadline = startedAt + timeoutMs;
         const context = quickjs.newContext();
         try {
             context.runtime.setMemoryLimit(options.heapLimitBytes ?? DEFAULT_HEAP_LIMIT_BYTES);
             context.runtime.setMaxStackSize(options.stackLimitBytes ?? DEFAULT_STACK_LIMIT_BYTES);
-            context.runtime.setInterruptHandler(
-                () => controller.signal.aborted || Date.now() > deadline,
-            );
+            context.runtime.setInterruptHandler(() => {
+                const now = performance.now();
+                if (now > deadline || now - startedAt - httpWaitMs > cpuBudgetMs) {
+                    executionTimedOut = true;
+                    return true;
+                }
+                return controller.signal.aborted;
+            });
             installCapabilityObject(context, {
                 ...capabilities,
                 httpGet: async (url) => {
+                    const waitStartedAt = performance.now();
+                    waitingOnHttp = true;
                     try {
                         const response = await capabilities.httpGet(url);
                         if (response.status === 404 || response.status === 410)
@@ -310,6 +335,9 @@ async function runCompiledSmartNoteCheckLocked(
                             }
                         }
                         throw error;
+                    } finally {
+                        httpWaitMs += performance.now() - waitStartedAt;
+                        waitingOnHttp = false;
                     }
                 },
             });
@@ -331,7 +359,8 @@ async function runCompiledSmartNoteCheckLocked(
         // Queue deadlines and lease loss are control flow, not evidence that a
         // healthy compiled check is failing. Only this run's own timeout counts.
         if (externallyCancelled && !executionTimedOut) return cancelledResult(error);
-        if (!httpFailure && missingResource) return { ok: true, result: { met: false } };
+        if (!executionTimedOut && !httpFailure && missingResource)
+            return { ok: true, result: { met: false } };
         return failureResult(
             formatSandboxError(httpFailure ?? error),
             isSmartNoteNetworkError(httpFailure ?? error),

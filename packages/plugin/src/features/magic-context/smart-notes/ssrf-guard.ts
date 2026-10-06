@@ -8,6 +8,7 @@ import {
     isTerminalSmartNoteNetworkError,
     SmartNoteNetworkError,
     SmartNoteSecurityError,
+    smartNoteNetworkTimeout,
 } from "./types";
 
 export interface ResolvedSmartNoteAddress {
@@ -51,7 +52,7 @@ export interface GuardedSmartNoteHttpGetOptions {
 }
 
 const DNS_TIMEOUT_MS = 3_000;
-const DEFAULT_HTTP_TIMEOUT_MS = 5_000;
+export const SMART_NOTE_HTTP_TIMEOUT_MS = 5_000;
 // Bound streamed network input independently of compiler/model output limits.
 const DEFAULT_HTTP_BODY_LIMIT_BYTES = 1024 * 1024;
 const MAX_HTTP_ADDRESS_CANDIDATES = 4;
@@ -128,7 +129,7 @@ export async function guardedSmartNoteHttpGet(
     input: string,
     options: GuardedSmartNoteHttpGetOptions,
 ): Promise<{ status: number; body: string }> {
-    const timeoutMs = options.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
+    const timeoutMs = options.timeoutMs ?? SMART_NOTE_HTTP_TIMEOUT_MS;
     const bodyLimitBytes = options.bodyLimitBytes ?? DEFAULT_HTTP_BODY_LIMIT_BYTES;
     const requestAddress = options.requestAddress ?? requestValidatedAddress;
     const controller = new AbortController();
@@ -233,11 +234,7 @@ export async function guardedSmartNoteHttpGet(
             })(),
             new Promise<never>((_, reject) => {
                 timer = setTimeout(() => {
-                    reject(
-                        new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out", {
-                            terminal: true,
-                        }),
-                    );
+                    reject(smartNoteNetworkTimeout("SMART_NOTE_NETWORK: request timed out"));
                     controller.abort();
                 }, timeoutMs);
             }),
@@ -496,16 +493,12 @@ export function requestValidatedAddress(
         // branch: passing an Error to destroy() lets stream internals re-throw
         // it where no listener reaches.
         const onAbort = () => {
-            reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted"));
+            reject(smartNoteNetworkTimeout("SMART_NOTE_NETWORK: aborted"));
             request.destroy();
         };
         options.signal.addEventListener("abort", onAbort, { once: true });
         request.on("timeout", () => {
-            reject(
-                new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out", {
-                    terminal: true,
-                }),
-            );
+            reject(smartNoteNetworkTimeout("SMART_NOTE_NETWORK: request timed out"));
             request.destroy();
         });
         request.on("error", (error) => {
@@ -675,12 +668,12 @@ async function withAbortAndTimeout<T>(
             promise,
             new Promise<T>((_, reject) => {
                 timer = setTimeout(
-                    () => reject(new SmartNoteNetworkError(timeoutMessage)),
+                    () => reject(smartNoteNetworkTimeout(timeoutMessage)),
                     timeoutMs,
                 );
                 signal.addEventListener(
                     "abort",
-                    () => reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted")),
+                    () => reject(smartNoteNetworkTimeout("SMART_NOTE_NETWORK: aborted")),
                     { once: true },
                 );
             }),
@@ -691,7 +684,7 @@ async function withAbortAndTimeout<T>(
 }
 
 function throwIfAborted(signal: AbortSignal): void {
-    if (signal.aborted) throw new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted");
+    if (signal.aborted) throw smartNoteNetworkTimeout("SMART_NOTE_NETWORK: aborted");
 }
 
 function toNetworkError(error: unknown, fallback: string): SmartNoteNetworkError {

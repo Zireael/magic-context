@@ -3,7 +3,7 @@ import { getLeaseHolder, peekLeaseHolderAndExpiry } from "../dreamer/lease";
 import { leaseKeyFor } from "../dreamer/task-registry";
 import { markNoteReady } from "../storage-notes";
 import { createSmartNoteCapabilities } from "./capabilities";
-import { runCompiledSmartNoteCheck } from "./sandbox-runner";
+import { runCompiledSmartNoteCheck, SMART_NOTE_CHECK_TIMEOUT_MS } from "./sandbox-runner";
 import { nextSmartNoteCheckDueAt } from "./schedule";
 import {
     commitSmartNoteState,
@@ -73,7 +73,13 @@ export async function runDueCompiledSmartNoteChecks(
         args.leaseHeld ?? inferEvaluateSmartNotesLeaseHeld(args.db, args.projectIdentity);
 
     for (const note of due) {
-        if (Date.now() - startedAt >= (args.sweepBudgetMs ?? DEFAULT_SWEEP_BUDGET_MS)) break;
+        const remaining =
+            (args.sweepBudgetMs ?? DEFAULT_SWEEP_BUDGET_MS) - (Date.now() - startedAt);
+        if (remaining <= 0) break;
+        // Admit fewer notes rather than shorten their network deadline. The first
+        // attempt still supports explicitly small test/caller budgets; the outer
+        // signal also bounds module acquisition and time queued for the shared VM.
+        if (ran > 0 && remaining < SMART_NOTE_CHECK_TIMEOUT_MS) break;
         if (!note.compiledCheck) continue;
         const compiledCheck = note.compiledCheck;
         ran++;
@@ -81,10 +87,6 @@ export async function runDueCompiledSmartNoteChecks(
         const abortFromCaller = () => controller.abort(args.signal?.reason);
         if (args.signal?.aborted) abortFromCaller();
         else args.signal?.addEventListener("abort", abortFromCaller, { once: true });
-        const remaining = Math.max(
-            500,
-            (args.sweepBudgetMs ?? DEFAULT_SWEEP_BUDGET_MS) - (Date.now() - startedAt),
-        );
         const timer = setTimeout(
             () => controller.abort(new Error("smart-note sweep budget exhausted")),
             remaining,
@@ -98,7 +100,6 @@ export async function runDueCompiledSmartNoteChecks(
                         signal,
                     }),
                 signal: controller.signal,
-                timeoutMs: Math.min(2_000, remaining),
             });
             const runFinishedAt = Date.now();
             const expected = {

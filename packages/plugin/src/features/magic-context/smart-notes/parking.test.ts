@@ -287,8 +287,11 @@ test.each([
     expect(state()).toMatchObject({
         checkStatus: "compiled",
         readyReason: null,
-        checkNextDueAt: reset * 1000,
     });
+    // Compilation quota failures now join the network backoff counter rather
+    // than spending logic strikes. That accumulated backoff may exceed the reset hint.
+    expect(state().checkNextDueAt).toBeGreaterThanOrEqual(reset * 1000);
+    expect(state().checkFailureCount).toBe(0);
     expect(getStaleCompiledSmartNotes(db, PROJECT, Date.now(), 10)).toEqual([]);
     expect(notices()).toEqual([]);
 });

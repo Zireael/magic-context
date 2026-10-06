@@ -16,6 +16,31 @@ compiler or confirmation model. The compiler still limits repair error feedback
 to 2 KiB, generated output to 128 Ki characters and compiled code to 64 KiB.
 The local readFile limit remains 64 KiB and the sandbox heap remains 8 MiB.
 
+## Check and sweep deadlines
+
+A guarded HTTP call has a 5-second wall-clock deadline, including DNS (whose own
+limit is 3 seconds), redirects and readability probes. Compile dry-runs, scheduled
+checks and liveness checks share a check deadline derived from that HTTP deadline:
+5 seconds plus 1 second of VM entry/resumption margin. The 2-second execution
+budget still interrupts busy loops; time suspended in HTTP does not spend it.
+Multiple sequential HTTP calls share the check deadline, not a fresh check budget
+per call.
+
+The dreamer's due-check sweep still has a 10-second outer budget (standalone timer
+sweeps retain 15 seconds). After the first attempt, another note is admitted only
+if a full 6-second check budget remains. Fast checks can still fill the existing
+10-note cap, but slow sweeps process fewer notes instead of truncating each HTTP
+request. The outer deadline also covers WASM loading and queuing for the shared VM;
+external cancellation leaves note health unchanged.
+
+HTTP/DNS deadlines and a check's own deadline while suspended in HTTP carry a
+transient retry time with a five-minute minimum. Storage applies exponential
+network backoff on top, without spending compilation/logic strikes or creating
+fallback/owner-repair notices. A busy loop, including one after a completed HTTP
+call, remains a normal execution failure rather than a transient network failure.
+Pi uses the same dream-task executor, compiler and sandbox as OpenCode, so these
+bounds and classifications apply to both hosts.
+
 ## Absence versus inaccessible data
 
 A watched resource returning 404 or 410 is absent. Normal guest verdicts are
