@@ -74,7 +74,12 @@ async function whileWriterIsLocked<T>(dbPath: string, operation: () => T): Promi
          await Bun.sleep(1200);
          db.exec("ROLLBACK"); db.close();`,
         ],
-        { env: { ...process.env, OPENCODE_DB: dbPath }, stdout: "pipe", stderr: "pipe" },
+        {
+            env: { ...process.env, OPENCODE_DB: dbPath },
+            stdout: "pipe",
+            stderr: "pipe",
+            windowsHide: true,
+        },
     );
     const reader = child.stdout.getReader();
     try {
