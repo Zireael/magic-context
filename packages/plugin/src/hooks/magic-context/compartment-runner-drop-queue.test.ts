@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import {
     closeDatabase,
     getPendingOps,
@@ -25,7 +26,6 @@ import {
 } from "../../features/magic-context/storage";
 import { queuePendingOp } from "../../features/magic-context/storage-ops";
 import { getActiveTagsBySession } from "../../features/magic-context/storage-tags";
-import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import { applyPendingOperations } from "./apply-operations";
 import {
     prepareCompartmentDrops,

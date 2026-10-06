@@ -1,14 +1,12 @@
 import { afterEach, expect, it } from "bun:test";
+import golden from "../../../../../crates/mc-module/tests/fixtures/protected-tool-refusal.json";
 import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
-import type { TagEntry } from "../../features/magic-context/types";
 import {
     __resetToolDefinitionMeasurements,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
+import type { TagEntry } from "../../features/magic-context/types";
 import { resolveDecisionCalibration } from "./decision-calibration";
-import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
-import type { MessageLike } from "./tag-messages";
-import golden from "../../../../../crates/mc-module/tests/fixtures/protected-tool-refusal.json";
 import {
     contextRefusalError,
     outgoingContextRefusal,
@@ -16,6 +14,8 @@ import {
     PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE,
     protectedToolRefusal,
 } from "./emergency-fail-closed";
+import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
+import type { MessageLike } from "./tag-messages";
 import { evaluateEmergencyFailClosed } from "./transform-postprocess-phase";
 
 afterEach(() => __resetToolDefinitionMeasurements());

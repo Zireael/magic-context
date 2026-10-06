@@ -4,15 +4,15 @@ import {
     getLargestMeasuredToolDefinitionTokens,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
+import { outgoingContextRefusal } from "./emergency-fail-closed";
 import {
-    describeFinalWireTail,
     createFinalWireUsageTracker,
+    describeFinalWireTail,
     estimateFinalWireInputTokens,
     type FinalWireTokenEstimate,
 } from "./final-wire-token-estimate";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
-import { outgoingContextRefusal } from "./emergency-fail-closed";
 
 const MODEL = { providerID: "test-provider", modelID: "test-model", agentName: "build" };
 
