@@ -78,6 +78,14 @@ credit-limited pilot can be resumed this way **only after authorization and a
 credit refill**. `analyze-scoring.ts` reports scored denominators explicitly,
 paired noise and the common-triplet subset; credit failures are not zero scores.
 
+A transport disconnect does not prove the provider cancelled a run. Before
+retrying an unknown-outcome transport failure, query `run.status` with its
+original admission identity. If it completed, recover the original answer with
+`run.result` and its `session.subscribe` replay instead of regenerating it. In
+this trial, two such original outputs were recovered and used in the primary
+analysis; their unnecessary fresh-lineage retries are retained as excluded
+completed attempts with usage, never substituted for the original scores.
+
 Keep only sanitized `scoring-evidence.json` in git. `scoring-quality.json` and
 raw outputs contain P1 bodies and stay private in the throwaway root. Selected
 first lines may be quoted in the report for the requested qualitative check.

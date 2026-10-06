@@ -46,7 +46,7 @@ for (let index = 0; index < 30; index++) {
             if (validationError !== result.outputValidationError || JSON.stringify(parsed) !== JSON.stringify(result.scores)) throw new Error(`Score extraction mismatch ${index}-${arm}`);
             cells[arm] = {
                 status: validationError ? "invalid_output" : "scored",
-                runId: result.runId, durationMs: result.durationMs, promptHash: result.promptHash, systemHash: result.systemHash,
+                runId: result.runId, durationMs: result.durationMs, recoveredFrom: result.recoveredFrom, promptHash: result.promptHash, systemHash: result.systemHash,
                 outputHash: hash(result.text), outputValidationError: validationError, usage: steps[0].usage,
                 scores: parsed.map(({ p1, ...s }) => ({ ...s, p1Hash: hash(p1), p1Characters: p1.length })),
             };
@@ -97,7 +97,8 @@ if (existsSync(join(root, "superseded"))) for (const file of readdirSync(join(ro
     const r = await Bun.file(join(root, "superseded", file)).json();
     const usage: Json = {};
     for (const e of r.events.filter((e: Json) => e.type === "step_finished")) addUsage(usage, e.usage);
-    superseded.push({ index: r.index, arm: r.variant, model: r.model, runId: r.runId, error: r.error, usage });
+    superseded.push({ index: r.index, arm: r.variant, model: r.model, runId: r.runId, status: r.error ? "failed_attempt" : "completed_excluded_retry", error: r.error, usage,
+        scores: r.scores?.map(({ p1, ...s }: Json) => ({ ...s, p1Hash: hash(p1), p1Characters: p1.length })) });
 }
 writeFileSync(join(root, "scoring-quality.json"), JSON.stringify(quality, null, 2));
 writeFileSync(join(root, "scoring-evidence.json"), JSON.stringify({ revisedSystemHash: hash(COMPARTMENT_AGENT_SYSTEM_PROMPT), summary, superseded, cases }, null, 2));
