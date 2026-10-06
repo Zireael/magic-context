@@ -134,7 +134,7 @@ export default function HarnessModelFields(props: HarnessModelFieldsProps) {
   };
 
   return (
-    <div class="harness-model-fields" data-harness={props.harness}>
+    <div class="harness-model-fields" data-harness={props.harness} data-agent={props.agent}>
       <div class="config-field">
         <div class="config-field-header">
           <span class="config-field-label">Model</span>

@@ -25,6 +25,11 @@ export default function SearchPicker(props: {
     setOpen(false);
     trigger.focus();
   };
+  const displayValue = () =>
+    props.options.find((option) => option.value === props.value)?.label ??
+    props.value ??
+    props.emptyLabel ??
+    "Use harness default";
   return (
     <div class="search-picker">
       <button
@@ -34,17 +39,13 @@ export default function SearchPicker(props: {
         aria-label={props.label}
         aria-expanded={open()}
         aria-haspopup="dialog"
+        title={displayValue()}
         onClick={() => {
           setQuery("");
           setOpen(!open());
         }}
       >
-        <span>
-          {props.options.find((option) => option.value === props.value)?.label ??
-            props.value ??
-            props.emptyLabel ??
-            "Use harness default"}
-        </span>
+        <span class="model-select-value">{displayValue()}</span>
         <span class="model-select-chevron">▾</span>
       </button>
       <Show when={open()}>

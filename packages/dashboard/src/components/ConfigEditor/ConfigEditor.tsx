@@ -555,7 +555,7 @@ function ConfigForm(props: {
       {/* Sticky Action Bar */}
       <div class="config-action-bar">
         <div class="config-file-meta">
-          <code>{props.path}</code>
+          <code title={props.path}>{props.path}</code>
           <span>
             {isUserScope()
               ? "Shared CortexKit user config · OpenCode, Pi & OMP"
