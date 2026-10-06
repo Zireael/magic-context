@@ -276,6 +276,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             expect(markerInput).toBeLessThan(400);
             expect(replayPasses.at(-1)!.inputCount).toBe(markerInput);
             const comparedPasses = [controlPasses.at(-1)!, markerPasses.at(-1)!, replayPasses.at(-1)!];
+            console.log(`rust marker compared passes=${JSON.stringify(comparedPasses.map(pass => ({ decision: pass.decision, reason: pass.reason })))}`);
             expect(comparedPasses.every(pass => pass.applied && pass.servedFrom === "transform")).toBe(true);
             expect(comparedPasses.every(pass => pass.decision === "SOFT+" || pass.decision === "DEFER")).toBe(true);
             // The first smaller input is sent whole, not mistaken for an append

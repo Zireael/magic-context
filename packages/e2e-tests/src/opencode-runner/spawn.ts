@@ -292,7 +292,7 @@ export function createIsolatedEnv(): IsolatedEnv {
  * - magic-context.jsonc: starts with small thresholds so tests trigger historian
  *   deterministically with modest scripted token counts.
  */
-function writeConfigs(
+export function writeConfigs(
     env: IsolatedEnv,
     mockProviderURL: string,
     opts: SpawnOptions,
@@ -399,25 +399,23 @@ function writeConfigs(
         console.error(`[mock-config] ${JSON.stringify({ configDir: env.configDir, mockProviderURL, opencodeConfig, magicContext })}`);
     }
 
-    // The plugin's loadPluginConfig() looks for magic-context.jsonc under
-    // ${XDG_CONFIG_HOME}/opencode/magic-context.jsonc (user config) or
-    // <workdir>/magic-context.jsonc (project root).
-    //
-    // We set XDG_CONFIG_HOME=env.configDir in the child env, so the user
-    // config path resolves to env.configDir/opencode/magic-context.jsonc.
-    // Put the file there; a sibling one in env.configDir is never read.
-    const userConfigDir = join(env.configDir, "opencode");
+    // Write the authoritative shared user config on every boot, including restarts.
+    // A legacy OpenCode file is ignored once startup migration has created the
+    // CortexKit file, so rewriting that legacy path would leave old settings live.
+    const userConfigDir = join(env.configDir, "cortexkit");
     mkdirSync(userConfigDir, { recursive: true });
     writeFileSync(
         join(userConfigDir, "magic-context.jsonc"),
         JSON.stringify(magicContext, null, 2),
     );
 
-    // Same directory, but this file is OpenCode's own global config — the layer
+    // OpenCode's own global config stays in its host-specific directory — the layer
     // a launcher's OPENCODE_CONFIG_DIR sits on top of rather than replacing.
     if (opts.openCodeGlobalConfigExtra) {
+        const openCodeConfigDir = join(env.configDir, "opencode");
+        mkdirSync(openCodeConfigDir, { recursive: true });
         writeFileSync(
-            join(userConfigDir, "opencode.json"),
+            join(openCodeConfigDir, "opencode.json"),
             JSON.stringify(
                 { $schema: "https://opencode.ai/config.json", ...opts.openCodeGlobalConfigExtra },
                 null,

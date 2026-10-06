@@ -322,8 +322,10 @@ export async function spawnOpencode1(
 			2,
 		),
 	);
+	const magicContextConfigDir = join(configHome, "cortexkit");
+	mkdirSync(magicContextConfigDir, { recursive: true });
 	writeFileSync(
-		join(openCodeConfigDir, "magic-context.jsonc"),
+		join(magicContextConfigDir, "magic-context.jsonc"),
 		JSON.stringify(
 			{
 				auto_update: false,
