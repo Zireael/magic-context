@@ -31,8 +31,8 @@ env:
 #     historian publish behavior, tag-owner collision, synthetic todowrite, cross-harness
 #     memory, etc. Spawns real `opencode serve` / Pi subprocesses against the embedded
 #     mock provider. Catches cache-stability + correctness regressions that the smoke
-#     layer cannot see. The Rust hermetic lane checks public sibling sources in an
-#     independent build and four parallel test shards.
+#     layer cannot see. The Rust hermetic lane builds from the crate versions and git
+#     revisions pinned in Cargo.lock, with a dedicated locked-source ck-subc build.
 #
 # Prior to v0.21.x the Docker e2e ran in a separate workflow (e2e-docker.yml) on the
 # same tag push, so publishes could complete even if e2e failed. Folding both e2e
@@ -341,39 +341,53 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - name: Check out commons
-        uses: actions/checkout@v5
-        with:
-          repository: cortexkit/commons
-          path: .siblings/commons
-      - name: Check out subconscious
+      - name: Resolve Cargo.lock crate pins
+        id: cargo-pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/cargo-lock-pins.py --self-test
+          pins="$(python3 scripts/cargo-lock-pins.py)"
+          printf '%s\n' "$pins" >> "$GITHUB_OUTPUT"
+          locked_crates="$(printf '%s\n' "$pins" | sed -n 's/^locked_crates=//p')"
+          echo "Cargo.lock pins: $locked_crates" >> "$GITHUB_STEP_SUMMARY"
+
+
+      # Cargo builds the locked subc-core library as a dependency but not its daemon
+      # binary target. Keep this checkout only in the artifact builder that produces
+      # ck-subc; the parallel e2e shards download and execute that binary.
+      - name: Check out Cargo.lock-pinned subconscious source for ck-subc
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
           path: .siblings/subconscious
-      - name: Link siblings at the expected relative paths
+          ref: ${{ steps.cargo-pins.outputs.subc_revision }}
+
+      - name: Record locked daemon source revision
+        id: daemon-source
         shell: bash
         run: |
           set -euo pipefail
-          ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"
-          ln -sfn "$GITHUB_WORKSPACE/.siblings/subconscious" "$GITHUB_WORKSPACE/../subconscious"
-          test -f "$GITHUB_WORKSPACE/../commons/Cargo.toml"
-          test -f "$GITHUB_WORKSPACE/../subconscious/Cargo.lock"
-      - name: Record public sibling revisions
-        shell: bash
-        run: |
-          set -euo pipefail
-          commons_sha="$(git -C "$GITHUB_WORKSPACE/../commons" rev-parse HEAD)"
-          subconscious_sha="$(git -C "$GITHUB_WORKSPACE/../subconscious" rev-parse HEAD)"
-          summary="Rust hermetic sibling checkouts: commons=${commons_sha}; subconscious=${subconscious_sha}"
+          sha="$(git -C "$GITHUB_WORKSPACE/.siblings/subconscious" rev-parse HEAD)"
+          expected="${{ steps.cargo-pins.outputs.subc_revision }}"
+          if [[ "$sha" != "$expected" ]]; then
+            echo "checked out daemon source $sha, expected Cargo.lock revision $expected" >&2
+            exit 1
+          fi
+          summary="ck-subc source pinned by Cargo.lock: $sha"
           echo "$summary"
           echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Derive hermetic Cargo cache key
         id: cargo-cache-key
         shell: bash
         run: |
           set -euo pipefail
-          digest="$(sha256sum Cargo.lock ../commons/Cargo.toml ../subconscious/Cargo.lock | sha256sum | awk '{print $1}')"
+          # Include the resolved graph and the exact daemon source revision.
+          lock_digest="$(sha256sum Cargo.lock | awk '{print $1}')"
+          source_sha="${{ steps.daemon-source.outputs.sha }}"
+          digest="$(printf '%s\n%s\n' "$lock_digest" "$source_sha" | sha256sum | awk '{print $1}')"
           echo "key=rust-hermetic-${RUNNER_OS}-${RUNNER_ARCH}-${digest}" >> "$GITHUB_OUTPUT"
       - name: Restore ck-subc and ckdev-mc-e2e Cargo target cache
         uses: actions/cache@v4
@@ -390,7 +404,7 @@ jobs:
           cp "$target/release/ck-mc" "$target/prebuilt/ckdev-mc-e2e"
           CARGO_TARGET_DIR="$target" cargo build --release -p mc-module --features drive-fault
           cp "$target/release/ck-mc" "$target/prebuilt/ckdev-mc-e2e-drive-fault"
-          (cd ../subconscious && CARGO_TARGET_DIR="$target" cargo build --release -p subc-core --bins)
+          (cd "$GITHUB_WORKSPACE/.siblings/subconscious" && CARGO_TARGET_DIR="$target" cargo build --release -p subc-core --bins)
           cp "$target/release/ck-subc" "$target/prebuilt/ck-subc"
       - uses: actions/upload-artifact@v4
         with:
@@ -417,18 +431,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - uses: actions/checkout@v5
-        with:
-          repository: cortexkit/commons
-          path: .siblings/commons
-      - uses: actions/checkout@v5
-        with:
-          repository: cortexkit/subconscious
-          path: .siblings/subconscious
-      - name: Link sibling workspaces
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"
-          ln -sfn "$GITHUB_WORKSPACE/.siblings/subconscious" "$GITHUB_WORKSPACE/../subconscious"
       - name: Install workspace dependencies
         run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4

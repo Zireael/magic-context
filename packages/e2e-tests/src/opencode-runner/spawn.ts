@@ -620,7 +620,7 @@ interface RustSpawnResources {
  */
 async function provisionRustMode(existingEnv?: IsolatedEnv): Promise<RustSpawnResources> {
     const prereqs = detectRustModePrereqs();
-    if (!prereqs.ok || !prereqs.subconsciousRoot) {
+    if (!prereqs.ok) {
         throw new Error(
             `MC_E2E_MODE=rust prerequisite failure: ${prereqs.skipReason ?? "unknown prerequisite"}`,
         );
