@@ -136,6 +136,7 @@ import {
 import { registerV2Commands } from "./commands";
 import { DeletedSessionTombstones } from "./deleted-session-tombstones";
 import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
+import { registerV2DreamScheduleTimer } from "./dream-timer";
 import { startDreamTrigger } from "./dream-trigger";
 import { V2GenerateReplay } from "./generate";
 import { HiddenChildHook, registerHiddenChildAgents } from "./hidden-child";
@@ -771,28 +772,47 @@ export async function registerContext(context: V2Context) {
         );
     };
     const dreamerAtBoot = config.dreamer;
-    const startDreamer = (executor: HiddenCompletionExecutor) =>
-        resolveProjectIdentityForSession(directory, config.allow_home_project) &&
-        dreamerAtBoot &&
-        !dreamerAtBoot.disable
-            ? startDreamTrigger(context, {
-                  config: dreamerAtBoot,
-                  sample: () => {
-                      const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
-                      return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
-                  },
-                  executor: withLiveDreamerOutputCap(
-                      executor,
-                      config,
-                      () => liveConfigReader.poll().effective,
-                  ),
-                  projectIdentity: () =>
-                      resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
-                  projectMemoryEnabled: config.memory.enabled,
-                  language: config.language,
-                  mural: config.mural,
-              })
-            : undefined;
+    const startDreamer = (executor: HiddenCompletionExecutor) => {
+        const projectIdentity = resolveProjectIdentityForSession(
+            directory,
+            config.allow_home_project,
+        );
+        if (!projectIdentity || !dreamerAtBoot || dreamerAtBoot.disable) return undefined;
+        const cappedExecutor = withLiveDreamerOutputCap(
+            executor,
+            config,
+            () => liveConfigReader.poll().effective,
+        );
+        const trigger = startDreamTrigger(context, {
+            config: dreamerAtBoot,
+            sample: () => {
+                const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
+                return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
+            },
+            executor: cappedExecutor,
+            projectIdentity: () =>
+                resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
+            projectMemoryEnabled: config.memory.enabled,
+            language: config.language,
+            mural: config.mural,
+        });
+        // The trigger runs due tasks after a session turn; the schedule timer runs
+        // them on their cron schedule when nobody is chatting.
+        const timer = registerV2DreamScheduleTimer({
+            directory,
+            projectIdentity,
+            config,
+            dreamer: dreamerAtBoot,
+            liveConfig: () => liveConfigReader.poll().effective,
+            executor: cappedExecutor,
+            openReader: openStoreReader,
+        });
+        return {
+            async dispose() {
+                await Promise.all([trigger.dispose(), timer.dispose()]);
+            },
+        };
+    };
     // Both stay undefined after a refused start until recoverHiddenWork wires them.
     let hiddenCompletionExecutor: HiddenCompletionExecutor | undefined =
         db &&

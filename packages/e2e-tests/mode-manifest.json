@@ -2745,6 +2745,14 @@
             ]
         },
         {
+            "path": "tests/opencode2/dream-schedule-timer.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 627: the dreamer's schedule timer registers from the OpenCode 2 lane and dispatches a due task on the pinned GA host with no session turn, parenting its child session to the idle session in the location",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/opencode2/generate.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
