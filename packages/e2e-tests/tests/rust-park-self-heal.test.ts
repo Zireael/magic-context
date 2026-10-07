@@ -145,9 +145,12 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
             const all = await h.waitForRustPasses(beforeCount + 4);
             const after = all.slice(beforeCount);
 
-            // Wedge-free recovery: the module served real transforms again after the
-            // restart, and the session is not left permanently parked.
-            expect(after.some((p) => p.servedFrom === "transform")).toBe(true);
+            // Wedge-free recovery means a healthy module applies and advances its
+            // row version. The host may retain frozen bytes until a genuine rebuild.
+            expect(after.some((p) =>
+                p.applied && p.rowVersion > (before.at(-1)?.rowVersion ?? 0) &&
+                (p.servedFrom === "transform" || p.servedFrom === "lkg_frozen"),
+            )).toBe(true);
             expect(after.at(-1)!.decision).not.toBe("parked");
         } catch (error) {
             await rethrowWithDiagnostics(sessionId, error);
@@ -454,7 +457,8 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
             const sessionId = await h.createSession();
             try {
                 await driveToSteadyState(h, sessionId, 3);
-                const beforeCount = h.readRustPasses().length;
+                const before = h.readRustPasses();
+                const beforeCount = before.length;
 
                 // Prolonged outage: kill the module and keep it down across several
                 // passes so the adapter crosses its three-failure park threshold.
@@ -496,9 +500,12 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
                 const all = await h.waitForRustPasses(beforeCount + 15);
                 const recovery = all.slice(beforeCount + 5);
 
-                // Outcome: after the module recovers the session un-parks and serves
-                // real transforms again — no permanent park.
-                expect(recovery.some((p) => p.servedFrom === "transform")).toBe(true);
+                // Applied healthy defers prove recovery without demanding a rewrite
+                // of the frozen prompt; parked shortcuts cannot advance the module.
+                expect(recovery.some((p) =>
+                    p.applied && p.rowVersion > (before.at(-1)?.rowVersion ?? 0) &&
+                    (p.servedFrom === "transform" || p.servedFrom === "lkg_frozen"),
+                )).toBe(true);
                 expect(recovery.at(-1)!.decision).not.toBe("parked");
             } catch (error) {
                 await rethrowWithDiagnostics(sessionId, error);
