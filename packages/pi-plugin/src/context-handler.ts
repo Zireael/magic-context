@@ -288,6 +288,7 @@ import {
 	applyNativeReasoningReplayPi,
 	applyNativeToolInputReplayPi,
 	authorizePiToolRemoval,
+	preparePiToolRemovalMeasurements,
 } from "./native-replay-state-pi";
 import { hasVisibleNoteReadCallPi } from "./note-visibility-pi";
 import {
@@ -5661,6 +5662,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					saved: nativeRemovalInputs,
 					canApply: isCacheBustingPass,
 				}),
+			authorizeToolRemovals: (callIds) =>
+				preparePiToolRemovalMeasurements({
+					db: args.db,
+					sessionId: args.sessionId,
+					callIds,
+					saved: nativeRemovalInputs,
+					canApply: isCacheBustingPass,
+				}),
 		},
 	);
 	logTransformTiming(args.sessionId, "transcriptBuild", tTranscriptBuild);
@@ -6481,6 +6490,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				args.messages,
 				{
 					protectedTags: args.protectedTags,
+					prepareToolRemovalMeasurements:
+						transcript.prepareToolRemovalMeasurements,
 					protectedToolTags,
 					protectedCutoff: usesTokenProtection
 						? protectionWindowForPass.cutoff
