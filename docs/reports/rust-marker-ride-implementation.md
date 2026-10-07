@@ -110,3 +110,13 @@ tool-description content, literal marker advancement to 16940, a full smaller-in
 byte-identical subsequent replay and an append delta. No product gate or rebuild
 assertion is relaxed, and the byte-preserving HARD control keeps its unchanged
 configuration and false permission.
+
+After merging the frozen-replay policy from master (`d0cd505c`), the shared
+adoption seam remains `shouldAdoptModuleAfterFreeze(moduleDecisionBusts,
+frozenReplayReleased)`. Its first argument is the immutable
+`response.prefix_bust_permitted === true`, not a decision-label guess. Its
+second argument is a local safety release and grants no marker authority.
+Synchronous LKG replacement uses that adoption result or unsupported-capability
+conservatism; marker admission and postprocess still receive only producer
+permission. The former eight-pass marker fixture now asserts continued freezing
+and retained pending work, matching the intentionally changed master policy.
