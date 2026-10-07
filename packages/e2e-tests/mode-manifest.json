@@ -3,6 +3,14 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
         {
+            "path": "tests/pi-historian-runtime.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real Pi loader-only evaluation leaves a separate unbound action runtime but must not poison the serving historian; real OMP historian and mapper retain the disabled-built-in intersection. Mock provider only, throwaway roots checked by host and child PID lsof. Pi version comparisons use MC_E2E_PI_PACKAGE_JSON.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["pi", "omp"]
+        },
+        {
             "path": "tests/opencode2/error-result-compaction.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
