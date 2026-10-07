@@ -23758,6 +23758,200 @@ mod tests {
     }
 
     #[test]
+    fn tagged_tool_attachments_survive_native_cache_and_explicit_drop_stays_dropped() {
+        for status in ["completed", "error"] {
+            let mut native = vec![json!({
+                "info": { "id": "tool-msg", "role": "assistant" },
+                "parts": [{ "type": "tool", "callID": "call", "tool": "read", "state": {
+                    "status": status, "input": {}, "output": "Read result", "error": "Read result",
+                    "attachments": [
+                        { "type": "file", "id": "image-id", "mime": "image/jpeg", "url": "data:image/jpeg;base64,aW1n", "filename": "screen.jpg", "vendor": { "keep": true } },
+                        { "type": "file", "mime": "application/pdf", "url": "data:application/pdf;base64,cGRm", "filename": "read.pdf" },
+                        { "type": "vendor-file", "id": "opaque-id", "payload": [1, 2] },
+                        { "type": "text", "text": "attached text", "vendor": "keep" }
+                    ], "time": { "start": 1, "end": 2 }
+                } }]
+            })];
+            native.push(native_text_message("user-one", "user", "first prompt"));
+            let ingress = codec::decode_opencode(&native).messages;
+            let request = native_cache_request(status, ingress.clone(), native.clone(), "fp-1");
+            let mut served = ingress.iter().map(|m| m.ck.clone()).collect::<Vec<_>>();
+            let CkKind::ToolResult { output, .. } = &mut served[0].content[1].kind else {
+                panic!("result")
+            };
+            let blocks = match &mut output.kind {
+                CkOutputKind::Content { blocks } | CkOutputKind::ErrorContent { blocks } => blocks,
+                _ => panic!("attachments must be projected as content"),
+            };
+            let ck_wire::ResultBlockKind::Text { text } = &mut blocks[0].kind else {
+                panic!("text child")
+            };
+            *text = "§1§ Read result".into();
+            served[0].content[1].mark_modified();
+            served[0].mark_modified();
+            let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+            let tags = BTreeMap::new();
+            let (first, _) = run_native_cache_pass(
+                &cache,
+                &request,
+                served.clone(),
+                &tags,
+                false,
+                0,
+                NativeCacheKeyMode::Normal,
+            );
+            let first_native = first.native_messages.unwrap();
+            assert_eq!(
+                first_native[0]["parts"][0]["state"]["attachments"],
+                native[0]["parts"][0]["state"]["attachments"]
+            );
+            let output_key = if status == "error" { "error" } else { "output" };
+            assert_eq!(
+                first_native[0]["parts"][0]["state"][output_key],
+                "§1§ Read result"
+            );
+            let frozen_bytes = serde_json::to_vec(&first_native[0]).unwrap();
+            for clear_cache in [false, true] {
+                if clear_cache {
+                    cache.lock().unwrap().remove(status);
+                }
+                let (replay, _) = run_native_cache_pass(
+                    &cache,
+                    &request,
+                    served.clone(),
+                    &tags,
+                    false,
+                    0,
+                    NativeCacheKeyMode::Normal,
+                );
+                assert_eq!(
+                    serde_json::to_vec(&replay.native_messages.unwrap()[0]).unwrap(),
+                    frozen_bytes
+                );
+            }
+            let appended = ck("next", 3, "defer");
+            let mut next_messages = ingress;
+            next_messages.push(appended.clone());
+            let mut next_native = native;
+            next_native.push(native_text_message("next", "user", "defer"));
+            let mut next = native_cache_request(status, next_messages, next_native, "fp-2");
+            next.tail_delta =
+                Some(json!({ "after": "fp-1", "replace_from": 2, "native_replace_from": 2 }));
+            served.push(appended.ck);
+            let prefix = next.native_messages.as_ref().unwrap()[..2]
+                .iter()
+                .cloned()
+                .map(Arc::new)
+                .collect::<Vec<_>>();
+            let frontier = NativeDeltaFrontier {
+                after: "fp-1".into(),
+                native_replace_from: 2,
+                native_prefix_retained_bytes: prefix
+                    .iter()
+                    .map(|value| native_value_retained_bytes(value))
+                    .collect(),
+                native_prefix: prefix,
+                projection_cache: None,
+            };
+            let mut replay = transform::TransformResponse::passthrough(
+                served.clone(),
+                next.full_array_fingerprint.clone(),
+            );
+            let stats = attach_native_messages_incremental(
+                &mut replay,
+                &next,
+                &[],
+                &tags,
+                None,
+                None,
+                false,
+                Some(&frontier),
+                0,
+                &cache,
+                NativeCacheKeyMode::Normal,
+            );
+            assert_eq!(stats.delta_fallback_reason, None);
+            assert!(stats.reused_messages > 0, "{stats:?}");
+            assert_eq!(
+                serde_json::to_vec(&replay.native_messages.unwrap()[0]).unwrap(),
+                frozen_bytes
+            );
+            // Native attach must not restore attachments that the frozen reduction removed.
+            let CkKind::ToolResult { output, .. } = &mut served[0].content[1].kind else {
+                panic!("result")
+            };
+            *output = CkToolOutput::bare(CkOutputKind::Text {
+                text: "[dropped §1§]".into(),
+            });
+            let (drop, _) = run_native_cache_pass(
+                &cache,
+                &next,
+                served,
+                &tags,
+                false,
+                0,
+                NativeCacheKeyMode::Normal,
+            );
+            assert!(drop.native_messages.unwrap()[0]["parts"][0]["state"]
+                .get("attachments")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn attachment_free_upgrade_keeps_native_served_bytes_identical() {
+        let native = vec![
+            json!({ "info": { "id": "tool-msg", "role": "assistant" }, "parts": [{ "type": "tool", "callID": "call", "tool": "read", "state": { "status": "completed", "input": { "path": "code.rs" }, "output": "line\n\u{0000}§raw§", "vendor": true, "time": { "start": 1, "end": 2 } } }] }),
+        ];
+        let fixed_ingress = codec::decode_opencode(&native).messages;
+        let mut old_ingress = fixed_ingress.clone();
+        let CkKind::ToolResult { output, .. } = &mut old_ingress[0].ck.content[1].kind else {
+            panic!("result")
+        };
+        *output = CkToolOutput::bare(CkOutputKind::Text {
+            text: "line\n\u{0000}§raw§".into(),
+        });
+        old_ingress[0].ck.content[1].mark_modified();
+        old_ingress[0].ck.mark_modified();
+        for tagged in [false, true] {
+            let render = |messages: Vec<CkIngressMessage>| {
+                let mut served = messages.iter().map(|m| m.ck.clone()).collect::<Vec<_>>();
+                if tagged {
+                    let CkKind::ToolResult { output, .. } = &mut served[0].content[1].kind else {
+                        panic!("result")
+                    };
+                    match &mut output.kind {
+                        CkOutputKind::Text { text } => text.insert_str(0, "§1§ "),
+                        CkOutputKind::Content { blocks } => {
+                            let ck_wire::ResultBlockKind::Text { text } = &mut blocks[0].kind
+                            else {
+                                panic!("text")
+                            };
+                            text.insert_str(0, "§1§ ");
+                        }
+                        _ => panic!("output"),
+                    }
+                    served[0].content[1].mark_modified();
+                    served[0].mark_modified();
+                }
+                let request = native_cache_request("upgrade", messages, native.clone(), "fp");
+                let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+                let (response, _) = run_native_cache_pass(
+                    &cache,
+                    &request,
+                    served,
+                    &BTreeMap::new(),
+                    false,
+                    0,
+                    NativeCacheKeyMode::Normal,
+                );
+                serde_json::to_vec(&response.native_messages.unwrap()).unwrap()
+            };
+            assert_eq!(render(old_ingress.clone()), render(fixed_ingress.clone()));
+        }
+    }
+
+    #[test]
     fn native_delta_ingress_core_is_independent_of_changed_output_messages() {
         let ingress = vec![
             ck("core-1", 1, "one"),

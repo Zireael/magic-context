@@ -3,6 +3,14 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
         {
+            "path": "tests/rust-tool-attachments.test.ts",
+            "tier": "rust-only",
+            "invocation": { "ts": false, "rust": true },
+            "rationale": "Real OpenCode 1 Rust-mode native attach: mock screenshot plus read image/PDF reach the Anthropic wire with tagged text on first sight and replay byte-identically on later defers; host PID lsof proves throwaway-store containment",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/checkout-claim.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
