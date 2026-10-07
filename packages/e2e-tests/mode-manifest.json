@@ -785,12 +785,12 @@
         },
         {
             "path": "tests/opencode2/commands-s2-wrapup.test.ts",
-            "tier": "excluded",
+            "tier": "ts-only",
             "invocation": {
-                "ts": false,
+                "ts": true,
                 "rust": false
             },
-            "rationale": "OpenCode v2 lane: /ctx-wrapup executed over the GA command API runs the historian through the v2 hidden-completion executor and publishes compartments; before the fix wrapup fell back to the v1 executor, which has no client on 2.x; the v2 lane runs from its own invocation (bun test tests/opencode2)",
+            "rationale": "Real OpenCode 2 /ctx-wrapup publishes through v2 bounded history and hidden completions on a pure-v2 store, including before the first pass after reopening, and a real v1-converted store. A flush renders the publication; no v1 pending marker, legacy row write or reconversion is allowed; PID lsof proves throwaway-store containment.",
             "contract_refs": [
                 "OC2-S1"
             ],
@@ -800,12 +800,12 @@
         },
         {
             "path": "tests/opencode2/recomp-hidden-executor.test.ts",
-            "tier": "excluded",
+            "tier": "ts-only",
             "invocation": {
-                "ts": false,
+                "ts": true,
                 "rust": false
             },
-            "rationale": "OpenCode v2 lane (issue 591): /ctx-recomp over the GA command API rebuilds compartments through the v2 hidden-completion executor instead of failing with MC-R01 on the missing OpenCode 1 client, and the next turn renders the rebuilt history; the v2 lane runs from its own invocation (bun test tests/opencode2)",
+            "rationale": "Real OpenCode 2 /ctx-recomp rebuilds and renders compartments through v2 bounded history and hidden completions on pure-v2 and real v1-converted stores, including before the first pass after reopening. Legacy rows and migration.v1-v2 remain unchanged; PID lsof proves throwaway-store containment.",
             "contract_refs": [
                 "OC2-S1"
             ],
