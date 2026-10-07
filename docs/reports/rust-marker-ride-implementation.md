@@ -82,3 +82,31 @@ assumptions in the plugin config-variable and Pi dreamer-home tests. Those files
 and claims are not changed. The e2e TypeScript project also has existing errors
 outside the marker fixture; package source/scripts typechecks pass and the edited
 marker fixture has no TypeScript diagnostics.
+
+## CI host-ordering follow-up
+
+The merged train at `647dbab69e` reproduced CI run `37567736485` on its
+OpenCode **1.18.32** pin: both mixed catch-up controls received SOFT+ instead
+of HARD. The same merged producer and plugin passed on **1.18.30**. The
+original delivery at `b173dfc875`, with its original native producer, also
+failed on 1.18.32. The protected-tools merge therefore did not cause this
+epoch suppression.
+
+The old fixture discovered new `AGENTS.md` instructions after restarting the
+host. On 1.18.32 the intercepted provider system changed and contained those
+instructions, but that turn's Rust transform still saw the previous system
+hash: generated context.db advanced from `67a2f683e94c065cd82cd798806ef6b0`
+to `3475ae3780857634ff4db5f64c8f95a8`, while store.db's
+`last_system_prompt_hash` remained the former value. The messages hook ran
+before the system hook. Its below-threshold SOFT+ and false permission were
+correct for the request it actually received; a later system observation must
+not authorize a cut on an earlier response.
+
+The fixture now changes a configured MC `ctx_search` tool description.
+That changes the provider tool schema **and** the request's render-config identity,
+independently of host hook ordering. The controls still require HARD with
+`reason=epoch_change`, scheduler defer, true permission, changed intercepted
+tool-description content, literal marker advancement to 16940, a full smaller-input send,
+byte-identical subsequent replay and an append delta. No product gate or rebuild
+assertion is relaxed, and the byte-preserving HARD control keeps its unchanged
+configuration and false permission.

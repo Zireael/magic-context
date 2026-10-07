@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { closeCompactionMarkerDb, injectCompactionMarker } from "../../plugin/src/features/magic-context/compaction-marker";
 import { MARKER_SUMMARY_TEXT } from "../../plugin/src/hooks/magic-context/compaction-marker-manager";
@@ -543,8 +543,15 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
         [[51,62],[64,74],[76,84],[87,108],[111,16940]].forEach(([start,end], index) => insertRange(index+4,start!,end!));
         expect(context.query("SELECT pending_compaction_marker_state AS pending FROM session_meta WHERE session_id=?").get(sessionId)).toEqual({ pending: null });
         const rawHistoryApiBytes = Buffer.byteLength(JSON.stringify(await h.listMessages(sessionId)));
-        writeFileSync(join(h.env.workdir,"AGENTS.md"), "Always preserve the generated mixed-history fixture instructions.\n");
-        await h.restart({ rust: true, magicContextConfig: config });
+        const previousTools = JSON.stringify(h.mainRequests().at(-1)!.body.tools);
+        // OpenCode can run messages.transform before system.transform, so a
+        // newly discovered AGENTS.md hash may reach Rust only on the next turn.
+        // Change MC's render configuration and a real provider tool description.
+        // That epoch is in this request without introducing a second, later
+        // system-hash epoch on the first smaller-input replay.
+        const epochConfig = { ...config, prompt_surface: { tool_descriptions: { ctx_search: "Search the generated mixed-history marker fixture." } } };
+        h.subc.writeModuleConfig(epochConfig);
+        await h.restart({ rust: true, magicContextConfig: epochConfig });
         assertHermeticStores(h);
         let peakRssKiB = 0;
         const sample = () => {
@@ -562,6 +569,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
         expect(hard.raw).toContain("prefix_bust_permitted=true");
         expect(hard.raw).toContain("reason=epoch_change");
         expect(hard.applied).toBe(true);
+        expect(JSON.stringify(h.mainRequests().at(-1)!.body.tools)).not.toBe(previousTools);
         const marker = () => JSON.parse((context.query("SELECT compaction_marker_state AS marker FROM session_meta WHERE session_id=?").get(sessionId) as {marker:string}).marker) as {boundaryOrdinal:number;boundaryMessageId:string};
         expect(marker().boundaryOrdinal).toBe(16940);
         expect(marker().boundaryMessageId).toBe(raw[16938]!.id);
@@ -603,7 +611,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
         oc.close(); context.close();
     }
 
-    it("deferred system epoch rebuild catches up a lagging marker with NULL pending", () => mixedCatchup(), 600_000);
+    it("deferred render epoch rebuild catches up a lagging marker with NULL pending", () => mixedCatchup(), 600_000);
     it("byte-preserving marker HARD holds the host marker, queued drops and frozen provider bytes", () => mixedCatchup(true), 600_000);
     it("mixed 16k catch-up has byte-stable following SOFT+ and bounded host writes", () => mixedCatchup(), 600_000);
 
