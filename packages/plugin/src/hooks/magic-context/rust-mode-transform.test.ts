@@ -1,8 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { listSessionCompactionMarkers } from "../../features/magic-context/compaction-marker";
@@ -37,6 +38,7 @@ import {
     getPersistedCompactionMarkerState,
     getPersistedNoteNudge,
     getThinkingBindingRecoveryTarget,
+    getTrailingBlankDecisions,
     recordDetectedContextLimit,
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
@@ -44,7 +46,10 @@ import {
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
-import { isRustMarkerAdmissionFenced } from "../../features/magic-context/storage-replay-document";
+import {
+    isRustMarkerAdmissionFenced,
+    setRustMarkerAdmissionFence,
+} from "../../features/magic-context/storage-replay-document";
 import { createTagger } from "../../features/magic-context/tagger";
 import {
     __resetToolDefinitionMeasurements,
@@ -352,12 +357,22 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 
 describe("Rust mode authority adapter", () => {
     function markerFaultFixture(
-        fault: "fence" | "after-marker" | "capture" | "bookkeeping" | "host-lock-capture",
+        fault:
+            | "fence"
+            | "after-marker"
+            | "capture"
+            | "bookkeeping"
+            | "host-lock-capture"
+            | "mirror"
+            | "final-fit"
+            | "os-cut",
         queueOldCapture = false,
         noCutOutcome?: MarkerUpdateOutcome,
         admissionEstimator?: Parameters<
             typeof createRustModeTransform
         >[1]["rawFallbackEstimatorForTests"],
+        schedulerDecision = "execute",
+        historianState = "idle",
     ) {
         const sid = `marker-admission-${fault}-${Date.now()}`;
         sessions.push(sid);
@@ -415,7 +430,9 @@ describe("Rust mode authority adapter", () => {
                 const oldRepresentation = step === 1 || (queueOldCapture && step === 2);
                 return {
                     decision: deferRebuild || (queueOldCapture && step === 2) ? "SOFT+" : "HARD",
-                    scheduler_decision: queueOldCapture && step === 2 ? "defer" : "execute",
+                    prefix_bust_permitted: !deferRebuild && !(queueOldCapture && step === 2),
+                    scheduler_decision: queueOldCapture && step === 2 ? "defer" : schedulerDecision,
+                    historian: { state: historianState },
                     row_version: step,
                     native_messages: oldRepresentation
                         ? makeMessages(sid)
@@ -461,19 +478,45 @@ describe("Rust mode authority adapter", () => {
                     if (noCutOutcome) fail = false;
                     throw new Error("injected late overflow bookkeeping failure");
                 }
+                if (
+                    fault === "mirror" &&
+                    fail &&
+                    step >= 2 &&
+                    String(sql).startsWith("UPDATE session_meta SET compaction_marker_state")
+                ) {
+                    throw new Error("injected post-cut context mirror failure");
+                }
                 return originalPrepare(sql);
             });
             const deps = makeDeps(db, moduleClient);
             deps.tagger = createTagger();
             deps.compactionMarkerStrategy = {
                 applyDeferred: (...args) => {
+                    expect(isRustMarkerAdmissionFenced(db, sid)).toBe(true);
                     const outcome = noCutOutcome ?? applyDeferredCompactionMarker(...args);
                     markerOutcomes.push(outcome);
+                    if (fault === "os-cut" && fail && outcome.kind === "applied") {
+                        const record = process.env.MC_RUST_MARKER_OS_CUT_RECORD;
+                        if (!record) throw new Error("missing isolated crash record path");
+                        writeFileSync(
+                            record,
+                            JSON.stringify({ sid, path, dataHome: process.env.XDG_DATA_HOME }),
+                        );
+                        process.kill(process.pid, "SIGKILL");
+                    }
                     if (fault === "after-marker" && fail && outcome.kind === "applied")
                         throw new Error("injected after irreversible marker write");
                     return outcome;
                 },
-                reconcile: reconcileMarkerRepresentation,
+                reconcile: (...args) => {
+                    reconcileMarkerRepresentation(...args);
+                    if (fault === "final-fit" && fail && step >= 2) {
+                        args[0].push({
+                            info: { id: "over-limit", role: "user", sessionID: sid },
+                            parts: [{ type: "text", text: "x".repeat(2_000_000) }],
+                        } as MessageLike);
+                    }
+                },
             };
             return createRustModeTransform(deps, {
                 moduleClient,
@@ -545,9 +588,342 @@ describe("Rust mode authority adapter", () => {
         };
     }
 
+    it("one shared rebuild drains while the historian is running", async () => {
+        const fixture = markerFaultFixture(
+            "capture",
+            false,
+            undefined,
+            undefined,
+            "defer",
+            "running",
+        );
+        try {
+            fixture.stopFault();
+            await fixture.serve();
+            const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1, injectAttempts: 3 };
+            setPendingCompactionMarkerState(fixture.db, fixture.sid, pending);
+            fixture.setDeferredRebuild(true);
+            await fixture.serve();
+            expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)).toEqual(pending);
+            expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+            expect(fixture.calls).not.toContain("session.flush");
+            fixture.setDeferredRebuild(false);
+            await fixture.serve();
+            expect(
+                getPersistedCompactionMarkerState(fixture.db, fixture.sid)?.boundaryOrdinal,
+            ).toBe(1);
+            expect(getPendingCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+        } finally {
+            fixture.dispose();
+        }
+    });
+
+    it("an error response cannot grant host authority even with true permission and native messages", async () => {
+        const sessionId = `rust-error-permission-${Date.now()}`;
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        const db = makeDb();
+        const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1, injectAttempts: 3 };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        let writes = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          status: "error",
+                          decision: "HARD",
+                          prefix_bust_permitted: true,
+                          committed: true,
+                          row_version: 7,
+                          coverage_ordinal: 1,
+                          boundary_id: "m1#0",
+                          native_messages: [
+                              {
+                                  info: { role: "user", sessionID: sessionId },
+                                  parts: [
+                                      {
+                                          type: "text",
+                                          text: "<session-history>invalid response</session-history>",
+                                          synthetic: true,
+                                      },
+                                  ],
+                              },
+                              ...makeMessages(sessionId),
+                          ],
+                      }
+                    : { ok: true },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        deps.compactionMarkerStrategy = {
+            applyDeferred: () => {
+                writes++;
+                return { kind: "applied", markerOrdinal: 1 };
+            },
+            reconcile: reconcileMarkerRepresentation,
+        };
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = makeMessages(sessionId);
+        await expect(
+            transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId)),
+        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(writes).toBe(0);
+        expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+        transform.dispose();
+    });
+
+    it("supported false wire permission captures newest-tail replay while unsupported wire permission holds", async () => {
+        for (const permission of [false, undefined, null, 1, "true", {}]) {
+            const sessionId = `rust-wire-tail-${String(permission)}-${Date.now()}`;
+            sessions.push(sessionId);
+            installRawProvider(sessionId);
+            const db = makeDb();
+            const input = [
+                ...makeMessages(sessionId),
+                {
+                    info: { id: "newest", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "already served tail" }],
+                },
+            ] as MessageLike[];
+            input[0]!.info.model = { providerID: "anthropic", modelID: "mock-sonnet" };
+            input[1]!.info.providerID = "anthropic";
+            input[1]!.info.modelID = "mock-sonnet";
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method }) =>
+                    method === "transform"
+                        ? {
+                              decision: "SOFT+",
+                              ...(permission === undefined
+                                  ? {}
+                                  : { prefix_bust_permitted: permission }),
+                              row_version: 1,
+                              native_messages: structuredClone(input),
+                          }
+                        : { ok: true },
+            };
+            const deps = makeDeps(db, moduleClient);
+            deps.liveModelBySession?.set(sessionId, {
+                providerID: "anthropic",
+                modelID: "mock-sonnet",
+            });
+            deps.getModelKey = () => "anthropic/mock-sonnet";
+            const transform = createRustModeTransform(deps, { moduleClient });
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+            expect(getTrailingBlankDecisions(db, sessionId).get("newest")).toBe(
+                permission === false ? "strip" : undefined,
+            );
+            expect(output.messages).toEqual(input);
+            transform.dispose();
+        }
+    });
+
+    it("all host first applications hold without an actual boolean permission", async () => {
+        for (const wireValue of [undefined, null, false, 1, "true", "false", {}]) {
+            const sessionId = `rust-permission-${String(wireValue)}-${Date.now()}`;
+            sessions.push(sessionId);
+            installRawProvider(sessionId);
+            const db = makeDb();
+            const pending = {
+                ordinal: 1,
+                endMessageId: "m1",
+                publishedAt: 1,
+                injectAttempts: 3,
+                lastInjectError: "locked",
+                firstInjectFailedAt: 1,
+            };
+            setPendingCompactionMarkerState(db, sessionId, pending);
+            let writes = 0;
+            const calls: string[] = [];
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method }) => {
+                    calls.push(method);
+                    if (method !== "transform") return { ok: true };
+                    return {
+                        decision: "HARD",
+                        scheduler_decision: "execute",
+                        committed: true,
+                        ...(wireValue === undefined ? {} : { prefix_bust_permitted: wireValue }),
+                        row_version: 7,
+                        coverage_ordinal: 1,
+                        boundary_id: "m1#0",
+                        native_messages: [
+                            {
+                                info: { role: "user", sessionID: sessionId },
+                                parts: [
+                                    {
+                                        type: "text",
+                                        text: "<session-history>stable</session-history>",
+                                        synthetic: true,
+                                    },
+                                ],
+                            },
+                            ...makeMessages(sessionId),
+                        ],
+                    };
+                },
+            };
+            const deps = makeDeps(db, moduleClient);
+            deps.tagger = createTagger();
+            deps.compactionMarkerStrategy = {
+                applyDeferred: () => {
+                    writes++;
+                    return { kind: "applied", markerOrdinal: 1 };
+                },
+                reconcile: reconcileMarkerRepresentation,
+            };
+            const transform = createRustModeTransform(deps, { moduleClient });
+            const input = makeMessages(sessionId);
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+            expect(writes).toBe(0);
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+            expect(calls).not.toContain("session.flush");
+            expect(getSlot(sessionId)).toBeDefined();
+            setRustMarkerAdmissionFence(db, sessionId, true);
+            await expect(
+                transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId)),
+            ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            expect(isRustMarkerAdmissionFenced(db, sessionId)).toBe(true);
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+            transform.dispose();
+        }
+    });
+
+    it.skipIf(process.env.MC_RUST_MARKER_OS_CUT_CHILD !== "1")("marker OS cut child", async () => {
+        const fixture = markerFaultFixture("os-cut", false, undefined, undefined, "defer");
+        await fixture.serve();
+        await fixture.serve();
+        throw new Error("the crash probe did not reach the committed host cut");
+    });
+
+    it("defer HARD failed admission remains fenced across restart", async () => {
+        for (const fault of [
+            "after-marker",
+            "capture",
+            "bookkeeping",
+            "mirror",
+            "final-fit",
+        ] as const) {
+            const fixture = markerFaultFixture(fault, false, undefined, undefined, "defer");
+            try {
+                await fixture.serve();
+                await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(1);
+                if (fault === "mirror")
+                    expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+                else
+                    expect(
+                        getPersistedCompactionMarkerState(fixture.db, fixture.sid)?.boundaryOrdinal,
+                    ).toBe(1);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+                expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
+                fixture.restart();
+                expect(getSlot(fixture.sid)).toBeUndefined();
+                fixture.setDeferredRebuild(true);
+                fixture.stopFault();
+                await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
+                fixture.setDeferredRebuild(false);
+                expect(await fixture.serve()).toContain("new admitted prefix");
+                expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(false);
+            } finally {
+                fixture.dispose();
+            }
+        }
+        const home = createTestTempDirFromPath(join(tmpdir(), "marker-os-cut-"));
+        const recordPath = join(home, "crash.json");
+        const child = spawnSync(
+            process.execPath,
+            ["test", import.meta.path, "-t", "marker OS cut child"],
+            {
+                env: {
+                    ...process.env,
+                    MC_RUST_MARKER_OS_CUT_CHILD: "1",
+                    MC_RUST_MARKER_OS_CUT_RECORD: recordPath,
+                },
+                encoding: "utf8",
+                timeout: 30_000,
+                windowsHide: true,
+            },
+        );
+        expect(child.signal).toBe("SIGKILL");
+        const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+            sid: string;
+            path: string;
+            dataHome: string;
+        };
+        sessions.push(record.sid);
+        availabilityDataHomes.push(record.dataHome, home, dirname(record.path));
+        process.env.XDG_DATA_HOME = record.dataHome;
+        installRawProvider(record.sid);
+        const recoveredDb = new Database(record.path) as ContextDatabase;
+        databases.push(recoveredDb);
+        registerLkgPersistence(createDbLkgPersistence(recoveredDb));
+        expect(listSessionCompactionMarkers(record.sid)).toHaveLength(1);
+        expect(isRustMarkerAdmissionFenced(recoveredDb, record.sid)).toBe(true);
+        expect(loadPersistedLkgSlot(recoveredDb, record.sid)).toBeUndefined();
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          decision: "HARD",
+                          prefix_bust_permitted: true,
+                          committed: true,
+                          row_version: 3,
+                          coverage_ordinal: 1,
+                          boundary_id: "m1#0",
+                          native_messages: [
+                              {
+                                  info: { role: "user", sessionID: record.sid },
+                                  parts: [
+                                      {
+                                          type: "text",
+                                          text: "<session-history>new admitted prefix</session-history>",
+                                          synthetic: true,
+                                      },
+                                  ],
+                              },
+                              ...makeMessages(record.sid),
+                          ],
+                      }
+                    : { ok: true },
+        };
+        const deps = makeDeps(recoveredDb, moduleClient);
+        deps.tagger = createTagger();
+        const transform = createRustModeTransform(deps, { moduleClient });
+        try {
+            const input = makeMessages(record.sid);
+            await transform.run(
+                record.sid,
+                input,
+                { messages: [...input] },
+                makeMeta(recoveredDb, record.sid),
+            );
+            expect(isRustMarkerAdmissionFenced(recoveredDb, record.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(recoveredDb, record.sid)?.jsonPrefix).toContain(
+                "new admitted prefix",
+            );
+        } finally {
+            transform.dispose();
+        }
+    });
+
     // Allow time for the separate process's seven-second SQLite write lock to release.
     it("a busy host cut followed by priced capture failure retains still-safe LKG across restart", async () => {
-        const fixture = markerFaultFixture("host-lock-capture");
+        const fixture = markerFaultFixture(
+            "host-lock-capture",
+            false,
+            undefined,
+            undefined,
+            "defer",
+        );
         try {
             const old = await fixture.serve();
             expect(await fixture.serveAliased()).toBe(old);
@@ -801,6 +1177,7 @@ describe("Rust mode authority adapter", () => {
                 return {
                     decision: "HARD",
                     scheduler_decision: "execute",
+                    prefix_bust_permitted: true,
                     row_version: step,
                     native_messages: makeMessages(sid),
                     ...(step === 2
@@ -948,9 +1325,27 @@ describe("Rust mode authority adapter", () => {
                 if (step === 2) throw new Error("module temporarily unavailable");
                 return {
                     decision: step === 1 || step === 5 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: step === 1 || step === 5,
                     scheduler_decision: step === 1 || step === 5 ? "execute" : "defer",
                     row_version: step,
-                    native_messages: makeMessages(sessionId),
+                    ...(step === 5 ? { coverage_ordinal: 1, boundary_id: "m1#0" } : {}),
+                    native_messages: [
+                        ...(step === 5
+                            ? [
+                                  {
+                                      info: { role: "user", sessionID: sessionId },
+                                      parts: [
+                                          {
+                                              type: "text",
+                                              text: "<session-history>indexed</session-history>",
+                                              synthetic: true,
+                                          },
+                                      ],
+                                  },
+                              ]
+                            : []),
+                        ...makeMessages(sessionId),
+                    ],
                 };
             },
         };
@@ -979,6 +1374,71 @@ describe("Rust mode authority adapter", () => {
         expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryOrdinal).toBe(1);
         expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
     });
+    it("frozen SOFT+ and local bounded freeze release cannot drain retained markers", async () => {
+        const sessionId = `rust-local-release-marker-${Date.now()}`;
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        installAvailabilityDb(sessionId);
+        const db = makeDb();
+        const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1, injectAttempts: 3 };
+        const native = [
+            {
+                info: { role: "user", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "text",
+                        text: "<session-history>stable</session-history>",
+                        synthetic: true,
+                    },
+                ],
+            },
+            ...makeMessages(sessionId),
+        ];
+        let step = 0;
+        let writes = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) => {
+                if (method !== "transform") return { ok: true };
+                if (++step === 2) throw new Error("module temporarily unavailable");
+                return {
+                    decision: step === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: step === 1,
+                    row_version: 1,
+                    coverage_ordinal: 1,
+                    boundary_id: "m1#0",
+                    native_messages: structuredClone(native),
+                };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        deps.compactionMarkerStrategy = {
+            applyDeferred: () => {
+                writes++;
+                return { kind: "applied", markerOrdinal: 1 };
+            },
+            reconcile: reconcileMarkerRepresentation,
+        };
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const serve = async () => {
+            const input = makeMessages(sessionId);
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+            return JSON.stringify(output.messages);
+        };
+        const first = await serve();
+        await serve();
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(true);
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        for (let pass = 0; pass < 8; pass++) {
+            expect(await serve()).toBe(first);
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(writes).toBe(0);
+        }
+        expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+        transform.dispose();
+    });
+
     it("unprovable shared boundaries fail by name without replay or parking", async () => {
         const sessionId = "ses-unprovable-shared-boundaries";
         sessions.push(sessionId);
@@ -1041,7 +1501,7 @@ describe("Rust mode authority adapter", () => {
             const moduleClient: RustModeModuleClient = {
                 call: async ({ method }) =>
                     method === "transform"
-                        ? { decision: "SOFT+", native_messages: [] }
+                        ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                         : { ok: true },
             };
             const runner = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
@@ -1371,7 +1831,11 @@ describe("Rust mode authority adapter", () => {
                     ]);
                 }
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: makeMessages(sessionId) }
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: false,
+                          native_messages: makeMessages(sessionId),
+                      }
                     : { ok: true };
             },
         };
@@ -1415,7 +1879,11 @@ describe("Rust mode authority adapter", () => {
                         (body?.pass_inputs as Record<string, unknown>)?.cache_ttl,
                     ]);
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: makeMessages(sessionId) }
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: false,
+                          native_messages: makeMessages(sessionId),
+                      }
                     : { ok: true };
             },
         };
@@ -1510,6 +1978,7 @@ describe("Rust mode authority adapter", () => {
             {
                 decision: "HARD",
                 materialize_reason: "first_render",
+                prefix_bust_permitted: true,
                 scheduler_decision: "execute",
                 historian: {
                     fired: false,
@@ -1613,6 +2082,7 @@ describe("Rust mode authority adapter", () => {
             {
                 decision: "HARD",
                 scheduler_decision: "execute",
+                prefix_bust_permitted: true,
                 row_version: 1,
                 native_messages: stableNative,
             },
@@ -1758,6 +2228,7 @@ describe("Rust mode authority adapter", () => {
                 if (transformPass === 1) {
                     return {
                         decision: "HARD",
+                        prefix_bust_permitted: true,
                         row_version: 1,
                         native_messages: structuredClone(representationA),
                     };
@@ -1765,6 +2236,7 @@ describe("Rust mode authority adapter", () => {
                 const priced = transformPass === 5;
                 return {
                     decision: priced ? "SOFT" : "SOFT+",
+                    prefix_bust_permitted: priced,
                     scheduler_decision: priced ? "execute" : "defer",
                     row_version: transformPass,
                     first_divergence: {
@@ -1842,10 +2314,20 @@ describe("Rust mode authority adapter", () => {
                 if (method !== "transform") return { ok: true };
                 transformPass += 1;
                 if (transformPass === 1) {
-                    return { decision: "HARD", row_version: 1, native_messages: stable };
+                    return {
+                        decision: "HARD",
+                        prefix_bust_permitted: true,
+                        row_version: 1,
+                        native_messages: stable,
+                    };
                 }
                 if (externalEpochObserved) {
-                    return { decision: "HARD", row_version: 3, native_messages: drained };
+                    return {
+                        decision: "HARD",
+                        prefix_bust_permitted: true,
+                        row_version: 3,
+                        native_messages: drained,
+                    };
                 }
                 return {
                     decision: "SOFT+",
@@ -1979,16 +2461,16 @@ describe("Rust mode authority adapter", () => {
                 moduleElapsedMs: 8.765,
             }),
         ).toBe(
-            "rust pass: decision=HARD reason=first_render identity_delta=mur served_from=transform in=4 out=3 applied=true row_version=0 elapsed=12.3 ms module=8.8 ms stages=identity_resolve:0.0 prompt_surface:0.0 mural_resolve:0.0 prefix_guard:0.0 ordinal_resolve:0.0 ordinal_rebuild:0.0 ordinal_rows:0 ordinal_mode:memo state_sync:0.0 clone:0.0 wire_build:0.0 wire_messages:0 transport:0.0 transport_pages:0 transport_bytes:0 apply:0.0 lkg_snapshot:0.0 mirror_pull:0.0 compartment_mirror:0.0 other:12.3 transport_lane:0.0 transport_route:0.0 transport_encode:0.0 transport_issue:0.0 transport_response_wait_decode:0.0 transport_settle:0.0 transport_wrapper:0.0 preflight:0.0 todo_verdict:0.0 todo_probe:0.0 todo_persist:0.0 todo_probe_required:0 todo_probe_reason:none todo_unprobed_bust:0 session_directory:0.0 paging:0.0 output_clone:0.0 delivery:0.0 bookkeeping:0.0",
+            "rust pass: decision=HARD reason=first_render prefix_bust_permitted=unsupported identity_delta=mur served_from=transform in=4 out=3 applied=true row_version=0 elapsed=12.3 ms module=8.8 ms stages=identity_resolve:0.0 prompt_surface:0.0 mural_resolve:0.0 prefix_guard:0.0 ordinal_resolve:0.0 ordinal_rebuild:0.0 ordinal_rows:0 ordinal_mode:memo state_sync:0.0 clone:0.0 wire_build:0.0 wire_messages:0 transport:0.0 transport_pages:0 transport_bytes:0 apply:0.0 lkg_snapshot:0.0 mirror_pull:0.0 compartment_mirror:0.0 other:12.3 transport_lane:0.0 transport_route:0.0 transport_encode:0.0 transport_issue:0.0 transport_response_wait_decode:0.0 transport_settle:0.0 transport_wrapper:0.0 preflight:0.0 todo_verdict:0.0 todo_probe:0.0 todo_persist:0.0 todo_probe_required:0 todo_probe_reason:none todo_unprobed_bust:0 session_directory:0.0 paging:0.0 output_clone:0.0 delivery:0.0 bookkeeping:0.0",
         );
     });
 
-    it("accepts materialized boundaries only from a committed execute with served bust permission", () => {
+    it("accepts materialized boundaries from a committed rebuild regardless of scheduler", () => {
         expect(
             __rustModeTransformTest.materializedCompactionBoundary(
                 {
                     decision: "HARD",
-                    scheduler_decision: "execute",
+                    scheduler_decision: "defer",
                     committed: true,
                     row_version: 12,
                     coverage_ordinal: 9_590,
@@ -2025,6 +2507,64 @@ describe("Rust mode authority adapter", () => {
         ).toBeUndefined();
     });
 
+    it("deferred rebuilding extraction preserves every durable coordinate guard", () => {
+        const valid = {
+            committed: true,
+            scheduler_decision: "defer",
+            row_version: 12,
+            coverage_ordinal: 9590,
+            boundary_id: "msg_boundary#3",
+        };
+        expect(__rustModeTransformTest.materializedCompactionBoundary(valid, true)).toEqual({
+            rowVersion: 12,
+            ordinal: 9590,
+            endMessageId: "msg_boundary",
+        });
+        expect(
+            __rustModeTransformTest.materializedCompactionBoundary(valid, false),
+        ).toBeUndefined();
+        for (const patch of [
+            ...[undefined, false, 1, "true"].map((committed) => ({ committed })),
+            ...[
+                undefined,
+                0,
+                -1,
+                1.5,
+                Number.POSITIVE_INFINITY,
+                Number.NaN,
+                Number.MAX_SAFE_INTEGER + 1,
+                "12",
+            ].map((row_version) => ({ row_version })),
+            ...[
+                undefined,
+                -1,
+                1.5,
+                Number.POSITIVE_INFINITY,
+                Number.NaN,
+                Number.MAX_SAFE_INTEGER + 1,
+                "9590",
+            ].map((coverage_ordinal) => ({ coverage_ordinal })),
+            ...[
+                undefined,
+                null,
+                "",
+                "missing-hash",
+                "#0",
+                "msg#",
+                "msg#-1",
+                "msg#abc",
+                "msg#1.5",
+                "msg# 1",
+            ].map((boundary_id) => ({ boundary_id })),
+        ])
+            expect(
+                __rustModeTransformTest.materializedCompactionBoundary(
+                    { ...valid, ...patch },
+                    true,
+                ),
+            ).toBeUndefined();
+    });
+
     it("arms the deferred-note nudge only when a module fold advances the published sequence", async () => {
         const sessionId = `rust-note-nudge-publish-${Date.now()}`;
         sessions.push(sessionId);
@@ -2047,6 +2587,7 @@ describe("Rust mode authority adapter", () => {
                     ? {
                           decision: "HARD",
                           scheduler_decision: "execute",
+                          prefix_bust_permitted: true,
                           committed: true,
                           row_version: 4,
                           coverage_ordinal: coverageOrdinal,
@@ -2095,6 +2636,7 @@ describe("Rust mode authority adapter", () => {
                     ? {
                           decision: "HARD",
                           scheduler_decision: "execute",
+                          prefix_bust_permitted: true,
                           committed: true,
                           row_version: 4,
                           coverage_ordinal: 12,
@@ -2139,7 +2681,11 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method !== "transform") return { ok: true };
                 transformBody = body;
-                return { decision: "HARD", native_messages: makeMessages(sessionId) };
+                return {
+                    decision: "HARD",
+                    prefix_bust_permitted: true,
+                    native_messages: makeMessages(sessionId),
+                };
             },
         };
         const deps = makeDeps(db, moduleClient);
@@ -2397,7 +2943,7 @@ describe("Rust mode authority adapter", () => {
                     throw authoritySeqMismatch(5);
                 }
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: native }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native }
                     : { ok: true };
             },
         };
@@ -2473,7 +3019,7 @@ describe("Rust mode authority adapter", () => {
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) =>
                 method === "transform"
-                    ? { decision: "SOFT+", native_messages: native }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native }
                     : { ok: true },
         };
         const deps = makeDeps(db, moduleClient);
@@ -2493,7 +3039,7 @@ describe("Rust mode authority adapter", () => {
         const moduleClient: RustModeModuleClient = {
             call: async ({ method }) =>
                 method === "transform"
-                    ? { decision: "SOFT+", native_messages: native }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native }
                     : { ok: true },
         };
         const fullDigest = spyOn(lkgSlot, "lkgContentDigest");
@@ -2600,7 +3146,7 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") transformRequest = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -2644,7 +3190,7 @@ describe("Rust mode authority adapter", () => {
                 methods.push(method);
                 if (method === "transform") transformRequest = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: native }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native }
                     : { ok: true };
             },
         };
@@ -2689,7 +3235,7 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") requests.push(body as Record<string, unknown>);
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -2748,7 +3294,11 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") transformRequest = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: makeMessages(sessionId) }
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: false,
+                          native_messages: makeMessages(sessionId),
+                      }
                     : { ok: true };
             },
         };
@@ -2946,7 +3496,11 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") transformRequest = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: makeMessages(sessionId) }
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: false,
+                          native_messages: makeMessages(sessionId),
+                      }
                     : { ok: true };
             },
         };
@@ -3018,7 +3572,7 @@ describe("Rust mode authority adapter", () => {
                 call: async ({ method, body }) => {
                     if (method === "transform") requestBody = body as Record<string, unknown>;
                     return method === "transform"
-                        ? { decision: "SOFT+", native_messages: [] }
+                        ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                         : { ok: true };
                 },
             };
@@ -3047,7 +3601,7 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") requestBodies.push(body as Record<string, unknown>);
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -3086,7 +3640,7 @@ describe("Rust mode authority adapter", () => {
                 call: async ({ method, body }) => {
                     if (method === "transform") requestBody = body as Record<string, unknown>;
                     return method === "transform"
-                        ? { decision: "SOFT+", native_messages: [] }
+                        ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                         : { ok: true };
                 },
             };
@@ -3114,7 +3668,7 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") requestBody = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -3147,6 +3701,7 @@ describe("Rust mode authority adapter", () => {
                 bodies.push(body as Record<string, unknown>);
                 return {
                     decision,
+                    prefix_bust_permitted: decision === "HARD",
                     materialize_reason: materializeReason,
                     native_messages: makeMessages(sessionId),
                 };
@@ -3232,7 +3787,7 @@ describe("Rust mode authority adapter", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") requestBody = body as Record<string, unknown>;
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -3392,7 +3947,7 @@ describe("Rust mode authority adapter", () => {
                     retryStarted = true;
                     return { status: "need_full_sync" };
                 }
-                return { decision: "SOFT+", native_messages: native };
+                return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native };
             },
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
@@ -3434,6 +3989,7 @@ describe("Rust mode authority adapter", () => {
                 bodies.push(body as Record<string, unknown>);
                 return {
                     decision: "SOFT+",
+                    prefix_bust_permitted: false,
                     native_messages: [
                         { role: "assistant", parts: [{ type: "text", text: "stable" }] },
                     ],
@@ -3478,7 +4034,7 @@ describe("Rust mode authority adapter", () => {
                 transforms += 1;
                 // Pass two sends a tail delta that the restarted module cannot apply.
                 if (transforms === 2) return { status: "need_full_sync" };
-                return { decision: "SOFT+", native_messages: native };
+                return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native };
             },
         };
         const deps = makeDeps(db, moduleClient);
@@ -3531,7 +4087,11 @@ describe("Rust mode authority adapter", () => {
                 if (method !== "transform") return { ok: true };
                 transforms += 1;
                 if (transforms === 2) return { status: "need_full_sync" };
-                return { decision: transforms === 3 ? "HARD" : "SOFT+", native_messages: native };
+                return {
+                    decision: transforms === 3 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: transforms === 3,
+                    native_messages: native,
+                };
             },
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
@@ -3609,7 +4169,7 @@ describe("Rust mode authority adapter", () => {
                     };
                 if (transforms === 4 || transforms === 5)
                     throw new Error("rust module transform timed out");
-                return { decision: "SOFT+", native_messages: native };
+                return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native };
             },
         };
         const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
@@ -3708,7 +4268,12 @@ describe("Rust mode authority adapter", () => {
                     );
                 }
                 return page.transform_page_complete === true
-                    ? { decision: "HARD", served_from: "transform", native_messages: native }
+                    ? {
+                          decision: "HARD",
+                          prefix_bust_permitted: true,
+                          served_from: "transform",
+                          native_messages: native,
+                      }
                     : { staged: true };
             },
         };
@@ -3765,7 +4330,12 @@ describe("Rust mode authority adapter", () => {
                     };
                 }
                 return page.transform_page_complete === true
-                    ? { decision: "HARD", served_from: "transform", native_messages: native }
+                    ? {
+                          decision: "HARD",
+                          prefix_bust_permitted: true,
+                          served_from: "transform",
+                          native_messages: native,
+                      }
                     : { staged: true };
             },
         };
@@ -4365,6 +4935,7 @@ describe("Rust mode authority adapter", () => {
                 return method === "transform"
                     ? {
                           decision: transformPass === 1 ? "HARD" : "SOFT+",
+                          prefix_bust_permitted: transformPass === 1,
                           row_version: transformPass,
                           native_messages: [],
                       }
@@ -4525,6 +5096,7 @@ describe("Rust mode authority adapter", () => {
                 if (failTransform) throw new Error("daemon unavailable");
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "m1", role: "user", sessionID: sessionId },
@@ -4566,6 +5138,7 @@ describe("Rust mode authority adapter", () => {
                 pass += 1;
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             role: "assistant",
@@ -4648,6 +5221,7 @@ describe("Rust mode authority adapter", () => {
                 if (method !== "transform") return { ok: true };
                 return {
                     decision: ++pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1,
                     row_version: pass,
                     native_messages: structuredClone(input),
                 };
@@ -4719,6 +5293,7 @@ describe("Rust mode authority adapter", () => {
                 if (unavailable) throw new Error("module unavailable");
                 return {
                     decision: ++pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1,
                     row_version: pass,
                     native_messages: [
                         {
@@ -4759,6 +5334,7 @@ describe("Rust mode authority adapter", () => {
                 pass += 1;
                 return {
                     decision: pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1,
                     native_messages: [
                         {
                             info: { id: "served", role: "assistant", sessionID: sessionId },
@@ -4814,6 +5390,7 @@ describe("Rust mode authority adapter", () => {
                     );
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "served", role: "assistant", sessionID: sessionId },
@@ -4853,6 +5430,7 @@ describe("Rust mode authority adapter", () => {
                 }
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "served", role: "assistant", sessionID: sessionId },
@@ -4890,6 +5468,7 @@ describe("Rust mode authority adapter", () => {
                 pass += 1;
                 return {
                     decision: pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 1,
                     native_messages: [
                         {
                             info: { id: "served", role: "assistant", sessionID: sessionId },
@@ -4958,6 +5537,7 @@ describe("Rust mode authority adapter", () => {
                 pass += 1;
                 return {
                     decision: pass === 1 ? "HARD" : "SOFT",
+                    prefix_bust_permitted: true,
                     row_version: pass,
                     native_messages: [
                         {
@@ -5038,6 +5618,7 @@ describe("Rust mode authority adapter", () => {
                 // baseline would already strip it proactively.
                 return {
                     decision: rowVersion === 1 ? "SOFT+" : "HARD",
+                    prefix_bust_permitted: rowVersion !== 1,
                     row_version: rowVersion,
                     native_messages: nativeMessages(),
                 };
@@ -5104,6 +5685,7 @@ describe("Rust mode authority adapter", () => {
                 return {
                     decision: "SOFT+",
                     row_version: pass,
+                    prefix_bust_permitted: false,
                     native_messages: [
                         {
                             info: { id: "served", role: "assistant", sessionID: sessionId },
@@ -5260,6 +5842,7 @@ describe("Rust mode authority adapter", () => {
                     throw Object.assign(new Error("request deadline"), { code: "ETIMEDOUT" });
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "m1", role: "user", sessionID: sessionId },
@@ -5606,7 +6189,9 @@ describe("Rust mode authority adapter", () => {
                     .filter(([loggedSession]) => loggedSession === sessionId)
                     .map(([, message]) => message)
                     .find((message) => message.startsWith("rust pass:")),
-            ).toContain("decision=error reason=state_sync_non_retryable served_from=refused");
+            ).toContain(
+                "decision=error reason=state_sync_non_retryable prefix_bust_permitted=unsupported served_from=refused",
+            );
 
             for (let pass = 0; pass < 2; pass += 1) {
                 const parked = makeMessages(sessionId);
@@ -5777,7 +6362,11 @@ describe("Rust mode authority adapter", () => {
                 if (method === "transform") transformCalls += 1;
                 if (shouldFail) throw new Error("daemon unavailable");
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [{ role: "assistant", parts: [] }] }
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: false,
+                          native_messages: [{ role: "assistant", parts: [] }],
+                      }
                     : { ok: true };
             },
         };
@@ -5955,6 +6544,7 @@ describe("Rust mode authority adapter", () => {
                 if (failTransform) throw new Error("daemon unavailable");
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         { role: "assistant", parts: [{ type: "text", text: "lkg" }] },
                     ],
@@ -6068,6 +6658,7 @@ describe("Rust mode authority adapter", () => {
                 if (failTransform) throw new Error("daemon unavailable");
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "m1", role: "user", sessionID: sessionId },
@@ -6213,11 +6804,16 @@ describe("native output delta", () => {
                 if (transformBodies.length === 1) {
                     return {
                         decision: "SOFT+",
+                        prefix_bust_permitted: false,
                         native_messages: structuredClone(request.native_messages),
                     };
                 }
                 if (request.tail_delta) return { status: "ok", served_from: "transform" };
-                return { decision: "SOFT+", native_messages: structuredClone(healedNative) };
+                return {
+                    decision: "SOFT+",
+                    prefix_bust_permitted: false,
+                    native_messages: structuredClone(healedNative),
+                };
             },
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
@@ -6337,6 +6933,7 @@ describe("delta prefix-mutation guard", () => {
                 }
                 return {
                     decision: "SOFT+",
+                    prefix_bust_permitted: false,
                     native_messages: structuredClone(moduleNativeSnapshot),
                 };
             },
@@ -6428,7 +7025,7 @@ describe("delta prefix-mutation guard", () => {
             call: async ({ method, body }) => {
                 if (method === "transform") requestBodies.push(body as Record<string, unknown>);
                 return method === "transform"
-                    ? { decision: "SOFT+", native_messages: [] }
+                    ? { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] }
                     : { ok: true };
             },
         };
@@ -6641,6 +7238,7 @@ describe("delta prefix-mutation guard", () => {
                 }
                 return {
                     decision: "SOFT+",
+                    prefix_bust_permitted: false,
                     native_messages: [
                         {
                             info: { id: "m1", role: "user", sessionID: sessionId },
@@ -6756,6 +7354,7 @@ describe("Rust stalled transform probe", () => {
                 }
                 return {
                     decision: "SOFT+",
+                    prefix_bust_permitted: false,
                     native_messages: [
                         { role: "assistant", parts: [{ type: "text", text: "scoped result" }] },
                     ],
@@ -6805,7 +7404,7 @@ describe("Rust stalled transform probe", () => {
                 }
                 if (calls.length === 3)
                     await new Promise((resolve) => clock.setTimeout(resolve, 20000));
-                return { decision: "SOFT+", native_messages: native };
+                return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: native };
             },
         };
         const transform = createRustModeTransform(makeDeps(db, moduleClient), {
@@ -6948,6 +7547,7 @@ describe("Rust stalled transform probe", () => {
                 await new Promise((resolve) => clock.setTimeout(resolve, 5000));
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: [
                         {
                             info: { id: "m1", role: "user", sessionID: sessionId },
@@ -7192,7 +7792,11 @@ describe("LKG durability across restarts", () => {
             call: async ({ method }) => {
                 if (method !== "transform") return { ok: true };
                 if (fail()) throw new Error("daemon unavailable");
-                return { decision: "HARD", native_messages: structuredClone(native) };
+                return {
+                    decision: "HARD",
+                    prefix_bust_permitted: true,
+                    native_messages: structuredClone(native),
+                };
             },
         };
         return { moduleClient, servedNative: () => structuredClone(native) };
@@ -7457,6 +8061,7 @@ describe("LKG durability across restarts", () => {
                 if (pass === 2) throw new Error("daemon unavailable");
                 return {
                     decision: pass === 4 ? "HARD" : pass === 1 ? "HARD" : "SOFT+",
+                    prefix_bust_permitted: pass === 4 || pass === 1,
                     native_messages: structuredClone(
                         pass === 1
                             ? representationA
@@ -7527,6 +8132,7 @@ describe("LKG durability across restarts", () => {
                 if (calls > 1) throw new Error("daemon unavailable");
                 return {
                     decision: "HARD",
+                    prefix_bust_permitted: true,
                     native_messages: structuredClone(frozenRepresentation),
                 };
             },
@@ -8131,6 +8737,7 @@ describe("proactive thinking strip on a released frozen replay", () => {
                 if (pass === 2) throw new Error("daemon unavailable");
                 return {
                     decision: pass === 1 ? "HARD" : decision,
+                    prefix_bust_permitted: pass === 1 || decision === "HARD" || decision === "SOFT",
                     served_from: "transform",
                     row_version: pass,
                     native_messages: moduleOutput(lastInput),
@@ -8336,7 +8943,7 @@ it("fails after the second authority mismatch in one transform pass", async () =
         call: async ({ method }) => {
             methods.push(method);
             if (method === "state_sync") throw authoritySeqMismatch(4);
-            return { decision: "SOFT+", native_messages: [] };
+            return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] };
         },
     };
     const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });

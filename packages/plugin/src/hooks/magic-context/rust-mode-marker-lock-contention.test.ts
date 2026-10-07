@@ -129,6 +129,7 @@ async function runPassUnderLock(args: {
             lockedAt = performance.now();
             return {
                 decision: args.decision ?? "HARD",
+                prefix_bust_permitted: args.decision !== "SOFT+",
                 scheduler_decision: "execute",
                 committed: true,
                 row_version: 4,
@@ -339,6 +340,7 @@ describe("Rust-mode compaction target recording under cross-process write conten
         const result = await runPassUnderLock({ db, dbPath, sessionId, lockHoldMs: 300 });
 
         expect(servedText(result.served)).toContain(MODULE_TEXT);
-        expect(result.drained).toEqual([newer]);
+        // The response consumed ordinal 7, so pending 50 must not even be attempted.
+        expect(result.drained).toEqual([]);
     }, 20_000);
 });

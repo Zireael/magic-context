@@ -760,12 +760,13 @@ function materializedCompactionBoundary(
 ): import("./transform-postprocess-phase").RustMaterializedCompactionBoundary | undefined {
     if (!cacheBustingPass) return undefined;
     if (response.committed !== true) return undefined;
-    if (
-        typeof response.scheduler_decision !== "string" ||
-        response.scheduler_decision.toLowerCase() !== "execute"
-    ) {
-        return undefined;
-    }
+    return servedCompactionBoundary(response);
+}
+
+/** Exact consumed coordinates, not authority to mint a new target. */
+function servedCompactionBoundary(
+    response: Record<string, unknown>,
+): import("./transform-postprocess-phase").RustMaterializedCompactionBoundary | undefined {
     const ordinal = response.coverage_ordinal;
     const rowVersion = response.row_version;
     const boundaryId = response.boundary_id;
@@ -830,6 +831,7 @@ function armNoteNudgeOnRustPublish(args: {
 function formatRustPassLog(args: {
     decision: string;
     committed?: boolean;
+    prefixBustPermitted?: boolean;
     reason: string;
     schedulerDecision?: string;
     schedulerDeferReason?: string;
@@ -876,6 +878,7 @@ function formatRustPassLog(args: {
         : "";
     const identityFields =
         (args.committed === undefined ? "" : ` committed=${args.committed}`) +
+        ` prefix_bust_permitted=${args.prefixBustPermitted ?? "unsupported"}` +
         (args.identityDelta?.length ? ` identity_delta=${args.identityDelta.join(",")}` : "");
     return `rust pass: decision=${args.decision} reason=${args.reason}${schedulerFields}${historianFields}${identityFields} served_from=${args.servedFrom} in=${args.inputCount} out=${args.outputCount} applied=${args.applied} row_version=${rowVersion} elapsed=${args.elapsedMs.toFixed(1)} ms module=${args.moduleElapsedMs.toFixed(1)} ms stages=identity_resolve:${timings.identityResolve.toFixed(1)} prompt_surface:${timings.promptSurface.toFixed(1)} mural_resolve:${timings.muralResolve.toFixed(1)} prefix_guard:${timings.prefixGuard.toFixed(1)} ordinal_resolve:${timings.ordinalResolve.toFixed(1)} ordinal_rebuild:${timings.ordinalRebuild.toFixed(1)} ordinal_rows:${timings.ordinalRows} ordinal_mode:${timings.ordinalMode} state_sync:${timings.stateSync.toFixed(1)} clone:${timings.clone.toFixed(1)} wire_build:${timings.wireBuild.toFixed(1)} wire_messages:${timings.wireMessages} transport:${timings.transport.toFixed(1)} transport_pages:${timings.transportPages} transport_bytes:${timings.transportBytes} apply:${timings.apply.toFixed(1)} lkg_snapshot:${timings.lkgSnapshot.toFixed(1)} mirror_pull:${timings.mirrorPull.toFixed(1)} compartment_mirror:${timings.compartmentMirror.toFixed(1)} other:${unattributed.toFixed(1)} transport_lane:${timings.transportDetail.lane.toFixed(1)} transport_route:${timings.transportDetail.route.toFixed(1)} transport_encode:${timings.transportDetail.encode.toFixed(1)} transport_issue:${timings.transportDetail.issue.toFixed(1)} transport_response_wait_decode:${timings.transportDetail.responseWait.toFixed(1)} transport_settle:${timings.transportDetail.settle.toFixed(1)} transport_wrapper:${Math.max(0, timings.transport - Object.values(timings.transportDetail).reduce((sum, ms) => sum + ms, 0)).toFixed(1)} preflight:${timings.preflight.toFixed(1)} todo_verdict:${timings.todoVerdict.toFixed(1)} todo_probe:${timings.todoProbe.toFixed(1)} todo_persist:${timings.todoPersist.toFixed(1)} todo_probe_required:${timings.todoProbeRequired} todo_probe_reason:${timings.todoProbeReason} todo_unprobed_bust:${timings.todoUnprobedBust} session_directory:${timings.sessionDirectory.toFixed(1)} paging:${timings.paging.toFixed(1)} output_clone:${timings.outputClone.toFixed(1)} delivery:${timings.delivery.toFixed(1)} bookkeeping:${timings.bookkeeping.toFixed(1)}`;
 }
@@ -935,6 +938,14 @@ function assertNativeBoundary(output: unknown[], sessionId: string, boundaryId: 
 }
 
 function responseValue(response: unknown): Record<string, unknown> {
+    if (
+        isRecord(response) &&
+        (response.ok === false || response.isError === true || response.error != null)
+    ) {
+        throw new RustTransformProtocolError(
+            "rust transform wire invariant failed: error envelope cannot permit host mutations",
+        );
+    }
     if (isRecord(response) && isRecord(response.result)) return response.result;
     if (isRecord(response)) return response;
     throw new Error("module transform returned a non-object response");
@@ -2411,6 +2422,7 @@ export function createRustModeTransform(
         let materializeReason = "none";
         let schedulerDecision: string | undefined;
         let responseCommitted: boolean | undefined;
+        let responsePrefixBustPermitted: boolean | undefined;
         let schedulerDeferReason: string | undefined;
         let historianNoFire: string | undefined;
         let historianCanonicalCause: string | undefined;
@@ -2702,6 +2714,7 @@ export function createRustModeTransform(
                 formatRustPassLog({
                     decision,
                     committed: responseCommitted,
+                    prefixBustPermitted: responsePrefixBustPermitted,
                     reason: materializeReason,
                     schedulerDecision,
                     schedulerDeferReason,
@@ -2729,6 +2742,10 @@ export function createRustModeTransform(
             }
         };
         const captureResponseTelemetry = (response: Record<string, unknown>): void => {
+            responsePrefixBustPermitted =
+                typeof response.prefix_bust_permitted === "boolean"
+                    ? response.prefix_bust_permitted
+                    : undefined;
             responseCommitted =
                 typeof response.committed === "boolean" ? response.committed : undefined;
             decision =
@@ -3846,6 +3863,16 @@ export function createRustModeTransform(
                     throw new Error("rust module omitted native content after a full-array retry");
                 }
             }
+            if (
+                response.ok === false ||
+                response.isError === true ||
+                response.error != null ||
+                (response.status !== undefined && response.status !== "ok")
+            ) {
+                throw new RustTransformProtocolError(
+                    "rust transform wire invariant failed: unsuccessful native response cannot permit host mutations",
+                );
+            }
             const explicitDecision =
                 typeof response.decision === "string" && response.decision.length > 0
                     ? response.decision
@@ -3858,22 +3885,26 @@ export function createRustModeTransform(
                 );
             }
             const decisionUpper = explicitDecision.toUpperCase();
+            const permissionSupported = typeof response.prefix_bust_permitted === "boolean";
+            const moduleDecisionBusts = response.prefix_bust_permitted === true;
+            if (!permissionSupported) {
+                sessionLog(
+                    sessionId,
+                    "rust prefix-bust permission unsupported: upgrade ck-mc to a build emitting boolean prefix_bust_permitted; holding host first applications",
+                );
+            }
+            if (moduleDecisionBusts && decisionUpper === "SOFT+") {
+                throw new RustTransformProtocolError(
+                    "rust transform wire invariant failed: SOFT+ cannot permit a prefix bust",
+                );
+            }
             // `let`: a frozen LKG replay that can no longer validate (or hits its bound) releases
             // the freeze on this pass, which then behaves as priced below.
-            let cacheBustingPass =
-                decisionUpper === "HARD" ||
-                decisionUpper === "MIGRATE_HARD" ||
-                decisionUpper === "EXECUTE" ||
-                // SOFT re-renders m1 (delta folds, coverage folds): the served bytes changed,
-                // so the previously saved request is already stale.
-                decisionUpper === "SOFT";
-            // The module's own permission. A released frozen replay below also makes the
-            // pass priced, but it changes bytes only from the first message the freeze
-            // served raw, so it is not a permission to rewrite from the start.
-            const moduleDecisionBusts = cacheBustingPass;
+            // Local frozen-release pricing never grants producer/marker permission.
+            let cacheBustingPass = moduleDecisionBusts;
             if (markerAdmissionRecovery && !moduleDecisionBusts)
                 throw new RustTransformProtocolError(
-                    "rust marker admission recovery: module did not return a rebuilding decision",
+                    "rust marker admission recovery: supported prefix_bust_permitted=true required; upgrade ck-mc if unsupported",
                 );
             // Read the freeze flag before the deferred m0/m1 divergence below can set it, so
             // `passStartedFrozen` records only a freeze an earlier pass entered.
@@ -3929,6 +3960,7 @@ export function createRustModeTransform(
                         : undefined,
                 );
                 let appliedMessages = moduleMessages;
+                let markerStrategyFailure: Error | undefined;
                 let replayedFrozenRepresentation = false;
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
@@ -4113,6 +4145,7 @@ export function createRustModeTransform(
                         projectPath: memoryProjectPath,
                         sessionDirectory: directory,
                         materializedBoundary,
+                        consumedBoundary: servedCompactionBoundary(response),
                         markerAdmissionProven,
                         beforeMarkerApply: () => {
                             if (!markerAdmissionRecovery) markerSafeSnapshot = getSlot(sessionId);
@@ -4132,6 +4165,9 @@ export function createRustModeTransform(
                             } else {
                                 markerSafeSnapshot = undefined;
                                 fenceMarkerAdmission(sessionId, state);
+                                if (outcome.kind === "retryable-failure") {
+                                    markerStrategyFailure = outcome.error;
+                                }
                             }
                         },
                         compactionMarkerStrategy: deps.compactionMarkerStrategy,
@@ -4143,6 +4179,7 @@ export function createRustModeTransform(
                             model?.modelID,
                         ),
                         cacheBustingPass: moduleDecisionBusts,
+                        prefixPermissionSupported: permissionSupported,
                         moduleReasoningTrimOnly: response.reasoning_trim_only === true,
                         // A frozen session hands the strip gate the last-served array on
                         // every pass that reaches postprocess. That includes a module bust
@@ -4151,7 +4188,8 @@ export function createRustModeTransform(
                         // signed thinking block is valid only while every byte before it is
                         // unchanged, so thinking after the first changed message must be
                         // stripped.
-                        ...(passStartedFrozen || frozenReleaseReason || coldStartLastServed
+                        ...(permissionSupported &&
+                        (passStartedFrozen || frozenReleaseReason || coldStartLastServed)
                             ? { frozenReleaseLastServed }
                             : {}),
                         trailingBlankSourceDecisions,
@@ -4164,6 +4202,10 @@ export function createRustModeTransform(
                     });
                     thinkingBindingRecovery = postprocess.thinkingBindingRecovery;
                     markerAt = postprocess.markerAt;
+                    // A possibly committed host write with unfinished mirror/CAS
+                    // work is not an admitted cut, even if fresh native output fits.
+                    // Keep the durable fence until a supported recovery repairs it.
+                    if (markerStrategyFailure) throw markerStrategyFailure;
                 }
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
                     assertNativeBoundary(appliedMessages, sessionId, boundaryId);
@@ -4184,7 +4226,7 @@ export function createRustModeTransform(
                         db: deps.db,
                         sessionId,
                         messages: appliedMessages,
-                        cacheBustingPass,
+                        cacheBustingPass: moduleDecisionBusts,
                     });
                 }
                 if (
@@ -4248,10 +4290,13 @@ export function createRustModeTransform(
                 }
 
                 const lkgSnapshotStartedAt = performance.now();
+                // An old producer cannot certify replay stability. Persist the installed
+                // representation synchronously without granting host mutation authority.
+                const synchronousReplacement = cacheBustingPass || !permissionSupported;
                 // A cache-busting replacement invalidates the previous snapshot only after the
                 // replacement is installed. If installation fails, the prior LKG remains available
                 // and its replay still applies durable binding-mismatch strips.
-                if (cacheBustingPass && !markerDefinitelyNoCut) {
+                if (synchronousReplacement && !markerDefinitelyNoCut) {
                     dropSlot(sessionId, "lkg_cache_bust_pending_capture");
                     state.lkgAcceptedCapture = undefined;
                 }
@@ -4290,14 +4335,14 @@ export function createRustModeTransform(
                     captureMode = "declined";
                     const error = new Error("LKG snapshot preparation was rejected");
                     captureFailed("async", error);
-                    if (cacheBustingPass) throw error;
-                } else if (cacheBustingPass || state.lkgSyncCaptureRequired) {
-                    captureMode = cacheBustingPass ? "sync_priced" : "sync_recovery";
+                    if (synchronousReplacement) throw error;
+                } else if (synchronousReplacement || state.lkgSyncCaptureRequired) {
+                    captureMode = synchronousReplacement ? "sync_priced" : "sync_recovery";
                     try {
-                        commitRustCapture(state, capturePlan, cacheBustingPass);
+                        commitRustCapture(state, capturePlan, synchronousReplacement);
                     } catch (error) {
                         captureFailed("sync", error);
-                        if (cacheBustingPass) throw error;
+                        if (synchronousReplacement) throw error;
                     }
                 } else {
                     try {

@@ -210,7 +210,7 @@ afterEach(() => {
 });
 
 describe("applyDeferredCompactionMarker — outcomes", () => {
-    it("r2 proof: a retained partial at the prior target ordinal still vetoes the next cut", () => {
+    function checkRetainedPartial() {
         const home = useTempDataHome("r2-retained-partial-");
         const sid = "ses-r2-retained";
         const oc = createOpenCodeDb(home);
@@ -267,7 +267,11 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
                 home,
             ),
         ).toEqual({ kind: "stale-skip", reason: "partial-message-boundary" });
-    });
+    }
+    it(
+        "r2 proof: a retained partial at the prior target ordinal still vetoes the next cut",
+        checkRetainedPartial,
+    );
     it("lock-contention diagnostics promise the next cache-busting pass, not the next ordinary pass", () => {
         expect(RUST_MARKER_LOCK_SKIP_LOG).toContain("next cache-busting pass retries");
         expect(RUST_MARKER_LOCK_SKIP_LOG).not.toContain("next pass retries");
@@ -372,7 +376,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(getPersistedCompactionMarkerState(db, sid)?.boundaryMessageId).toBe("old-user");
     });
 
-    it("advances ALF's seven sparse successor gaps only when the remaining raw coordinates are historian-synthetic", () => {
+    it("sparse certificates and retained partial turns survive newly eligible cuts", () => {
         // Read-only context.db coordinates, 2026-10-05: three gaps are already
         // behind marker 121728. No raw OpenCode store or live content is copied.
         const gaps = [
@@ -384,7 +388,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
             [1799, 123686, 123689],
             [1843, 126147, 126150],
         ] as const;
-        for (const realMessage of [false, true]) {
+        for (const gapFlag of [true, false, "true", null, undefined]) {
             closeDatabase();
             closeCompactionMarkerConnection();
             const dataHome = useTempDataHome("marker-alf-sparse-");
@@ -449,7 +453,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
                         JSON.stringify({
                             type: "text",
                             text: "background task notice",
-                            synthetic: !(realMessage && ordinal === 123687),
+                            synthetic: ordinal === 123687 ? gapFlag : true,
                         }),
                     );
                 }
@@ -475,14 +479,15 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
                 { rowVersion: 1, ordinal: 134815, endMessageId: "target" },
             );
             expect(outcome).toEqual(
-                realMessage
+                gapFlag !== true
                     ? { kind: "stale-skip", reason: "partial-message-boundary" }
                     : { kind: "applied", markerOrdinal: 134815 },
             );
             expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryOrdinal).toBe(
-                realMessage ? 121728 : 134815,
+                gapFlag !== true ? 121728 : 134815,
             );
         }
+        checkRetainedPartial();
     });
     it("advances past an indexed end covered by the next ordinal", () => {
         const dataHome = useTempDataHome("partial-adjacent-marker-");

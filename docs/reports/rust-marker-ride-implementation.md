@@ -1,0 +1,84 @@
+# Rust OpenCode marker permission
+
+`prefix_bust_permitted` is additive response metadata, never prompt content. New
+ck-mc builds serialize both boolean values. The normal transform sets it from the
+final `is_provider_prefix_mutation_pass`, after classification and lineage
+demotion. Publication follow-up replaces the entire result; permission, native
+messages and coverage therefore remain from the same attempt. Additive-only
+transforms use their final HARD/MIGRATE_HARD/SOFT plan; passthrough and full-sync
+constructors emit false. Older Rust responses deserialize conservatively.
+
+The OpenCode adapter accepts only actual boolean true as host authority. Labels,
+scheduler decisions, metadata commits and local frozen-release pricing cannot
+grant it. A true SOFT+ response is a protocol error. False and unsupported
+responses hold marker targets and retry counters. Unsupported responses log an
+upgrade diagnostic and conservatively persist the installed LKG synchronously,
+without enabling host first applications. An armed admission fence requires a
+supported rebuilding response after the real recovery flush; an old producer
+must be upgraded, not repaired by deleting the fence.
+
+Error envelopes and unsuccessful native statuses are rejected before host
+processing. An uncertain retryable host write (including a failed context mirror
+after the OpenCode transaction committed) refuses the turn and retains the fence;
+only typed definitely-no-cut outcomes can preserve the safely available old slot.
+
+The immutable producer permission governs target extraction (independently of
+scheduler execute), marker admission/drain, marker reconciliation, reasoning
+bust strips, note-nudge eligibility and synthetic
+todo-anchor adoption. Frozen-release pricing remains separate and never grants
+marker authority. This boundary also supplies `moduleDecisionBusts` for subsequent
+frozen-replay adoption-policy work.
+
+The newest-assistant trailing-blank capture is a first-serve decision, not a
+prefix first-mutation. Supported true **and false** responses preserve this
+existing ingress-race capture; unsupported responses hold it. Absorbing strip
+does not rewrite already-served bytes, and host replay never manufactures keep
+bytes. The real-host paired trailing-blank control establishes why delaying this
+capture until a prefix bust would change historical replay.
+
+Coverage and permission are independent. Fresh targets still require a commit
+and valid response coordinates. Retained retries require the actual served
+coverage, including on noncommitting rebuilds. If a newer pending publication
+outruns that coverage, the host skips the cut entirely and preserves the newer
+blob and all retry health. It does not overwrite newer work with the older
+response target, flush to catch up, or query a later status for permission.
+
+Pi does not consume this field or acquire OpenCode marker/fence semantics.
+The Claude Code gateway receives additive metadata only; it acquires no marker
+cut. Gateway parser compatibility is external to this repository and is not
+certified here; the field requiring the external compatibility check is
+`prefix_bust_permitted`.
+
+The execute-only extractor assertion was intentionally changed to accept a
+committed rebuilding response regardless of scheduler. Both SOFT+ negative
+assertions and monotonic/cooldown note-nudge controls remain. Lock fixtures now
+expect a newer, unconsumed target not to be attempted; fake served responses
+explicitly identify their supported permission instead of relying on a production
+label fallback. Frozen-release policy itself is not changed in this patch.
+
+## Verification boundaries
+
+The mixed fixture uses generated user/assistant history, completed tool parts with
+large JSON outputs, tied timestamps in the covered head, seven sparse gaps and an
+assistant end whose preceding user remains the host boundary. It records actual
+transform payload bytes separately from the raw-history API bytes, sampled peak
+RSS summed across host/daemon/module, successful output fit, host writer acquire
+and hold times, the first smaller full send and subsequent append delta. Provider
+equality compares distinct intercepted HTTP system/messages objects, not hashes
+of a single object.
+
+Fault coverage includes scheduler-defer after-marker, capture, late bookkeeping,
+context-mirror and final-fit failures, a held real SQLite host writer with typed
+definitely-no-cut rollback, and SIGKILL of an adapter process immediately after
+its real host-store commit and before admission. The SIGKILL fixture is a Bun
+adapter/SQLite process, not an OpenCode server OS-kill or provider-ack test. The
+real OpenCode recovery control separately exercises actual session.flush transport.
+The paused publication control uses two real context connections and commits
+legacy pending work between response recording and the drain's reread; it does
+not claim an in-flight Rust historian publication writes legacy pending blobs.
+
+Throwaway-HOME full package suites expose unrelated existing HOME/homedir
+assumptions in the plugin config-variable and Pi dreamer-home tests. Those files
+and claims are not changed. The e2e TypeScript project also has existing errors
+outside the marker fixture; package source/scripts typechecks pass and the edited
+marker fixture has no TypeScript diagnostics.

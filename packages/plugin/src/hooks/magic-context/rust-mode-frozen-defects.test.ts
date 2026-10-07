@@ -181,6 +181,7 @@ function frozenSession(label: string, options: { compactionOff?: boolean } = {})
             if (step === "throw-busy") throw sqliteBusy();
             return {
                 decision: step,
+                prefix_bust_permitted: step === "HARD" || step === "SOFT",
                 served_from: "transform",
                 row_version: pass,
                 native_messages: moduleOutput(lastInput),

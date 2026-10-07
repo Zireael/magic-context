@@ -43,6 +43,7 @@ import {
     armThinkingBindingRecovery,
     clearThinkingBindingRecoveryIf,
     getCompactionMarkerHealth,
+    getDeferredClearedCompactionMarkerState,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
     getPersistedTodoPermissionDenied,
@@ -101,6 +102,7 @@ import * as operations from "./transform-operations";
 import { applyFlushedStatuses } from "./transform-operations";
 import {
     abortSessionFailClosed,
+    applyRustModeDeferredCompactionMarker,
     checkM0MutationDriftAndSignal,
     clearPendingCompactionMarkerAfterSuccessfulDrain,
     evaluateEmergencyFailClosed,
@@ -1715,6 +1717,204 @@ describe("deferred compaction marker representation", () => {
         expect(JSON.stringify(replay)).toBe(firstBytes);
     });
 
+    it("newer pending publication waits until consumed by the served response", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-rust-consumed-coverage";
+        createOpenCodeDbWithoutMessages("rust-consumed-coverage-");
+        const oc = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        for (const ordinal of [1, 10, 11, 20]) {
+            oc.prepare("INSERT INTO message VALUES (?, ?, ?, ?, ?)").run(
+                `m${ordinal}`,
+                sessionId,
+                ordinal,
+                ordinal,
+                JSON.stringify({ role: "user" }),
+            );
+        }
+        oc.close();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 10,
+                startMessageId: "m1",
+                endMessageId: "m10",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "first",
+                content: "first",
+            },
+            {
+                sequence: 1,
+                startMessage: 11,
+                endMessage: 20,
+                startMessageId: "m11",
+                endMessageId: "m20",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "later",
+                content: "later",
+            },
+        ]);
+        const pending = {
+            ordinal: 20,
+            endMessageId: "m20",
+            publishedAt: 2,
+            injectAttempts: 3,
+            firstInjectFailedAt: 1,
+            lastInjectError: "writer busy",
+        };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        for (const committed of [true, false]) {
+            applyRustModeDeferredCompactionMarker({
+                db,
+                sessionId,
+                cacheBustingPass: true,
+                admissionProven: true,
+                ...(committed
+                    ? { boundary: { rowVersion: 7, ordinal: 10, endMessageId: "m10" } }
+                    : {}),
+                consumedBoundary: { rowVersion: 7, ordinal: 10, endMessageId: "m10" },
+            });
+            expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(getCompactionMarkerHealth(db, sessionId).attempts).toBe(3);
+        }
+        // A noncommitting response can retry, but only with its own consumed coverage.
+        applyRustModeDeferredCompactionMarker({
+            db,
+            sessionId,
+            cacheBustingPass: true,
+            admissionProven: true,
+            consumedBoundary: { rowVersion: 8, ordinal: 20, endMessageId: "m20" },
+        });
+        expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryOrdinal).toBe(20);
+        expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
+
+        // Pause a legacy publication until the response's target transaction
+        // commits, then publish through a different connection before the drain
+        // rereads pending. The response still represents only ordinal 10.
+        db.close();
+        const home = createTestTempDirFromPath(join(tmpdir(), "rust-publication-interleave-"));
+        tempDirs.push(home);
+        db = new Database(join(home, "context.db"));
+        initializeDatabase(db);
+        const racingSession = `${sessionId}-paused`;
+        createOpenCodeDbWithoutMessages("rust-publication-raw-");
+        const raw = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        for (const ordinal of [1, 10, 11, 20])
+            raw.prepare("INSERT INTO message VALUES (?, ?, ?, ?, ?)").run(
+                `m${ordinal}`,
+                racingSession,
+                ordinal,
+                ordinal,
+                JSON.stringify({ role: "user" }),
+            );
+        raw.close();
+        appendCompartments(db, racingSession, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 10,
+                startMessageId: "m1",
+                endMessageId: "m10",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "served",
+                content: "served",
+            },
+        ]);
+        const publisher = new Database(join(home, "context.db"));
+        const newer = { ...pending, injectAttempts: 4 };
+        const prepare = db.prepare.bind(db);
+        let pendingReads = 0;
+        const publication = spyOn(db, "prepare").mockImplementation((sql) => {
+            if (
+                String(sql).includes("SELECT pending_compaction_marker_state") &&
+                ++pendingReads === 2
+            ) {
+                publisher
+                    .transaction(() => {
+                        appendCompartments(publisher, racingSession, [
+                            {
+                                sequence: 1,
+                                startMessage: 11,
+                                endMessage: 20,
+                                startMessageId: "m11",
+                                endMessageId: "m20",
+                                startBlockIndex: 0,
+                                endBlockIndex: 0,
+                                title: "published later",
+                                content: "published later",
+                            },
+                        ]);
+                        setPendingCompactionMarkerState(publisher, racingSession, newer);
+                    })
+                    .immediate();
+            }
+            return prepare(sql);
+        });
+        let fences = 0;
+        try {
+            applyRustModeDeferredCompactionMarker({
+                db,
+                sessionId: racingSession,
+                cacheBustingPass: true,
+                admissionProven: true,
+                boundary: { rowVersion: 7, ordinal: 10, endMessageId: "m10" },
+                beforeApply: () => {
+                    fences++;
+                },
+            });
+            expect(pendingReads).toBe(2);
+            expect(fences).toBe(0);
+            expect(getPersistedCompactionMarkerState(db, racingSession)).toBeNull();
+            expect(getPendingCompactionMarkerState(db, racingSession)).toEqual(newer);
+            expect(getCompactionMarkerHealth(db, racingSession).attempts).toBe(4);
+        } finally {
+            publication.mockRestore();
+            publisher.close();
+        }
+    });
+
+    it("genuine rebuild without fresh coordinates retires the cleared marker in the same cycle", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-rust-cleared-marker";
+        setPersistedCompactionMarkerState(db, sessionId, {
+            boundaryMessageId: "m10",
+            targetEndMessageId: "m10",
+            boundaryOrdinal: 10,
+            summaryMessageId: "summary",
+            summaryPartId: "summary-part",
+            compactionPartId: "compaction",
+        });
+        setPersistedCompactionMarkerState(db, sessionId, null);
+        const serve = (cacheBustingPass: boolean) => {
+            const messages = [
+                {
+                    info: { id: "tail", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "tail" }],
+                },
+            ] as MessageLike[];
+            runRustModePostprocess({
+                db: db!,
+                sessionId,
+                messages,
+                cacheBustingPass,
+                fullFeatureMode: true,
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: false, frozen: true },
+            });
+            return messages;
+        };
+        expect(serve(false).some((message) => message.info.summary === true)).toBe(true);
+        expect(getDeferredClearedCompactionMarkerState(db, sessionId)).not.toBeNull();
+        expect(serve(true).some((message) => message.info.summary === true)).toBe(false);
+        expect(getDeferredClearedCompactionMarkerState(db, sessionId)).toBeNull();
+    });
+
     it("committed scheduler-execute boundary metadata cannot drain a marker without served bust permission", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -1823,6 +2023,7 @@ describe("deferred compaction marker representation", () => {
                 sessionId,
                 messages,
                 cacheBustingPass,
+                consumedBoundary: { rowVersion: 7, ordinal: 10, endMessageId: "msg-partial" },
                 fullFeatureMode: true,
                 tagger: createTagger(),
                 ctxReduceAvailability: { callable: false, frozen: true },
@@ -1892,6 +2093,7 @@ describe("deferred compaction marker representation", () => {
                 messages,
                 sessionDirectory: dataHome,
                 cacheBustingPass: true,
+                consumedBoundary: { rowVersion: 7, ordinal: 10, endMessageId: "msg-boundary" },
                 fullFeatureMode: true,
                 tagger: createTagger(),
                 ctxReduceAvailability: { callable: false, frozen: true },
@@ -1968,6 +2170,7 @@ describe("deferred compaction marker representation", () => {
                 messages: served,
                 sessionDirectory: dataHome,
                 cacheBustingPass,
+                consumedBoundary: { rowVersion: 7, ordinal: 10, endMessageId: "msg-boundary" },
                 fullFeatureMode: true,
                 tagger: createTagger(),
                 ctxReduceAvailability: { callable: false, frozen: true },
@@ -7034,6 +7237,37 @@ describe("final message representation", () => {
             resolvedProviderID: "anthropic",
         });
         expect(JSON.stringify(lkgReplay)).toBe(replayBytes);
+    });
+
+    it("supported false permission captures the newest-tail decision while unsupported permission holds it", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        for (const permission of [false, undefined, null, "true", 1, {}]) {
+            const sessionId = `ses-newest-tail-${String(permission)}`;
+            const messages = [
+                {
+                    info: { id: "newest", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "already served tail" }],
+                },
+            ] as MessageLike[];
+            runRustModePostprocess({
+                db,
+                sessionId,
+                messages,
+                cacheBustingPass: false,
+                prefixPermissionSupported: typeof permission === "boolean",
+                fullFeatureMode: true,
+                resolvedProviderID: "anthropic",
+                trailingBlankSourceDecisions: new Map([["newest", "strip"]]),
+                trailingBlankNewestAssistantId: "newest",
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: false, frozen: true },
+            });
+            expect(getTrailingBlankDecisions(db, sessionId).get("newest")).toBe(
+                permission === false ? "strip" : undefined,
+            );
+            expect(messages[0]!.parts).toEqual([{ type: "text", text: "already served tail" }]);
+        }
     });
 
     it("lets Rust module trailing-blank output outrank host keep decisions", () => {
