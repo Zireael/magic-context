@@ -197,12 +197,18 @@ export function removeReasoningParts(
     messages: MessageLike[],
     ids: ReadonlySet<string>,
     providerID: string | undefined,
+    protectedMessages?: ReadonlySet<MessageLike>,
 ): number {
     if (ids.size === 0) return 0;
     const exempt = findLatestAssistantReasoningMutationExemptMessage(messages);
     let removed = 0;
     for (const message of messages) {
-        if (message.info.role !== "assistant" || message === exempt) continue;
+        if (
+            protectedMessages?.has(message) ||
+            message.info.role !== "assistant" ||
+            message === exempt
+        )
+            continue;
         const id = message.info.id;
         if (typeof id !== "string" || !ids.has(id)) continue;
         if (!reasoningPayloadLeavesWithParts(message)) continue;

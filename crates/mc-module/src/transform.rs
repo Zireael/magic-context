@@ -2072,6 +2072,8 @@ struct Channel1Target {
 /// handler maps these to a clean Error frame rather than a partial/raw array.
 #[derive(Debug)]
 pub enum TransformError {
+    /// The current signed assistant turn cannot be reduced without editing thinking.
+    AnthropicLatestTurnFull,
     ProtectedToolResultsOverLimit,
     Store(McStoreError),
     /// Anthropic cannot accept an assistant-terminal retry, and moving completed output
@@ -2125,6 +2127,7 @@ pub const PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE: &str = "The tool results ke
 impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TransformError::AnthropicLatestTurnFull => write!(f, "ANTHROPIC_LATEST_TURN_FULL: Context reached 95% within a thinking-bearing assistant turn. End the tool loop and send a new user message, or clear the session to continue."),
             TransformError::ProtectedToolResultsOverLimit => write!(f,
                 "{PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE}"),
             TransformError::Store(e) => write!(f, "store: {e}"),
@@ -5120,7 +5123,11 @@ fn apply_once(
     // below can authorize new provider-visible mutations.
     // Subagents execute a reductions-only branch, not the prefix plan. Inherited
     // HARD/reconcile advisories cannot price automatic reductions without a fold.
-    let prefix_materialization_enabled = !req.is_subagent;
+    let active_thinking_turn = active_anthropic_thinking_turn(req);
+    if active_thinking_turn && usage_percentage >= 95.0 {
+        return Err(TransformError::AnthropicLatestTurnFull);
+    }
+    let prefix_materialization_enabled = !req.is_subagent && !active_thinking_turn;
     let profile_transition = !loaded.meta.last_serializer_profile.is_empty()
         && loaded.meta.last_serializer_profile != req.serializer_profile;
     // A known previous identity that differs from this request means the provider's
@@ -5206,12 +5213,13 @@ fn apply_once(
                 && current_m1_digest != applied_m1_revision)))
         || loaded.meta.soft_refresh_pending
         || (prefix_materialization_enabled && scheduler_outcome.idle_ttl_fired);
-    let supersession_ride_available = independent_rebuild
+    let supersession_ride_available = !active_thinking_turn
+        && (independent_rebuild
         // Subagents cannot fold history. Execute is their one shared permission
         // for queued drops and automatic cleanup, not a request to change bytes.
         || (req.is_subagent && scheduler_outcome.pass.canonical_decision() == "execute")
         || force_episode_available
-        || scheduler_outcome.pass == scheduler::PassDecision::Emergency95;
+        || scheduler_outcome.pass == scheduler::PassDecision::Emergency95);
     let pass_already_busting = supersession_ride_available;
     let emergency_minimum_waived = independent_rebuild;
     let calibration_candidate = crate::decision_calibration::DecisionCalibration::freeze_for_model(
@@ -5244,7 +5252,8 @@ fn apply_once(
     // profile default now covers every pass directly.
     let tail_reclaim_enabled = serializer_profile.is_none_or(healing::tail_reclaim);
     let cached_m1_missing_due = cached_m1_missing(&loaded.core);
-    let producer_gate = tail_reclaim_enabled
+    let producer_gate = !active_thinking_turn
+        && tail_reclaim_enabled
         && producer_gate(
             scheduler_outcome.pass,
             !loaded.meta.initialized
@@ -5700,7 +5709,8 @@ fn apply_once(
     // The reductions-only child branch preserves inherited history and accepts
     // reduction units only. Image/system/age-reasoning strip units stay primary-only;
     // an execute ride must not silently widen that separate replay contract.
-    let is_bust_pass = !req.is_subagent && is_provider_prefix_mutation_pass;
+    let is_bust_pass =
+        !active_thinking_turn && !req.is_subagent && is_provider_prefix_mutation_pass;
     if replay_legacy_treatment && is_provider_prefix_mutation_pass {
         return Err(TransformError::SyntheticTreatmentBust);
     }
@@ -15010,7 +15020,7 @@ fn new_merged_reasoning_strip_units(
     rendered_messages: &[ServedMessage],
     can_mutate_provider_prefix: bool,
 ) -> Vec<FrozenUnit> {
-    if !can_mutate_provider_prefix {
+    if !can_mutate_provider_prefix || active_anthropic_thinking_turn(req) {
         return Vec::new();
     }
     let Some(profile) = SerializerProfile::parse(&req.serializer_profile) else {
@@ -16265,6 +16275,40 @@ fn is_mutable_merged_reasoning_block(block: &CkWireBlock) -> bool {
             .provider_extras
             .get("opencode")
             .is_some_and(|extras| extras.contains_key("cache_control"))
+}
+
+fn latest_assistant_turn_start(messages: &[CkIngressMessage]) -> usize {
+    messages
+        .iter()
+        .rposition(|message| {
+            !message.ck.meta.synthetic
+                && message.ck.role == "user"
+                && message.ck.content.iter().any(|block| {
+                    !matches!(block.kind, ck_wire::CkKind::ToolResult { .. })
+                        && !is_reasoning_ignored_block(block)
+                })
+        })
+        .map_or(0, |index| index + 1)
+}
+
+fn protected_thinking_turn_mids(req: &TransformRequest) -> HashSet<&str> {
+    let route = req.provider_id.as_deref().unwrap_or("").to_lowercase();
+    let model = req.model_key.as_deref().unwrap_or("").to_lowercase();
+    if !route.contains("anthropic") && !model.contains("claude") && !model.contains("anthropic") {
+        return HashSet::new();
+    }
+    req.messages[latest_assistant_turn_start(&req.messages)..]
+        .iter()
+        .filter(|m| m.ck.role == "assistant")
+        .map(|m| m.mid.as_str())
+        .collect()
+}
+
+fn active_anthropic_thinking_turn(req: &TransformRequest) -> bool {
+    let protected = protected_thinking_turn_mids(req);
+    req.messages
+        .iter()
+        .any(|m| protected.contains(m.mid.as_str()) && m.ck.content.iter().any(is_reasoning_block))
 }
 
 fn latest_assistant_mid(messages: &[CkIngressMessage]) -> Option<&str> {
@@ -19500,6 +19544,41 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn latest_thinking_turn_is_not_a_merged_reasoning_strip_candidate() {
+        let mut messages = vec![item("user", 1, "task")];
+        for (mid, ordinal) in [("a1", 2), ("a2", 3), ("a3", 4)] {
+            let mut assistant = trailing_regression_assistant(mid, ordinal, None, false);
+            assistant.ck.content.insert(
+                0,
+                CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: mid.to_string(),
+                    signature: Some(format!("signed-{mid}")),
+                }),
+            );
+            messages.push(assistant);
+        }
+        let mut request = req("latest-turn", "cfg", messages);
+        request.serializer_profile = "opencode-aisdk".to_string();
+        request.provider_id = Some("anthropic".to_string());
+        let rendered = request
+            .messages
+            .iter()
+            .map(|m| ServedMessage::from_message(m.ck.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            new_merged_reasoning_strip_units(&CoreState::default(), &request, &rendered, true)
+                .is_empty()
+        );
+        request
+            .messages
+            .push(item("next-user", 5, "next real turn"));
+        let completed =
+            new_merged_reasoning_strip_units(&CoreState::default(), &request, &rendered, true);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].key, "strip:merged_reasoning:a2");
+    }
+
     fn protection_cutoff(cutoff: Option<i64>) -> TagNumberCutoffProjection {
         TagNumberCutoffProjection {
             coordinate_space: CoordinateSpace::TagNumber,
@@ -22590,6 +22669,83 @@ pub(crate) mod tests {
     #[test]
     fn issue_619_subagent_execute_drains_queued_drops() {
         check_issue_619_subagent_ride(true, true, true);
+    }
+
+    #[test]
+    fn latest_thinking_turn_holds_pending_drops_through_force_and_refuses_at_95() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut first = assistant_tool_call("a1", 2, "t1");
+        first.ck.content.insert(
+            0,
+            CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed-one".to_string(),
+                signature: Some("signature-one".to_string()),
+            }),
+        );
+        first.ck.content.insert(
+            1,
+            CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: "spent assistant text".to_string(),
+            }),
+        );
+        let mut second = assistant_tool_call("a2", 4, "t2");
+        second.ck.content.insert(
+            0,
+            CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed-two".to_string(),
+                signature: Some("signature-two".to_string()),
+            }),
+        );
+        let mut request = with_usage(
+            req(
+                "latest-turn-drops",
+                "cfg",
+                vec![
+                    item("prompt", 1, "task"),
+                    first,
+                    tool_result("r1", 3, "t1", "spent output"),
+                    second,
+                    tool_result("r2", 5, "t2", "newest output"),
+                ],
+            ),
+            76_000,
+            100_000,
+        );
+        request.is_subagent = true;
+        request.provider_id = Some("anthropic".to_string());
+        request.model_key = Some("anthropic/claude-sonnet-5".to_string());
+        request.serializer_profile = "opencode-aisdk".to_string();
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        transform(&s, &request, &ctx).unwrap();
+        let baseline = transform(&s, &request, &ctx).unwrap();
+        s.append_pending_agent_drops("latest-turn-drops", &["a1#1".into()], 1)
+            .unwrap();
+        for tokens in [76_000, 85_000] {
+            request = with_usage(request, tokens, 100_000);
+            assert_eq!(
+                transform(&s, &request, &ctx).unwrap().ck_messages,
+                baseline.ck_messages
+            );
+            assert_eq!(
+                s.load_pending_agent_drops("latest-turn-drops")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        request = with_usage(request, 95_000, 100_000);
+        assert!(matches!(
+            transform(&s, &request, &ctx),
+            Err(TransformError::AnthropicLatestTurnFull)
+        ));
+        request.messages.push(item("next-real-user", 6, "continue"));
+        request = with_usage(request, 76_000, 100_000);
+        transform(&s, &request, &ctx).unwrap();
+        assert!(s
+            .load_pending_agent_drops("latest-turn-drops")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -24,6 +24,7 @@ import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { spawnOpencode, type SpawnedOpencode, type SpawnOptions } from "./opencode-runner/spawn";
 
 export interface TestHarnessOptions {
+    thinkingScope?: (body: Record<string, unknown>) => string | undefined;
     /** Use a canonical provider id when testing provider-specific replay lanes. */
     mockProviderID?: string;
     /** magic-context config overrides. Merged onto test defaults. */
@@ -60,6 +61,7 @@ export interface SdkClient {
         prompt: (opts: {
             path: { id: string };
             body: {
+                messageID?: string;
                 model: { providerID: string; modelID: string };
                 parts: Array<{ type: "text"; text: string }>;
                 agent?: string;
@@ -136,7 +138,7 @@ export class TestHarness implements HostHarness {
 
     static async create(options: TestHarnessOptions = {}): Promise<TestHarness> {
         const mock = new MockProvider();
-        const { baseURL } = await mock.start();
+        const { baseURL } = await mock.start({ thinkingScope: options.thinkingScope });
 
         // Always install a default so unexpected extra requests don't 500.
         mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);

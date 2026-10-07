@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 import {
     resolveProjectIdentity,
@@ -89,6 +88,11 @@ import {
     estimateFinalWireInputTokens,
 } from "./final-wire-token-estimate";
 import { createHistorianHostRunner } from "./historian-host-runner";
+import { isAnthropicFamilyRoute } from "./sentinel";
+import { captureLatestTurnOriginals, prepareLatestThinkingRecovery } from "./latest-thinking-recovery";
+import { hasActiveAnthropicThinkingTurn,
+    latestAssistantTurnMessages,
+} from "./latest-assistant-turn";
 import {
     claimLkgRequestIdentity,
     type LkgRequestIdentity,
@@ -2473,6 +2477,11 @@ export function createRustModeTransform(
             );
         }
         const inputCount = messages.length;
+        const inputHasActiveThinking = hasActiveAnthropicThinkingTurn(messages, "anthropic");
+        const thinkingRecovery = prepareLatestThinkingRecovery({ db: deps.db, sessionId, messages,
+            id: message => (message as MessageLike)?.info.id, parts: message => (message as MessageLike)?.parts ?? [],
+        });
+        const restoreLatestTurnOriginals = thinkingRecovery.restore ? captureLatestTurnOriginals(messages as MessageLike[]) : undefined;
         let requestInputTokens = 0;
         let decision = "error";
         let materializeReason = "none";
@@ -4219,7 +4228,14 @@ export function createRustModeTransform(
                             if (!isTransientSqliteError(error)) throw error;
                         }
                     }
+                    const protectedThinkingMessages = latestAssistantTurnMessages(
+                        appliedMessages as MessageLike[],
+                    );
+                    const activeThinkingTurn = inputHasActiveThinking && isAnthropicFamilyRoute(model?.providerID, model?.modelID);
                     const postprocess = runRustModePostprocess({
+                        activeThinkingTurn,
+                        protectedThinkingMessages: thinkingRecovery.restore ? protectedThinkingMessages : undefined,
+                        restoreLatestTurnOriginals: () => restoreLatestTurnOriginals?.(appliedMessages as MessageLike[]),
                         db: deps.db,
                         sessionId,
                         messages: appliedMessages as MessageLike[],

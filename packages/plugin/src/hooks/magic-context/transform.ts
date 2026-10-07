@@ -1,3 +1,4 @@
+import { captureLatestTurnOriginals, prepareLatestThinkingRecovery } from "./latest-thinking-recovery";
 import type { ProtectedTokensTierOverrides } from "../../config/project-security";
 import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
 import {
@@ -123,6 +124,11 @@ import {
     prepareCompartmentInjection,
     selectHiddenMessagesAtCompactionSeam,
 } from "./inject-compartments";
+import {
+    ANTHROPIC_LATEST_TURN_FULL,
+    hasActiveAnthropicThinkingTurn,
+    latestAssistantTurnMessages,
+} from "./latest-assistant-turn";
 import { saveLkgSlotToDb } from "./lkg-persist";
 import { captureLkgSlot, createLkgEntryProjector, resolveLkgModelKeys } from "./lkg-replay";
 import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
@@ -1126,18 +1132,31 @@ export function createTransform(deps: TransformDeps) {
         // as they always have: a session with nothing frozen yet, and one the
         // host has never resolved (no stored project binding), whose frozen
         // pair was itself rendered with the launch directory.
-        const freezeM0M1 =
-            sessionDirectoryFellBack &&
-            sessionMeta.cachedM0Bytes != null &&
-            sessionMeta.cachedM1Bytes != null &&
-            (() => {
-                try {
-                    return hasRecordedSessionProjectIdentity(db, sessionId);
-                } catch {
-                    // Unknown: keep the frozen pair rather than risk a rebuild.
-                    return true;
-                }
-            })();
+        const activeThinkingModel = findLastAssistantModel(messages) ?? deps.liveModelBySession?.get(sessionId);
+        const thinkingRecovery = prepareLatestThinkingRecovery({ db, sessionId, messages,
+            id: message => (message as MessageLike)?.info.id,
+            parts: message => (message as MessageLike)?.parts ?? [],
+        });
+        if (thinkingRecovery.ended) deps.pendingMaterializationSessions?.add(sessionId);
+        let restoreLatestTurnOriginals: (() => void) | undefined;
+        let activeThinkingTurn = hasActiveAnthropicThinkingTurn(
+            messages,
+            activeThinkingModel?.providerID,
+            activeThinkingModel?.modelID,
+        );
+        let freezeM0M1 =
+            activeThinkingTurn ||
+            (sessionDirectoryFellBack &&
+                sessionMeta.cachedM0Bytes != null &&
+                sessionMeta.cachedM1Bytes != null &&
+                (() => {
+                    try {
+                        return hasRecordedSessionProjectIdentity(db, sessionId);
+                    } catch {
+                        // Unknown: keep the frozen pair rather than risk a rebuild.
+                        return true;
+                    }
+                })());
         if (freezeM0M1) {
             sessionLog(
                 sessionId,
@@ -1482,7 +1501,18 @@ export function createTransform(deps: TransformDeps) {
         // the live map. Reusing this value keeps cold/hot output identical and keeps
         // postprocess from making a divergent provider decision later in the pass.
         const resolvedProviderID = modelForBudget?.providerID;
+        activeThinkingTurn ||= hasActiveAnthropicThinkingTurn(
+            messages,
+            resolvedProviderID,
+            modelForBudget?.modelID,
+        );
+        freezeM0M1 ||= activeThinkingTurn;
         const canUseEmptySentinels = modelAcceptsEmptyContent(resolvedProviderID);
+        const protectedThinkingMessages =
+            activeThinkingTurn ||
+            isAnthropicFamilyRoute(resolvedProviderID, modelForBudget?.modelID)
+                ? latestAssistantTurnMessages(messages)
+                : new Set<MessageLike>();
         const resolvedContextLimit = modelForBudget
             ? resolveTrustedContextLimit(modelForBudget.providerID, modelForBudget.modelID, {
                   db,
@@ -2189,6 +2219,7 @@ export function createTransform(deps: TransformDeps) {
                     servedMessages: messages,
                 });
                 targets = result.targets;
+                if (thinkingRecovery.restore) restoreLatestTurnOriginals = captureLatestTurnOriginals(messages);
                 reasoningByMessage = result.reasoningByMessage;
                 messageTagNumbers = result.messageTagNumbers;
                 batch = result.batch;
@@ -2368,6 +2399,9 @@ export function createTransform(deps: TransformDeps) {
         const watermark = getMaxDroppedTagNumber(db, sessionId);
 
         let contextUsage = contextUsageEarly;
+        if (activeThinkingTurn && contextUsage.percentage >= 95) {
+            throw contextRefusalError(ANTHROPIC_LATEST_TURN_FULL);
+        }
         const rawGetNotifParams = runNotificationParams;
         const tCompartmentPhase = performance.now();
         const compartmentPhase = await runCompartmentPhase({
@@ -2694,6 +2728,10 @@ export function createTransform(deps: TransformDeps) {
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
             resolvedProviderID,
+            activeThinkingTurn,
+            protectedThinkingMessages: thinkingRecovery.restore ? protectedThinkingMessages : undefined,
+            restoreLatestTurnOriginals,
+            resolvedModelID: modelForBudget?.modelID,
             thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(
                 modelForBudget?.providerID,
                 modelForBudget?.modelID,

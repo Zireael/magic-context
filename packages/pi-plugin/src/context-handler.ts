@@ -30,6 +30,7 @@
  * native compaction.
  */
 
+import { captureOriginalTurn, prepareLatestThinkingRecovery } from "@magic-context/core/hooks/magic-context/latest-thinking-recovery";
 import * as crypto from "node:crypto";
 import type {
 	ContextEvent,
@@ -185,6 +186,10 @@ import {
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
+import {
+	ANTHROPIC_LATEST_TURN_FULL,
+	hasActiveAnthropicThinkingTurn,
+} from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
 import {
 	markNoteNudgeDelivered,
 	observeNoteNudgeServe,
@@ -3498,6 +3503,8 @@ export function registerPiContextHandler(
 						ctx.model?.api !== "openai-codex-responses" &&
 						ctx.model?.api !== "openai-responses",
 				},
+				resolvedProviderID: ctx.model?.provider,
+				resolvedModelID: ctx.model?.id,
 				canUseEmptySentinels,
 				temporalAwareness: options.injection?.temporalAwareness === true,
 				appendCompaction: resolvePiAppendCompaction(ctx),
@@ -5131,6 +5138,8 @@ function maybeFireHistorian(args: {
 	}
 }
 interface RunPipelineArgs {
+	resolvedProviderID?: string;
+	resolvedModelID?: string;
 	db: ContextDatabase;
 	tagger: Tagger;
 	sessionId: string;
@@ -5457,6 +5466,19 @@ async function runCompactionOffPipeline(
 
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.compactionOff) return runCompactionOffPipeline(args);
+	const thinkingRecovery = prepareLatestThinkingRecovery({ db: args.db, sessionId: args.sessionId, messages: args.messages,
+        id: (message, index) => resolvePiStableId(message, index, args.entryIds, args.entryIdByRef ?? undefined),
+        parts: message => Array.isArray((message as { content?: unknown })?.content) ? (message as { content: unknown[] }).content : [],
+    });
+    if (thinkingRecovery.ended) signalPiPendingMaterialization(args.sessionId);
+    let restoreOriginals: ReturnType<typeof captureOriginalTurn<unknown>> | undefined;
+    const activeThinkingTurn = hasActiveAnthropicThinkingTurn(
+		args.messages,
+		args.resolvedProviderID,
+		args.resolvedModelID,
+	);
+	if (activeThinkingTurn && args.contextUsage.percentage >= 95)
+		throw contextRefusalError(ANTHROPIC_LATEST_TURN_FULL);
 	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
 		resolvePiStableId(
 			msg,
@@ -5799,7 +5821,18 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		persistedM0BeforeFold.cachedM0Bytes === null
 			? -1
 			: persistedM0BeforeFold.cachedM0MaxCompartmentSeq;
-	if ((foldDueDecision.value || softRefreshOpportunity) && piM0State) {
+	if (activeThinkingTurn && piM0State) {
+		piM0State.preparedPrefix = prepareCachedM0M1PiReplay(
+			piM0State,
+			args.db,
+			injectionPassSnapshot?.cachedRow,
+		);
+	}
+	if (
+		!activeThinkingTurn &&
+		(foldDueDecision.value || softRefreshOpportunity) &&
+		piM0State
+	) {
 		try {
 			// Persist the fold before opening mutation gates. The shadow array keeps
 			// this pre-execution off the outgoing wire; the normal injection below
@@ -5917,7 +5950,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				publishedM1RefreshedThisPass ||
 				(canConsumeDeferredLate && deferredHistoryWasPendingAtPassStart)),
 	};
-	const isCacheBustingPass = hasReclaimRide(rideSignals);
+	const isCacheBustingPass = !activeThinkingTurn && hasReclaimRide(rideSignals);
 	if (args.temporalAwareness && isCacheBustingPass) {
 		temporalDecisions = freezeTemporalDecisions(
 			args.db,
@@ -6051,6 +6084,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			}),
 	);
 	logTransformTiming(args.sessionId, "tagMessages", tTag);
+    if (thinkingRecovery.restore) {
+        transcript.commit();
+        restoreOriginals = captureOriginalTurn(args.messages as unknown[], message => (message as { content: unknown }).content,
+            (message, content) => { (message as { content: unknown }).content = content; });
+    }
 
 	// Legacy dropped-tool skeletons (argument marker) convert to the
 	// real-or-absent rule only on a pass whose HARD fold executed and loses the
@@ -6351,6 +6389,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		try {
 			const tReplayReasoning = performance.now();
 			const clearedReplay = replayClearedReasoningPi({
+				protectLatestTurn: false,
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
@@ -6358,6 +6397,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				piMessageStableId: stableIdResolver,
 			});
 			const inlineReplay = replayStrippedInlineThinkingPi({
+				protectLatestTurn: false,
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
@@ -6662,6 +6702,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				alreadyGone: (id) => bindingStripped.has(id),
 			});
 			const clearOutcome = clearOldReasoningPi({
+				protectLatestTurn: false,
 				messages: workingMessages,
 				messageIdToMaxTag,
 				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
@@ -6672,6 +6713,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// message, so it never starts on a prefix-bound model; the cutoff
 			// above already stops below any text it could reach on replay.
 			const stripOutcome = stripInlineThinkingPi({
+				protectLatestTurn: false,
 				messages: workingMessages,
 				messageIdToMaxTag,
 				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
@@ -6734,6 +6776,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.reasoningClearing && shouldRunHeuristics && routineCleanupApplied) {
 		try {
 			replayStrippedInlineThinkingPi({
+				protectLatestTurn: false,
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
@@ -7332,7 +7375,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 
-	const materialized = injectionResult?.m0Materialized === true;
+	restoreOriginals?.(workingMessages);
+    const materialized = injectionResult?.m0Materialized === true;
 	if (
 		args.reasoningClearing?.prefixBound &&
 		firstEditSourceOrder &&
