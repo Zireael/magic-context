@@ -3467,6 +3467,81 @@ describe("dropped-token telemetry", () => {
             clearInterval(timer);
         }
     }, 30_000);
+
+    it("serves a busting pass without waiting for the log-only ctx_reduce permission read", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-ctx-reduce-permission-background";
+        clearToolPermissionDenied(sessionId);
+        const message = makeToolMessage("background-drop");
+        insertKnownToolTag(sessionId, "background-drop", 1, 41);
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+
+        // A host that has not answered yet, like the loaded OpenCode server that
+        // held this read for 14 seconds. The ctx_reduce read only feeds a log line.
+        let answerHost: (() => void) | undefined;
+        const hostAnswered = new Promise<void>((resolve) => {
+            answerHost = resolve;
+        });
+        let hostCalls = 0;
+        const slowHost = async (value: unknown): Promise<unknown> => {
+            hostCalls += 1;
+            await hostAnswered;
+            return { data: value };
+        };
+        const client = {
+            app: {
+                agents: () =>
+                    slowHost([{ name: "test-agent", permission: { ctx_reduce: "deny" } }]),
+            },
+            session: { get: () => slowHost({ agent: "test-agent", permission: [] }) },
+        } as never;
+        const logged: string[] = [];
+        const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+            (_session, ...values) => {
+                logged.push(values.map(String).join(" "));
+            },
+        );
+        try {
+            const pass = runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, [message], {
+                    schedulerDecision: "execute",
+                    pendingMaterializationSessions: new Set([sessionId]),
+                    schedulerDeferReason: null,
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets: new Map([[1, makeDropTarget(message)]]),
+                    client,
+                    activeAgent: "test-agent",
+                    // Keep the todowrite read, which does decide served bytes,
+                    // out of this pass so only the ctx_reduce read can block it.
+                    todowriteAvailability: { callable: false, frozen: true },
+                }),
+            );
+            const outcome = await Promise.race([
+                pass.then(() => "served" as const),
+                new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 2_000)),
+            ]);
+            expect(outcome).toBe("served");
+            expect(hostCalls).toBe(2);
+            expect(getTagsBySession(db, sessionId)[0]?.status).toBe("dropped");
+            expect(logged.some((line) => line.includes("ctx_reduce permission is denied"))).toBe(
+                false,
+            );
+
+            // The read still completes in the background and logs the deny once.
+            answerHost?.();
+            for (let turn = 0; turn < 10; turn += 1) {
+                await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+            expect(
+                logged.filter((line) => line.includes("ctx_reduce permission is denied")),
+            ).toHaveLength(1);
+        } finally {
+            logSpy.mockRestore();
+            answerHost?.();
+            clearToolPermissionDenied(sessionId);
+        }
+    });
 });
 
 describe("two-pass tool reclaim", () => {

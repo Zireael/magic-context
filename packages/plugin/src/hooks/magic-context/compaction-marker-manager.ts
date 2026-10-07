@@ -316,6 +316,15 @@ export function applyDeferredCompactionMarker(
     trustedBoundary?: TrustedMaterializedCompactionBoundary,
 ): MarkerUpdateOutcome {
     let cut: "definitely-no-cut" | "uncertain" = "definitely-no-cut";
+    // Step timings for the applied-drain log line. The drain reads both stores
+    // and writes OpenCode's under its lock; one slow step must be attributable.
+    let stepStartedAt = performance.now();
+    const stepMs: string[] = [];
+    const endStep = (name: string): void => {
+        const now = performance.now();
+        stepMs.push(`${name}Ms=${(now - stepStartedAt).toFixed(1)}`);
+        stepStartedAt = now;
+    };
     try {
         // Rust may fence the target with the exact durable boundary returned by the
         // materializing response. Other callers validate against local compartment rows.
@@ -329,6 +338,7 @@ export function applyDeferredCompactionMarker(
         const validation = responseFencesTarget
             ? "ok"
             : validatePendingTarget(db, sessionId, pending);
+        endStep("validate");
         if (validation !== "ok") {
             sessionLog(
                 sessionId,
@@ -356,6 +366,8 @@ export function applyDeferredCompactionMarker(
         // under us), leave the old marker intact so OpenCode keeps its current
         // cache boundary instead of seeing a needless no-marker/full-history pass.
         const boundary = findBoundaryUserMessage(sessionId, pending.endMessageId);
+        // Covers the existing-marker coverage check above and this lookup.
+        endStep("boundary");
         if (!boundary) {
             return {
                 kind: "retryable-failure",
@@ -377,6 +389,7 @@ export function applyDeferredCompactionMarker(
             );
             return { kind: "stale-skip", reason: "partial-message-boundary" };
         }
+        endStep("discardCheck");
 
         // Replace both host-store row sets under one BEGIN IMMEDIATE. A busy
         // store fails before deletion; any later failure rolls the deletion back.
@@ -390,6 +403,7 @@ export function applyDeferredCompactionMarker(
             directory: directory ?? process.cwd(),
             resolvedBoundary: boundary,
         });
+        endStep("replace");
         if (replacement.kind !== "committed") {
             return {
                 kind: "retryable-failure",
@@ -409,9 +423,10 @@ export function applyDeferredCompactionMarker(
             },
             removedSummaryMessageId,
         );
+        endStep("persist");
         sessionLog(
             sessionId,
-            `compaction-marker drain: applied at ordinal ${pending.ordinal}, boundary user msg ${result.boundaryMessageId}`,
+            `compaction-marker drain: applied at ordinal ${pending.ordinal}, boundary user msg ${result.boundaryMessageId} ${stepMs.join(" ")}`,
         );
         return {
             kind: "applied",

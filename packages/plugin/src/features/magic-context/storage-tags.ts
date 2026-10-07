@@ -2415,6 +2415,36 @@ export function getTagsByNumbers(
     return rows.map(toTagEntry);
 }
 
+const newestToolTagNumberStatements = new WeakMap<Database, PreparedStatement>();
+
+/**
+ * Tag numbers of the session's newest `limit` tool tags, any status, newest
+ * first. Equals filtering a full `getTagsBySession` load to tool tags and
+ * keeping the highest numbers: the row checks mirror `isTagRow`, so a malformed
+ * row is skipped here exactly as that load skips it. The walk runs backwards on
+ * the UNIQUE(session_id, tag_number) index and stops after `limit` rows.
+ */
+export function getNewestToolTagNumbers(db: Database, sessionId: string, limit: number): number[] {
+    if (limit <= 0) return [];
+    let statement = newestToolTagNumberStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT tag_number FROM tags
+              WHERE session_id = ? AND type = 'tool'
+                AND typeof(message_id) = 'text'
+                AND typeof(status) = 'text'
+                AND typeof(byte_size) IN ('integer', 'real')
+                AND typeof(tag_number) IN ('integer', 'real')
+              ORDER BY tag_number DESC
+              LIMIT ?`,
+        );
+        newestToolTagNumberStatements.set(db, statement);
+    }
+    return (statement.all(sessionId, limit) as Array<{ tag_number: number }>).map(
+        (row) => row.tag_number,
+    );
+}
+
 const droppedNumberStatements = new WeakMap<Database, PreparedStatement>();
 
 /** Return only dropped tags whose numbers are visible replay targets. */

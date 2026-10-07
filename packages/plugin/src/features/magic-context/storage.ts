@@ -294,6 +294,7 @@ export {
     getMaxDroppedTagNumber,
     getMaxTagNumberBySession,
     getMinMessageTagNumberForRawId,
+    getNewestToolTagNumbers,
     getOldestActiveUnprotectedToolTags,
     getPersistedToolTagAccounting,
     getTagById,

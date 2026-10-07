@@ -1,8 +1,9 @@
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getDroppedTagsByNumbers,
+    getNewestToolTagNumbers,
     getPendingOps,
-    getTagsBySession,
+    getTagsByNumbers,
     removePendingOp,
     updateTagDropMode,
     updateTagStatus,
@@ -311,11 +312,22 @@ export function applyPendingOperations(
         db.transaction(() => {
             admitted = true;
             startedAt = performance.now();
-            const tags = preloadedTags ?? getTagsBySession(db, sessionId);
+            const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
+            // Load only the rows this batch reads: the operations' own tags. A
+            // full getTagsBySession load (every tag the session ever had, about
+            // 100k rows on a long session) ran here while this transaction held
+            // the writer lock and cost over a second per call.
+            const tags =
+                preloadedTags ??
+                getTagsByNumbers(db, sessionId, [
+                    ...new Set([
+                        ...pendingOps.map((op) => op.tagId),
+                        ...syntheticPendingOps.map((op) => op.tagId),
+                    ]),
+                ]);
             const tagById = new Map(tags.map((tag) => [tag.tagNumber, tag] as const));
             const tagStatusById = new Map(tags.map((tag) => [tag.tagNumber, tag.status] as const));
             const tagTypeById = new Map(tags.map((tag) => [tag.tagNumber, tag.type] as const));
-            const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
             const opsToApply: Array<{ op: PendingOp; synthetic: boolean }> = [
                 ...pendingOps.map((op) => ({ op, synthetic: false })),
                 ...syntheticPendingOps.map((op) => ({ op, synthetic: true })),
@@ -335,13 +347,17 @@ export function applyPendingOperations(
 
             // Newest-K tool calls at THIS moment — the skeleton window. Computed
             // once per apply pass over all tool tags (any status: the window
-            // reflects conversation recency, not droppability).
+            // reflects conversation recency, not droppability). Preloaded tags
+            // carry the window rows (getTagsForPendingOperations); otherwise an
+            // index walk reads just those K tag numbers.
             const skeletonWindow = new Set(
-                tags
-                    .filter((tag) => tag.type === "tool")
-                    .map((tag) => tag.tagNumber)
-                    .sort((left, right) => right - left)
-                    .slice(0, RECENT_TOOL_SKELETON_WINDOW),
+                preloadedTags
+                    ? tags
+                          .filter((tag) => tag.type === "tool")
+                          .map((tag) => tag.tagNumber)
+                          .sort((left, right) => right - left)
+                          .slice(0, RECENT_TOOL_SKELETON_WINDOW)
+                    : getNewestToolTagNumbers(db, sessionId, RECENT_TOOL_SKELETON_WINDOW),
             );
 
             for (const { op: pendingOp, synthetic } of opsToApply) {

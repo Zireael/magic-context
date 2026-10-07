@@ -104,8 +104,7 @@ import type {
 import {
     cachedToolPermissionDenied,
     hasLoggedCtxReducePermissionDeny,
-    markCtxReducePermissionDenyLogged,
-    resolveToolPermissionDenied,
+    observeCtxReducePermissionDeny,
     todowritePermissionDenied,
 } from "./ctx-reduce-availability";
 import type { Channel1State } from "./ctx-reduce-nudge";
@@ -353,6 +352,7 @@ export async function applyTodoSynthesis(args: {
         args.todowriteAvailability.frozen && !args.todowriteAvailability.callable;
 
     if (args.isCacheBustingPass && args.client && !toolsMapUnavailable) {
+        const tTodoPermission = performance.now();
         try {
             permissionDenied = await todowritePermissionDenied(
                 args.client,
@@ -370,6 +370,9 @@ export async function applyTodoSynthesis(args: {
                 error,
             );
         }
+        // The only OpenCode API round trip left inline on a busting pass: the
+        // todowrite verdict decides whether the synthetic todo pair is served.
+        logTransformTiming(args.sessionId, "pp.todoPermissionRead", tTodoPermission);
     }
 
     const todowriteUnavailable = toolsMapUnavailable || permissionDenied;
@@ -2093,6 +2096,16 @@ export async function runPostTransformPhase(
             `m[0] HARD fold decision: reason=${foldDueDecision.reason ?? "unknown"} executed=${foldExecutedThisPass} bustsServedPrefix=${foldBustsServedPrefixThisPass}`,
         );
     }
+    // Fold decision, cached-prefix capture and the m[1] soft refresh (one write
+    // transaction that renders m[1]) all run above; time them as one stage so
+    // pp.setupAndOperations has no untimed stretch.
+    logTransformTiming(
+        args.sessionId,
+        "pp.prefixPreflight",
+        tPostprocessSetup,
+        `foldExecuted=${foldExecutedThisPass} m1Refreshed=${publishedM1RefreshedThisPass}`,
+    );
+    const tPassDecisions = performance.now();
 
     const shouldReadPendingOps =
         !compactionOff &&
@@ -2185,30 +2198,16 @@ export async function runPostTransformPhase(
     // "unavailable" (see primeCtxReduceSpawnPermission). A deny added after the
     // freeze cannot flip it without rewriting the cached prefix, so observe the
     // live permission signal on the same busts and only log that guidance may be
-    // stale until the session restarts. This log never changes the wire.
+    // stale until the session restarts. This log never changes the wire, so the
+    // read runs in the background: awaiting its two OpenCode API round trips
+    // inline once held a busting pass for 14 seconds on a loaded host.
     if (
         isCacheBustingPass &&
         args.client &&
         args.ctxReduceAvailability.callable &&
         !hasLoggedCtxReducePermissionDeny(args.sessionId)
     ) {
-        try {
-            const denied = await resolveToolPermissionDenied(
-                args.client,
-                args.sessionId,
-                "ctx_reduce",
-                args.activeAgent,
-            );
-            if (denied) {
-                markCtxReducePermissionDenyLogged(args.sessionId);
-                sessionLog(
-                    args.sessionId,
-                    "ctx_reduce permission is denied by OpenCode; frozen guidance remains until session restart",
-                );
-            }
-        } catch (error) {
-            sessionLog(args.sessionId, "ctx_reduce permission read failed (ignored):", error);
-        }
+        void observeCtxReducePermissionDeny(args.client, args.sessionId, args.activeAgent);
     }
     const canUseEmptySentinels = modelAcceptsEmptyContent(args.resolvedProviderID);
     // Whole-part reasoning removal serves every provider except canonical
@@ -2354,6 +2353,14 @@ export async function runPostTransformPhase(
         }
     }
     let autoReclaimDidMutateThisPass = false;
+    // Pending-op read, temporal decisions, the background permission observer
+    // start and the reasoning-removal read.
+    logTransformTiming(
+        args.sessionId,
+        "pp.passDecisions",
+        tPassDecisions,
+        `pendingOps=${pendingOps.length}`,
+    );
     try {
         if (shouldApplyPendingOps) {
             const applyReason = isExplicitFlush
@@ -2369,16 +2376,11 @@ export async function runPostTransformPhase(
             );
             const tApply = performance.now();
             // P0 perf: don't pass `args.tags` here. applyPendingOperations
-            // genuinely needs the full tag set (including dropped/compacted
-            // rows it uses to skip already-processed pending ops), but the
-            // upstream `args.tags` is now active-only. Letting the function
-            // lazy-load via its own getTagsBySession() call inside the
-            // pending-ops transaction is the right behavior:
-            //   - Most passes have 0 pending ops and never reach this
-            //     branch, so the full-tags load is avoided entirely.
-            //   - When pending ops do exist (rare execute/flush passes),
-            //     the load runs once inside the same transaction the
-            //     mutations need, which is unavoidable.
+            // needs every status of the operations' own tags (dropped and
+            // compacted rows mark ops that are already processed), but the
+            // upstream `args.tags` is active-only. It loads just those rows
+            // and the newest-tool skeleton window inside its own write
+            // transaction, so the reads and the mutations see one snapshot.
             pendingOpsDidMutate = applyPendingOperations(
                 args.sessionId,
                 args.db,
@@ -2725,6 +2727,7 @@ export async function runPostTransformPhase(
         let autoReclaimTargetCount = 0;
         let autoReclaimDidMutate = false;
         if (toolReclaimApplicationOpportunity && !emergencyDropEligible) {
+            const tReclaimSelect = performance.now();
             const syntheticPendingOps = buildSyntheticToolReclaimOps({
                 db: args.db,
                 sessionId: args.sessionId,
@@ -2780,7 +2783,14 @@ export async function runPostTransformPhase(
                 }
             }
             autoReclaimTargetCount = syntheticPendingOps.length;
+            logTransformTiming(
+                args.sessionId,
+                "toolReclaim.select",
+                tReclaimSelect,
+                `targets=${autoReclaimTargetCount}`,
+            );
             if (syntheticPendingOps.length > 0) {
+                const tReclaimApply = performance.now();
                 autoReclaimDidMutate = applyPendingOperations(
                     args.sessionId,
                     args.db,
@@ -2792,6 +2802,7 @@ export async function runPostTransformPhase(
                     editMarkerTagIds,
                     (reduction) => droppedTokenReductions.push(reduction),
                 );
+                logTransformTiming(args.sessionId, "toolReclaim.apply", tReclaimApply);
                 if (autoReclaimDidMutate) {
                     droppedCount += syntheticPendingOps.length;
                     autoReclaimDidMutateThisPass = true;
@@ -2803,6 +2814,7 @@ export async function runPostTransformPhase(
                 }
             }
         }
+        const tBatchFinalize = performance.now();
         args.batch?.finalize();
         // Advance whenever reclaim could have applied, even if no tags were
         // selected. Plain execute-band residency does not advance the watermark;
@@ -2821,7 +2833,9 @@ export async function runPostTransformPhase(
                 `tool reclaim auto-drop: targets=${autoReclaimTargetCount} mutated=${autoReclaimDidMutate}`,
             );
         }
-        logTransformTiming(args.sessionId, "batchFinalize:heuristics", performance.now());
+        // Covers the batch finalize and the reclaim watermark write above. It
+        // used to start its timer at the log call itself and always read 0 ms.
+        logTransformTiming(args.sessionId, "batchFinalize:heuristics", tBatchFinalize);
         if (args.sessionMeta.lastTransformError !== null) {
             updateSessionMeta(args.db, args.sessionId, { lastTransformError: null });
         }
@@ -2836,11 +2850,13 @@ export async function runPostTransformPhase(
     }
 
     if (isCacheBustingPass) {
+        const tDroppedEstimate = performance.now();
         droppedTokens = estimateDroppedTokensFromTagReductions(
             args.db,
             args.sessionId,
             droppedTokenReductions,
         );
+        logTransformTiming(args.sessionId, "pp.droppedTokenEstimate", tDroppedEstimate);
     }
 
     // All replay-only fields below come from one coherent session_meta row.
@@ -3287,9 +3303,16 @@ export async function runPostTransformPhase(
                     `compaction-marker drain: refusing ordinal ${pending.ordinal} because prefix trim through ${args.pendingCompartmentInjection?.compartmentEndMessageId ?? "<none>"} was not proven; preserving deferred history refresh signal`,
                 );
             } else {
+                const tMarkerDrain = performance.now();
                 const outcome = (
                     args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy
                 ).applyDeferred(args.db, args.sessionId, pending, args.sessionDirectory);
+                logTransformTiming(
+                    args.sessionId,
+                    "pp.markerDrain",
+                    tMarkerDrain,
+                    `outcome=${outcome.kind}`,
+                );
                 switch (outcome.kind) {
                     case "applied":
                     case "already-current":
@@ -3339,6 +3362,7 @@ export async function runPostTransformPhase(
     // here has state to replay; leaving it live would re-insert a synthetic
     // summary into the wire of a mode that must stay additive-only.
     if (!compactionOff) {
+        const tMarkerWire = performance.now();
         (args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy).reconcile(
             args.messages,
             persistedCompactionMarkerState,
@@ -3350,6 +3374,7 @@ export async function runPostTransformPhase(
                 isCacheBustingPass,
             },
         );
+        logTransformTiming(args.sessionId, "pp.markerWireReconcile", tMarkerWire);
     }
 
     const deferredHistoryDrainEligible =
