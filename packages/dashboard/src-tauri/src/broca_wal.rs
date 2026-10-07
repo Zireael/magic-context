@@ -177,20 +177,27 @@ pub(crate) fn session_runs(
     session_snapshot(state_root, identity).map(|fold| (fold.runs, fold.activity_note))
 }
 
-pub(crate) fn session_activity_note(
-    state_root: &Path,
-    identity: &SessionIdentity,
-) -> Option<String> {
-    session_snapshot(state_root, identity)?.activity_note
+/// The session's compatibility note as of the last time its WAL was read in
+/// this process, without reading it now. The Cache tab's session list calls
+/// this for every listed Broca session on every poll; decoding each of those
+/// WALs (and archived ones out of their containers) just for the note cost far
+/// more than the list. A session's WAL is read when its events are fetched,
+/// which the tab does for the sessions it shows, so their notes appear by the
+/// next poll.
+pub(crate) fn session_activity_note(identity: &SessionIdentity) -> Option<String> {
+    shared_cache().lock().ok()?.known_note(identity)
+}
+
+fn shared_cache() -> &'static Mutex<WalCache> {
+    static CACHE: OnceLock<Mutex<WalCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(WalCache::default()))
 }
 
 fn session_snapshot(state_root: &Path, identity: &SessionIdentity) -> Option<Fold> {
-    static CACHE: OnceLock<Mutex<WalCache>> = OnceLock::new();
-    let mut cache = CACHE
-        .get_or_init(|| Mutex::new(WalCache::default()))
+    shared_cache()
         .lock()
-        .ok()?;
-    cache.session_snapshot(state_root, identity)
+        .ok()?
+        .session_snapshot(state_root, identity)
 }
 
 // ── Frame decoding ─────────────────────────────────────────────────────────
@@ -540,8 +547,13 @@ struct WalCursor {
     expected_seq: u64,
     fold: Fold,
     /// Set once the file proved unreadable; it stays unreadable until it
-    /// shrinks (Broca rewrote it), since corruption does not heal.
+    /// shrinks or is replaced (Broca rewrote it), since corruption does not
+    /// heal.
     failed: Option<String>,
+    /// The (device, inode) of the file this cursor read, when known. A
+    /// different file at the same path (replaced, not appended to) is read
+    /// again from the start even when it is not shorter.
+    file_key: Option<(u64, u64)>,
 }
 
 impl Default for WalCursor {
@@ -552,6 +564,7 @@ impl Default for WalCursor {
             expected_seq: 1,
             fold: Fold::default(),
             failed: None,
+            file_key: None,
         }
     }
 }
@@ -561,7 +574,10 @@ impl WalCursor {
     /// (or one frame, when a single frame is bigger).
     fn advance<R: Read + Seek>(&mut self, reader: &mut R, len: u64, budget: usize) {
         if len < self.offset {
-            *self = Self::default();
+            *self = Self {
+                file_key: self.file_key,
+                ..Self::default()
+            };
         }
         if self.failed.is_some()
             || self.fold.activity_note.is_some()
@@ -849,6 +865,8 @@ fn fold_stamp(name: &str) -> Option<u64> {
 #[derive(Debug, Default)]
 pub(crate) struct WalCache {
     live: HashMap<PathBuf, WalCursor>,
+    /// Each session's compatibility note from its last read, by address.
+    notes: HashMap<String, Option<String>>,
     containers: HashMap<PathBuf, CachedContainer>,
     /// Decoded archived members by (container, member offset, container length).
     archived: HashMap<(PathBuf, u64, u64), Result<Fold, String>>,
@@ -865,16 +883,39 @@ impl WalCache {
             .map(|fold| fold.runs)
     }
 
+    fn known_note(&self, identity: &SessionIdentity) -> Option<String> {
+        self.notes.get(&identity.addr()).cloned().flatten()
+    }
+
     fn session_snapshot(&mut self, state_root: &Path, identity: &SessionIdentity) -> Option<Fold> {
         let address = identity.addr();
+        let fold = self.read_session(state_root, &address);
+        if self.notes.len() >= MAX_REMEMBERED_FILES && !self.notes.contains_key(&address) {
+            self.notes.clear();
+        }
+        self.notes.insert(
+            address,
+            fold.as_ref().and_then(|fold| fold.activity_note.clone()),
+        );
+        fold
+    }
+
+    fn read_session(&mut self, state_root: &Path, address: &str) -> Option<Fold> {
         let live_path = state_root.join("wal").join(format!("{address}.wal"));
         match File::open(&live_path) {
             Ok(mut file) => {
-                let len = file.metadata().ok()?.len();
+                let metadata = file.metadata().ok()?;
+                let (len, file_key) = (metadata.len(), file_identity(&metadata));
                 if !self.live.contains_key(&live_path) && self.live.len() >= MAX_REMEMBERED_FILES {
                     self.live.clear();
                 }
                 let cursor = self.live.entry(live_path).or_default();
+                if cursor.file_key != file_key {
+                    *cursor = WalCursor {
+                        file_key,
+                        ..WalCursor::default()
+                    };
+                }
                 cursor.advance(&mut file, len, READ_BUDGET_BYTES);
                 if cursor.failed.is_some() {
                     return None;
@@ -883,7 +924,7 @@ impl WalCache {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.live.remove(&live_path);
-                self.archived_runs(&state_root.join("wal-archive"), &address)
+                self.archived_runs(&state_root.join("wal-archive"), address)
             }
             Err(_) => None,
         }
@@ -1780,6 +1821,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_live_file_replaced_by_one_no_shorter_is_read_again_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_live(dir.path(), &one_step_wal("r1"));
+        let mut cache = WalCache::default();
+        let runs = cache.session_runs(dir.path(), &identity()).unwrap();
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+
+        // Same length, different file: written aside and renamed over the
+        // old one, so only the file's identity says it changed.
+        let replacement = one_step_wal("r2");
+        assert_eq!(replacement.len(), one_step_wal("r1").len());
+        let aside = path.with_extension("tmp");
+        std::fs::write(&aside, &replacement).unwrap();
+        std::fs::rename(&aside, &path).unwrap();
+        let runs = cache.session_runs(dir.path(), &identity()).unwrap();
+        assert_eq!(step_ids(&runs), [("r2".to_string(), 1)]);
+    }
+
+    #[test]
+    fn the_list_note_reports_only_what_was_already_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = two_runs();
+        wal.bytes.extend(frame(4, wal.seq + 1, 0, b"future"));
+        write_live(dir.path(), &wal.bytes);
+        let mut cache = WalCache::default();
+        // Asking for the note reads nothing, so nothing is known yet.
+        assert_eq!(cache.known_note(&identity()), None);
+        assert!(cache.live.is_empty());
+        let note = cache
+            .session_snapshot(dir.path(), &identity())
+            .unwrap()
+            .activity_note;
+        assert!(note.is_some());
+        assert_eq!(cache.known_note(&identity()), note);
+    }
+
+    #[test]
     fn compatibility_notes_and_prefix_steps_survive_live_and_archive_caches() {
         for archived in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -1798,7 +1876,7 @@ pub(crate) mod tests {
                 let (runs, note) = session_runs(dir.path(), &identity()).unwrap();
                 assert_eq!(step_ids(&runs).len(), 3);
                 assert!(note.as_deref().unwrap().contains("showing data up to"));
-                assert_eq!(session_activity_note(dir.path(), &identity()), note);
+                assert_eq!(session_activity_note(&identity()), note);
             }
         }
     }
