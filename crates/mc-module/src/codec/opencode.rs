@@ -1452,13 +1452,13 @@ fn unshown_attachment_notice(block: &ResultBlock, media: &MediaBlock) -> String 
 }
 
 fn tool_media_is_unshown(block: &ResultBlock, media: &MediaBlock) -> bool {
-    // A retained native child is losslessly replayable even if its vendor format
-    // is not understood here. Only synthesized children need a supported source.
+    // An unchanged native child is losslessly replayable even in a vendor format.
+    // A changed media source instead needs a representable fresh carrier.
     block
         .provider_extras
         .get(HARNESS)
         .and_then(|ns| ns.get("rawAttachment"))
-        .is_none()
+        .is_none_or(|retained| media_from_part(retained) != *media)
         && render_media_part(media)
             .get("url")
             .and_then(Value::as_str)
@@ -1768,6 +1768,29 @@ mod tests {
                 serde_json::to_vec(&encoded).unwrap()
             );
         }
+        // A retained carrier is not usable when CK has changed its source to a
+        // representation the host cannot encode. Do not emit a URL-less file.
+        let mut with_carrier = message.clone();
+        let CkKind::ToolResult { output, .. } = &mut with_carrier.content[0].kind else {
+            panic!("result")
+        };
+        let CkOutputKind::Content { blocks } = &mut output.kind else {
+            panic!("content")
+        };
+        blocks[1].provider_extras.entry(HARNESS.into()).or_default().insert(
+            "rawAttachment".into(),
+            json!({ "type": "file", "mime": "image/jpeg", "url": "data:image/jpeg;base64,aW1n", "id": "iikxf4", "width": 1382, "height": 868, "filename": "screen.jpg" }),
+        );
+        let drift = encode_opencode(
+            std::slice::from_ref(&with_carrier),
+            &DecodeSidecar::new("opencode"),
+            None,
+        );
+        assert_eq!(
+            drift[0]["parts"][0]["state"]["output"],
+            encoded[0]["parts"][0]["state"]["output"]
+        );
+        assert!(drift[0]["parts"][0]["state"].get("attachments").is_none());
     }
 
     #[test]

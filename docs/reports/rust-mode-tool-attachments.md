@@ -221,9 +221,8 @@ Deployment must update the plugin adapter as well as ck-mc: native attachment
 encoding treats the CK result as authoritative, so a module-only placement with
 an old attachment-blind adapter is not the projection repair. The native codec
 continues respecting explicit reduced outputs, while the new adapter provides
-all unreduced media/opaque children. The final follow-up commit only corrects the
-new test's scheduler assertion and records verification; the product source is
-exactly the implementation commit stamped into the fresh binaries.
+all unreduced media/opaque children. The follow-up commit corrects the new test's scheduler assertion and records
+verification. A subsequent native loss-notice refinement is recorded below.
 
 The live evidence alone cannot identify which particular tag-admission guard
 held each untagged CEREB result; that would require ingress/module state not
@@ -231,3 +230,18 @@ present in request-body captures. The source-level exemption/pending-tag paths
 explain the distinction without reading a forbidden live store. The confirmed
 repair point is the attachment-blind adapter projection and its editable native
 round trip, not a special case for computer_use or for one provider.
+
+### Retained-carrier drift control
+
+A final check also forces an unsupported CK media source **with** a retained
+native attachment. A raw carrier can be replayed unchanged only while it still
+represents the CK media; otherwise the renderer creates a fresh carrier and must
+show the loss notice if that source is not representable. The extended existing
+notice test failed first (only tagged text, no notice), then passed with the
+predicate comparing the carrier's media before treating it as replayable.
+Unchanged vendor/native carriers still replay losslessly.
+
+After this refinement: all 27 native codec tests, the 2 attachment/cache tests,
+and the attachment-free upgrade test passed; package-scoped clippy -D warnings
+and fmt also passed. Final identified binaries and real-host rerun are recorded
+below; the earlier full native-attach shard remains separately identified above.
