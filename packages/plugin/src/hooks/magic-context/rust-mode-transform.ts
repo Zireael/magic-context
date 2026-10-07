@@ -191,9 +191,9 @@ class RustTransformProtocolError extends Error {
 }
 
 /**
- * A frozen replay is over the provider-proven context limit while emergency
- * recovery is armed, and the module's output is over it too (or cannot be shown
- * to fit). Neither array can be sent, so the pass refuses. The module itself is
+ * A frozen replay is over the trusted context limit, and the module's output is
+ * over it too (or cannot be shown to fit). Neither array can be sent, so the pass
+ * refuses even without a prior provider rejection. The module itself is
  * healthy, so this is not counted as a module failure.
  */
 class FrozenReplayOverProvenLimitRefusal extends Error {
@@ -2620,9 +2620,9 @@ export function createRustModeTransform(
          * Admission for a healthy pass that would serve the frozen replay `candidate`
          * instead of `moduleOutput`. Returns a release reason when the frozen bytes no
          * longer fit but the module's output does, null to keep serving the freeze, and
-         * throws `FrozenReplayOverProvenLimitRefusal` when emergency recovery is armed
-         * and neither array fits the provider-proven limit. An unproven measurement
-         * never releases: adopting module output on a guess would bust the cache of
+         * throws `FrozenReplayOverProvenLimitRefusal` when the replay is known over
+         * a trusted limit and the native output cannot be shown to fit. An unproven
+         * frozen measurement never releases: adopting module output on a guess would bust the cache of
          * every frozen session on a model whose estimate is incomplete.
          */
         const frozenReplayAdmission = (
@@ -2684,7 +2684,7 @@ export function createRustModeTransform(
                     ? `frozen_fit_both_over limit=${limit}`
                     : `frozen_fit_unproven module=unproven limit=${limit}`,
             );
-            return null;
+            throw new FrozenReplayOverProvenLimitRefusal(moduleFit, limit);
         };
         const finishPass = (applied: boolean, served = true): void => {
             // A pass that serves nothing leaves the provider's last-seen array unchanged,

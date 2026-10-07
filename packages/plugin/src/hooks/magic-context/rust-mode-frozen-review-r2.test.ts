@@ -20,6 +20,7 @@ import {
 } from "../../features/magic-context/storage-meta";
 import {
     recordDetectedContextLimit,
+    recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
@@ -30,8 +31,10 @@ import { __test as transformDecisionTest } from "../../features/magic-context/tr
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import { resolveContextWindowGeometry, resolveTrustedContextLimit } from "./event-resolvers";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
+import { clearLkgMeasuredRequest, noteLkgProviderResponse } from "./lkg-measured-request";
 import { createDbLkgPersistence } from "./lkg-persist";
 import { lkgReplayFits, lkgReplayLimit } from "./lkg-replay-fit";
 import { registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
@@ -190,7 +193,7 @@ type Step = "throw" | string | { decision: string; response: Record<string, unkn
  * process: a fresh adapter on the same database with the in-memory slot store
  * emptied, so the next read hydrates the durable slot.
  */
-function reviewSession(label: string, model: Model = OPUS) {
+function reviewSession(label: string, model: Model = OPUS, pageBytes = 512 * 1024) {
     sessionCounter += 1;
     const sessionId = `rust-frozen-review-r2-${label}-${sessionCounter}-${Date.now()}`;
     const modelKey = `${model.providerID}/${model.modelID}`;
@@ -239,7 +242,7 @@ function reviewSession(label: string, model: Model = OPUS) {
     const makeAdapter = () =>
         createRustModeTransform(deps, {
             moduleClient,
-            modulePageMaxBytes: 512 * 1024,
+            modulePageMaxBytes: pageBytes,
             scheduleLkgCapture: (capture) => capture(),
             rawFallbackEstimatorForTests: (args) => estimateFinalWireInputTokens(args),
         });
@@ -513,5 +516,68 @@ describe("review r2: an adapter OpenCode drops without disposing it", () => {
             if (liveRustLkgReplayParticipantCountForTest() === 0) break;
         }
         expect(liveRustLkgReplayParticipantCountForTest()).toBe(0);
+    });
+});
+
+describe("frozen recovery admission", () => {
+    for (const emergency of [false, true]) {
+        it(`${emergency ? "CONTROL: emergency" : "REVIEW: both-over"} frozen recovery must refuse rather than send ten known-over requests`, async () => {
+            const s = reviewSession(`known-over-${emergency}`, OPUS, 8 * 1024 * 1024);
+            s.setModuleOutput(tagAllUsers);
+            const input = [s.user("m1", "question")];
+            await s.run(input, "HARD");
+            await s.run(input, "throw");
+            if (emergency)
+                recordOverflowDetected(s.db, s.sessionId, 200_000, "anthropic/claude-opus-5-5");
+            input.push(assistant(s.sessionId, "a1"), s.user("m2", "word ".repeat(300_000)));
+            let sent = 0;
+            const refusals: unknown[] = [];
+            for (let i = 0; i < 10; i++) {
+                try {
+                    await s.run(input, "SOFT+");
+                    sent++;
+                } catch (error) {
+                    refusals.push(error);
+                }
+            }
+            expect({ sent, refused: refusals.length }).toEqual({ sent: 0, refused: 10 });
+            for (const refusal of refusals) {
+                expect(refusal).toBeInstanceOf(EmergencyFailClosedError);
+                expect((refusal as Error).message).toContain("MC-H07");
+            }
+            expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+            expect(s.transform.getState(s.sessionId).failureCount).toBe(1);
+        });
+    }
+
+    it("CONTROL: frozen replay measured under the limit still sends despite an over-budget prefix estimate", async () => {
+        const s = reviewSession("measured-under", OPUS, 8 * 1024 * 1024);
+        const modelKey = "anthropic/claude-opus-5-5";
+        const input = [s.user("m1", "word ".repeat(300_000))];
+        noteLkgProviderResponse({
+            sessionId: s.sessionId,
+            modelKey,
+            responseId: "a1",
+            inputTokens: 0,
+        });
+        try {
+            const initial = await s.run(input, "HARD");
+            noteLkgProviderResponse({
+                sessionId: s.sessionId,
+                modelKey,
+                responseId: "a1",
+                inputTokens: 1_000,
+                finish: "stop",
+            });
+            input.push(assistant(s.sessionId, "a1"), s.user("m2", "small tail"));
+            const frozen = await s.run(input, "throw");
+            expect(frozen).toEqual([...initial, ...input.slice(1)]);
+            expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+            s.setModuleOutput(tagAllUsers);
+            expect(await s.run(input, "SOFT+")).toEqual(frozen);
+            expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+        } finally {
+            clearLkgMeasuredRequest(s.sessionId);
+        }
     });
 });
