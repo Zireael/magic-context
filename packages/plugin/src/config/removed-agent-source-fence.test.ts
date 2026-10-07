@@ -52,7 +52,8 @@ describe("retired agent source fence", () => {
         for (const file of SOURCE_ROOTS.flatMap((root) => sourceFiles(root))) {
             const matches = readFileSync(file, "utf8").match(RETIRED_AGENT_PATTERN) ?? [];
             const allowed =
-                (file === WARNING_SOURCE && matches.length === 1) || EXTERNAL_RUN_KIND_FILES.has(file);
+                (file === WARNING_SOURCE && matches.length === 1) ||
+                EXTERNAL_RUN_KIND_FILES.has(file);
             if (!allowed && matches.length > 0) {
                 offenses.push(`${relative(REPO_ROOT, file)} (${matches.length})`);
             }
