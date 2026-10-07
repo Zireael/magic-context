@@ -101,7 +101,7 @@
   --bg-panel: #fafbfc;
   --bg-card: #ffffff;
   --bg-hover: #eceef2;
-  --bg-active: #e6edfb;
+  --bg-active: #e9eefb;
   --bg-input: #ffffff;
   --border: #dfe2e8;
   --border-light: #c4c9d2;
@@ -116,17 +116,17 @@
   --on-accent: #ffffff;
   --green: #166534;
   --green-dim: #14532d;
-  --amber: #9c4806;
+  --amber: #934406;
   --amber-dim: #7c3a06;
-  --red: #b91c1c;
+  --red: #ab1d1d;
   --red-dim: #991b1b;
   --purple: #7e22ce;
-  --indigo: #4f46e5;
+  --indigo: #4338ca;
   --success: #15803d;
-  --danger: #b91c1c;
+  --danger: #ab1d1d;
   --error-bg: #fdeeee;
   --error-border: #f1c4c4;
-  --error-text: #b91c1c;
+  --error-text: #ab1d1d;
   --restart-border: #e2c08f;
   --focus-ring: #1d4ed8;
   --badge-neutral-bg: #e3e6eb;
@@ -1879,6 +1879,15 @@ body {
 .dreamer-task-card-disabled {
   font-style: italic;
   opacity: 0.7;
+}
+
+/* Opacity dimming pushes these secondary labels below AA on light surfaces, so
+   the light theme uses the muted text colour at full opacity instead. */
+:root[data-theme="light"] .dreamer-task-card-name,
+:root[data-theme="light"] .dreamer-task-card-next,
+:root[data-theme="light"] .dreamer-task-card-disabled {
+  opacity: 1;
+  color: var(--text-muted);
 }
 
 .dreamer-task-card-error {

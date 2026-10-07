@@ -42,7 +42,7 @@ export const CONTRAST_PAIRS: ContrastPair[] = [
     min: 4.5,
   })),
   ...PILL_COLORS.flatMap((color) =>
-    ["bg-card", "bg-base"].map((surface) => ({
+    ["bg-card", "bg-base", "bg-active"].map((surface) => ({
       label: `${color} pill text on its 15% tint over ${surface}`,
       fg: color,
       bg: { tint: color, percent: 15, over: surface },

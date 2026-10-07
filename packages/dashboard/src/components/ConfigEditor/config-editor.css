@@ -139,6 +139,11 @@
   opacity: 0.7;
 }
 
+/* The dimmed index numbers fall below AA on light surfaces; keep them opaque. */
+:root[data-theme="light"] .config-section-index button span {
+  opacity: 1;
+}
+
 .config-section-index button:hover {
   background: var(--bg-hover);
   color: var(--text-primary);

@@ -79,7 +79,7 @@ function importanceInfo(importance: number): {
 }
 
 /**
- * Importance band → the same CSS color the row pills use, so the timeline strip
+ * Importance band → the chart fill matching the row pill's hue, so the timeline strip
  * encodes importance (red=critical, amber=high, blue=medium, gray=low) instead
  * of a meaningless per-sequence rainbow. `dim` recedes low-importance segments.
  */
@@ -87,12 +87,12 @@ function importanceBarColor(importance: number, expanded: boolean): string {
   const { pillColor } = importanceInfo(importance);
   const base =
     pillColor === "red"
-      ? "var(--red)"
+      ? "var(--chart-bad)"
       : pillColor === "amber"
-        ? "var(--amber)"
+        ? "var(--chart-warn)"
         : pillColor === "blue"
-          ? "var(--accent)"
-          : "var(--text-muted)";
+          ? "var(--chart-info)"
+          : "var(--chart-neutral)";
   // Slightly mute unexpanded segments so the expanded one (and high-importance
   // warm colors) read as the focal points; gray bands recede the most.
   const mix = expanded ? 100 : pillColor === "gray" ? 55 : 78;
