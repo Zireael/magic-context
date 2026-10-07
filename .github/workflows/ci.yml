@@ -86,7 +86,9 @@ jobs:
       - name: Test
         env:
           MAGIC_CONTEXT_DEBUG_ASSERTIONS: "1"
-        run: bun run test
+        # The opt-in content walks cost more on the largest transform fixtures.
+        # Leave enough room for those checks instead of timing them out at 30s.
+        run: bun run test --timeout=60000
 
       # Exercise the node:sqlite branch of shared/sqlite.ts under REAL Node —
       # bun test only covers the bun:sqlite branch, so the transaction() shim,
@@ -147,7 +149,8 @@ jobs:
       - name: Test
         env:
           MAGIC_CONTEXT_DEBUG_ASSERTIONS: "1"
-        run: bun run --cwd packages/pi-plugin test
+        # Keep parallel work bounded while the opt-in content walks run.
+        run: bun run --cwd packages/pi-plugin test --parallel=4 --timeout=60000
 
   check-dashboard:
     name: Check (dashboard)

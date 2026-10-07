@@ -977,7 +977,8 @@ describe("tail hygiene last-writer guard", () => {
             sessionLog.mockRestore();
             if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
             else process.env.NODE_ENV = originalNodeEnv;
-            if (originalDebugAssertions === undefined) delete process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
+            if (originalDebugAssertions === undefined)
+                delete process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
             else process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS = originalDebugAssertions;
         }
     });
