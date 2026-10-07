@@ -672,6 +672,73 @@ describe("Rust mode authority adapter", () => {
         transform.dispose();
     });
 
+    it("a SOFT+ response that also claims prefix-bust permission is rejected before any host edit", async () => {
+        // A defer (SOFT+) replays the provider's cached prefix byte for byte, so a
+        // response that pairs it with permission to bust that prefix contradicts
+        // itself. The host must treat it as a broken wire and grant nothing: no
+        // compaction marker cut, and the queued marker target stays as it was.
+        const sessionId = `rust-softplus-permission-${Date.now()}`;
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        const db = makeDb();
+        const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1, injectAttempts: 3 };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        let writes = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          decision: "SOFT+",
+                          prefix_bust_permitted: true,
+                          committed: true,
+                          row_version: 7,
+                          coverage_ordinal: 1,
+                          boundary_id: "m1#0",
+                          native_messages: [
+                              {
+                                  info: { role: "user", sessionID: sessionId },
+                                  parts: [
+                                      {
+                                          type: "text",
+                                          text: "<session-history>contradictory response</session-history>",
+                                          synthetic: true,
+                                      },
+                                  ],
+                              },
+                              ...makeMessages(sessionId),
+                          ],
+                      }
+                    : { ok: true },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        deps.compactionMarkerStrategy = {
+            applyDeferred: () => {
+                writes++;
+                return { kind: "applied", markerOrdinal: 1 };
+            },
+            reconcile: reconcileMarkerRepresentation,
+        };
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = makeMessages(sessionId);
+        const output = { messages: [...input] as unknown[] };
+        let refusal: unknown;
+        try {
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+        } catch (error) {
+            refusal = error;
+        }
+        expect(writes).toBe(0);
+        expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+        expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+        expect(JSON.stringify(output.messages)).not.toContain("contradictory response");
+        expect(refusal).toBeInstanceOf(EmergencyFailClosedError);
+        expect(String((refusal as { cause?: unknown }).cause)).toContain(
+            "SOFT+ cannot permit a prefix bust",
+        );
+        transform.dispose();
+    });
+
     it("supported false wire permission captures newest-tail replay while unsupported wire permission holds", async () => {
         for (const permission of [false, undefined, null, 1, "true", {}]) {
             const sessionId = `rust-wire-tail-${String(permission)}-${Date.now()}`;
