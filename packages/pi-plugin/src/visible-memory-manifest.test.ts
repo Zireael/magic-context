@@ -12,10 +12,18 @@ import {
 	getOrCreateSessionMeta,
 	queueMemoryMutation,
 } from "@magic-context/core/features/magic-context/storage";
+import {
+	encodeCachedM0UpgradeIdentity,
+	withCachedM0MemoryIds,
+} from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
 import { renderMemoryBlockV2 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { createTestTempDirFromPath } from "@magic-context/core/shared/test-temp-dir";
-import { injectM0M1Pi, materializeM0Pi } from "./inject-compartments-pi";
+import {
+	injectM0M1Pi,
+	materializeM0Pi,
+	mustMaterializePi,
+} from "./inject-compartments-pi";
 import { createTestDb, userMessage } from "./test-utils.test";
 
 function fixture() {
@@ -41,17 +49,25 @@ function fixture() {
 			count: value.memory_block_count,
 		};
 	};
-	const serve = (refresh = false) => {
+	const serveWithResult = (refresh = false) => {
 		const messages = [userMessage("tail", 1000)];
-		injectM0M1Pi(state, db, messages as never, undefined, refresh);
-		return messages.slice(0, 2);
+		const result = injectM0M1Pi(
+			state,
+			db,
+			messages as never,
+			undefined,
+			refresh,
+		);
+		return { prefix: messages.slice(0, 2), result };
 	};
+	const serve = (refresh = false) => serveWithResult(refresh).prefix;
 	return {
 		db,
 		state,
 		row,
 		manifest,
 		serve,
+		serveWithResult,
 		close: () => {
 			db.close();
 			rmSync(dir, { recursive: true, force: true });
@@ -60,6 +76,107 @@ function fixture() {
 }
 
 describe("Pi visible-memory manifest", () => {
+	it("replays a previous-code snapshot without a HARD fold or byte change on the first upgraded pass", () => {
+		const f = fixture();
+		try {
+			const baseline = insertMemory(f.db, {
+				projectPath: f.state.projectIdentity,
+				category: "ARCHITECTURE",
+				content: "legacy baseline",
+			});
+			f.serve();
+			insertMemory(f.db, {
+				projectPath: f.state.projectIdentity,
+				category: "ARCHITECTURE",
+				content: "legacy delta",
+			});
+			const before = f.serve(true);
+			const legacyIdentity = encodeCachedM0UpgradeIdentity(
+				"pi-m0m1-v2:ready",
+				"cre2",
+				false,
+				"m8000-h60000",
+				"mre3",
+				"m8000-h60000",
+			);
+			expect(
+				getOrCreateSessionMeta(f.db, f.state.sessionId).cachedM0UpgradeState,
+			).toBe(withCachedM0MemoryIds(legacyIdentity, [baseline.id]));
+			// Previous Pi snapshots recorded only the m[0] ids even with an m[1] delta.
+			f.db
+				.prepare(
+					"UPDATE session_meta SET cached_m0_upgrade_state = ?, memory_block_ids = ?, memory_block_count = 1 WHERE session_id = ?",
+				)
+				.run(legacyIdentity, JSON.stringify([baseline.id]), f.state.sessionId);
+			const row = f.row();
+			expect(mustMaterializePi(f.state, f.db).value).toBe(false);
+			const upgraded = f.serveWithResult();
+			expect(upgraded.result.m0Materialized).toBe(false);
+			expect(upgraded.prefix).toEqual(before);
+			expect(f.row()).toEqual(row);
+		} finally {
+			f.close();
+		}
+	});
+
+	it("ignores adding or changing only frozen ids for HARD decisions and stays SOFT after metadata adoption", () => {
+		const f = fixture();
+		try {
+			const baseline = insertMemory(f.db, {
+				projectPath: f.state.projectIdentity,
+				category: "ARCHITECTURE",
+				content: "unchanged baseline",
+			});
+			const before = f.serve();
+			const legacyIdentity = encodeCachedM0UpgradeIdentity(
+				"pi-m0m1-v2:ready",
+				"cre2",
+				false,
+				"m8000-h60000",
+				"mre3",
+				"m8000-h60000",
+			);
+			for (const identity of [
+				legacyIdentity,
+				withCachedM0MemoryIds(legacyIdentity, [baseline.id]),
+				withCachedM0MemoryIds(legacyIdentity, []),
+			]) {
+				f.db
+					.prepare(
+						"UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?",
+					)
+					.run(identity, f.state.sessionId);
+				expect(mustMaterializePi(f.state, f.db).value).toBe(false);
+				const served = f.serveWithResult();
+				expect(served.result.m0Materialized).toBe(false);
+				expect(served.prefix).toEqual(before);
+			}
+			f.db
+				.prepare(
+					"UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?",
+				)
+				.run(legacyIdentity, f.state.sessionId);
+			const delta = insertMemory(f.db, {
+				projectPath: f.state.projectIdentity,
+				category: "ARCHITECTURE",
+				content: "metadata adoption delta",
+			});
+			const refreshed = f.serveWithResult(true);
+			expect(refreshed.result.m0Materialized).toBe(false);
+			expect(f.manifest()).toEqual({ ids: [baseline.id, delta.id], count: 2 });
+			expect(
+				(f.row() as { cached_m0_upgrade_state: string })
+					.cached_m0_upgrade_state,
+			).toBe(withCachedM0MemoryIds(legacyIdentity, [baseline.id]));
+			expect(mustMaterializePi(f.state, f.db).value).toBe(false);
+			const next = f.serveWithResult();
+			expect(next.result.m0Materialized).toBe(false);
+			expect(next.prefix).toEqual(refreshed.prefix);
+		} finally {
+			f.close();
+		}
+	});
+
 	it("includes additive m[1] memories and replaces rather than accumulates refreshed ids", () => {
 		const f = fixture();
 		try {
