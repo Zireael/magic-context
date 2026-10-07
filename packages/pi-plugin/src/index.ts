@@ -41,6 +41,7 @@ import type {
 	HistorianConfig,
 	MagicContextConfig,
 } from "@magic-context/core/config/schema/magic-context";
+import { createSubcCheckoutClaimGate } from "@magic-context/core/features/magic-context/checkout-claim";
 import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
@@ -84,6 +85,7 @@ import {
 	resolveHistorianContextLimit,
 	resolveKnownHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
+import { getDefaultSubcConnectionFile } from "@magic-context/core/hooks/magic-context/module-transport";
 import {
 	clearNoteNudgeTriggerAndCooldown,
 	onNoteTrigger,
@@ -1753,6 +1755,13 @@ async function startPiMagicContextRuntime(
 		},
 	);
 	projectDepsByDir.set(projectDir, bootProjectDeps);
+	// One gate per Pi process: refuses to write for a session whose agent another
+	// machine holds. Checked at session start and before every context pass
+	// (cached, so a pass pays for it at most once per cache period).
+	const checkoutClaim = createSubcCheckoutClaimGate(
+		"pi",
+		() => config.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+	);
 
 	function syncDreamerProjectRegistration(
 		current: ResolvedPiProjectDeps,
@@ -1890,6 +1899,16 @@ async function startPiMagicContextRuntime(
 		}
 
 		const sessionId = resolveSessionId(ctx);
+		// Session start is Magic Context's first write for a session in this
+		// process. Skip every write below when another machine holds the
+		// session's agent; the first turn is then refused by the context handler.
+		if (sessionId) {
+			const claimRefusal = await checkoutClaim.refusal(sessionId, ctx.cwd);
+			if (claimRefusal) {
+				if (ctx.hasUI) ctx.ui.notify(claimRefusal.message, "error");
+				return;
+			}
+		}
 		const model = ctx.model;
 		if (sessionId && model?.provider && model.id) {
 			seedSessionCacheTtlIfUnsynced({
@@ -1932,7 +1951,9 @@ async function startPiMagicContextRuntime(
 	// Register the per-LLM-call transform pipeline. Tags eligible message
 	// parts via the shared Tagger and applies queued drops from
 	// `pending_ops` so /ctx-flush and ctx_reduce work against Pi sessions.
-	registerPiContextHandler(pi, bootProjectDeps.contextOptions);
+	registerPiContextHandler(pi, bootProjectDeps.contextOptions, {
+		checkoutClaim,
+	});
 	// Pi's model registry reaches the extension only with the first session
 	// context, so the chain the historian will actually use is logged by
 	// reportPiModelChains at session start. Logging the configured model here

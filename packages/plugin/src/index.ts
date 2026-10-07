@@ -11,6 +11,7 @@ import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { createDreamerOutputCapSampler } from "./config/live-child-output-cap";
 import { dreamerRunConfig, historianRunConfig, pluginConfigReader } from "./config/live-run-config";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
+import { createSubcCheckoutClaimGate } from "./features/magic-context/checkout-claim";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import type {
@@ -912,6 +913,30 @@ const server: Plugin = async (ctx) => {
             getMagicContext: () => magicContextRuntime.magicContext,
             failClosed,
             failClosedBlockingEnabled,
+            // Refuse before any write when another machine holds the session's
+            // agent; MC writes nothing when the plugin is disabled.
+            checkoutClaim: pluginConfig.enabled
+                ? {
+                      gate: createSubcCheckoutClaimGate(
+                          "opencode",
+                          () =>
+                              pluginConfig.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+                      ),
+                      projectRoot: ctx.directory,
+                      onRefusal: async (sessionId, message) => {
+                          const { sendStatusNotification } = await importPluginModule(
+                              () => import("./hooks/magic-context/send-session-notification"),
+                          );
+                          const { abortSessionFailClosed } = await importPluginModule(
+                              () => import("./hooks/magic-context/transform-postprocess-phase"),
+                          );
+                          await sendStatusNotification(ctx.client, sessionId, message, {
+                              toastDurationMs: 15000,
+                          });
+                          await abortSessionFailClosed(ctx.client, sessionId);
+                      },
+                  }
+                : undefined,
             // Compaction-off mode (issue #266): fail_closed_blocking is inert
             // BY DESIGN in this mode — a failed transform degrades to
             // passthrough of the input messages instead of blocking the turn.
