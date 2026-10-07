@@ -430,8 +430,9 @@ pub struct ConfiguredRunners {
 /// Both runner settings are read from the user tier only, so the answer is the same
 /// for every project this process serves. That is what lets the boot manifest
 /// declare its routes from it. The harness default is per request, and a Claude
-/// Code request with nothing configured still goes to Broca, so the Broca route is
-/// declared unless BOTH roles are configured to the host runner.
+/// Code request with nothing configured still goes to Broca, so the background-
+/// completion route to Broca is declared unless BOTH roles are configured to the
+/// host runner. The optional provider runner route is declared independently.
 pub fn user_configured_runners() -> ConfiguredRunners {
     user_configured_runners_at(&user_config_path())
 }
