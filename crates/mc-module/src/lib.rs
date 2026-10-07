@@ -19025,6 +19025,8 @@ pub fn manifest_with_route_targets(
         sub_supervises: false,
     }])
     .consumes(vec![ConsumerRole::ServiceClient {
+        // ServiceClient is a route declaration, not a capability requirement. The provider
+        // runner may be absent: only an incoming provider call needs its callback/read route.
         of: route_targets(resolved_routes),
     }])
     .build()
@@ -19117,10 +19119,10 @@ mod tests {
         assert_eq!(
             hosted.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string()],
+                of: vec!["thalamus".to_string(), "broca".to_string()],
             }]
         );
-        // Self-signals drop out with the runner target, but the field stays declared
+        // Self-signals drop out with the background-completion target, but the field stays declared
         // ("examined, none").
         assert_eq!(hosted.self_signals, Some(vec![]));
         assert_eq!(
@@ -22101,7 +22103,7 @@ mod tests {
             .collect()
     }
 
-    fn big_messages() -> Vec<CkIngressMessage> {
+    pub(super) fn big_messages() -> Vec<CkIngressMessage> {
         big_messages_from(1)
     }
 
@@ -22141,7 +22143,7 @@ mod tests {
 
     const TEST_HISTORIAN_MODEL: &str = "test/model";
 
-    fn request(messages: Vec<CkIngressMessage>) -> Value {
+    pub(super) fn request(messages: Vec<CkIngressMessage>) -> Value {
         request_with_usage(messages, 45_000, 50_000)
     }
 
@@ -33515,7 +33517,7 @@ mod tests {
         }
     }
 
-    fn historian_output_for_prompt(prompt: &str) -> String {
+    pub(super) fn historian_output_for_prompt(prompt: &str) -> String {
         let (start, end) = prompt_ordinal_range(prompt).unwrap_or((1, 3));
         historian_output(start, end, "autonomous summary")
     }
