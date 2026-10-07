@@ -1690,7 +1690,9 @@ function ConfigForm(props: {
                 const todowriteOverlay = () => Boolean(booleanSetting("todowrite.overlay"));
                 const setTodowrite = (patch: Record<string, unknown>) =>
                   handleFieldChange("todowrite", { ...todowrite(), ...patch });
-                const smartDrops = () => Boolean(booleanSetting("smart_drops"));
+                const [protectedToolsDraft, setProtectedToolsDraft] = createSignal<
+                  string | undefined
+                >();
                 const sqlite = () =>
                   (getNestedValue(formData(), "sqlite") as
                     | { cache_size_mb?: number; mmap_size_mb?: number }
@@ -1915,31 +1917,60 @@ function ConfigForm(props: {
                         </div>
                       </Show>
 
-                      {/* Smart drops */}
+                      {/* Automatic result protection */}
                       <div class="config-field" hidden={activeSection() !== "Context window"}>
                         <div class="config-field-header">
-                          <span class="config-field-label">Smart Drops</span>
-                          <HelpPopover topic="smart_drops" label="Smart Drops" />
-                          <span class="config-field-key">smart_drops</span>
+                          <span class="config-field-label">Protected Tools</span>
+                          <span class="config-field-key">protected_tools</span>
                         </div>
                         <span class="config-field-desc">
-                          Experimental: content-aware reclaim of provably-superseded tool output, on
-                          top of the existing auto-drop.
+                          Keep each tool's newest active results from automatic and queued drops.
+                          Counts merge over the defaults; 0 disables protection for a tool.
                         </span>
-                        <label class="toggle-switch">
-                          <input
-                            type="checkbox"
-                            checked={smartDrops()}
-                            onChange={(e) =>
-                              handleFieldChange("smart_drops", e.currentTarget.checked)
+                        <details class="config-help">
+                          <summary>Protection policy</summary>
+                          <p>
+                            Enter a JSON object mapping tool names to whole numbers ≥ 0. Names
+                            ignore case and leading mcp_. Protection applies even at 95% pressure,
+                            with no byte cap: large protected outputs can reach refusal sooner.
+                            Changes affect later cache-rebuilding passes. Queued drops wait for
+                            newer calls to displace the result; historian summaries and folds are
+                            unaffected.
+                          </p>
+                        </details>
+                        <textarea
+                          class="code-editor"
+                          rows={4}
+                          placeholder={'{ "todowrite": 1, "ctx_reduce": 3 }'}
+                          value={
+                            protectedToolsDraft() ??
+                            JSON.stringify(
+                              getNestedValue(formData(), "protected_tools") ?? {},
+                              null,
+                              2,
+                            )
+                          }
+                          onInput={(e) => {
+                            const text = e.currentTarget.value;
+                            setProtectedToolsDraft(text);
+                            try {
+                              const next = parseJsonc(text);
+                              if (
+                                next &&
+                                typeof next === "object" &&
+                                !Array.isArray(next) &&
+                                Object.values(next).every(
+                                  (n) => typeof n === "number" && Number.isInteger(n) && n >= 0,
+                                )
+                              ) {
+                                handleFieldChange("protected_tools", next);
+                                setProtectedToolsDraft(undefined);
+                              }
+                            } catch {
+                              /* Keep invalid drafts visible without saving them. */
                             }
-                          />
-                          <span class="toggle-slider" />
-                          <span class="toggle-label">
-                            {smartDrops() ? "Enabled" : "Disabled"}
-                            {inheritedDefault("smart_drops")}
-                          </span>
-                        </label>
+                          }}
+                        />
                       </div>
 
                       {/* System prompt injection */}

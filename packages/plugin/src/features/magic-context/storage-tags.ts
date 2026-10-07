@@ -3,7 +3,7 @@ import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
 import { tagOrderConstraintIndex } from "./migration-v95-perf-indexes";
-import { newestCtxReduceTagNumbers } from "./reclaim-protection";
+import { removePendingOp } from "./storage-ops";
 import type { TagEntry } from "./types";
 
 declare module "./types" {
@@ -357,7 +357,7 @@ const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedS
 
 /**
  * Return age-reclaim candidates with the same persisted token estimate used by reclaim hints.
- * The newest ctx_reduce exemplars are omitted before the watermark/value checks in the caller.
+ * Protection is applied by the caller using its shared per-selection snapshot.
  * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
  */
 export function getActiveToolTagsForAgeReclaim(
@@ -395,8 +395,7 @@ export function getActiveToolTagsForAgeReclaim(
                         : (outputTokens ?? 0) + (inputTokens ?? 0),
             };
         });
-    const protectedCtxReduceTags = newestCtxReduceTagNumbers(tags);
-    return tags.filter((tag) => !protectedCtxReduceTags.has(tag.tagNumber));
+    return tags;
 }
 
 /**
@@ -1847,9 +1846,10 @@ export function markTagsCompactedByMessageIds(
     db: Database,
     sessionId: string,
     messageIds: Iterable<string>,
+    eligibleTagNumbers?: ReadonlySet<number>,
 ): number {
     const ids = new Set(messageIds);
-    if (ids.size === 0) return 0;
+    if (ids.size === 0 || eligibleTagNumbers?.size === 0) return 0;
 
     // SQLite's default LIKE folds ASCII only, whereas String.toLowerCase also
     // folds Unicode. Wildcards in the source id were escaped by the old query.
@@ -1896,7 +1896,7 @@ export function markTagsCompactedByMessageIds(
         .prepare(`WITH ids AS MATERIALIZED (
             SELECT value AS source_id, lower(value) AS folded_id FROM json_each(?)
         )
-        SELECT id, message_id, tool_owner_message_id FROM tags INDEXED BY ${tagOrderConstraintIndex(db)}
+        SELECT id, tag_number, message_id, tool_owner_message_id FROM tags INDEXED BY ${tagOrderConstraintIndex(db)}
         WHERE session_id = ? AND status IN ('active', 'dropped') AND (
             message_id IN (SELECT source_id FROM ids)
             OR tool_owner_message_id IN (SELECT source_id FROM ids)
@@ -1914,10 +1914,15 @@ export function markTagsCompactedByMessageIds(
             nulPrefixes.size > 0 ? 1 : 0,
         ) as {
         id: number;
+        tag_number: number;
         message_id: string | null;
         tool_owner_message_id: string | null;
     }[];
-    const candidates = rows.filter((row) => matches(row.message_id, row.tool_owner_message_id));
+    const candidates = rows.filter(
+        (row) =>
+            (eligibleTagNumbers === undefined || eligibleTagNumbers.has(row.tag_number)) &&
+            matches(row.message_id, row.tool_owner_message_id),
+    );
     if (candidates.length === 0) return 0;
 
     // Recheck identity as well as status: another process can retarget or retire
@@ -1927,7 +1932,7 @@ export function markTagsCompactedByMessageIds(
          WHERE id = ? AND session_id = ?
             AND status IN ('active', 'dropped')
             AND message_id IS ? AND tool_owner_message_id IS ?
-          RETURNING id`,
+          RETURNING tag_number`,
     );
     let cursor = 0;
     let changed = 0;
@@ -1936,7 +1941,18 @@ export function markTagsCompactedByMessageIds(
         let processed = 0;
         do {
             const row = candidates[cursor++];
-            if (update.get(row.id, sessionId, row.message_id, row.tool_owner_message_id)) changed++;
+            const retired = update.get(
+                row.id,
+                sessionId,
+                row.message_id,
+                row.tool_owner_message_id,
+            ) as { tag_number: number } | null;
+            if (retired) {
+                // Retiring this source removes it from the request, so delete its queued
+                // operation in the same transaction instead of waiting for another drain.
+                removePendingOp(db, sessionId, retired.tag_number);
+                changed++;
+            }
             processed++;
         } while (cursor < candidates.length && processed < 128 && performance.now() - start < 8);
     });

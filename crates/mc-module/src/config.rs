@@ -139,6 +139,7 @@ pub struct McModuleConfig {
     /// filesystem path.
     pub prompt_surface_guidance_override: Option<String>,
     pub smart_drops: bool,
+    pub protected_tools: std::collections::BTreeMap<String, usize>,
     pub cache_ttl: String,
     /// Configured cache lifetimes (including an explicit `default`). Try the exact model key first;
     /// then try provider-qualified and bare model names, removing the final dash suffix and
@@ -195,6 +196,7 @@ impl Default for McModuleConfig {
             temporal_awareness: true,
             prompt_surface_guidance_override: None,
             smart_drops: false,
+            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             catalog: CatalogConfigInputs::default(),
@@ -755,8 +757,13 @@ fn merge_tiers_with_warnings(
             cfg.historian_context_limit_tokens = limit;
             cfg.historian_context_limit_known = true;
         }
-        if let Some(enabled) = user.pointer("/smart_drops").and_then(Value::as_bool) {
-            cfg.smart_drops = enabled;
+        if let Some(map) = user.pointer("/protected_tools").and_then(Value::as_object) {
+            for (name, count) in map {
+                if let Some(count) = count.as_u64().and_then(|count| usize::try_from(count).ok()) {
+                    cfg.protected_tools
+                        .insert(crate::selection::normalize_tool_name(name), count);
+                }
+            }
         }
         if let Some(enabled) = user
             .pointer("/dreamer/inject_docs")
@@ -807,8 +814,16 @@ fn merge_tiers_with_warnings(
         warn_ignored_project_key(project, "/memory/user_profile_budget_tokens", &mut warnings);
         warn_ignored_project_key(project, "/historian/context_limit_tokens", &mut warnings);
         warn_ignored_project_key(project, "/historian/runner", &mut warnings);
-        if let Some(enabled) = project.pointer("/smart_drops").and_then(Value::as_bool) {
-            cfg.smart_drops = enabled;
+        if let Some(map) = project
+            .pointer("/protected_tools")
+            .and_then(Value::as_object)
+        {
+            for (name, count) in map {
+                if let Some(count) = count.as_u64().and_then(|count| usize::try_from(count).ok()) {
+                    cfg.protected_tools
+                        .insert(crate::selection::normalize_tool_name(name), count);
+                }
+            }
         }
         if let Some(enabled) = project
             .pointer("/dreamer/inject_docs")
@@ -1761,6 +1776,31 @@ mod tests {
         let defaults = merge_tiers(None, None);
         assert!(defaults.inject_docs);
         assert!(defaults.temporal_awareness);
+    }
+
+    #[test]
+    fn protected_tools_merge_defaults_user_project_and_ignore_smart_drops() {
+        let config = merge_tiers(
+            Some(
+                &serde_json::json!({"protected_tools":{"MCP_CUSTOM":3,"todowrite":0},"smart_drops":false}),
+            ),
+            Some(
+                &serde_json::json!({"protected_tools":{"custom":2,"CTX_REDUCE":1},"smart_drops":"ignored"}),
+            ),
+        );
+        assert_eq!(
+            config.protected_tools,
+            [
+                ("custom".to_string(), 2),
+                ("ctx_reduce".to_string(), 1),
+                ("todowrite".to_string(), 0)
+            ]
+            .into()
+        );
+        assert_eq!(
+            merge_tiers(None, None).protected_tools,
+            crate::selection::default_protected_tools()
+        );
     }
 
     #[test]
