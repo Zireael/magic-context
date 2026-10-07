@@ -3,6 +3,14 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
         {
+            "path": "tests/checkout-claim.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Agent checkout claim: real OpenCode 1 and Pi hosts against a wire-level fake subc daemon playing ALF agent.for_host_session and engram claim.read refuse a held-elsewhere session before any Magic Context write or provider call, then serve it once the claim moves back; PID lsof proves throwaway-store containment. OpenCode 2 runs the same gate in its context hook (unit-tested against the same fake daemon); OMP shares Pi's plugin; Rust mode goes through the TypeScript plugin's pass",
+            "contract_refs": ["AGENT-CHECKOUT-CLAIM"],
+            "hosts": ["opencode", "pi"]
+        },
+        {
             "path": "tests/cache-ttl-live-config.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

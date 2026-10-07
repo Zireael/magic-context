@@ -128,6 +128,7 @@ import {
 	hasTrustedAbsoluteWall,
 	reloadWindowOverlay,
 } from "@magic-context/core/shared/window-geometry";
+import { gatePiEventsByCheckoutClaim } from "./checkout-claim-pi";
 import { handlePiCloneSessionStart } from "./clone-inheritance";
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
 import {
@@ -1291,10 +1292,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
  * runtime without requiring a process restart.
  */
 async function startPiMagicContextRuntime(
-	pi: ExtensionAPI,
+	hostPi: ExtensionAPI,
 	database: ContextDatabase,
 	dbPath: string,
 ): Promise<void> {
+	// One checkout-claim gate per runtime: Magic Context must not write for a
+	// session whose agent another machine holds. Session start and every context
+	// pass check it explicitly (session start tells the user, the context pass
+	// refuses the turn); every other event handler registered through `pi` below
+	// skips such a session. Verdicts are cached per session, so a pass pays for
+	// at most one check per cache period. The connection file is resolved per
+	// check, so the configured one applies once the config below has loaded.
+	let subcConnectionFile: string | undefined;
+	const checkoutClaim = createSubcCheckoutClaimGate(
+		"pi",
+		() => subcConnectionFile ?? getDefaultSubcConnectionFile(),
+	);
+	const pi = gatePiEventsByCheckoutClaim(hostPi, () => checkoutClaim);
 	const db = database;
 
 	// v22 deferred legacy-memory identity backfill. openDatabase() has already
@@ -1755,13 +1769,7 @@ async function startPiMagicContextRuntime(
 		},
 	);
 	projectDepsByDir.set(projectDir, bootProjectDeps);
-	// One gate per Pi process: refuses to write for a session whose agent another
-	// machine holds. Checked at session start and before every context pass
-	// (cached, so a pass pays for it at most once per cache period).
-	const checkoutClaim = createSubcCheckoutClaimGate(
-		"pi",
-		() => config.subc?.connection_file ?? getDefaultSubcConnectionFile(),
-	);
+	subcConnectionFile = config.subc?.connection_file;
 
 	function syncDreamerProjectRegistration(
 		current: ResolvedPiProjectDeps,

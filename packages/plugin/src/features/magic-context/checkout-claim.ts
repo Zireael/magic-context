@@ -502,3 +502,27 @@ export function createSubcCheckoutClaimGate(
         connector: subcCheckoutClaimConnector(connectionFile),
     });
 }
+
+/**
+ * The session an OpenCode 1 bus event belongs to, or undefined for events that
+ * name none. Session lifecycle events carry it as `info.id`; message events as
+ * `info.sessionID`; part events as `part.sessionID`; the rest as `sessionID`.
+ */
+export function openCodeEventSessionId(event: {
+    type?: unknown;
+    properties?: unknown;
+}): string | undefined {
+    const properties = isRecord(event.properties) ? event.properties : undefined;
+    if (!properties) return undefined;
+    const pick = (value: unknown) =>
+        typeof value === "string" && value.length > 0 ? value : undefined;
+    const info = isRecord(properties.info) ? properties.info : undefined;
+    const part = isRecord(properties.part) ? properties.part : undefined;
+    const isSessionEvent = typeof event.type === "string" && event.type.startsWith("session.");
+    return (
+        pick(properties.sessionID) ??
+        pick(info?.sessionID) ??
+        pick(part?.sessionID) ??
+        (isSessionEvent ? pick(info?.id) : undefined)
+    );
+}

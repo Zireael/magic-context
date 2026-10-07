@@ -10,6 +10,7 @@ import {
     type CheckoutClaimOutcome,
     CheckoutClaimRefusalError,
     isCheckoutClaimRefusalError,
+    openCodeEventSessionId,
     readCheckoutClaim,
     subcCheckoutClaimConnector,
 } from "./checkout-claim";
@@ -509,5 +510,41 @@ describe("subcCheckoutClaimConnector over the subc wire", () => {
             verdict: "admit_unchecked",
             reason: "not_configured",
         });
+    });
+});
+
+describe("openCodeEventSessionId", () => {
+    it("finds the session in each OpenCode 1 event shape", () => {
+        expect(
+            openCodeEventSessionId({
+                type: "session.created",
+                properties: { info: { id: "ses_a", parentID: "" } },
+            }),
+        ).toBe("ses_a");
+        expect(
+            openCodeEventSessionId({
+                type: "message.updated",
+                properties: { info: { id: "msg_1", sessionID: "ses_b" } },
+            }),
+        ).toBe("ses_b");
+        expect(
+            openCodeEventSessionId({
+                type: "message.part.updated",
+                properties: { part: { id: "prt_1", sessionID: "ses_c" } },
+            }),
+        ).toBe("ses_c");
+        expect(
+            openCodeEventSessionId({ type: "session.idle", properties: { sessionID: "ses_d" } }),
+        ).toBe("ses_d");
+        // A message's own id is not a session id.
+        expect(
+            openCodeEventSessionId({
+                type: "message.removed",
+                properties: { info: { id: "msg_2" } },
+            }),
+        ).toBeUndefined();
+        expect(
+            openCodeEventSessionId({ type: "server.connected", properties: {} }),
+        ).toBeUndefined();
     });
 });
