@@ -1160,22 +1160,28 @@ pub trait HistorianProducerDriver: Send {
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError>;
+    /// `variant` is the host-configured variant of `model` (for example an OpenCode
+    /// reasoning variant); a module runner sends it as `model.variant`.
+    #[allow(clippy::too_many_arguments)] // Each value is a distinct field of one send.
     async fn start_with_temperature(
         &mut self,
         session_id: &str,
         system: &str,
         prompt: &str,
         model: &str,
+        _variant: Option<&str>,
         _temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
         self.start(session_id, system, prompt, model).await
     }
+    #[allow(clippy::too_many_arguments)] // Each value is a distinct field of one send.
     async fn start_with_generation(
         &mut self,
         session_id: &str,
         system: &str,
         prompt: &str,
         model: &str,
+        _variant: Option<&str>,
         _max_output_tokens: u32,
         _temperature: f64,
     ) -> Result<RunHandle, HistorianProducerError> {
@@ -1240,6 +1246,7 @@ impl HistorianProducerDriver for HistorianProducer {
         system: &str,
         prompt: &str,
         model: &str,
+        variant: Option<&str>,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
         HistorianProducer::start_with_temperature(
@@ -1248,6 +1255,7 @@ impl HistorianProducerDriver for HistorianProducer {
             system,
             prompt,
             model,
+            variant,
             temperature,
         )
         .await
@@ -1259,6 +1267,7 @@ impl HistorianProducerDriver for HistorianProducer {
         system: &str,
         prompt: &str,
         model: &str,
+        variant: Option<&str>,
         max_output_tokens: u32,
         temperature: f64,
     ) -> Result<RunHandle, HistorianProducerError> {
@@ -1268,6 +1277,7 @@ impl HistorianProducerDriver for HistorianProducer {
             system,
             prompt,
             model,
+            variant,
             max_output_tokens,
             Some(temperature),
         )
@@ -1353,6 +1363,10 @@ pub struct HistorianFireRequest<'a> {
     /// Fallback windows must belong to their own model, never to the primary model.
     pub fallback_context_limits: std::collections::BTreeMap<String, usize>,
     pub model_limits: std::collections::BTreeMap<String, HistorianModelLimits>,
+    /// Host-configured variant per chain model (for example an OpenCode reasoning
+    /// variant), sent to the runner as `model.variant`. A model without an entry sends
+    /// no variant.
+    pub model_variants: std::collections::BTreeMap<String, String>,
     pub max_output_tokens: u32,
     pub from_ordinal: u64,
     pub to_ordinal: u64,
@@ -2111,6 +2125,7 @@ where
                 request.system.as_ref(),
                 &prompt,
                 model,
+                request.model_variants.get(model).map(String::as_str),
                 request.temperature,
             )
             .await
@@ -3311,6 +3326,7 @@ mod tests {
             history_budget_tokens: None,
             historian_model_chain: None,
             historian_model_limits: Default::default(),
+            historian_model_variants: Default::default(),
             historian_timeout_ms: None,
             historian_max_output_tokens: None,
             declared_trim: None,
@@ -3547,6 +3563,7 @@ mod tests {
         observed_systems: Vec<String>,
         observed_prompts: Vec<String>,
         observed_temperatures: Vec<Option<f64>>,
+        observed_variants: Vec<Option<String>>,
         await_run_ids: Vec<String>,
         observed_await_timeouts: Vec<Duration>,
         cancels: Vec<String>,
@@ -3606,9 +3623,11 @@ mod tests {
             system: &str,
             prompt: &str,
             model: &str,
+            variant: Option<&str>,
             temperature: Option<f64>,
         ) -> Result<RunHandle, HistorianProducerError> {
             self.observed_temperatures.push(temperature);
+            self.observed_variants.push(variant.map(str::to_string));
             self.start(session_id, system, prompt, model).await
         }
 
@@ -3733,6 +3752,7 @@ mod tests {
             producer_source_tokens: 1,
             historian_context_limit_tokens: Some(200_000),
             model_limits: Default::default(),
+            model_variants: Default::default(),
             fallback_context_limits: models
                 .iter()
                 .map(|model| (model.clone(), 200_000))

@@ -666,6 +666,8 @@ pub struct HistorianAssemblerConfig {
     pub project_slug: String,
     pub model_chain: Vec<String>,
     pub model_limits: std::collections::BTreeMap<String, crate::historian::HistorianModelLimits>,
+    /// Host-configured variant per chain model; see `HistorianFireRequest::model_variants`.
+    pub model_variants: std::collections::BTreeMap<String, String>,
     pub token_budget: usize,
     pub historian_context_limit_tokens: Option<usize>,
     pub max_output_tokens: u32,
@@ -723,6 +725,7 @@ pub struct AssembledHistorianFiring {
     pub prompt: String,
     pub model_chain: Vec<String>,
     pub model_limits: std::collections::BTreeMap<String, crate::historian::HistorianModelLimits>,
+    pub model_variants: std::collections::BTreeMap<String, String>,
     pub producer_source_tokens: usize,
     pub historian_context_limit_tokens: Option<usize>,
     pub max_output_tokens: u32,
@@ -778,6 +781,7 @@ impl AssembledHistorianFiring {
             historian_context_limit_tokens: self.historian_context_limit_tokens,
             fallback_context_limits: Default::default(),
             model_limits: self.model_limits.clone(),
+            model_variants: self.model_variants.clone(),
             max_output_tokens: self.max_output_tokens,
             from_ordinal: self.from_ordinal,
             to_ordinal: self.to_ordinal,
@@ -1326,6 +1330,7 @@ pub fn assemble_historian_firing(
     Ok(AssembleHistorianFiringOutcome::Fire(Box::new(
         AssembledHistorianFiring {
             model_limits: config.model_limits.clone(),
+            model_variants: config.model_variants.clone(),
             prompt,
             model_chain: config.model_chain,
             producer_source_tokens,
@@ -2360,6 +2365,7 @@ mod tests {
             HistorianAssemblerConfig {
                 expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "issue424-capacity".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -2630,6 +2636,7 @@ mod tests {
         let config = HistorianAssemblerConfig {
             expand_tools: BTreeMap::new(),
             model_limits: Default::default(),
+            model_variants: Default::default(),
             session_id: "noise".to_string(),
             project_path: "/proj".to_string(),
             project_slug: "proj".to_string(),
@@ -2771,6 +2778,7 @@ mod tests {
             HistorianAssemblerConfig {
                 expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "ses-below-budget".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -2830,6 +2838,7 @@ mod tests {
             HistorianAssemblerConfig {
                 expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "ses-fold-only".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -2914,6 +2923,7 @@ mod tests {
             HistorianAssemblerConfig {
                 expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "ses-sparse".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),

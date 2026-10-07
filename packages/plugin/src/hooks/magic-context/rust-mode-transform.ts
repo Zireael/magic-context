@@ -1421,6 +1421,28 @@ function resolvedHistorianModelChain(
     return [...new Set(models)];
 }
 
+/**
+ * The configured OpenCode variant (e.g. a reasoning effort such as `high`) of each
+ * historian chain model, keyed by the same model strings as the chain. When a module
+ * runner runs the historian, it sends this as the runner's `model.variant`. The chain
+ * keeps the first entry for a repeated model, so that entry's variant wins here too.
+ * A model whose entry configures no variant has no key and sends none.
+ */
+function resolvedHistorianModelVariants(
+    deps: Pick<TransformDeps, "historianModel" | "fallbackModels">,
+): Record<string, string> {
+    const variants: Record<string, string> = {};
+    const seen = new Set<string>();
+    for (const entry of [deps.historianModel, ...(deps.fallbackModels ?? [])]) {
+        const model = typeof entry === "string" ? entry : entry?.model;
+        if (typeof model !== "string" || model.length === 0 || seen.has(model)) continue;
+        seen.add(model);
+        const variant = typeof entry === "string" ? undefined : entry?.qualifier;
+        if (variant) variants[model] = variant;
+    }
+    return variants;
+}
+
 function resolvedHistorianModelLimits(
     chain: readonly string[],
 ): Record<string, { context?: number; input?: number; output?: number }> {
@@ -1628,6 +1650,7 @@ function buildTransformBody(args: {
         history_budget_tokens: args.passInputs.history_budget_tokens,
         historian_model_chain: args.passInputs.historian_model_chain,
         historian_model_limits: args.passInputs.historian_model_limits,
+        historian_model_variants: args.passInputs.historian_model_variants,
         historian_timeout_ms: args.passInputs.historian_timeout_ms,
         clear_reasoning_age: args.passInputs.clear_reasoning_age,
         caveman_enabled: args.passInputs.caveman_enabled === true,
@@ -3080,10 +3103,11 @@ export function createRustModeTransform(
             // the actual identity so the module can adopt only a system-only delta.
             const observedSystemHash = sessionMeta.systemPromptHash ?? "";
             const rustSystemHash = observedSystemHash;
-            const historianChain = resolvedHistorianModelChain({
+            const historianModels = {
                 historianModel: historianRun?.model ?? deps.historianModel,
                 fallbackModels: historianRun?.fallbackModels ?? deps.fallbackModels,
-            });
+            };
+            const historianChain = resolvedHistorianModelChain(historianModels);
             const passInputs: Record<string, unknown> = {
                 historian_model_limits: resolvedHistorianModelLimits(historianChain),
                 historian_max_output_tokens: historianRun
@@ -3100,6 +3124,7 @@ export function createRustModeTransform(
                 auto_search_min_prompt_chars: deps.autoSearch?.minPromptChars ?? 20,
                 history_budget_tokens: historyBudgetTokens,
                 historian_model_chain: historianChain,
+                historian_model_variants: resolvedHistorianModelVariants(historianModels),
                 historian_timeout_ms:
                     historianRun?.timeoutMs ??
                     deps.historianTimeoutMs ??
@@ -4879,6 +4904,7 @@ export const __rustModeTransformTest = {
     hardWallUsagePercentage,
     muralInputForWire,
     resolvedHistorianModelChain,
+    resolvedHistorianModelVariants,
     resolvedHistorianModelLimits,
     formatRustPassLog,
     formatRustInputCoverageLog,

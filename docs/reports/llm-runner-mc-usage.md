@@ -6,10 +6,10 @@ The route open (`historian_producer.rs:1002-1059`, `route_targets.rs:14-95`) sen
 
 | Item | MC | Where |
 |---|---|---|
-| `session.send` | Sends `prompt` (string), `model {provider, model}` split at the first `/` of `provider/model`, `tools: []`, `generation.max_output_tokens` (historian 32,000), optional `generation.temperature` (classify 0.1), `system` when non-empty | `historian_producer.rs:815-853` |
-| `model.variant` | Not sent. A runner session therefore can't choose a reasoning variant (a gap on MC's side) | `historian_producer.rs:821-838` |
+| `session.send` | Sends `prompt` (string), `model {provider, model, variant?}` split at the first `/` of `provider/model`, `tools: []`, `generation.max_output_tokens` (historian 32,000), optional `generation.temperature` (classify 0.1), `system` when non-empty | `historian_producer.rs:815-853` |
+| `model.variant` | Sent when the host configured a variant for the attempt's model (for example an OpenCode reasoning variant such as `high`), on every send; omitted, never sent empty, when none is configured. MC sends only queued sends (no `delivery`), which must name the variant because a queued send does not inherit the session's. The historian gets per-model variants from the transform's `historian_model_variants` map and the dreamer's classify task from `dreamer.run_task`'s `model_variants` map, both keyed by the chain's model strings, so each fallback attempt sends its own model's variant or none. The `model` object is serialized as `provider`, `model`, `variant`, and a test compares it byte for byte with Broca's `send_request.model_variant_queue.json` and `send_request.model_variant_steer.json` goldens, copied into `crates/mc-module/testdata/broca/` | `session_send_request`, `HistorianProducer::start_with_generation` |
 | `send_id` | Sends the attempt-owned producer session id. Stable across a transport resend/reconnect of that attempt; distinct for a new historian firing or dreamer attempt | `HistorianProducer::start_with_generation` |
-| `delivery`, `mark`, `plan`, `prompt_blocks` | Not sent | `historian_producer.rs:833-853` |
+| `delivery`, `mark`, `plan`, `prompt_blocks` | Not sent; every send is a queued send | `historian_producer.rs:833-853` |
 | Other send fields (`tool_choice`, `stop_when`, `budget`, `cache`, `keep_warm`, `on_restart`, `conversation_key`, `work_class`, `context_limit`, `service_tier`, `context_management`, `auth`, `one_shot`, `append_episode`) | Not sent | `historian_producer.rs:833-853` |
 | `session.send` reply | Decodes `run_id` (active) or `state: "pending"` plus `submission_id` (queued, then retracts). Does not recognise `paused` as a send outcome | `historian_producer.rs:855-869, 1263-1297` |
 | `session.subscribe` | Sends `from: "start"`; decodes control units (`type`/`kind`, `run_id`, `reason`/`detail`, `error`, `finish_reason`), assistant text and usage (`input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_write_tokens`) | `historian_producer.rs:966-978, 1091-1186, 1339-1391` |
@@ -25,7 +25,7 @@ The route open (`historian_producer.rs:1002-1059`, `route_targets.rs:14-95`) sen
 
 Answers to the diff's closing questions, from MC's side:
 1. MC uses `run.status`, `run.cancel` and `session.retract`, but not `session.warm`.
-2. MC sends `model.provider` and `model.model`, not `variant`.
+2. MC sends `model.provider` and `model.model`, plus `model.variant` when the host configured one for that model.
 3. MC now sends `send_id` from its attempt-owned producer session identity, so lost-reply resends can deduplicate without reusing an id for a new attempt.
 4. MC never sends `mark`.
 5. MC doesn't handle `paused` as a send outcome; a paused run during streaming counts as a failure.

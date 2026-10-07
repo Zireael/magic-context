@@ -38,6 +38,77 @@ struct GenerationRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
 }
+
+/// The `model` object of a `session.send`. Broca decodes it as `{provider, model,
+/// variant?}` and freezes the variant (for example a reasoning effort such as `high`)
+/// on the run. A typed struct rather than a `json!` object keeps the field order
+/// `provider`, `model`, `variant` on the wire, byte-identical to Broca's own send
+/// goldens. `variant` is omitted, never sent empty, when the attempt names none.
+#[derive(Serialize)]
+struct SendModel<'a> {
+    provider: &'a str,
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variant: Option<&'a str>,
+}
+
+/// `session.send` params, in Broca's golden field order (`prompt`, `send_id`, `model`)
+/// followed by the fields only this client adds. Magic Context never sends `delivery`,
+/// so every send is Broca's default queued delivery, which must name its variant
+/// explicitly: a queued send does not inherit one from the session.
+#[derive(Serialize)]
+struct SendParams<'a> {
+    prompt: &'a str,
+    send_id: &'a str,
+    model: SendModel<'a>,
+    tools: &'a [Value],
+    generation: GenerationRequest,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    system: &'a str,
+}
+
+#[derive(Serialize)]
+struct SendRequest<'a> {
+    method: &'static str,
+    params: SendParams<'a>,
+}
+
+/// Build one `session.send` request. `model` is the canonical `provider/model` string,
+/// split at the FIRST slash so multi-slash model names keep their remainder intact.
+fn session_send_request<'a>(
+    send_id: &'a str,
+    system: &'a str,
+    prompt: &'a str,
+    model: &'a str,
+    variant: Option<&'a str>,
+    max_output_tokens: u32,
+    temperature: Option<f64>,
+) -> Result<SendRequest<'a>, HistorianProducerError> {
+    let (provider, model_name) = model.split_once('/').ok_or_else(|| {
+        HistorianProducerError::Subc(ProducerErrorBody::untagged(
+            "invalid_model",
+            format!("model '{model}' is not in canonical provider/model form"),
+        ))
+    })?;
+    Ok(SendRequest {
+        method: "session.send",
+        params: SendParams {
+            prompt,
+            send_id,
+            model: SendModel {
+                provider,
+                model: model_name,
+                variant: variant.filter(|variant| !variant.is_empty()),
+            },
+            tools: &[],
+            generation: GenerationRequest {
+                max_output_tokens,
+                temperature,
+            },
+            system,
+        },
+    })
+}
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for a summarization run to finish. A historian pass legitimately
@@ -802,6 +873,7 @@ impl HistorianProducer {
             system,
             prompt,
             model,
+            None,
             HISTORIAN_MAX_OUTPUT_TOKENS,
             None,
         )
@@ -814,6 +886,7 @@ impl HistorianProducer {
         system: &str,
         prompt: &str,
         model: &str,
+        variant: Option<&str>,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
         self.start_with_generation(
@@ -821,18 +894,23 @@ impl HistorianProducer {
             system,
             prompt,
             model,
+            variant,
             HISTORIAN_MAX_OUTPUT_TOKENS,
             temperature,
         )
         .await
     }
 
+    /// `variant` is the host-configured model variant for this attempt's model (for
+    /// example an OpenCode reasoning variant). It rides `model.variant`; `None` omits it.
+    #[allow(clippy::too_many_arguments)] // Each value is a distinct field of one send.
     pub async fn start_with_generation(
         &mut self,
         session_id: &str,
         system: &str,
         prompt: &str,
         model: &str,
+        variant: Option<&str>,
         max_output_tokens: u32,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
@@ -848,43 +926,24 @@ impl HistorianProducer {
         // the wire's empty-as-absent rule, so we omit the field entirely.
         //
         // The params shape mirrors llm-runner's SendParams (llmr-module-serve wire.rs):
-        // `model` is a nested {provider, model} object, split from our canonical
-        // "provider/model" string at the FIRST slash so multi-slash model names keep
-        // their remainder intact. The server decodes strictly enough that a flat model
-        // string fails the whole send with invalid_params, which a live rig drive
-        // surfaced as firings dying before any producer run existed.
-        let (provider, model_name) = model.split_once('/').ok_or_else(|| {
-            HistorianProducerError::Subc(ProducerErrorBody::untagged(
-                "invalid_model",
-                format!("model '{model}' is not in canonical provider/model form"),
-            ))
-        })?;
-        let mut params = serde_json::Map::new();
+        // `model` is a nested {provider, model, variant?} object. The server decodes
+        // strictly enough that a flat model string fails the whole send with
+        // invalid_params, which a live rig drive surfaced as firings dying before any
+        // producer run existed.
+        //
         // Each historian firing (including model fallbacks) and dreamer attempt owns
-        // a distinct session id. Use that durable attempt identity, not a connection
-        // nonce or frame correlation id: resending after a lost reply must deduplicate,
-        // while a new attempt after a classified failure must start a new run.
-        params.insert("send_id".into(), json!(session_id));
-        params.insert("prompt".into(), json!(prompt));
-        params.insert(
-            "model".into(),
-            json!({ "provider": provider, "model": model_name }),
-        );
-        params.insert("tools".into(), json!([]));
-        params.insert(
-            "generation".into(),
-            json!(GenerationRequest {
-                max_output_tokens,
-                temperature,
-            }),
-        );
-        if !system.is_empty() {
-            params.insert("system".into(), json!(system));
-        }
-        let body = json!({
-            "method": "session.send",
-            "params": params
-        });
+        // a distinct session id. Use that durable attempt identity as `send_id`, not a
+        // connection nonce or frame correlation id: resending after a lost reply must
+        // deduplicate, while a new attempt after a classified failure must start a new run.
+        let body = session_send_request(
+            session_id,
+            system,
+            prompt,
+            model,
+            variant,
+            max_output_tokens,
+            temperature,
+        )?;
         let response = self.unary_json(route, body).await?;
         match send_outcome(&response) {
             SendOutcome::Active(run_id) => Ok(RunHandle { run_id }),
@@ -1098,7 +1157,7 @@ impl HistorianProducer {
     async fn unary_json(
         &mut self,
         route: OpenedRoute,
-        body: Value,
+        body: impl Serialize + Send,
     ) -> Result<Value, HistorianProducerError> {
         let corr = self.send_request(route, body).await?;
         let frame = self
@@ -1115,7 +1174,7 @@ impl HistorianProducer {
     async fn send_request(
         &mut self,
         route: OpenedRoute,
-        body: Value,
+        body: impl Serialize + Send,
     ) -> Result<u64, HistorianProducerError> {
         let corr = self.next_corr();
         let bytes = serde_json::to_vec(&body)?;
@@ -2462,6 +2521,7 @@ mod tests {
                     "role guidance",
                     "prompt",
                     "prov/model-a",
+                    None,
                     Some(temperature),
                 )
                 .await
@@ -2475,6 +2535,105 @@ mod tests {
                 json!(temperature)
             );
         }
+    }
+
+    /// Broca's own `session.send` goldens, vendored byte-for-byte; see
+    /// `testdata/broca/README.md` for their source path and Broca commit.
+    const BROCA_SEND_MODEL_VARIANT_QUEUE: &str =
+        include_str!("../testdata/broca/send_request.model_variant_queue.json");
+    const BROCA_SEND_MODEL_VARIANT_STEER: &str =
+        include_str!("../testdata/broca/send_request.model_variant_steer.json");
+
+    fn golden_send_params(variant: Option<&str>) -> String {
+        let request = session_send_request(
+            "s-1",
+            "",
+            "continue",
+            "openai/gpt-6.1-sol",
+            variant,
+            HISTORIAN_MAX_OUTPUT_TOKENS,
+            None,
+        )
+        .unwrap();
+        assert_eq!(request.method, "session.send");
+        serde_json::to_string(&request.params).unwrap()
+    }
+
+    /// The send params this client serializes start with exactly Broca's queued-send
+    /// golden (`prompt`, `send_id`, `model` with its variant), byte for byte. Only the
+    /// fields Broca's golden leaves out (`tools`, `generation`) follow it.
+    #[test]
+    fn session_send_with_variant_matches_broca_queue_golden_bytes() {
+        let golden_body = BROCA_SEND_MODEL_VARIANT_QUEUE
+            .strip_suffix('}')
+            .expect("golden is one JSON object");
+        assert_eq!(
+            golden_send_params(Some("high")),
+            format!(
+                "{golden_body},\"tools\":[],\"generation\":{{\"max_output_tokens\":{HISTORIAN_MAX_OUTPUT_TOKENS}}}}}"
+            )
+        );
+    }
+
+    /// Broca's steer golden carries the same `model` object plus `delivery: "steer"`.
+    /// This client never sends `delivery` (every send is a queued send, which must name
+    /// its variant), so the steer golden pins only that the model object is shared.
+    #[test]
+    fn broca_steer_golden_shares_the_queue_golden_model_object() {
+        let steer_body = BROCA_SEND_MODEL_VARIANT_STEER
+            .strip_suffix(r#","delivery":"steer"}"#)
+            .expect("steer golden ends with its delivery field");
+        let queue_body = BROCA_SEND_MODEL_VARIANT_QUEUE
+            .strip_suffix('}')
+            .expect("golden is one JSON object");
+        assert_eq!(steer_body, queue_body);
+        assert!(
+            golden_send_params(Some("high")).starts_with(steer_body),
+            "the steer golden's model object must match this client's bytes too"
+        );
+    }
+
+    #[test]
+    fn session_send_without_variant_omits_the_field() {
+        let params = golden_send_params(None);
+        assert!(
+            params.contains(r#","model":{"provider":"openai","model":"gpt-6.1-sol"},"#),
+            "{params}"
+        );
+        assert!(!params.contains("variant"), "{params}");
+        // An empty configured variant is absent, never sent as "".
+        assert_eq!(golden_send_params(Some("")), params);
+    }
+
+    #[tokio::test]
+    async fn start_with_generation_sends_the_variant_on_the_wire() {
+        let server = fake_server(json!({"state":"active","run_id":"run-v"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client
+            .start_with_generation(
+                "mc-dreamer:classify:v",
+                "role",
+                "prompt",
+                "openai/gpt-6.1-sol",
+                Some("high"),
+                4_000,
+                Some(0.1),
+            )
+            .await
+            .unwrap();
+        client.close().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.sends[0]["model"],
+            json!({ "provider": "openai", "model": "gpt-6.1-sol", "variant": "high" })
+        );
+        assert_eq!(log.sends[0]["send_id"], json!("mc-dreamer:classify:v"));
+        assert_eq!(
+            log.sends[0]["generation"]["max_output_tokens"],
+            json!(4_000)
+        );
+        assert_eq!(log.sends[0]["system"], json!("role"));
     }
 
     #[tokio::test]

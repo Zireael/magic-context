@@ -6718,6 +6718,7 @@ impl McHandler {
                 project_slug: project_slug.clone(),
                 model_chain: model_chain.to_vec(),
                 model_limits: parsed.historian_model_limits.clone(),
+                model_variants: parsed.historian_model_variants.clone(),
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 historian_context_limit_tokens: cfg
                     .historian_context_limit_known
@@ -6957,6 +6958,7 @@ impl McHandler {
                 project_slug: project_slug.clone(),
                 model_chain,
                 model_limits: parsed.historian_model_limits.clone(),
+                model_variants: parsed.historian_model_variants.clone(),
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 historian_context_limit_tokens: cfg
                     .historian_context_limit_known
@@ -12064,6 +12066,32 @@ impl McHandler {
                 message: "dreamer.run_task requires the host-resolved model_chain".to_string(),
             };
         };
+        // Optional `model_variants` maps a chain model to its host-configured variant
+        // (for example an OpenCode reasoning variant), sent to the runner as
+        // `model.variant`. Older hosts omit it and their sends keep naming no variant.
+        let model_variants: BTreeMap<String, String> = match request.get("model_variants") {
+            None | Some(Value::Null) => BTreeMap::new(),
+            Some(Value::Object(entries)) => {
+                let mut variants = BTreeMap::new();
+                for (model, variant) in entries {
+                    let Some(variant) = variant.as_str() else {
+                        return invalid_params_error(
+                            "dreamer.run_task model_variants values must be strings",
+                        );
+                    };
+                    if variant.trim().is_empty() || variant.len() > 256 {
+                        return invalid_params_error(
+                            "dreamer.run_task model_variants values must be 1-256 bytes",
+                        );
+                    }
+                    variants.insert(model.clone(), variant.to_string());
+                }
+                variants
+            }
+            Some(_) => {
+                return invalid_params_error("dreamer.run_task model_variants must be an object");
+            }
+        };
         let classify_system_prompt = historian_prompt::with_content_language_directive(
             CLASSIFY_SYSTEM_PROMPT,
             binding.config.language.as_deref(),
@@ -12181,6 +12209,7 @@ impl McHandler {
                     classify_system_prompt.as_ref(),
                     prompt_body,
                     model,
+                    model_variants.get(model).map(String::as_str),
                     CLASSIFY_MAX_OUTPUT_TOKENS,
                     CLASSIFY_TEMPERATURE,
                 )
@@ -21324,6 +21353,8 @@ mod tests {
         prompts: Mutex<Vec<String>>,
         systems: Mutex<Vec<String>>,
         models: Mutex<Vec<String>>,
+        /// The `model.variant` each variant-carrying start named, in attempt order.
+        variants: Mutex<Vec<Option<String>>>,
         /// The provider session each start ran under, in attempt order.
         sessions: Mutex<Vec<String>>,
         on_await_output: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -21364,6 +21395,41 @@ mod tests {
         async fn bind_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
             self.state.binds.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn start_with_temperature(
+            &mut self,
+            session_id: &str,
+            system: &str,
+            prompt: &str,
+            model: &str,
+            variant: Option<&str>,
+            _temperature: Option<f64>,
+        ) -> Result<RunHandle, HistorianProducerError> {
+            self.state
+                .variants
+                .lock()
+                .expect("variants mutex")
+                .push(variant.map(str::to_string));
+            self.start(session_id, system, prompt, model).await
+        }
+
+        async fn start_with_generation(
+            &mut self,
+            session_id: &str,
+            system: &str,
+            prompt: &str,
+            model: &str,
+            variant: Option<&str>,
+            _max_output_tokens: u32,
+            _temperature: f64,
+        ) -> Result<RunHandle, HistorianProducerError> {
+            self.state
+                .variants
+                .lock()
+                .expect("variants mutex")
+                .push(variant.map(str::to_string));
+            self.start(session_id, system, prompt, model).await
         }
 
         async fn start(
@@ -31858,6 +31924,94 @@ mod tests {
                 .contains("Write human-readable prose you author in: Turkish (Türkçe).")));
     }
 
+    /// Each classify attempt sends its own model's host-configured variant, and an
+    /// attempt whose model has no entry sends none: a fallback must not inherit the
+    /// primary's reasoning variant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_sends_each_attempt_its_own_model_variant() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .expect("await results mutex")
+            .extend([
+                Ok(ProducerOutput {
+                    text: "no manifest".to_string(),
+                    length_capped: false,
+                    usage: None,
+                }),
+                Ok(ProducerOutput {
+                    text: "<classify></classify>".to_string(),
+                    length_capped: false,
+                    usage: None,
+                }),
+            ]);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_root, "ses"));
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": "variant-command",
+                    "model_chain": ["test/primary", "test/fallback"],
+                    "model_variants": { "test/primary": "high" },
+                    "payload": { "prompt_body": "classify", "items": [] },
+                }),
+            )
+            .await;
+        assert!(
+            matches!(outcome, HandlerOutcome::Response(_)),
+            "dreamer run failed: {outcome:?}"
+        );
+        assert_eq!(
+            producer.models.lock().expect("models mutex").as_slice(),
+            ["test/primary", "test/fallback"]
+        );
+        assert_eq!(
+            producer.variants.lock().expect("variants mutex").as_slice(),
+            [Some("high".to_string()), None]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_rejects_a_non_string_model_variant() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_root, "ses"));
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": "bad-variant-command",
+                    "model_chain": ["test/primary"],
+                    "model_variants": { "test/primary": 3 },
+                    "payload": { "prompt_body": "classify", "items": [] },
+                }),
+            )
+            .await;
+        match outcome {
+            HandlerOutcome::Error { message, .. } => assert!(
+                message.contains("model_variants values must be strings"),
+                "{message}"
+            ),
+            other => panic!("expected invalid params, got {other:?}"),
+        }
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+    }
+
     /// The classify response carries the runner's token spend so the host can record it
     /// on the invocation row, and omits the field when the runner reported none.
     #[tokio::test(flavor = "current_thread")]
@@ -37819,6 +37973,36 @@ mod tests {
             producer.models.lock().expect("models mutex").as_slice(),
             ["anthropic/profile-historian"],
             "the Broca dispatch must use the host's profile-resolved primary"
+        );
+    }
+
+    /// The transform's per-model variant map reaches the historian's Broca send for the
+    /// model that actually runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn transform_historian_model_variant_reaches_the_broca_send() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let mut transform = request(big_messages());
+        transform["serializer_profile"] = json!("opencode-aisdk");
+        transform["historian_model_chain"] =
+            json!(["openai/profile-historian", "anthropic/profile-fallback"]);
+        transform["historian_model_variants"] = json!({
+            "openai/profile-historian": "high",
+            "anthropic/profile-fallback": "low",
+        });
+
+        let response = call_transform_request(&handler, transform).await;
+        assert_eq!(response["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+        assert_eq!(
+            producer.models.lock().expect("models mutex").as_slice(),
+            ["openai/profile-historian"]
+        );
+        assert_eq!(
+            producer.variants.lock().expect("variants mutex").as_slice(),
+            [Some("high".to_string())]
         );
     }
 

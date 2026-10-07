@@ -890,6 +890,12 @@ pub struct TransformRequest {
     #[serde(default)]
     pub historian_model_limits:
         std::collections::BTreeMap<String, crate::historian::HistorianModelLimits>,
+    /// Host-configured variant per `historian_model_chain` model (for example an
+    /// OpenCode reasoning variant such as `high`). A module runner sends it as the
+    /// `session.send` `model.variant`; a model without an entry sends none. Absent on
+    /// older hosts, which therefore keep sending no variant.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub historian_model_variants: std::collections::BTreeMap<String, String>,
     /// Host-resolved per-attempt historian deadline; absent on older adapters.
     #[serde(default)]
     pub historian_timeout_ms: Option<u64>,
@@ -1115,6 +1121,8 @@ struct TransformRequestWire {
     historian_model_limits:
         std::collections::BTreeMap<String, crate::historian::HistorianModelLimits>,
     #[serde(default)]
+    historian_model_variants: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
     historian_timeout_ms: Option<u64>,
     #[serde(default)]
     historian_max_output_tokens: Option<u32>,
@@ -1212,6 +1220,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             history_budget_tokens: wire.history_budget_tokens,
             historian_model_chain: wire.historian_model_chain,
             historian_model_limits: wire.historian_model_limits,
+            historian_model_variants: wire.historian_model_variants,
             historian_timeout_ms: wire.historian_timeout_ms,
             historian_max_output_tokens: wire.historian_max_output_tokens,
             declared_trim: wire.declared_trim,
@@ -18538,6 +18547,7 @@ pub(crate) mod tests {
             history_budget_tokens: None,
             historian_model_chain: None,
             historian_model_limits: Default::default(),
+            historian_model_variants: Default::default(),
             historian_max_output_tokens: None,
             historian_timeout_ms: None,
             declared_trim: None,

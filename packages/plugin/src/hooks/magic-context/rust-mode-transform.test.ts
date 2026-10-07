@@ -9319,6 +9319,42 @@ it("copies the profile-resolved historian chain onto the authority wire", () => 
     expect(limits["openai/profile-fallback"]).toBeDefined();
 });
 
+it("copies each historian chain model's configured variant onto the authority wire", () => {
+    const models = {
+        historianModel: { model: "anthropic/profile-historian", qualifier: "high" },
+        fallbackModels: [
+            { model: "openai/profile-fallback", qualifier: "low" },
+            "google/plain-fallback",
+            // A repeated model keeps the first entry's slot, so its variant stays `high`.
+            { model: "anthropic/profile-historian", qualifier: "max" },
+        ],
+    };
+    const variants = __rustModeTransformTest.resolvedHistorianModelVariants(models);
+    const body = __rustModeTransformTest.buildTransformBody({
+        sessionId: "profile-variant-wire",
+        input: [],
+        nativeMessages: [],
+        passInputs: {
+            historian_model_chain: __rustModeTransformTest.resolvedHistorianModelChain(models),
+            historian_model_variants: variants,
+        },
+        usage: {},
+        modelKey: null,
+        providerId: null,
+    });
+
+    expect(body.historian_model_variants).toEqual({
+        "anthropic/profile-historian": "high",
+        "openai/profile-fallback": "low",
+    });
+    expect(
+        __rustModeTransformTest.resolvedHistorianModelVariants({
+            historianModel: "anthropic/plain",
+            fallbackModels: [],
+        }),
+    ).toEqual({});
+});
+
 it("copies caveman settings onto the authority wire", () => {
     const body = __rustModeTransformTest.buildTransformBody({
         sessionId: "caveman-wire",
