@@ -85,9 +85,9 @@
         },
         {
             "path": "tests/system-prompt-change-order.test.ts",
-            "tier": "both-modes",
-            "invocation": { "ts": true, "rust": true },
-            "rationale": "OpenCode 1 runs messages.transform before system.transform; an AGENTS.md edit and a configured instruction-file edit with a queued drop must each rewrite the provider prefix once, on the request that first carries the new system text, not again on the next request. Runs only when the opencode executable on PATH matches a pinned npm opencode-darwin-arm64 1.18.30/1.18.35 executable hash; skips with a message otherwise",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "Opt-in real-host hook-order probe: run directly with bun test tests/system-prompt-change-order.test.ts (also with MC_E2E_MODE=rust) and a pinned npm opencode-darwin-arm64 1.18.30/1.18.35 executable first on PATH. An AGENTS.md edit and a configured instruction-file edit with a queued drop must each rewrite the provider prefix once, not again on the next request. Only these executable hashes have been validated as messages-first; Linux CI installs OpenCode 1.18.32, which is not a validated reference host, so selecting this probe there yields zero passing tests. Keep the hash guard and byte assertions intact until a Linux reference host is validated",
             "contract_refs": ["S2-MIGRATION"],
             "hosts": ["opencode"]
         },

@@ -32,12 +32,12 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(62);
-        expect(rust).toHaveLength(58);
+        expect(ts).toHaveLength(61);
+        expect(rust).toHaveLength(57);
         expect(rust).toContain("tests/idle-ttl-restart.test.ts");
         expect(rust).toContain("tests/subagent-behavior.test.ts");
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(3);
-        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(43);
+        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(42);
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(28);
         expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(36);
         // These OpenCode 2 files are ts-only with hosts ["opencode2"], so only the
@@ -137,6 +137,7 @@ describe("mode manifest validator", () => {
             "tests/rust-classify-host-runner.test.ts",
             "tests/rust-full-sync-frame-cap.test.ts",
             "tests/rust-plugin-stage-cache.test.ts",
+            "tests/system-prompt-change-order.test.ts",
             "tests/window-overlay-reload.test.ts",
         ]);
         expect(new Set([...ts, ...rust]).size).toBe(validation.files.length - excluded.length);

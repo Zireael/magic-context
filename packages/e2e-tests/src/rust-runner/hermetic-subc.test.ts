@@ -1,10 +1,11 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { __hermeticSubcTest } from "./hermetic-subc";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 
 describe("hermetic Rust process isolation", () => {
     it("uses an e2e-owned Cargo target directory", () => {
@@ -26,7 +27,7 @@ describe("hermetic Rust process isolation", () => {
     it("stages a runnable test binary under a ckdev process name", () => {
         const scratchParent = join(tmpdir(), "magic-context", "e2e-binary-stage-test");
         mkdirSync(scratchParent, { recursive: true });
-        const scratch = mkdtempSync(join(scratchParent, "run-"));
+        const scratch = createTestTempDirFromPath(join(scratchParent, "run-"));
         try {
             const source = join(scratch, "ck-mc");
             writeFileSync(source, "test executable");
