@@ -38,6 +38,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { clearSession } from "../../features/magic-context/storage-meta-session";
 import type { Tagger } from "../../features/magic-context/tagger";
+import { deleteTemporalDecision } from "../../features/magic-context/temporal-decisions";
 import {
     clearTransformDecisionSession,
     scheduleOpenCodeTransformDecisionWrite,
@@ -51,6 +52,10 @@ import {
     refreshModelLimitsFromApi,
 } from "../../shared/models-dev-cache";
 import { recordPromptSessionError } from "../../shared/prompt-async-transport";
+import {
+    isSuccessfulProviderCompletion,
+    providerResponseFailed,
+} from "../../shared/provider-response-completion";
 import { hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { removeCompactionMarkerForSession } from "./compaction-marker-manager";
@@ -69,6 +74,7 @@ import {
     resolveModelKey,
     resolveSessionId,
 } from "./event-resolvers";
+import { lkgProviderInputTotal, noteLkgProviderResponse } from "./lkg-measured-request";
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
 import { readRawSessionMessages } from "./read-session-chunk";
@@ -121,8 +127,10 @@ export interface EventHandlerDeps {
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
         cache_ttl: CacheTtlConfig;
+        cacheTtlConfigured?: boolean;
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
     };
+    sampleCacheTtlConfig?: () => { cache_ttl: CacheTtlConfig; cacheTtlConfigured?: boolean };
     tagger: Tagger;
     // openDatabase() returns Database | null, but the hook only constructs these
     // deps after it has already null-checked and disabled MC on storage failure,
@@ -202,6 +210,7 @@ function cleanupRemovedMessageState(
     return deps.db
         .transaction(() => {
             const removedTagNumbers = deleteTagsByMessageId(deps.db, sessionId, messageId);
+            deleteTemporalDecision(deps.db, sessionId, messageId);
             sessionLog(
                 sessionId,
                 `event message.removed: deleted ${removedTagNumbers.length} tag(s) for message ${messageId}`,
@@ -323,13 +332,15 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     );
                 }
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
+                const ttlConfig = deps.sampleCacheTtlConfig?.() ?? deps.config;
                 updateSessionMeta(deps.db, info.id, {
                     isSubagent: info.parentID.length > 0,
                     cacheTtl: resolveSessionCacheTtl(
                         deps.db,
                         info.id,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value,
                 });
             } catch (error) {
@@ -520,6 +531,19 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
+            noteLkgProviderResponse({
+                sessionId: info.sessionID,
+                responseId: info.messageID,
+                modelKey:
+                    info.providerID && info.modelID
+                        ? `${info.providerID}/${info.modelID}`
+                        : undefined,
+                inputTokens: lkgProviderInputTotal(info.tokens),
+                completedAt: info.completedAt,
+                finish: info.finish,
+                error: info.error,
+            });
+
             // Invalidate this message's cached token contribution. The message
             // content is finalized at this event — if a prior transform pass
             // happened to cache partial/streaming content (or the message is
@@ -689,10 +713,22 @@ export function createEventHandler(deps: EventHandlerDeps) {
             const hasUsageTokens = usageTokens.some(
                 (value) => typeof value === "number" && value > 0,
             );
-            const terminalAssistantUpdate =
-                info.messageID !== undefined &&
-                hasUsageTokens &&
-                (typeof info.finish === "string" || typeof info.completedAt === "number");
+            const successfulCompletion = isSuccessfulProviderCompletion({
+                completedAt: info.completedAt,
+                finish: info.finish,
+                error: info.error,
+            });
+            const responseFailed = providerResponseFailed({
+                finish: info.finish,
+                error: info.error,
+            });
+            const responseTime =
+                typeof info.completedAt === "number" &&
+                Number.isFinite(info.completedAt) &&
+                info.completedAt > 0
+                    ? info.completedAt
+                    : now;
+            const terminalAssistantUpdate = info.messageID !== undefined && successfulCompletion;
             if (terminalAssistantUpdate && info.messageID) {
                 scheduleOpenCodeTransformDecisionWrite({
                     db: deps.db,
@@ -711,6 +747,22 @@ export function createEventHandler(deps: EventHandlerDeps) {
             );
 
             const hasKnownUsage = hasUsageTokens || deps.contextUsageMap.has(info.sessionID);
+            // Completion and pressure are independent. Some providers omit usage
+            // entirely; their successful replies still refresh the idle clock.
+            // A shell, error or abort cannot spend an expiry, even with time.completed.
+            if (successfulCompletion && !hasUsageTokens) {
+                try {
+                    const meta = getOrCreateSessionMeta(deps.db, info.sessionID);
+                    const completedAt = responseTime;
+                    if (completedAt > meta.lastResponseTime) {
+                        updateSessionMeta(deps.db, info.sessionID, {
+                            lastResponseTime: completedAt,
+                        });
+                    }
+                } catch (error) {
+                    sessionLog(info.sessionID, "event completion clock persistence failed:", error);
+                }
+            }
             if (!hasKnownUsage) {
                 sessionLog(
                     info.sessionID,
@@ -724,31 +776,34 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 const updates: Partial<SessionMeta> = {};
                 // last_response_time is the idle clock for the provider cache:
                 // the scheduler's TTL execute and the ttl_idle HARD fold both
-                // measure from it. Only a request the provider served refreshes
-                // that cache, and only such a request reports tokens. OpenCode
+                // measure from it. Usage proves the provider served a request;
+                // successful completion above also proves it when usage is absent. OpenCode
                 // creates the assistant message for a new request with zero
                 // tokens before it runs that request's transform, and a request
                 // the provider refuses (a spent quota) ends with zero tokens.
                 // Stamping on those made the first pass after a long idle look
                 // like it followed a fresh response, so it deferred and queued
                 // drops never applied.
-                if (hasUsageTokens) {
-                    updates.lastResponseTime = now;
+                if (hasUsageTokens && !responseFailed) {
+                    updates.lastResponseTime = responseTime;
                 }
 
-                if (typeof deps.config.cache_ttl === "string") {
+                const ttlConfig = deps.sampleCacheTtlConfig?.() ?? deps.config;
+                if (typeof ttlConfig.cache_ttl === "string") {
                     updates.cacheTtl = resolveSessionCacheTtl(
                         deps.db,
                         info.sessionID,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value;
                 } else if (modelKey) {
                     updates.cacheTtl = resolveSessionCacheTtl(
                         deps.db,
                         info.sessionID,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value;
                 }
 
@@ -816,6 +871,14 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     }
 
                     const sessionMeta = getOrCreateSessionMeta(deps.db, info.sessionID);
+                    // A delayed usage update may follow a newer usage-less reply.
+                    // It must not move the independently tracked response clock back.
+                    if (!responseFailed) {
+                        updates.lastResponseTime = Math.max(
+                            sessionMeta.lastResponseTime,
+                            responseTime,
+                        );
+                    }
                     // A proven floor belongs to the model whose accepted request
                     // proved it, the same rule resolveContextLimit applies. Carrying
                     // another model's floor over would give this model a limit none

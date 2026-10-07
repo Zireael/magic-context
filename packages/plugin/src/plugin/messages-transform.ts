@@ -1,3 +1,4 @@
+import type { CheckoutClaimGate } from "../features/magic-context/checkout-claim";
 import {
     type FailClosedController,
     isFailClosedBlockingError,
@@ -15,13 +16,13 @@ import { updateSessionMeta } from "../features/magic-context/storage-meta-sessio
 import { DegradedPassRefusalError } from "../hooks/magic-context/degraded-pass-refusal";
 import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
 import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-replay";
+import { lkgReplayFits, lkgReplayLimit } from "../hooks/magic-context/lkg-replay-fit";
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import {
     noteExternalLkgReplay,
     type RustLkgReplayParticipant,
     resolveRustLkgReplayParticipant,
-    rustAdapterHasRunSession,
 } from "../hooks/magic-context/rust-lkg-freeze-registry";
 import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-refusal";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
@@ -216,8 +217,8 @@ function preserveUserTerminatedTail(
 }
 
 /**
- * Top-level transform wrapper. Ordinary bugs remain fail-open, but unsafe
- * storage failures deliberately refuse the turn after trying LKG. See issue #23:
+ * Top-level transform wrapper. Every failed managed pass replays LKG or
+ * refuses the turn. See issue #23:
  * https://github.com/cortexkit/magic-context/issues/23
  *
  * Error handling is tiered:
@@ -243,15 +244,9 @@ function preserveUserTerminatedTail(
  *        for errors that reach it, and an error thrown early enough bypasses
  *        it entirely. Writing it here at the outer boundary guarantees
  *        observability.
- *     3. Return with messages unmodified for this pass.
- *
- * Ordinary transform failures are not rethrown because OpenCode's Effect pipeline
- * turns thrown errors into user-visible prompt failures. FailClosedBlockingError,
- * EmergencyFailClosedError, RawFallbackContextLimitError, and AssistantTerminalRetryError
- * are intentional exceptions.
- * We accept degraded behavior (no injection / no drops this turn) rather than
- * blocking the user for ordinary bugs — but deterministic inoperability and an unsafe
- * assistant-terminal retry must block loudly.
+ *     3. Refuse if LKG could not replay. A small raw request is still unsafe:
+ *        it omits persisted decisions and changes the provider's cached prefix.
+ *        Only compaction-off mode passes the input through on failure.
  *
  * The transform is not assumed idempotent: only transaction acquisition retries.
  */
@@ -274,8 +269,6 @@ export function createMessagesTransformHandler(args: {
      * error it raises is converted to passthrough here.
      */
     compactionOff?: boolean;
-    /** Let the v2 hook decide whether an ordinary error needs post-fold refusal or passthrough. */
-    propagateUnexpectedErrors?: boolean;
     onStorageBusyRefusal?: (sessionId: string, message: string) => Promise<void>;
     /** Validate and restore host-owned prompt segments before adopting replayed messages. */
     onLkgReplay?: () => void;
@@ -287,6 +280,18 @@ export function createMessagesTransformHandler(args: {
      * registry picks the adapter (the one that most recently ran the session).
      */
     rustReplayParticipant?: () => RustLkgReplayParticipant | null | undefined;
+    /**
+     * The checkout claim check, run before anything in the pass can write. A
+     * session whose agent another machine holds is refused here, in every mode
+     * (compaction-off included): passing it through would let this machine keep
+     * working on an agent it does not hold.
+     */
+    checkoutClaim?: {
+        gate: Pick<CheckoutClaimGate, "refusal">;
+        projectRoot: string;
+        /** Tells the user before the refusal is thrown (the host shows a thrown error tersely). */
+        onRefusal?: (sessionId: string, message: string) => Promise<void>;
+    };
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
     const resolveRust = (sessionId: string): RustLkgReplayParticipant | undefined =>
         args.rustReplayParticipant
@@ -299,6 +304,24 @@ export function createMessagesTransformHandler(args: {
             typeof sessionId === "string" &&
             sessionId.length > 0 &&
             args.internalChildSessions?.has(sessionId) === true;
+        // Magic Context's own child sessions belong to no agent; every other
+        // session is checked once per cache period before the pass writes.
+        if (args.checkoutClaim && sessionId && !isInternalChild) {
+            const refusal = await args.checkoutClaim.gate.refusal(
+                sessionId,
+                args.checkoutClaim.projectRoot,
+            );
+            if (refusal) {
+                if (args.checkoutClaim.onRefusal) {
+                    try {
+                        await args.checkoutClaim.onRefusal(sessionId, refusal.message);
+                    } catch (noticeError) {
+                        log("[magic-context] checkout-claim host refusal failed:", noticeError);
+                    }
+                }
+                throw refusal;
+            }
+        }
         // Snapshot only the array, never nested messages: compaction-off gates
         // every stage that writes retained message internals, and its additive
         // path only prepends new synthetic message objects. A shallow snapshot
@@ -481,10 +504,43 @@ export function createMessagesTransformHandler(args: {
                                           resolvedProviderID: keys.providerKey ?? undefined,
                                       }),
                         });
+                        // TypeScript mode has no Rust result to check, but replaying
+                        // the saved request for a known model still has to pass the
+                        // same fit check as Rust mode: measured size of the saved
+                        // request plus an estimate for the messages added since.
+                        let tsFit = true;
+                        if (replay.ok && !rust && keys.providerKey && keys.modelKey) {
+                            const model = {
+                                providerID: keys.providerKey,
+                                modelID: keys.modelKey.slice(keys.providerKey.length + 1),
+                            };
+                            if (
+                                lkgReplayLimit({
+                                    db,
+                                    sessionId,
+                                    model,
+                                    modelKey: keys.modelKey,
+                                }) !== undefined
+                            ) {
+                                const fit = lkgReplayFits({
+                                    db,
+                                    sessionId,
+                                    messages: replay.messages,
+                                    model,
+                                    modelKey: keys.modelKey,
+                                    systemPromptTokens: getOrCreateSessionMeta(db, sessionId)
+                                        .systemPromptTokens,
+                                    agentName: agent,
+                                });
+                                tsFit = fit.fits;
+                                if (!fit.fits && fit.detail) sessionLog(sessionId, fit.detail);
+                            }
+                        }
                         if (
                             replay.ok &&
-                            rust &&
-                            !rust.replayFits(sessionId, replay.messages, inputMessages)
+                            (!tsFit ||
+                                (rust &&
+                                    !rust.replayFits(sessionId, replay.messages, inputMessages)))
                         ) {
                             replayBlocked = true;
                             sessionLog(sessionId, "lkg_replay_does_not_fit");
@@ -533,24 +589,6 @@ export function createMessagesTransformHandler(args: {
             const message = error instanceof Error ? error.message : String(error);
             const isTransient =
                 isTransientSqliteError(error) || error instanceof StorageBusyRefusalError;
-            if (
-                !args.compactionOff &&
-                !isTransient &&
-                sessionId &&
-                (args.rustReplayParticipant
-                    ? resolveRust(sessionId) !== undefined
-                    : rustAdapterHasRunSession(sessionId))
-            ) {
-                // A Rust-mode session whose pass failed and whose last-known-good replay
-                // could not serve. Passing the input through unchanged would send the
-                // raw history, which can be far larger than the window and, while the
-                // adapter is frozen, rewrites bytes the provider holds. Refuse instead.
-                // TypeScript-mode sessions keep their fail-open handling below.
-                throw new DegradedPassRefusalError("rust-mode-transform-failed", {
-                    cause: error,
-                });
-            }
-
             if (isTransient) {
                 if (!args.compactionOff) {
                     const refusal =
@@ -573,13 +611,11 @@ export function createMessagesTransformHandler(args: {
                 return output.messages;
             }
 
-            if (args.propagateUnexpectedErrors) throw error;
-
             // Persistent non-transient errors are the real risk: silent forever
             // disable unless we surface them. Persist to session_meta so the
             // sidebar shows an obvious failure indicator.
             log(
-                `[magic-context] transform FAILED code=${code ?? "none"} name=${name ?? "none"}: ${message}. Continuing with unmodified messages for this pass.`,
+                `[magic-context] transform FAILED code=${code ?? "none"} name=${name ?? "none"}: ${message}. ${args.compactionOff ? "Compaction-off: passing through input." : "No last-good replay; refusing the turn."}`,
                 error,
             );
 
@@ -612,6 +648,9 @@ export function createMessagesTransformHandler(args: {
                     // can't recover. Next pass may succeed.
                     log("[magic-context] failed to persist transform error:", persistError);
                 }
+            }
+            if (!args.compactionOff) {
+                throw new DegradedPassRefusalError("messages-transform-failed", { cause: error });
             }
         }
         restoreCompactionOffInput();

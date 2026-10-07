@@ -90,12 +90,7 @@ async fn cereb_full_sync_through_real_daemon() {
     let fixture =
         fs::read(std::env::var("MC_SYNC_PROBE_FIXTURE").expect("fixture required")).unwrap();
     let workspace = workspace_root();
-    let subconscious = subconscious_root(&workspace);
-    let daemon_bin = ensure_binary(
-        &subconscious,
-        subconscious.join("target/debug/ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
-    );
+    let daemon_bin = ensure_daemon_binary(&workspace, &["build", "-p", "subc-core", "--bins"]);
     let module_bin = ensure_binary(
         &workspace,
         workspace.join("target/debug/ck-mc"),
@@ -170,14 +165,8 @@ async fn mc_transform_spine_through_real_daemon() {
     std::env::remove_var(subc_os::LAUNCH_NONCE_FD_ENV);
 
     let workspace = workspace_root();
-    let subconscious = subconscious_root(&workspace);
-
     // Build the daemon (from the sibling subconscious workspace) and our module.
-    let daemon_bin = ensure_binary(
-        &subconscious,
-        subconscious.join("target/debug/ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
-    );
+    let daemon_bin = ensure_daemon_binary(&workspace, &["build", "-p", "subc-core", "--bins"]);
     let module_bin = ensure_binary(
         &workspace,
         workspace.join("target/debug/ck-mc"),
@@ -608,6 +597,7 @@ fn spawn_daemon(
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn daemon {}: {e}", daemon_bin.display()));
+    assert_dev_process_name(child.id());
     LiveDaemon {
         child,
         runtime_dir: runtime_dir.to_path_buf(),
@@ -653,6 +643,7 @@ fn spawn_module_with_differential(
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn module {}: {e}", module_bin.display()));
+    assert_dev_process_name(child.id());
     // The module logs to stderr; an undrained pipe fills its 64KB buffer and the module
     // BLOCKS on a stderr write mid-boot, so it never registers (observed as a spurious
     // unknown_module reject once boot logging grew past the buffer). Drain continuously
@@ -668,6 +659,34 @@ fn spawn_module_with_differential(
     }
     ModuleProcess { child }
 }
+
+#[cfg(unix)]
+fn assert_dev_process_name(pid: u32) {
+    let output = Command::new("ps")
+        .args(["-axo", "pid,comm"])
+        .output()
+        .expect("ps must be available to verify the test process name");
+    assert!(output.status.success(), "ps -axo pid,comm failed");
+    let process_line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(pid.to_string().as_str()))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("ps -axo pid,comm did not list test PID {pid}"));
+    let executable = process_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|command| Path::new(command).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    assert!(
+        executable.starts_with("ckdev-"),
+        "test PID {pid} must not look like a production fleet binary: {process_line}"
+    );
+    println!("ps -axo pid,comm: {process_line}");
+}
+
+#[cfg(not(unix))]
+fn assert_dev_process_name(_: u32) {}
 
 fn write_empty_config(config_dir: &Path) {
     fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
@@ -807,7 +826,105 @@ fn ensure_binary(manifest_dir: &Path, path: PathBuf, cargo_args: &[&str]) -> Pat
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(path.exists(), "expected binary at {}", path.display());
-    path
+    dev_named_binary(&path)
+}
+
+fn ensure_daemon_binary(workspace: &Path, cargo_args: &[&str]) -> PathBuf {
+    if let Some(binary) = std::env::var_os("MC_TEST_CK_SUBC_BIN") {
+        let path = PathBuf::from(binary);
+        assert!(
+            path.is_file(),
+            "test daemon binary is missing: {}",
+            path.display()
+        );
+        return dev_named_binary(&path);
+    }
+    let subconscious = subconscious_root(workspace);
+    ensure_binary(
+        &subconscious,
+        daemon_binary_path(&subconscious, cargo_args),
+        cargo_args,
+    )
+}
+
+// A caller can isolate its daemon build with --target-dir. Resolve the output
+// from that same argument instead of looking in the sibling's default target.
+fn daemon_binary_path(subconscious: &Path, cargo_args: &[&str]) -> PathBuf {
+    let target = cargo_args
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| {
+            if *arg == "--target-dir" {
+                Some(
+                    *cargo_args
+                        .get(index + 1)
+                        .expect("--target-dir needs a path"),
+                )
+            } else {
+                arg.strip_prefix("--target-dir=")
+            }
+        })
+        .map(|target| subconscious.join(target))
+        .unwrap_or_else(|| subconscious.join("target"));
+    target.join("debug/ck-subc")
+}
+
+#[test]
+fn daemon_binary_path_matches_cargo_target_directory() {
+    let source = std::env::temp_dir().join("daemon-source");
+    let isolated_target = std::env::temp_dir().join("store-init-subc");
+    assert_eq!(
+        daemon_binary_path(&source, &["build", "--locked", "--bin", "ck-subc"]),
+        source.join("target/debug/ck-subc")
+    );
+    assert_eq!(
+        daemon_binary_path(
+            &source,
+            &["build", "--target-dir", isolated_target.to_str().unwrap()]
+        ),
+        isolated_target.join("debug/ck-subc")
+    );
+    assert_eq!(
+        daemon_binary_path(&source, &["build", "--target-dir=isolated"]),
+        source.join("isolated/debug/ck-subc")
+    );
+}
+
+/// Run copied Cargo outputs under names that cannot be confused with fleet daemons.
+fn dev_named_binary(path: &Path) -> PathBuf {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("test binary must have a UTF-8 filename");
+    let suffix = if filename == "ck" {
+        "cli"
+    } else {
+        filename
+            .strip_prefix("ckdev-")
+            .or_else(|| filename.strip_prefix("ck-"))
+            .unwrap_or_else(|| panic!("expected a ck, ck-* or ckdev-* test binary, got {filename}"))
+    };
+    let dev_dir = std::env::temp_dir()
+        .join("magic-context/mc-module-test-binaries")
+        .join(std::process::id().to_string());
+    fs::create_dir_all(&dev_dir).expect("create isolated binary staging directory");
+    let dev_path = dev_dir.join(format!("ckdev-{suffix}"));
+    if path == dev_path.as_path() {
+        return dev_path;
+    }
+    let _ = fs::remove_file(&dev_path);
+    // A copy, never a hard link: on macOS a daemon exec'd through a hard link to
+    // cargo's output was occasionally SIGKILLed at startup, while a copy never was.
+    fs::copy(path, &dev_path)
+        .map(|_| ())
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to stage test binary {} as {}: {error}",
+                path.display(),
+                dev_path.display()
+            )
+        });
+    dev_path
 }
 
 fn workspace_root() -> PathBuf {
@@ -824,7 +941,10 @@ fn subconscious_root(workspace: &Path) -> PathBuf {
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("{name}-{}-{nonce}", std::process::id()))
+    std::env::temp_dir()
+        .join("magic-context")
+        .join(name)
+        .join(format!("{}-{nonce}", std::process::id()))
 }
 
 /// Run with `cargo test --locked -p mc-module --test real_daemon mc_pipe_only_supervision_through_real_daemon -- --exact --nocapture`.
@@ -897,7 +1017,7 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
     let daemon = spawn_daemon(&daemon_bin, &runtime, &config, &data);
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
     let stop_module = StopSupervisedModule {
-        ck_bin: target.join("debug/ck"),
+        ck_bin: dev_named_binary(&target.join("debug/ck")),
         daemon: &daemon,
         data_home: data.clone(),
     };
@@ -936,7 +1056,7 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
         fs::read_to_string(&environment).unwrap(),
         "env_absent\nfd_present\n"
     );
-    let ck_bin = target.join("debug/ck");
+    let ck_bin = dev_named_binary(&target.join("debug/ck"));
     let provenance = Command::new(&ck_bin)
         .args([
             "--subc",
@@ -1110,11 +1230,9 @@ impl Drop for StopSupervisedModule<'_> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hostless_store_init_first_transform_through_real_daemon() {
     let workspace = workspace_root();
-    let subconscious = subconscious_root(&workspace);
     let target = workspace.join("target/store-init-subc");
-    let daemon_bin = ensure_binary(
-        &subconscious,
-        target.join("debug/ck-subc"),
+    let daemon_bin = ensure_daemon_binary(
+        &workspace,
         &[
             "build",
             "--locked",
@@ -1128,7 +1246,7 @@ async fn hostless_store_init_first_transform_through_real_daemon() {
             target.to_str().unwrap(),
         ],
     );
-    let module_bin = PathBuf::from(env!("CARGO_BIN_EXE_ck-mc"));
+    let module_bin = dev_named_binary(Path::new(env!("CARGO_BIN_EXE_ck-mc")));
     let parent = std::env::temp_dir().join("magic-context/store-init");
     fs::create_dir_all(&parent).unwrap();
     let temp = TempRoot(parent.join(format!(
@@ -1285,14 +1403,18 @@ async fn planning_clones_through_real_daemon() {
     PROJECT_BASE.set(project.canonicalize().unwrap()).unwrap();
     write_empty_config(&config);
     let daemon = spawn_daemon(
-        &PathBuf::from(std::env::var_os("MC_PLANNING_DAEMON").unwrap()),
+        &dev_named_binary(&PathBuf::from(
+            std::env::var_os("MC_PLANNING_DAEMON").unwrap(),
+        )),
         &runtime,
         &config,
         &data,
     );
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
     let module = spawn_module_with_differential(
-        &PathBuf::from(std::env::var_os("MC_PLANNING_MODULE").unwrap()),
+        &dev_named_binary(&PathBuf::from(
+            std::env::var_os("MC_PLANNING_MODULE").unwrap(),
+        )),
         &daemon.connection_file,
         &data,
         true,

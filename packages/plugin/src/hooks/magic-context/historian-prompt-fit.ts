@@ -11,8 +11,10 @@
  *
  * `fitHistorianPrompt` reserves the fixed parts and the output first, then gives
  * the chunk what remains. When the full requested chunk does not fit, it trims
- * the fixed context in this order until it does: recent compartments (oldest
- * first), project-memory lines (lowest priority first), then seed examples.
+ * the fixed context in this order until it does: diverse older compartments,
+ * recent compartments (oldest first), project-memory lines (lowest priority
+ * first), then seed examples. Recent examples preserve continuity without scores
+ * to prevent anchoring in one-compartment runs; diverse examples carry scores.
  * When everything is trimmed, the chunk shrinks to whatever room is left. Only
  * when not even a minimal chunk fits is the prompt refused, with a reason that
  * stays identical until the model, its window, or the instructions change, so a
@@ -29,13 +31,13 @@ import { calibrationForModelKey, providerMass } from "./decision-calibration";
 import { resolveHistorianProducerLimits } from "./derive-budgets";
 import { orderHistorianMemories, renderHistorianMemoryBlock } from "./inject-compartments";
 import { historianProducerReserve, producerInputTokenLimit } from "./producer-window-guard";
-import { estimateTokens } from "./read-session-formatting";
+import { estimateFixedPromptTokens } from "./read-session-formatting";
 import {
     type ReferenceCompartment,
     renderSeedExamplesBlock,
     renderSessionReferencesBlock,
-    SESSION_REF_WINDOW,
     selectSeeds,
+    selectSessionReferences,
 } from "./reference-retrieval";
 
 /**
@@ -188,10 +190,16 @@ export function describeHistorianPromptTrim(
 export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromptFit {
     const requested = Math.max(0, Math.floor(args.requestedChunkTokens));
     const seeds = selectSeeds(args.sessionId, args.chunkStart);
+    const references = selectSessionReferences(
+        args.sessionCompartments,
+        seeds,
+        args.sessionId,
+        args.chunkStart,
+    );
     const memories = orderHistorianMemories(args.memories);
     const render = (refs: number, memoryCount: number, seedCount: number) => ({
         seedExamples: renderSeedExamplesBlock(seeds.slice(0, seedCount)),
-        sessionReferences: renderSessionReferencesBlock(args.sessionCompartments, refs),
+        sessionReferences: renderSessionReferencesBlock(references, refs),
         projectMemory: renderHistorianMemoryBlock(memories.slice(0, memoryCount)) ?? "",
     });
     const kept = (refs: number, memoryCount: number, seedCount: number) => ({
@@ -212,14 +220,14 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
             ok: true,
             guarded: false,
             chunkTokens: requested,
-            ...render(SESSION_REF_WINDOW, memories.length, seeds.length),
+            ...render(references.length, memories.length, seeds.length),
             trimmed: false,
-            kept: kept(SESSION_REF_WINDOW, memories.length, seeds.length),
+            kept: kept(references.length, memories.length, seeds.length),
         };
     }
 
     const calibration = calibrationForModelKey(args.window.modelKey);
-    const systemLocal = estimateTokens(args.systemPrompt);
+    const systemLocal = estimateFixedPromptTokens(args.systemPrompt);
     const mass = (proseLocal: number) =>
         providerMass({ prose: proseLocal, system: systemLocal }, calibration, true);
     if (!Number.isFinite(mass(0)) || mass(0) <= 0) {
@@ -242,7 +250,7 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
         });
         let tokens = counted.get(text);
         if (tokens === undefined) {
-            tokens = estimateTokens(text);
+            tokens = estimateFixedPromptTokens(text);
             counted.set(text, tokens);
         }
         return tokens;
@@ -272,12 +280,12 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
         roomTokens: Math.max(chunkTokens, roomFor(render(refs, memoryCount, seedCount))),
         ...render(refs, memoryCount, seedCount),
         trimmed:
-            refs < SESSION_REF_WINDOW || memoryCount < memories.length || seedCount < seeds.length,
+            refs < references.length || memoryCount < memories.length || seedCount < seeds.length,
         kept: kept(refs, memoryCount, seedCount),
     });
 
-    // 1. Recent compartments, oldest dropped first.
-    for (let refs = SESSION_REF_WINDOW; refs >= 0; refs -= 1) {
+    // 1. Diverse compartments first, then recent compartments oldest first.
+    for (let refs = references.length; refs >= 0; refs -= 1) {
         if (roomFor(render(refs, memories.length, seeds.length)) >= requested) {
             return accept(refs, memories.length, seeds.length, requested);
         }

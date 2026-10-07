@@ -1,5 +1,6 @@
 import type { EmbeddingFailureClass } from "../features/magic-context/memory/embedding-failure";
 import type { PromptFailureClass } from "./model-suggestion-retry";
+import { sanitizeDiagnosticText } from "./redaction";
 
 export const USER_FACING_FAILURES = {
     historian_unavailable: {
@@ -51,6 +52,11 @@ export const USER_FACING_FAILURES = {
         code: "MC-D02",
         sentence: "Memory maintenance could not reach its model.",
         action: "Check the model connection, then run /ctx-dream again.",
+    },
+    dream_local_refusal: {
+        code: "MC-D12",
+        sentence: "Memory maintenance was refused before reaching the model.",
+        action: "Check the hidden-request diagnostic in the Magic Context log before retrying.",
     },
     dream_step_limit: {
         code: "MC-D10",
@@ -239,6 +245,12 @@ export const USER_FACING_FAILURES = {
         sentence: "Magic Context has no context.db.",
         action: "Run `npx @cortexkit/magic-context doctor store init`, then restart ck-mc.",
     },
+    checkout_claim_held_elsewhere: {
+        code: "MC-C16",
+        sentence:
+            "This request was not sent: this agent is checked out on another machine, so Magic Context will not work on its sessions here.",
+        action: "Move the agent back to this machine, then send your message again.",
+    },
     single_store_migration_required: {
         code: "MC-C14",
         sentence: "Magic Context's Rust mode needs a one-time migration of its store.",
@@ -324,6 +336,7 @@ export function capabilityRefusalCode(capability: CapabilityRefusal): string {
 const DREAM_FAILURE_KEYS = {
     provider_timeout: "dream_provider_timeout",
     provider_error: "dream_provider_error",
+    local_refusal: "dream_local_refusal",
     step_limit: "dream_step_limit",
     token_budget: "dream_token_budget",
     empty_completion: "dream_empty_completion",
@@ -350,8 +363,12 @@ const EMBEDDING_FAILURE_KEYS = {
 export function renderDreamFailure(
     failureClass: PromptFailureClass,
     style: UserFacingTextStyle = "markdown",
+    refusalReason?: string | null,
 ): string {
-    return renderUserFacingFailure(DREAM_FAILURE_KEYS[failureClass], style);
+    const rendered = renderUserFacingFailure(DREAM_FAILURE_KEYS[failureClass], style);
+    return failureClass === "local_refusal" && refusalReason
+        ? `${rendered} Reason: ${sanitizeDiagnosticText(refusalReason).slice(0, 500)}`
+        : rendered;
 }
 
 export function dreamFailureCode(failureClass: PromptFailureClass): string {

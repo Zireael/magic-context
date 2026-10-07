@@ -62,6 +62,7 @@ export function stripSystemInjectedMessages(
     messages: MessageLike[],
     protectedTailStart: number,
     providerID?: string,
+    onFirstApplication?: (message: MessageLike, partIndex: number) => void,
 ): { stripped: number; sentineledIds: string[] } {
     let stripped = 0;
     const sentineledIds: string[] = [];
@@ -114,6 +115,7 @@ export function stripSystemInjectedMessages(
         }
 
         if (hasContentPart && allContentIsSystemInjection) {
+            onFirstApplication?.(msg, 0);
             msg.parts.length = 0;
             msg.parts.push(makeWholeMessageSentinel(providerID));
             stripped++;
@@ -175,6 +177,7 @@ const METADATA_PART_TYPES = new Set([
 export function stripDroppedPlaceholderMessages(
     messages: MessageLike[],
     providerID?: string,
+    onFirstApplication?: (message: MessageLike, partIndex: number) => void,
 ): {
     stripped: number;
     sentineledIds: string[];
@@ -232,6 +235,7 @@ export function stripDroppedPlaceholderMessages(
         }
 
         if (hasContentPart && !hasNonDroppedContent) {
+            onFirstApplication?.(msg, 0);
             msg.parts.length = 0;
             msg.parts.push(makeWholeMessageSentinel(providerID));
             stripped++;
@@ -1002,6 +1006,8 @@ export function stripProcessedImages(
         detect: boolean;
         watermark: number;
         messageTagNumbers: Map<MessageLike, number>;
+        /** Reports only first strips, never restoring an already frozen image. */
+        onFirstApplication?: (message: MessageLike, partIndex: number) => void;
     },
 ): StripProcessedImagesResult {
     const { detect, watermark, messageTagNumbers } = options;
@@ -1045,6 +1051,7 @@ export function stripProcessedImages(
                 part.url.startsWith("data:") &&
                 part.url.length > 200
             ) {
+                if (isNewDetection) options.onFirstApplication?.(msg, j);
                 msg.parts[j] = makeSentinel(part);
                 stripped++;
                 touchedThisMsg = true;

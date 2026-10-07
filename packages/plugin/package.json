@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-magic-context",
-  "version": "0.44.4",
+  "version": "0.45.0",
   "type": "module",
   "description": "OpenCode plugin for Magic Context — cross-session memory and context management",
   "main": "dist/index.js",
@@ -43,16 +43,17 @@
     "check:tui-compiled": "bun run build:tui && git diff --exit-code -- src/tui-compiled && test -z \"$(git status --porcelain -- src/tui-compiled)\"",
     "check:transformers-node-wasm": "bun scripts/verify-transformers-node-wasm.ts",
     "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",
-    "test": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && bun test --parallel=4 --timeout 30000",
-    "test:serial": "bun install --frozen-lockfile && bun test --timeout 30000",
+    "test": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && BUN_JSC_useOMGJIT=0 bun test --parallel=4 --timeout 30000",
+    "test:serial": "bun install --frozen-lockfile && BUN_JSC_useOMGJIT=0 bun test --timeout 30000",
     "test:parallel:probe": "bun scripts/verify-parallel-db-isolation.ts",
     "lint": "bun ../../scripts/check-bun.mjs && biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
     "format:check": "biome format .",
-    "clean": "rm -rf dist",
+    "clean": "bun ../../scripts/clean-dist-chunks.mjs dist index.js embedding-worker.js migration-worker.js transformers-web.js transformers-node-wasm.js && bun ../../scripts/clean-dist-chunks.mjs dist/v2 server.js embedding-worker.js migration-worker.js transformers-web.js transformers-node-wasm.js",
     "prepublishOnly": "bun run build && bun run build:tui"
   },
+  "//test": "Only test runs disable JSC's optimizing WebAssembly tier so per-file isolation does not pay its compilation cost on every file. This is not a production setting and does not change host process engine options.",
   "dependencies": {
     "@cortexkit/subc-client": "0.11.1",
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",

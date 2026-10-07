@@ -2,7 +2,8 @@ import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
-import { newestCtxReduceTagNumbers } from "./reclaim-protection";
+import { tagOrderConstraintIndex } from "./migration-v95-perf-indexes";
+import { removePendingOp } from "./storage-ops";
 import type { TagEntry } from "./types";
 
 declare module "./types" {
@@ -356,7 +357,7 @@ const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedS
 
 /**
  * Return age-reclaim candidates with the same persisted token estimate used by reclaim hints.
- * The newest ctx_reduce exemplars are omitted before the watermark/value checks in the caller.
+ * Protection is applied by the caller using its shared per-selection snapshot.
  * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
  */
 export function getActiveToolTagsForAgeReclaim(
@@ -394,8 +395,7 @@ export function getActiveToolTagsForAgeReclaim(
                         : (outputTokens ?? 0) + (inputTokens ?? 0),
             };
         });
-    const protectedCtxReduceTags = newestCtxReduceTagNumbers(tags);
-    return tags.filter((tag) => !protectedCtxReduceTags.has(tag.tagNumber));
+    return tags;
 }
 
 /**
@@ -441,17 +441,66 @@ export function getTriggerTagTokenUpperBound(
     return { bound: row?.bound ?? 0, nullCount: row?.null_count ?? 0 };
 }
 
+const scopedActiveTokenTotalStatements = new WeakMap<Database, PreparedStatement>();
+
 export function getActiveTagTokenTotalsByMessage(
     db: Database,
     sessionId: string,
+    messageIds?: readonly string[],
 ): Map<string, MessageTokenTotal> {
-    const rows = db
-        .prepare(
-            `SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
+    if (messageIds?.length === 0) return new Map();
+    const fields =
+        "id, tag_number, type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count"
+            .split(", ")
+            .map((field) => `tags.${field}`)
+            .join(", ");
+    let scoped = scopedActiveTokenTotalStatements.get(db);
+    if (messageIds && !scoped) {
+        // Seek exact owners through existing indexes. Do not use a tag-number
+        // floor: a visible result can belong to an older invocation below it.
+        // UNION includes id so overlapping owner ranges cannot double-count a row.
+        scoped = db.prepare(`
+            SELECT ${fields} FROM json_each(?) AS owners
+            CROSS JOIN tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND tags.type != 'tool' AND +status = 'active'
+              AND message_id >= owners.value || ':' AND message_id < owners.value || ';'
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND type != 'tool' AND +status = 'active'
+              AND message_id IN (SELECT value FROM json_each(?))
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_pi_fallback_tool_owner
+            WHERE session_id = ? AND type = 'tool' AND +status = 'active'
+              AND tool_owner_message_id IN (SELECT value FROM json_each(?))
+            UNION
+            SELECT ${fields} FROM tags INDEXED BY idx_tags_session_message_id
+            WHERE session_id = ? AND type = 'tool' AND +status = 'active'
+              AND tool_owner_message_id IS NULL AND message_id IN (SELECT value FROM json_each(?))
+            ORDER BY tag_number, id`);
+        scopedActiveTokenTotalStatements.set(db, scoped);
+    }
+    const owners = messageIds ? new Set(messageIds) : undefined;
+    const encoded = owners ? JSON.stringify([...owners]) : "";
+    const rows = (
+        messageIds && scoped
+            ? scoped.all(
+                  encoded,
+                  sessionId,
+                  sessionId,
+                  encoded,
+                  sessionId,
+                  encoded,
+                  sessionId,
+                  encoded,
+              )
+            : db
+                  .prepare(
+                      `SELECT type, message_id, tool_owner_message_id, token_count, input_token_count, reasoning_token_count
              FROM tags
              WHERE session_id = ? AND status = 'active'`,
-        )
-        .all(sessionId) as Array<{
+                  )
+                  .all(sessionId)
+    ) as Array<{
         type: string;
         message_id: string;
         tool_owner_message_id: string | null;
@@ -462,6 +511,7 @@ export function getActiveTagTokenTotalsByMessage(
     const out = new Map<string, MessageTokenTotal>();
     for (const row of rows) {
         const owner = ownerMessageIdForTagRow(row);
+        if (owners && !owners.has(owner)) continue;
         let entry = out.get(owner);
         if (!entry) {
             entry = { conversation: 0, toolCall: 0, toolOutput: 0, hasNull: false };
@@ -757,7 +807,9 @@ function getTagNumberByMessageIdStatement(db: Database): PreparedStatement {
     let stmt = getTagNumberByMessageIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT tag_number FROM tags WHERE session_id = ? AND message_id = ? ORDER BY tag_number ASC LIMIT 1",
+            // Without the owner index SQLite may walk the entire session in tag
+            // order to satisfy LIMIT, making repeated whitespace probes quadratic.
+            "SELECT tag_number FROM tags INDEXED BY idx_tags_session_message_id WHERE session_id = ? AND message_id = ? ORDER BY tag_number ASC LIMIT 1",
         );
         getTagNumberByMessageIdStatements.set(db, stmt);
     }
@@ -968,6 +1020,8 @@ export function markWhitespaceAssistantTagInert(
     );
 }
 
+const inertWhitespaceStatements = new WeakMap<Database, PreparedStatement>();
+
 /** Load legacy whitespace tags for cache-stable prefix replay; these rows are never active. */
 export function getInertWhitespaceAssistantTags(
     db: Database,
@@ -977,25 +1031,35 @@ export function getInertWhitespaceAssistantTags(
     if (messageIds) {
         // The fingerprint index lets the wire reader seek each visible owner instead
         // of scanning every compacted tag. Keep the unscoped API for reduction tools.
-        const statement = db.prepare(
-            `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
-             FROM tags
-             WHERE session_id = ? AND type = 'message' AND status = 'compacted'
-               AND entry_fingerprint >= ? AND entry_fingerprint < ?`,
-        );
-        return [...new Set(messageIds)].flatMap((messageId) => {
-            const prefix = `${WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX}${messageId}:p`;
-            const rows = statement.all(sessionId, prefix, `${prefix.slice(0, -1)}q`) as Array<{
-                tagNumber: number;
-                entryFingerprint: string;
-            }>;
-            return rows.map((row) => ({
-                tagNumber: row.tagNumber,
-                contentId: row.entryFingerprint.slice(
-                    WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
-                ),
-            }));
-        });
+        let statement = inertWhitespaceStatements.get(db);
+        if (!statement) {
+            // CROSS JOIN keeps the small owner list outside the fingerprint index
+            // seek, rather than scanning every retired row in a long session.
+            statement = db.prepare(
+                `SELECT tag_number AS tagNumber, entry_fingerprint AS entryFingerprint
+                 FROM json_each(?) AS owners CROSS JOIN tags
+                 WHERE tags.session_id = ? AND tags.type = 'message' AND tags.status = 'compacted'
+                   AND entry_fingerprint >= ? || owners.value || ':p'
+                   AND entry_fingerprint < ? || owners.value || ':q'
+                 ORDER BY CAST(owners.key AS INTEGER), entry_fingerprint, tags.id`,
+            );
+            inertWhitespaceStatements.set(db, statement);
+        }
+        const rows = statement.all(
+            JSON.stringify([...new Set(messageIds)]),
+            sessionId,
+            WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX,
+            WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX,
+        ) as Array<{
+            tagNumber: number;
+            entryFingerprint: string;
+        }>;
+        return rows.map((row) => ({
+            tagNumber: row.tagNumber,
+            contentId: row.entryFingerprint.slice(
+                WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length,
+            ),
+        }));
     }
     const rows = db
         .prepare(
@@ -1782,37 +1846,120 @@ export function markTagsCompactedByMessageIds(
     db: Database,
     sessionId: string,
     messageIds: Iterable<string>,
+    eligibleTagNumbers?: ReadonlySet<number>,
 ): number {
-    // RETURNING counts top-level tag rows without including writes made by triggers.
-    const update = db.prepare(
-        `UPDATE tags
-         SET status = 'compacted'
-         WHERE session_id = ?
-           AND status IN ('active', 'dropped')
-           AND (
-               message_id = ?
-               OR message_id LIKE ? ESCAPE '\\'
-               OR message_id LIKE ? ESCAPE '\\'
-               OR tool_owner_message_id = ?
-           )
-         RETURNING id`,
+    const ids = new Set(messageIds);
+    if (ids.size === 0 || eligibleTagNumbers?.size === 0) return 0;
+
+    // SQLite's default LIKE folds ASCII only, whereas String.toLowerCase also
+    // folds Unicode. Wildcards in the source id were escaped by the old query.
+    const asciiLower = (value: string) => value.replace(/[A-Z]/g, (char) => char.toLowerCase());
+    const foldedIds = new Set(Array.from(ids, asciiLower));
+    const nulPrefixes = new Set(
+        Array.from(ids)
+            .filter((id) => id.includes("\0"))
+            .map((id) => asciiLower(id.split("\0")[0])),
     );
-    return db
-        .transaction(() => {
-            let changed = 0;
-            for (const messageId of new Set(messageIds)) {
-                const escaped = escapeLikePattern(messageId);
-                changed += update.all(
-                    sessionId,
-                    messageId,
-                    `${escaped}:p%`,
-                    `${escaped}:file%`,
-                    messageId,
-                ).length;
+    const matches = (messageId: string | null, owner: string | null): boolean => {
+        if (messageId !== null && ids.has(messageId)) return true;
+        if (owner !== null && ids.has(owner)) return true;
+        if (messageId === null) return false;
+        // LIKE treats NUL as the end of both pattern and value; exact equality
+        // above does not. Keep that behavior even for malformed source ids.
+        const nul = messageId.indexOf("\0");
+        const value = nul < 0 ? messageId : messageId.slice(0, nul);
+        if (nulPrefixes.size > 0 && nulPrefixes.has(asciiLower(value))) return true;
+        // Check EVERY delimiter: ids themselves may contain :p or :file. Do not
+        // restrict :p% to numeric parts, or include Pi's :mc-text-v1: identity.
+        for (let colon = value.indexOf(":"); colon >= 0; colon = value.indexOf(":", colon + 1)) {
+            const suffix = value[colon + 1];
+            if (
+                (suffix === "p" ||
+                    suffix === "P" ||
+                    asciiLower(value.slice(colon + 1, colon + 5)) === "file") &&
+                foldedIds.has(asciiLower(value.slice(0, colon)))
+            )
+                return true;
+        }
+        return false;
+    };
+
+    // Discover candidates once, WITHOUT a writer transaction. The former OR /
+    // LIKE update used only the session prefix of the index once per source id.
+    // Scan in tag-number order: the message-id index visits the table in random
+    // source-id order, making even a single read expensive on a large store.
+    // Materialize the id sets once inside SQLite so ordinary unmatched rows
+    // never cross the JS boundary. Delimiter-bearing and NUL-bearing source ids
+    // use the general matcher above rather than assuming a single base id.
+    // All subsequent writes are primary-key lookups, not session scans.
+    const rows = db
+        .prepare(`WITH ids AS MATERIALIZED (
+            SELECT value AS source_id, lower(value) AS folded_id FROM json_each(?)
+        )
+        SELECT id, tag_number, message_id, tool_owner_message_id FROM tags INDEXED BY ${tagOrderConstraintIndex(db)}
+        WHERE session_id = ? AND status IN ('active', 'dropped') AND (
+            message_id IN (SELECT source_id FROM ids)
+            OR tool_owner_message_id IN (SELECT source_id FROM ids)
+            OR (instr(lower(message_id), ':p') > 0 AND
+                lower(substr(message_id, 1, instr(lower(message_id), ':p') - 1)) IN (SELECT folded_id FROM ids))
+            OR (instr(lower(message_id), ':file') > 0 AND
+                lower(substr(message_id, 1, instr(lower(message_id), ':file') - 1)) IN (SELECT folded_id FROM ids))
+            OR (? AND instr(message_id, ':') > 0)
+            OR ?
+        )`)
+        .all(
+            JSON.stringify(Array.from(ids)),
+            sessionId,
+            Array.from(ids).some((id) => id.includes(":")) ? 1 : 0,
+            nulPrefixes.size > 0 ? 1 : 0,
+        ) as {
+        id: number;
+        tag_number: number;
+        message_id: string | null;
+        tool_owner_message_id: string | null;
+    }[];
+    const candidates = rows.filter(
+        (row) =>
+            (eligibleTagNumbers === undefined || eligibleTagNumbers.has(row.tag_number)) &&
+            matches(row.message_id, row.tool_owner_message_id),
+    );
+    if (candidates.length === 0) return 0;
+
+    // Recheck identity as well as status: another process can retarget or retire
+    // a tag between the read and a batch. RETURNING excludes trigger writes.
+    const update = db.prepare(
+        `UPDATE tags SET status = 'compacted'
+         WHERE id = ? AND session_id = ?
+            AND status IN ('active', 'dropped')
+            AND message_id IS ? AND tool_owner_message_id IS ?
+          RETURNING tag_number`,
+    );
+    let cursor = 0;
+    let changed = 0;
+    const batch = db.transaction(() => {
+        const start = performance.now();
+        let processed = 0;
+        do {
+            const row = candidates[cursor++];
+            const retired = update.get(
+                row.id,
+                sessionId,
+                row.message_id,
+                row.tool_owner_message_id,
+            ) as { tag_number: number } | null;
+            if (retired) {
+                // Retiring this source removes it from the request, so delete its queued
+                // operation in the same transaction instead of waiting for another drain.
+                removePendingOp(db, sessionId, retired.tag_number);
+                changed++;
             }
-            return changed;
-        })
-        .immediate();
+            processed++;
+        } while (cursor < candidates.length && processed < 128 && performance.now() - start < 8);
+    });
+    // A failed later batch leaves only valid compacted rows. Retrying is safe,
+    // and never redoes the rows already committed by an earlier batch.
+    while (cursor < candidates.length) batch.immediate();
+    return changed;
 }
 
 /**
@@ -2268,6 +2415,38 @@ export function getTagsByNumbers(
     return rows.map(toTagEntry);
 }
 
+const newestToolTagNumberStatements = new WeakMap<Database, PreparedStatement>();
+
+/**
+ * Tag numbers of the session's newest `limit` tool tags, any status, newest
+ * first. Equals filtering a full `getTagsBySession` load to tool tags and
+ * keeping the highest numbers: the row checks mirror `isTagRow`, so a malformed
+ * row is skipped here exactly as that load skips it. The walk runs backwards on
+ * the UNIQUE(session_id, tag_number) index and stops after `limit` rows.
+ */
+export function getNewestToolTagNumbers(db: Database, sessionId: string, limit: number): number[] {
+    if (limit <= 0) return [];
+    let statement = newestToolTagNumberStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT tag_number FROM tags
+              WHERE session_id = ? AND type = 'tool'
+                AND typeof(message_id) = 'text'
+                AND typeof(status) = 'text'
+                AND typeof(byte_size) IN ('integer', 'real')
+                AND typeof(tag_number) IN ('integer', 'real')
+              ORDER BY tag_number DESC
+              LIMIT ?`,
+        );
+        newestToolTagNumberStatements.set(db, statement);
+    }
+    return (statement.all(sessionId, limit) as Array<{ tag_number: number }>).map(
+        (row) => row.tag_number,
+    );
+}
+
+const droppedNumberStatements = new WeakMap<Database, PreparedStatement>();
+
 /** Return only dropped tags whose numbers are visible replay targets. */
 export function getDroppedTagsByNumbers(
     db: Database,
@@ -2284,13 +2463,14 @@ export function getDroppedTagsByNumbers(
         return all;
     }
 
-    const placeholders = tagNumbers.map(() => "?").join(",");
-    const rows = db
-        .prepare(
-            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' AND tag_number IN (${placeholders}) ORDER BY tag_number ASC, id ASC`,
-        )
-        .all(sessionId, ...tagNumbers)
-        .filter(isTagRow);
+    let statement = droppedNumberStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND status = 'dropped' AND tag_number IN (SELECT value FROM json_each(?)) ORDER BY tag_number ASC, id ASC`,
+        );
+        droppedNumberStatements.set(db, statement);
+    }
+    const rows = statement.all(sessionId, JSON.stringify(tagNumbers)).filter(isTagRow);
 
     return rows.map(toTagEntry);
 }
@@ -2309,10 +2489,17 @@ export function getMaxDroppedTagNumber(db: Database, sessionId: string): number 
     return isMaxTagNumberRow(row) ? row.max_tag_number : 0;
 }
 
+const tagByIdStatements = new WeakMap<Database, PreparedStatement>();
+
 export function getTagById(db: Database, sessionId: string, tagId: number): TagEntry | null {
-    const result = db
-        .prepare(`SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND tag_number = ?`)
-        .get(sessionId, tagId);
+    let statement = tagByIdStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? AND tag_number = ?`,
+        );
+        tagByIdStatements.set(db, statement);
+    }
+    const result = statement.get(sessionId, tagId);
 
     if (!isTagRow(result)) {
         return null;

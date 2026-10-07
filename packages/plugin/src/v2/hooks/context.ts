@@ -7,6 +7,7 @@ import {
     pluginConfigReader,
 } from "../../config/live-run-config";
 import { getProtectedTokensTierOverrides } from "../../config/project-security";
+import { createSubcCheckoutClaimGate } from "../../features/magic-context/checkout-claim";
 import { summarizeManualDream } from "../../features/magic-context/dreamer/manual-summary";
 import { userMemoryCollectionEnabled } from "../../features/magic-context/dreamer/task-config";
 import { formatUnsupportedDreamTasks } from "../../features/magic-context/dreamer/task-registry";
@@ -54,7 +55,7 @@ import {
     recordToolParameters,
 } from "../../hooks/magic-context/dropped-input-guard";
 import { EmergencyFailClosedError } from "../../hooks/magic-context/emergency-fail-closed";
-import { resolveContextLimit } from "../../hooks/magic-context/event-resolvers";
+import { resolveContextLimit, resolveModelKey } from "../../hooks/magic-context/event-resolvers";
 import {
     type HistoryBoundaryRepair,
     repairMissingHistoryBoundary,
@@ -64,8 +65,14 @@ import {
     createToolExecuteAfterHook,
 } from "../../hooks/magic-context/hook-handlers";
 import { materializeM0 } from "../../hooks/magic-context/inject-compartments";
+import {
+    beginV2LkgRequest,
+    lkgProviderInputTotal,
+    noteLkgProviderResponse,
+} from "../../hooks/magic-context/lkg-measured-request";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
+import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
 import { preloadTokenizer } from "../../hooks/magic-context/read-session-formatting";
@@ -81,6 +88,8 @@ import { UnresolvedHistoryBoundaryError } from "../../hooks/magic-context/unreso
 import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { registerRpcHandlers } from "../../plugin/rpc-handlers";
+import { hideSubagentTools } from "../../plugin/subagent-tool-policy";
+import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { detectConflicts } from "../../shared/conflict-detector";
 import { getDataDir, getMagicContextStorageDir } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
@@ -118,11 +127,18 @@ import { seedV2ForkFromParent, sessionHasMagicContextState } from "../fork-inher
 import { cleanupLegacyHiddenChildren } from "../hidden-child-cleanup";
 import { nativeSessionRemove } from "../hidden-child-native";
 import { createLateHiddenExecutor, createV2HiddenCompletionExecutor } from "../hidden-completion";
-import { gaDatabasePath, V2StoreReader } from "../store-reader";
-import { deliverPendingChannel2, deliverSynthetic, isAdmittedSynthetic } from "./channel2";
+import { gaDatabasePath, type V2StoreReader, V2StoreReaderPool } from "../store-reader";
+import {
+    clearSyntheticCandidates,
+    deliverPendingChannel2,
+    deliverSynthetic,
+    isAdmittedSynthetic,
+    syntheticCandidates,
+} from "./channel2";
 import { registerV2Commands } from "./commands";
 import { DeletedSessionTombstones } from "./deleted-session-tombstones";
 import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
+import { registerV2DreamScheduleTimer } from "./dream-timer";
 import { startDreamTrigger } from "./dream-trigger";
 import { V2GenerateReplay } from "./generate";
 import { HiddenChildHook, registerHiddenChildAgents } from "./hidden-child";
@@ -266,6 +282,7 @@ export function createHostSeams(
         | "hostMessageReconciliationSource"
         | "hostProtectedTailBoundary"
         | "hostModelFallback"
+        | "getModelKey"
         | "hostRefusalNotice"
         | "hostRefuse"
     >
@@ -280,6 +297,13 @@ export function createHostSeams(
             }),
         // Draft-backed: v2 never reconstructs the live model from message.updated.
         hostModelFallback: (sessionID) => liveModels.get(sessionID) ?? null,
+        // The shared scheduler and historian pressure bands read this callback,
+        // not liveModelBySession directly. Resolve on each pass so the draft's
+        // model is authoritative before any usage arrives and after a switch.
+        getModelKey: (sessionID) => {
+            const model = liveModels.get(sessionID);
+            return resolveModelKey(model?.providerID, model?.modelID);
+        },
         hostRefusalNotice: async (_client, sessionID, message) => {
             pushNotification("toast", { message, variant: "error" }, sessionID);
             await deliverSynthetic(context, sessionID, message);
@@ -474,21 +498,26 @@ export function recordV2ToolDefinitions(draft: SessionContext): void {
  * lost there anyway) and only detected the change on the second pass, whose
  * separate HARD fold rebuilt the cache a second time.
  *
- * The verdict is therefore frozen first, from this draft's messages, with the
- * same resolver and the same message shape the message transform later in this
- * pass freezes it from (the adapted messages carry no per-message tools map, see
- * payload.ts), so it can only freeze to the value the transform would have
- * frozen. A draft with no user message leaves the verdict provisional, as before.
- * Any future read of OpenCode 2's ctx_reduce permissions has to run before this
- * call: once frozen, the verdict never changes for the session.
+ * Freeze from the host-filtered tool set before either shared handler can fall
+ * back to the v1 tables. OC2 has already applied agent and session permissions
+ * to draft.tools; its adapted messages carry no v1 tools map. Freezing from
+ * roles alone therefore advertised a denied ctx_reduce as callable. Only the
+ * first resolved user pass decides: later tool/agent changes cannot change
+ * the guidance or tags mid-session. A draft with no user message remains
+ * provisional, as before.
  */
 export async function applyV2SystemPrompt(
     systemPrompt: Pick<ReturnType<typeof createSystemPromptHashHandler>, "handler">,
-    draft: Pick<SessionContext, "sessionID" | "model" | "messages" | "system">,
+    draft: Pick<SessionContext, "sessionID" | "model" | "messages" | "system" | "tools">,
 ): Promise<void> {
     resolveCtxReduceAvailabilityFromMessages(
         draft.sessionID,
-        draft.messages.map((message) => ({ info: { role: message.role } })),
+        draft.messages.map((message) => ({
+            info: {
+                role: message.role,
+                tools: { ctx_reduce: Object.hasOwn(draft.tools, "ctx_reduce") },
+            },
+        })),
     );
     const system = { system: draft.system.map((part) => String(part.text ?? "")) };
     await systemPrompt.handler(
@@ -547,6 +576,10 @@ export async function registerContext(context: V2Context) {
         return;
     }
     const liveConfigReader = pluginConfigReader(directory, config);
+    const checkoutClaim = createSubcCheckoutClaimGate(
+        "opencode",
+        () => config.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+    );
     const compactionOff = !isCompactionEnabled(config);
     const conflicts = detectConflicts(directory, {
         compactionEnabled: !compactionOff,
@@ -648,9 +681,12 @@ export async function registerContext(context: V2Context) {
                   memorySyncRequestedSessions: rustMemorySyncRequestedSessions,
               })
             : undefined;
+    const hiddenChildHook = new HiddenChildHook();
     const tools =
         db && isDatabasePersisted(db)
-            ? await registerTools(context, db, config, moduleToolBackends?.backends)
+            ? await registerTools(context, db, config, moduleToolBackends?.backends, (id) =>
+                  hiddenChildHook.owns(id),
+              )
             : undefined;
     const usage: TransformDeps["contextUsageMap"] = new Map();
     const generateReplay = new V2GenerateReplay();
@@ -698,9 +734,11 @@ export async function registerContext(context: V2Context) {
             }
         }
     });
-    const hiddenChildHook = new HiddenChildHook();
     await registerHiddenChildAgents(context.agent);
     let hiddenAgentsReady: Promise<void> | undefined;
+    const readerPool = new V2StoreReaderPool();
+    const openStoreReader = () =>
+        readerPool.open(gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"));
     const createHiddenExecutor = async (database: NonNullable<typeof db>) => {
         await cleanupLegacyOnce(database);
         return createV2HiddenCompletionExecutor(
@@ -735,36 +773,52 @@ export async function registerContext(context: V2Context) {
                 keepSubagents: config.keep_subagents === true,
                 ensureAgent: () => (hiddenAgentsReady ??= context.agent.reload()),
                 modelCatalog: () => Promise.resolve(context.model.list()),
-                openReader: () =>
-                    new V2StoreReader(
-                        gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
-                    ),
+                openReader: openStoreReader,
             },
         );
     };
     const dreamerAtBoot = config.dreamer;
-    const startDreamer = (executor: HiddenCompletionExecutor) =>
-        resolveProjectIdentityForSession(directory, config.allow_home_project) &&
-        dreamerAtBoot &&
-        !dreamerAtBoot.disable
-            ? startDreamTrigger(context, {
-                  config: dreamerAtBoot,
-                  sample: () => {
-                      const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
-                      return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
-                  },
-                  executor: withLiveDreamerOutputCap(
-                      executor,
-                      config,
-                      () => liveConfigReader.poll().effective,
-                  ),
-                  projectIdentity: () =>
-                      resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
-                  projectMemoryEnabled: config.memory.enabled,
-                  language: config.language,
-                  mural: config.mural,
-              })
-            : undefined;
+    const startDreamer = (executor: HiddenCompletionExecutor) => {
+        const projectIdentity = resolveProjectIdentityForSession(
+            directory,
+            config.allow_home_project,
+        );
+        if (!projectIdentity || !dreamerAtBoot || dreamerAtBoot.disable) return undefined;
+        const cappedExecutor = withLiveDreamerOutputCap(
+            executor,
+            config,
+            () => liveConfigReader.poll().effective,
+        );
+        const trigger = startDreamTrigger(context, {
+            config: dreamerAtBoot,
+            sample: () => {
+                const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
+                return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
+            },
+            executor: cappedExecutor,
+            projectIdentity: () =>
+                resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
+            projectMemoryEnabled: config.memory.enabled,
+            language: config.language,
+            mural: config.mural,
+        });
+        // The trigger runs due tasks after a session turn; the schedule timer runs
+        // them on their cron schedule when nobody is chatting.
+        const timer = registerV2DreamScheduleTimer({
+            directory,
+            projectIdentity,
+            config,
+            dreamer: dreamerAtBoot,
+            liveConfig: () => liveConfigReader.poll().effective,
+            executor: cappedExecutor,
+            openReader: openStoreReader,
+        });
+        return {
+            async dispose() {
+                await Promise.all([trigger.dispose(), timer.dispose()]);
+            },
+        };
+    };
     // Both stay undefined after a refused start until recoverHiddenWork wires them.
     let hiddenCompletionExecutor: HiddenCompletionExecutor | undefined =
         db &&
@@ -811,6 +865,7 @@ export async function registerContext(context: V2Context) {
             maxOutputTokens: fresh.historian?.maxTokens,
             timeoutMs: fresh.historian_timeout_ms,
             twoPass: fresh.historian?.two_pass === true,
+            expandTools: fresh.historian?.expand_tools,
             autoPromote: fresh.memory?.auto_promote ?? true,
             userMemoriesEnabled: userMemoryCollectionEnabled(fresh.dreamer),
             commitClusterTrigger: fresh.commit_cluster_trigger,
@@ -859,9 +914,19 @@ export async function registerContext(context: V2Context) {
             log("[magic-context] v2 Channel 2 delivery deferred", error);
         }
     });
-    const openStoreReader = () =>
-        new V2StoreReader(gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"));
     const pagedRead = createV2RawMessageReader(openStoreReader);
+    // Commands can precede the first context pass after a restart. Their background
+    // historian reads need the same durable v2 source as automatic historian work.
+    const prepareHistorySession = (sessionID: string): void => {
+        if (!rawProviders.has(sessionID))
+            rawProviders.set(
+                sessionID,
+                setBoundedRawMessageProvider(
+                    sessionID,
+                    createV2RawMessageProvider(pagedRead, sessionID),
+                ),
+            );
+    };
     if (db && isDatabasePersisted(db)) {
         const backfillDb = db;
         scheduleAfterBootQuiet(() => {
@@ -964,6 +1029,7 @@ export async function registerContext(context: V2Context) {
      * when that could not be done safely (the context database is not durable, or a
      * store could not be read); the usage figure itself never makes a turn unsafe.
      */
+    const latestLkgResponseIds = new BoundedSessionMap<string | undefined>(1000);
     const recordUsage = async (
         draft: Pick<SessionContext, "sessionID" | "model">,
     ): Promise<boolean> => {
@@ -974,11 +1040,25 @@ export async function registerContext(context: V2Context) {
             await storage.probe();
             db = storage.require();
             getOrCreateSessionMeta(db, draft.sessionID);
-            const reader = new V2StoreReader(
-                gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
-            );
+            const reader = openStoreReader();
             try {
                 const latest = reader.latestAssistant(draft.sessionID);
+                latestLkgResponseIds.set(draft.sessionID, latest?.id);
+                if (latest)
+                    noteLkgProviderResponse({
+                        sessionId: draft.sessionID,
+                        responseId: latest.id,
+                        modelKey:
+                            latest.data.model?.providerID && latest.data.model?.id
+                                ? `${latest.data.model.providerID}/${latest.data.model.id}`
+                                : undefined,
+                        inputTokens: lkgProviderInputTotal(latest.data.tokens),
+                        completedAt: latest.data.time?.completed,
+                        createdAt: latest.data.time?.created ?? latest.time_created,
+                        finish: latest.data.finish,
+                        error: latest.data.error,
+                        v2: true,
+                    });
                 const draftModelKey = `${draft.model.providerID}/${draft.model.id}`;
                 if (!queriedModels.has(draftModelKey)) {
                     const catalog = await Promise.resolve(context.model.list());
@@ -1027,7 +1107,15 @@ export async function registerContext(context: V2Context) {
                     rowModel: latest?.data.model,
                     draftModel: { providerID: draft.model.providerID, id: draft.model.id },
                     tokens: latest?.data.tokens,
-                    completed: latest?.data.time?.completed,
+                    // Completion is authoritative. Legacy finish-only rows use a
+                    // stable stored message time, never the time of this reread.
+                    completed:
+                        latest?.data.time?.completed ??
+                        (latest?.data.finish
+                            ? (latest.data.time?.streamed ?? latest.data.time?.created)
+                            : undefined),
+                    finish: latest?.data.finish,
+                    error: latest?.data.error,
                     limitFor,
                 });
                 if (reading) {
@@ -1151,9 +1239,7 @@ export async function registerContext(context: V2Context) {
         // Leaving `result` unset hands the request back to the host, exactly as if
         // no hook were registered.
         if (compactionOff) return;
-        const reader = new V2StoreReader(
-            gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
-        );
+        const reader = openStoreReader();
         try {
             const watermark = reader.latestSequenceForIds(
                 draft.sessionID,
@@ -1214,6 +1300,25 @@ export async function registerContext(context: V2Context) {
         // A deletion that races an in-flight pass must not let that pass rebuild
         // the state just cleared by the one deletion event.
         if (deletedSessions.has(draft.sessionID)) return;
+        // Before anything below writes for this session: refuse the turn when
+        // another machine holds the session's agent. This holds in compaction-off
+        // mode too; passing the draft through would keep working on an agent this
+        // machine does not hold.
+        const claimRefusal = await checkoutClaim.refusal(draft.sessionID, directory);
+        if (claimRefusal) {
+            pushNotification(
+                "toast",
+                { message: claimRefusal.message, variant: "error" },
+                draft.sessionID,
+            );
+            await refuseBeforeProvider(
+                context.session,
+                draft.sessionID,
+                "checkout-claim-held-elsewhere",
+                claimRefusal,
+            );
+            throw new V2ContextRefusal(claimRefusal.message, { cause: claimRefusal });
+        }
         const systemAtEntry = structuredClone(draft.system);
         const slotAtEntry = getSlot(draft.sessionID);
         const restoreLkgSystem = () => {
@@ -1268,7 +1373,10 @@ export async function registerContext(context: V2Context) {
             const admissionDb = db ?? storage.current();
             if (!compactionOff && admissionDb)
                 await withAsyncPrivilegedWriter(admissionDb, () => undefined);
-            // Measure only after admission and after per-model descriptions are final.
+            // Hidden maintenance carriers returned above with their explicit
+            // allow-lists. Only this request's map changes, never registrations
+            // or the primary session's cached tool definitions.
+            if (admissionDb) hideSubagentTools(draft, admissionDb);
             recordV2ToolDefinitions(draft);
             // Only a failure to read or record usage refuses here. A high reading is
             // left to the transform below: its force band and emergency path are what
@@ -1365,16 +1473,11 @@ export async function registerContext(context: V2Context) {
             await cacheV2SessionDirectory(context.session, draft.sessionID, sessionDirectories);
             // Background historian reads outlive the context callback. Keep its source
             // registered until plugin disposal, rather than falling back to the v1 store.
-            if (!rawProviders.has(draft.sessionID))
-                rawProviders.set(
-                    draft.sessionID,
-                    setBoundedRawMessageProvider(
-                        draft.sessionID,
-                        createV2RawMessageProvider(pagedRead, draft.sessionID),
-                    ),
-                );
+            prepareHistorySession(draft.sessionID);
             transform ??= createTransform({
                 cacheTtlConfig: config.cache_ttl,
+                cacheTtlConfigured: config.cacheTtlConfigured,
+                sampleCacheTtlConfig: () => liveConfigReader.poll().effective,
                 db,
                 tagger,
                 ...createV2ThresholdDeps(config),
@@ -1428,6 +1531,7 @@ export async function registerContext(context: V2Context) {
                 // its own default, so no fallback belongs here.
                 historianMaxOutputTokens: config.historian?.maxTokens,
                 historianTwoPass: config.historian?.two_pass,
+                historianExpandTools: config.historian?.expand_tools,
                 historianRunner: config.historian?.runner,
                 historianHostRunnerEnabled: config.historian?.host_runner?.enabled,
                 // TypeScript mode folds on the host's own compaction rows, so its marker
@@ -1474,16 +1578,23 @@ export async function registerContext(context: V2Context) {
                 ...createHostSeams(context, readAllForConversion, pagedRead, liveModels),
             });
             const admitted = new Set<string>();
-            for (const message of draft.messages) {
-                if (message.id && (await isAdmittedSynthetic(context, draft.sessionID, message.id)))
-                    admitted.add(message.id);
-            }
-            const reader = new V2StoreReader(
-                gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
-            );
+            const reader = openStoreReader();
             let checkpoint: SessionContext["messages"][number] | undefined;
             let submitted: string | undefined;
             try {
+                const candidates = syntheticCandidates(
+                    context,
+                    draft.sessionID,
+                    reader.syntheticMessageIDs(draft.sessionID),
+                );
+                for (const message of draft.messages) {
+                    if (
+                        message.id &&
+                        candidates.has(message.id) &&
+                        (await isAdmittedSynthetic(context, draft.sessionID, message.id))
+                    )
+                        admitted.add(message.id);
+                }
                 const cut = reader.latestCompaction(draft.sessionID);
                 // Before anything restores or trims against the history boundary,
                 // make sure the host store still has it. Only TypeScript mode keeps
@@ -1612,10 +1723,14 @@ export async function registerContext(context: V2Context) {
                     );
             }
             const mapped = adaptPayload(draft, admitted);
+            beginV2LkgRequest(
+                draft.sessionID,
+                `${draft.model.providerID}/${draft.model.id}`,
+                latestLkgResponseIds.get(draft.sessionID),
+            );
             await createMessagesTransformHandler({
                 magicContext: { "experimental.chat.messages.transform": transform },
                 compactionOff,
-                propagateUnexpectedErrors: true,
                 onLkgReplay: restoreLkgSystem,
                 rustReplayParticipant: () => transform?.getRustReplayParticipant() ?? null,
             })(
@@ -1719,20 +1834,26 @@ export async function registerContext(context: V2Context) {
                 );
                 throw new V2ContextRefusal(STORAGE_BUSY_MESSAGE, { cause: refusal });
             }
-            if (isBlockingV2TransformError(error)) {
+            // Failures before the shared wrapper (for example adapting host
+            // history) also cannot hand the provider an unmanaged draft.
+            const managedError =
+                !compactionOff && !isBlockingV2TransformError(error)
+                    ? new DegradedPassRefusalError("v2-context-failed", { cause: error })
+                    : error;
+            if (isBlockingV2TransformError(managedError)) {
                 // These errors mean the shared transform cannot prove a safe prompt.
                 // Native compaction owns recovery when Magic Context compaction is off.
                 if (!compactionOff) {
                     // The host records an interrupted turn without its reason, so
                     // say on the TUI's notification channel what the user can do.
                     if (
-                        error instanceof UnresolvedHistoryBoundaryError ||
-                        error instanceof UnmanagedOverWindowError ||
-                        error instanceof DegradedPassRefusalError
+                        managedError instanceof UnresolvedHistoryBoundaryError ||
+                        managedError instanceof UnmanagedOverWindowError ||
+                        managedError instanceof DegradedPassRefusalError
                     ) {
                         pushNotification(
                             "toast",
-                            { message: error.message, variant: "error" },
+                            { message: managedError.message, variant: "error" },
                             draft.sessionID,
                         );
                     }
@@ -1740,10 +1861,10 @@ export async function registerContext(context: V2Context) {
                         context.session,
                         draft.sessionID,
                         "blocking-transform-error",
-                        error,
+                        managedError,
                     );
                     throw new V2ContextRefusal("Magic Context refused to send an unsafe prompt.", {
-                        cause: error,
+                        cause: managedError,
                     });
                 }
                 log("[magic-context] compaction-off: fail-closed inert, passing through", error);
@@ -1823,6 +1944,8 @@ export async function registerContext(context: V2Context) {
         hiddenCompletionExecutor: storageOpenedAtBoot
             ? hiddenCompletionExecutor
             : lateHiddenExecutor,
+        compactionMarkerStrategy: v2CompactionMarkerStrategy,
+        prepareHistorySession,
         storageDir,
     });
     // The v2 TUI reaches manual dreaming through RPC because this host has no
@@ -1881,6 +2004,7 @@ export async function registerContext(context: V2Context) {
                     summary.ran.length > 0 ||
                     summary.failed.length > 0 ||
                     summary.skippedNoWork.length > 0 ||
+                    (summary.skipped?.length ?? 0) > 0 ||
                     summary.deferredBusy.length > 0 ||
                     Object.keys(summary.backlogBefore ?? {}).length > 0 ||
                     Object.keys(summary.backlogAfter ?? {}).length > 0;
@@ -1949,6 +2073,8 @@ export async function registerContext(context: V2Context) {
             for (const release of rawProviders.values()) release();
             rawProviders.clear();
             restoredRows.clear();
+            readerPool.close();
+            clearSyntheticCandidates(context);
         },
     };
 }

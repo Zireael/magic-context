@@ -230,6 +230,7 @@ async function runOneWrapupIteration(args: {
     const runnerPromise = runCompartmentAgentForWrapup({
         client: ctx.client,
         hiddenCompletionExecutor: ctx.hiddenCompletionExecutor,
+        compactionMarkerStrategy: ctx.compactionMarkerStrategy,
         db: ctx.db,
         sessionId,
         historianChunkTokens: ctx.historianChunkTokens,
@@ -242,6 +243,7 @@ async function runOneWrapupIteration(args: {
         fallbackModelId: ctx.fallbackModelId,
         language: ctx.language,
         historianTwoPass: ctx.historianTwoPass,
+        historianExpandTools: ctx.historianExpandTools,
         memoryEnabled: ctx.memoryEnabled,
         autoPromote: ctx.autoPromote,
         // User-memory collection is forwarded on the same gate as every other

@@ -17,6 +17,7 @@ import { getCompartments } from "@magic-context/core/features/magic-context/comp
 import {
 	getFailingDreamTasks,
 	getMostRecentTaskRunAt,
+	getSkippedDreamTasks,
 } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "@magic-context/core/features/magic-context/dreamer/task-gates";
 import {
@@ -82,12 +83,18 @@ import type { WindowGeometryResult } from "@magic-context/core/shared/window-geo
 import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
 import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
+import { readHostSystemPrompt } from "../host-system-prompt";
 import { resolvePiWindowGeometry } from "../pi-context-limit";
 import { resolvePiStatusPressureSnapshot } from "../pi-pressure";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 
 /** Refresh cadence while dialog is open. */
 const REFRESH_INTERVAL_MS = 1000;
+
+// Top/bottom borders, and one border plus one padding column on each side.
+const BORDER_ROWS = 2;
+const BORDER_COLUMNS = 2;
+const PADDING_COLUMNS = 2;
 
 export interface StatusDialogDeps {
 	db: ContextDatabase;
@@ -197,6 +204,7 @@ export interface StatusDialogDetail {
 		backlog: ReturnType<typeof getDreamTaskBacklogs>;
 		/** Tasks whose last scheduled run failed; empty when all of them are healthy. */
 		failures: DreamTaskFailureState[];
+		skipped?: string[];
 		/**
 		 * The stage that stopped the last maintenance pass, or null when the pass
 		 * completed. Not a per-task failure: this is the whole pass never reaching
@@ -265,6 +273,9 @@ class StatusDialogComponent implements Component {
 	private detail: StatusDialogDetail;
 	private refreshTimer: ReturnType<typeof setInterval> | null = null;
 	private closed = false;
+	private scrollOffset = 0;
+	private viewportHeight = 1;
+	private maxScrollOffset = 0;
 
 	constructor(props: StatusDialogProps) {
 		this.props = props;
@@ -292,13 +303,25 @@ class StatusDialogComponent implements Component {
 	}
 
 	handleInput(data: string): void {
+		if (this.closed) return;
 		if (
 			matchesKey(data, "escape") ||
 			matchesKey(data, "ctrl+c") ||
 			matchesKey(data, "return")
 		) {
 			this.close();
+			return;
 		}
+		let offset = this.scrollOffset;
+		if (matchesKey(data, "up")) offset -= 1;
+		else if (matchesKey(data, "down")) offset += 1;
+		else if (matchesKey(data, "pageUp")) offset -= this.viewportHeight;
+		else if (matchesKey(data, "pageDown")) offset += this.viewportHeight;
+		else if (matchesKey(data, "home")) offset = 0;
+		else if (matchesKey(data, "end")) offset = this.maxScrollOffset;
+		else return;
+		this.scrollOffset = Math.max(0, Math.min(offset, this.maxScrollOffset));
+		this.props.tui.requestRender();
 	}
 
 	close(): void {
@@ -308,21 +331,52 @@ class StatusDialogComponent implements Component {
 	}
 
 	invalidate(): void {
-		// stateless render; nothing to invalidate
+		// No render cache; viewport metrics are recomputed in render.
 	}
 
 	render(width: number): string[] {
-		// drawBorder reserves 2 chars for left/right border + 1 char padding
-		// each side, leaving width-4 for inner content. Pass this through to
-		// renderInner so the segmented bar can fill the available row width
-		// instead of being capped at a hardcoded 56 chars.
-		const innerWidth = Math.max(20, width - 4);
+		const frameWidth = BORDER_COLUMNS + PADDING_COLUMNS;
+		const innerWidth = Math.max(1, width - frameWidth);
 		const inner = renderPiStatusOverlay(
 			this.detail,
 			this.props.theme,
 			innerWidth,
 		);
-		return drawBorder(inner, width, this.props.theme);
+		// Reserve the borders, title and close hint; only the body scrolls.
+		// The host clips overflowing overlays rather than scrolling them.
+		const rows = Math.max(0, this.props.tui.terminal.rows);
+		const header = inner.slice(0, 1);
+		const footer = inner.slice(-1);
+		const body = inner.slice(header.length, inner.length - footer.length);
+		const fixedRows = BORDER_ROWS + header.length + footer.length;
+		this.viewportHeight = Math.max(1, rows - fixedRows);
+		this.maxScrollOffset = Math.max(0, body.length - this.viewportHeight);
+		this.scrollOffset = Math.min(this.scrollOffset, this.maxScrollOffset);
+		if (rows <= fixedRows || width < frameWidth) {
+			const compact = rows <= footer.length ? footer : [...header, ...footer];
+			return compact
+				.slice(0, rows)
+				.map((line) => truncateToWidth(line, width, "…"));
+		}
+		if (this.maxScrollOffset === 0) {
+			return drawBorder(inner, width, this.props.theme);
+		}
+		const end = this.scrollOffset + this.viewportHeight;
+		const range = `${this.scrollOffset + 1}-${end}/${body.length}`;
+		const closeHint = footer[0] ?? "";
+		const scrollHint =
+			["↑↓/PgUp/PgDn/Home/End scroll", "↑↓"]
+				.map(
+					(controls) =>
+						closeHint +
+						this.props.theme.fg("muted", ` · ${controls} · ${range}`),
+				)
+				.find((line) => visibleWidth(line) <= innerWidth) ?? closeHint;
+		return drawBorder(
+			[...header, ...body.slice(this.scrollOffset, end), scrollHint],
+			width,
+			this.props.theme,
+		);
 	}
 
 	dispose(): void {
@@ -383,6 +437,7 @@ export function formatPiStatusSummary(s: StatusDialogDetail): string {
 			noteCount: s.sessionNoteCount + s.readySmartNoteCount,
 			embedding: s.embedding,
 			warnings: piStatusWarnings(s),
+			dreamerSkipped: s.dreamer.skipped,
 		},
 		"plain",
 	);
@@ -406,6 +461,7 @@ export function statusViewSourceFromPiDetail(
 		// Pi carries "no expiry" as an infinite remaining time rather than a flag.
 		cacheNeverExpires: s.cacheRemainingMs === Number.POSITIVE_INFINITY,
 		lastDreamerRunAt: s.dreamer.lastRunAt,
+		dreamerSkipped: s.dreamer.skipped,
 		dreamerTickFailure: s.dreamer.tickFailure,
 		warnings: piStatusWarnings(s),
 	};
@@ -605,11 +661,11 @@ export function renderPiStatusOverlay(
  * theme's borderMuted color so the overlay reads as a distinct surface.
  */
 function drawBorder(inner: string[], width: number, theme: Theme): string[] {
-	const innerWidth = Math.max(20, width - 4); // 2 chars border + 1 padding each side
+	const innerWidth = Math.max(0, width - BORDER_COLUMNS - PADDING_COLUMNS);
 	const border = (s: string) => theme.fg("borderMuted", s);
 
-	const top = border(`╭${"─".repeat(innerWidth + 2)}╮`);
-	const bottom = border(`╰${"─".repeat(innerWidth + 2)}╯`);
+	const top = border(`╭${"─".repeat(innerWidth + PADDING_COLUMNS)}╮`);
+	const bottom = border(`╰${"─".repeat(innerWidth + PADDING_COLUMNS)}╯`);
 	const side = border("│");
 
 	const out: string[] = [];
@@ -706,11 +762,8 @@ export function buildPiStatusDetail(
 	// so the dialog still has a sensible number outside command context.
 	let systemPromptTokens = meta.systemPromptTokens;
 	try {
-		const sysPrompt =
-			typeof ctx.getSystemPrompt === "function"
-				? ctx.getSystemPrompt()
-				: undefined;
-		if (typeof sysPrompt === "string" && sysPrompt.length > 0) {
+		const sysPrompt = readHostSystemPrompt(ctx);
+		if (sysPrompt !== undefined && sysPrompt.length > 0) {
 			systemPromptTokens = estimateTokens(sysPrompt);
 		}
 	} catch {
@@ -964,6 +1017,10 @@ export function buildPiStatusDetail(
 			),
 			failures: safeRead(
 				() => getFailingDreamTasks(deps.db, deps.projectIdentity),
+				[],
+			),
+			skipped: safeRead(
+				() => getSkippedDreamTasks(deps.db, deps.projectIdentity),
 				[],
 			),
 			// Recorded by the process-wide maintenance timer, so it is read from

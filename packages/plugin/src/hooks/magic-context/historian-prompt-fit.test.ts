@@ -1,11 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { Memory } from "../../features/magic-context/memory/types";
 import { buildCompartmentAgentPrompt, COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
 import { calibrationForModelKey, providerMass } from "./decision-calibration";
 import { fitHistorianPrompt, type HistorianPromptFitArgs } from "./historian-prompt-fit";
-import { producerInputTokenLimit } from "./producer-window-guard";
+import { PRODUCER_WINDOW_REFUSAL_MARGIN, producerInputTokenLimit } from "./producer-window-guard";
+import * as formatting from "./read-session-formatting";
 import { estimateTokens } from "./read-session-formatting";
-import type { ReferenceCompartment } from "./reference-retrieval";
+import { buildReferenceBlocks, type ReferenceCompartment } from "./reference-retrieval";
 
 const MODEL = "test/unknown-historian";
 
@@ -78,6 +79,66 @@ function limitOf(input: HistorianPromptFitArgs): number {
 }
 
 describe("fitHistorianPrompt", () => {
+    test("fit drops diverse examples before recent, and oldest recent first", () => {
+        const input = args({
+            memories: [],
+            sessionCompartments: Array.from({ length: 12 }, (_, i) => compartment(i)),
+        });
+        const full = buildReferenceBlocks(input);
+        const units = full.sessionReferences.match(/<compartment [\s\S]*?<\/compartment>/g) ?? [];
+        expect(units).toHaveLength(7);
+        for (const remaining of [6, 4, 3]) {
+            const expected = `<session_references>\n${units.slice(-remaining).join("\n\n")}\n</session_references>`;
+            const fixed = buildCompartmentAgentPrompt({
+                seedExamples: full.seedExamples,
+                sessionReferences: expected,
+                projectMemory: "",
+                inputSource: `Messages ${input.chunkStart}-${input.lastOrdinal}:\n\n`,
+                memoryEnabled: true,
+            });
+            const inputLimitTokens = Math.ceil(
+                providerMass(
+                    {
+                        system: estimateTokens(input.systemPrompt),
+                        prose: estimateTokens(fixed) + input.requestedChunkTokens + 64,
+                    },
+                    calibrationForModelKey(MODEL),
+                    true,
+                ) /
+                    (1 - PRODUCER_WINDOW_REFUSAL_MARGIN),
+            );
+            const fit = fitHistorianPrompt({
+                ...input,
+                window: { modelKey: MODEL, inputLimitTokens, maxOutputTokens: 8_000 },
+            });
+            if (!fit.ok) throw new Error(fit.reason);
+            expect(fit.kept.sessionReferences).toBe(remaining);
+            expect(fit.sessionReferences).toBe(expected);
+            expect(fit.kept.seeds).toBe(3);
+            for (let i = 12 - Math.min(4, remaining); i < 12; i++)
+                expect(fit.sessionReferences).toContain(`title="Compartment ${i}"`);
+            if (remaining === 3)
+                expect(fit.sessionReferences).not.toContain('title="Compartment 8"');
+        }
+    });
+    test("repeated fixed historian prompts reuse exact token counts without changing fit bytes", () => {
+        const input = args({
+            sessionId: "fit-token-reuse",
+            systemPrompt: `${COMPARTMENT_AGENT_SYSTEM_PROMPT}\nunique-token-reuse`,
+        });
+        const first = fitHistorianPrompt(input);
+        const estimate = spyOn(formatting, "estimateTokens");
+        try {
+            const repeated = fitHistorianPrompt(structuredClone(input));
+            expect(estimate).toHaveBeenCalledTimes(0);
+            expect(JSON.stringify(repeated)).toBe(JSON.stringify(first));
+            const edited = fitHistorianPrompt({ ...input, systemPrompt: `${input.systemPrompt}!` });
+            expect(estimate.mock.calls.length).toBeGreaterThan(0);
+            expect(edited.ok).toBe(true);
+        } finally {
+            estimate.mockRestore();
+        }
+    });
     test("keeps every block and the requested chunk when the window has room", () => {
         const input = args({});
         const fit = fitHistorianPrompt(input);

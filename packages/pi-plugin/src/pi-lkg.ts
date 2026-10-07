@@ -5,10 +5,19 @@ import {
 import { replayLkg } from "@magic-context/core/hooks/magic-context/lkg-replay";
 import {
 	captureSlot,
+	contentSnapshotValue,
 	dropSlot,
 	exactReusablePrefix,
 	getSlot,
 	incrementalLkgContentDigests,
+	LKG_SNAPSHOT_ARRAY,
+	LKG_SNAPSHOT_BOOLEAN,
+	LKG_SNAPSHOT_KEY,
+	LKG_SNAPSHOT_NULL,
+	LKG_SNAPSHOT_NUMBER,
+	LKG_SNAPSHOT_OBJECT,
+	LKG_SNAPSHOT_STRING,
+	LKG_SNAPSHOT_UNDEFINED,
 	type LkgContentField,
 	type LkgEntryNote,
 	type LkgSlot,
@@ -29,6 +38,7 @@ interface PiLkgInputSnapshot {
 	id: string;
 	messageIndex: number;
 	fields: readonly LkgContentField[];
+	providerUsageSignature?: string;
 }
 
 export interface PiLkgPassSnapshot {
@@ -53,6 +63,12 @@ export interface PiLkgCaptureTiming {
 	reusedPrefix: number;
 }
 
+/** Detached serialization of this pass's exact output, for same-pass observers. */
+export interface PiLkgSerializedOutput {
+	jsonMessages: readonly string[];
+	json: string;
+}
+
 interface PiLkgSessionState {
 	captureSequence: number;
 	syncCaptureRequired: boolean;
@@ -66,6 +82,10 @@ interface PiLkgSessionState {
 	capturedRequest?: PiLkgCapturePlan & {
 		envelopeSignature: string;
 		usage?: { signature: string; inputTokens: number };
+	};
+	measuredRequest?: PiLkgCapturePlan & {
+		envelopeSignature: string;
+		usage: { signature: string; inputTokens: number };
 	};
 }
 
@@ -173,6 +193,7 @@ export function notePiLkgProviderUsage(
 			signature: usage.signature,
 			inputTokens: usage.inputTokens,
 		};
+		if (state) state.measuredRequest = { ...request, usage: request.usage };
 		return true;
 	} catch {
 		return false;
@@ -197,13 +218,19 @@ export interface PiLkgCoordinator {
 		snapshot: PiLkgPassSnapshot,
 		parentOf?: (id: string) => string | null | undefined,
 	): PiLkgReplayResult;
+	/** Provider evidence for a healthy output, without performing a replay. */
+	measureOutgoingPrefix(
+		snapshot: PiLkgPassSnapshot,
+		messages: readonly unknown[],
+		parentOf?: (id: string) => string | null | undefined,
+	): PiMeasuredPrefixFit | undefined;
 	captureAppliedPass(args: {
 		snapshot: PiLkgPassSnapshot;
 		outputMessages: readonly unknown[];
 		outputEntryIds?: readonly (string | null | undefined)[];
 		cacheBusting: boolean;
 		hostEnvelopeSignature?: string;
-	}): void;
+	}): PiLkgSerializedOutput | undefined;
 }
 
 export function isTransientPiStorageError(error: unknown): boolean {
@@ -313,39 +340,79 @@ export function piStorageErrorReason(error: unknown): string {
 
 // JSON serializers on non-plain values (for example Date) are not represented
 // by field tokens. Keep the original array serialization path for those values.
-function isPlainJsonValue(
-	value: unknown,
-	seen = new WeakSet<object>(),
-): boolean {
-	if (!value || typeof value !== "object") return true;
-	if (seen.has(value)) return false;
-	const prototype = Object.getPrototypeOf(value);
-	if (
-		!Array.isArray(value) &&
-		prototype !== Object.prototype &&
-		prototype !== null
-	)
-		return false;
-	if (
-		prototype === Object.prototype &&
-		Object.getOwnPropertyDescriptor(prototype, "toJSON")
-	)
-		return false;
-	seen.add(value);
-	const keys = Object.keys(value);
-	if (Array.isArray(value) && keys.length !== value.length) return false;
-	for (const key of keys) {
-		const descriptor = Object.getOwnPropertyDescriptor(value, key);
-		if (
-			descriptor?.get ||
-			descriptor?.set ||
-			(key === "toJSON" && typeof descriptor?.value === "function") ||
-			!isPlainJsonValue(descriptor?.value, seen)
-		)
-			return false;
+/** Validate JSON-visible data and detach exact field tokens in the same walk. */
+function plainJsonFields(value: unknown): LkgContentField[] | null {
+	const fields: LkgContentField[] = [];
+	const seen = new WeakSet<object>();
+	const visit = (child: unknown): boolean => {
+		if (child === null) fields.push(LKG_SNAPSHOT_NULL);
+		else if (typeof child === "string") fields.push(LKG_SNAPSHOT_STRING, child);
+		else if (typeof child === "number") fields.push(LKG_SNAPSHOT_NUMBER, child);
+		else if (typeof child === "boolean")
+			fields.push(LKG_SNAPSHOT_BOOLEAN, child);
+		else if (typeof child !== "object") fields.push(LKG_SNAPSHOT_UNDEFINED);
+		else {
+			if (seen.has(child)) return false;
+			const array = Array.isArray(child);
+			const prototype = Object.getPrototypeOf(child);
+			if (
+				(!array && prototype !== Object.prototype && prototype !== null) ||
+				"toJSON" in child
+			)
+				return false;
+			const keys = Object.keys(child);
+			if (array && keys.length !== child.length) return false;
+			seen.add(child);
+			fields.push(array ? LKG_SNAPSHOT_ARRAY : LKG_SNAPSHOT_OBJECT);
+			const countIndex = fields.length;
+			fields.push(array ? child.length : 0);
+			let count = 0;
+			for (const key of keys) {
+				const descriptor = Object.getOwnPropertyDescriptor(child, key);
+				if (
+					!descriptor ||
+					!("value" in descriptor) ||
+					(array && key !== String(count))
+				)
+					return false;
+				const entry: unknown = descriptor.value;
+				if (
+					!array &&
+					(entry === undefined ||
+						typeof entry === "function" ||
+						typeof entry === "symbol")
+				)
+					continue;
+				count++;
+				if (!array) fields.push(LKG_SNAPSHOT_KEY, key);
+				if (!visit(entry)) return false;
+			}
+			if (!array) fields[countIndex] = count;
+			seen.delete(child);
+		}
+		return true;
+	};
+	if (!visit(value)) return null;
+	// The shared snapshot ignores an empty OpenCode diff summary. Native Pi
+	// messages never carry that shape, but preserve compatibility for adapters.
+	const normalized = contentSnapshotValue(value);
+	return normalized === value ? fields : lkgContentFields(normalized);
+}
+
+function plainOutputFields(
+	messages: readonly unknown[],
+): { id: string; fields: readonly LkgContentField[] }[] | null {
+	if ("toJSON" in messages || Object.keys(messages).length !== messages.length)
+		return null;
+	const outputs: { id: string; fields: readonly LkgContentField[] }[] = [];
+	for (let index = 0; index < messages.length; index++) {
+		const descriptor = Object.getOwnPropertyDescriptor(messages, String(index));
+		if (!descriptor || !("value" in descriptor)) return null;
+		const fields = plainJsonFields(descriptor.value);
+		if (!fields) return null;
+		outputs.push({ id: String(index), fields });
 	}
-	seen.delete(value);
-	return true;
+	return outputs;
 }
 
 function snapshotInputs(
@@ -374,9 +441,28 @@ function snapshotInputs(
 			`pi-lkg-unmapped:${lkgContentDigestFromFields(fields)}`;
 		if (seen.has(id)) return { inputs: [], failure: "lkg_duplicate_entry_id" };
 		seen.add(id);
-		inputs.push({ id, messageIndex: index, fields });
+		inputs.push({
+			id,
+			messageIndex: index,
+			fields,
+			providerUsageSignature: completedProviderUsage(messages[index])
+				?.signature,
+		});
 	}
 	return { inputs, failure: null };
+}
+
+/** Compact JSON arrays preserve the exact serialized rows before their closing
+ * bracket. A measurement cannot cover a rewritten row, even with the same ids. */
+function extendsMeasuredRequest(
+	measuredJson: string,
+	nextJson: string,
+): boolean {
+	return (
+		measuredJson === nextJson ||
+		(measuredJson.length > 2 &&
+			nextJson.startsWith(`${measuredJson.slice(0, -1)},`))
+	);
 }
 
 /**
@@ -483,7 +569,7 @@ export function createPiLkgCoordinator(
 		slot: LkgSlot | undefined,
 		parentOf?: (id: string) => string | null | undefined,
 	): PiMeasuredPrefixFit | undefined => {
-		const request = stateFor(snapshot.sessionId).capturedRequest;
+		const request = stateFor(snapshot.sessionId).measuredRequest;
 		const anchor = snapshot.replayAnchorInputIndex;
 
 		if (
@@ -492,40 +578,55 @@ export function createPiLkgCoordinator(
 			!parentOf ||
 			anchor === null ||
 			!snapshot.pristineTail ||
-			request.captureSequence !==
-				stateFor(snapshot.sessionId).captureSequence ||
-			request.captureSequence !== slot.captureSequence ||
-			request.capturedAt !== slot.capturedAt ||
-			request.jsonPrefix !== slot.jsonPrefix ||
+			!extendsMeasuredRequest(request.jsonPrefix, slot.jsonPrefix) ||
 			!request.modelKey ||
 			request.modelKey !== slot.modelKey ||
 			request.modelKey !== snapshot.modelKey ||
 			request.providerKey !== slot.providerKey ||
 			request.providerKey !== snapshot.providerKey ||
-			slot.lastInputMessageId !== request.inputs.at(-1)?.id ||
-			snapshot.inputs[anchor]?.id !== slot.lastInputMessageId
+			snapshot.inputs[anchor]?.id !== slot.lastInputMessageId ||
+			exactReusablePrefix(snapshot.inputs, request.inputs) !==
+				request.inputs.length
 		)
 			return;
-		const assistantId = snapshot.inputs[anchor + 1]?.id;
-		const usage = completedProviderUsage(snapshot.pristineTail[0]);
+		const assistant = snapshot.inputs[request.inputs.length];
+		const assistantId = assistant?.id;
 		if (
 			!assistantId ||
 			assistantId.startsWith("pi-lkg-unmapped:") ||
-			usage?.signature !== request.usage.signature
+			assistant.providerUsageSignature !== request.usage.signature
 		)
 			return;
+		let appendedMessages: MessageLike[];
 		try {
-			if (parentOf(assistantId) !== slot.lastInputMessageId) return;
+			if (parentOf(assistantId) !== request.inputs.at(-1)?.id) return;
+			const measuredLength = (JSON.parse(request.jsonPrefix) as unknown[])
+				.length;
+			const prefix = JSON.parse(slot.jsonPrefix) as MessageLike[];
+			const replyId =
+				measuredLength < prefix.length
+					? slot.piOutputEntryIds?.[measuredLength]
+					: snapshot.inputs[anchor + 1]?.id;
+			if (replyId !== assistantId) return;
+			appendedMessages = [
+				...prefix.slice(measuredLength),
+				...snapshot.pristineTail,
+			];
+			if (
+				completedProviderUsage(appendedMessages[0])?.signature !==
+				request.usage.signature
+			)
+				return;
 		} catch {
 			return;
 		}
-		// The accepted assistant reply is new input on this replay, so it remains
-		// in the tail priced above the provider's prior-request input count.
+		// Every message added since the measured request is new input, including
+		// its reply and any later unmeasured captures, not just the latest raw tail.
 		return {
 			modelKey: piModelRefToCanonical(request.modelKey).toLowerCase(),
 			inputTokens: request.usage.inputTokens,
 			envelopeSignature: request.envelopeSignature,
-			appendedMessages: snapshot.pristineTail,
+			appendedMessages,
 		};
 	};
 	const replay: PiLkgCoordinator["replay"] = (snapshot, parentOf) => {
@@ -623,14 +724,9 @@ export function createPiLkgCoordinator(
 		try {
 			// Pi clones the host array between hooks, so reference identity cannot prove
 			// an unchanged output. Detached field tokens also detect in-place rewrites.
-			const plainOutput = isPlainJsonValue(args.outputMessages);
-			const outputs = !plainOutput
-				? []
-				: args.outputMessages.map((message, index) => {
-						const fields = lkgContentFields(message);
-						if (!fields) throw new Error("LKG output snapshot failed");
-						return { id: String(index), fields };
-					});
+			const detachedOutputs = plainOutputFields(args.outputMessages);
+			const plainOutput = detachedOutputs !== null;
+			const outputs = detachedOutputs ?? [];
 			const priorOutput = plainOutput ? state.outputSnapshot : null;
 			const prefix = exactReusablePrefix(outputs, priorOutput?.inputs ?? null);
 			const jsonMessages = [
@@ -700,6 +796,17 @@ export function createPiLkgCoordinator(
 			capturedAt: Date.now(),
 			captureSequence: state.captureSequence,
 		};
+		// Capturing an unmeasured retry must not erase evidence for its unchanged
+		// served prefix. A rebuild, edited row, route or envelope does erase it.
+		if (
+			state.measuredRequest &&
+			(state.measuredRequest.modelKey !== plan.modelKey ||
+				state.measuredRequest.providerKey !== plan.providerKey ||
+				state.measuredRequest.envelopeSignature !==
+					args.hostEnvelopeSignature ||
+				!extendsMeasuredRequest(state.measuredRequest.jsonPrefix, jsonPrefix))
+		)
+			state.measuredRequest = undefined;
 		state.capturedRequest = args.hostEnvelopeSignature
 			? { ...plan, envelopeSignature: args.hostEnvelopeSignature }
 			: undefined;
@@ -716,8 +823,8 @@ export function createPiLkgCoordinator(
 		if (unchanged && !state.syncCaptureRequired) {
 			// Provider usage can arrive before the deferred commit. Refresh the
 			// replay slot's identity in memory now without rewriting unchanged
-			// durable bytes. The new capturedRequest has no usage, so previous
-			// measurements remain superseded.
+			// durable bytes. The new capturedRequest awaits its own usage; the last
+			// measured request can still price an identical or append-only prefix.
 			const kept = {
 				...livePrior,
 				capturedAt: plan.capturedAt,
@@ -840,20 +947,21 @@ export function createPiLkgCoordinator(
 		};
 		if (state.syncCaptureRequired) {
 			commit();
-			return;
+		} else {
+			try {
+				scheduleCapture(commit);
+			} catch (error) {
+				dropSlot(plan.sessionId, "lkg_capture_schedule_failed");
+				state.syncCaptureRequired = true;
+				state.acceptedInputs = null;
+				sessionLog(
+					plan.sessionId,
+					"LKG CAPTURE SCHEDULE FAILED; forcing synchronous capture on the next applied pass:",
+					error,
+				);
+			}
 		}
-		try {
-			scheduleCapture(commit);
-		} catch (error) {
-			dropSlot(plan.sessionId, "lkg_capture_schedule_failed");
-			state.syncCaptureRequired = true;
-			state.acceptedInputs = null;
-			sessionLog(
-				plan.sessionId,
-				"LKG CAPTURE SCHEDULE FAILED; forcing synchronous capture on the next applied pass:",
-				error,
-			);
-		}
+		return state.outputSnapshot ?? undefined;
 	};
 
 	return {
@@ -881,6 +989,38 @@ export function createPiLkgCoordinator(
 			return result;
 		},
 		captureAppliedPass,
+		measureOutgoingPrefix(snapshot, messages, parentOf) {
+			try {
+				const slot = getSlot(snapshot.sessionId);
+				const measured = measuredPrefixFor(snapshot, slot, parentOf);
+				if (!slot || !measured) return;
+				const prefix = JSON.parse(slot.jsonPrefix) as unknown[];
+				// A healthy reclaim may have removed or rewritten the old prefix.
+				// Usage belongs to those exact served bytes, never to their replacement.
+				if (
+					!Array.isArray(prefix) ||
+					messages.length < prefix.length ||
+					JSON.stringify(messages.slice(0, prefix.length)) !== slot.jsonPrefix
+				)
+					return;
+				const measuredRequest = stateFor(snapshot.sessionId).measuredRequest;
+				if (!measuredRequest) return;
+				const measuredLength = (
+					JSON.parse(measuredRequest.jsonPrefix) as unknown[]
+				).length;
+				const appendedMessages = messages.slice(measuredLength);
+				// Tagging/stripping can rewrite the new reply's content. Its usage
+				// identity must still match; price the actual returned tail separately.
+				if (
+					completedProviderUsage(appendedMessages[0])?.signature !==
+					measuredRequest.usage.signature
+				)
+					return;
+				return { ...measured, appendedMessages };
+			} catch {
+				return;
+			}
+		},
 	};
 }
 

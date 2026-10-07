@@ -1,4 +1,5 @@
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
+import { claimLkgRequestIdentity, noteCapturedLkgRequest } from "./lkg-measured-request";
 import {
     captureSlot,
     dropSlot,
@@ -10,6 +11,7 @@ import {
     lkgContentDigest,
     lkgContentDigestFromFields,
     lkgContentFields,
+    memoizedLkgContentDigestFromFields,
     noteEntry,
 } from "./lkg-slot";
 import { assertOpenAiCompatAdjacency } from "./openai-compat-adjacency";
@@ -66,12 +68,20 @@ export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
 }
 
 /** Keep exact pristine tokens in memory: ids or rolling hashes alone cannot prove reuse. */
-export function createLkgEntryProjector() {
+export function createLkgEntryProjector(
+    options: {
+        maxBytes?: number;
+        onReuse?: (stats: { reused: number; retained: number; retainedBytes: number }) => void;
+    } = {},
+) {
     const priors = new Map<
         string,
-        { snapshots: LkgInputSnapshot[]; digests: (string | null)[]; bytes: number }
+        {
+            entries: Map<string, { snapshot: LkgInputSnapshot; digest: string | null }>;
+            bytes: number;
+        }
     >();
-    const maxBytes = 64 * 1024 * 1024;
+    const maxBytes = options.maxBytes ?? 64 * 1024 * 1024;
     let bytes = 0;
     return (sessionId: string, messages: MessageLike[]): LkgEntryProjection[] => {
         const prior = priors.get(sessionId);
@@ -79,45 +89,68 @@ export function createLkgEntryProjector() {
             id: typeof message.info?.id === "string" ? message.info.id : "",
             fields: lkgContentFields(message),
         }));
-        const reusable = exactReusablePrefix(
-            snapshots.map((snapshot) => ({ ...snapshot, fields: snapshot.fields ?? [] })),
-            prior?.snapshots ?? null,
-        );
-        const digests = snapshots.map((snapshot, index) =>
-            index < reusable
-                ? (prior?.digests[index] ?? null)
-                : snapshot.fields
-                  ? lkgContentDigestFromFields(snapshot.fields)
-                  : null,
-        );
+        let reused = 0;
+        // Each digest describes one complete message, not the preceding history.
+        // A changed leading entry must not force hashing thousands of unchanged
+        // successors. Still compare every typed field, including metadata.
+        const digests = snapshots.map((snapshot) => {
+            const cached = prior?.entries.get(snapshot.id);
+            if (
+                snapshot.fields &&
+                cached &&
+                exactReusablePrefix([snapshot as LkgInputSnapshot], [cached.snapshot]) === 1
+            ) {
+                reused += 1;
+                return cached.digest;
+            }
+            if (!snapshot.fields) return null;
+            // An explicit projector budget must not retain entries in the
+            // separate shared memo beyond that caller's requested bound.
+            return options.maxBytes === undefined
+                ? memoizedLkgContentDigestFromFields(snapshot.id, snapshot.fields)
+                : lkgContentDigestFromFields(snapshot.fields);
+        });
         if (prior) {
             bytes -= prior.bytes;
             priors.delete(sessionId);
         }
-        const retained = snapshots.map((snapshot) => ({
-            ...snapshot,
-            fields: snapshot.fields ?? [],
-        }));
-        const size = retained.reduce(
-            (total, snapshot) =>
-                total +
+        let size = 0;
+        let retainedCount = 0;
+        // Oversized history used to discard the entire reuse state every pass.
+        // Keep as many exact entries as fit; an oversized entry is always hashed.
+        const retained = new Map<string, { snapshot: LkgInputSnapshot; digest: string | null }>();
+        snapshots.forEach((snapshot, index) => {
+            const entrySize =
                 snapshot.id.length * 2 +
-                snapshot.fields.reduce<number>(
+                (snapshot.fields?.reduce<number>(
                     (sum, field) => sum + 16 + (typeof field === "string" ? field.length * 2 : 0),
                     0,
-                ),
-            0,
-        );
-        if (size <= maxBytes) {
+                ) ?? 0) +
+                80 +
+                86;
+            if (!snapshot.fields || retained.has(snapshot.id) || size + entrySize > maxBytes)
+                return;
+            size += entrySize;
+            retainedCount += 1;
+            retained.set(snapshot.id, {
+                snapshot: snapshot as LkgInputSnapshot,
+                digest: digests[index] ?? null,
+            });
+        });
+        if (size <= maxBytes && retainedCount > 0) {
             while (priors.size >= 16 || bytes + size > maxBytes) {
                 const oldest = priors.entries().next().value;
                 if (!oldest) break;
                 bytes -= oldest[1].bytes;
                 priors.delete(oldest[0]);
             }
-            priors.set(sessionId, { snapshots: retained, digests, bytes: size });
+            priors.set(sessionId, {
+                entries: retained,
+                bytes: size,
+            });
             bytes += size;
         }
+        options.onReuse?.({ reused, retained: retainedCount, retainedBytes: size });
         return projectEntryWithDigests(messages, digests);
     };
 }
@@ -187,6 +220,8 @@ export interface LkgCaptureInput {
     modelKey: string | null;
     providerKey: string | null;
     capturedAt?: number;
+    systemPromptTokens?: number;
+    agentName?: string;
 }
 
 export type LkgValidationFailure =
@@ -373,7 +408,7 @@ export function captureLkgSlot(args: LkgCaptureInput): boolean {
     const built = buildLkgPrefix(args.input, args.output);
     if (!built) return false;
     const modelKeys = canonicalLkgModelKeys(args.modelKey, args.providerKey);
-    return captureSlot(args.sessionId, {
+    const slot: LkgSlot = {
         jsonPrefix: built.jsonPrefix,
         inputIdSeq: built.inputIdSeq,
         inputContentDigests: built.inputContentDigests,
@@ -381,7 +416,23 @@ export function captureLkgSlot(args: LkgCaptureInput): boolean {
         modelKey: modelKeys.modelKey,
         providerKey: modelKeys.providerKey,
         capturedAt: args.capturedAt ?? Date.now(),
-    });
+    };
+    const captured = captureSlot(args.sessionId, slot);
+    if (captured)
+        noteCapturedLkgRequest({
+            sessionId: args.sessionId,
+            slot,
+            // In TypeScript mode the saved last-known-good copy can stop before the
+            // tool calls still running at the end of the request. Such a partial copy
+            // is not what the provider measured, so it gets no usage identity.
+            request:
+                built.anchorIndex === args.input.length - 1
+                    ? claimLkgRequestIdentity(args.sessionId)
+                    : undefined,
+            systemPromptTokens: args.systemPromptTokens ?? 0,
+            agentName: args.agentName,
+        });
+    return captured;
 }
 
 function entryIdsAreValid(slot: LkgSlot, entryIds: string[]): boolean {

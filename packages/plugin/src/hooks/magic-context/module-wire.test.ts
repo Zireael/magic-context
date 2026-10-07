@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -621,6 +621,75 @@ describe("resolveOrdinalsForModule bounded rebuild", () => {
 const TEST_PAGE_MAX_BYTES = 512 * 1024;
 
 describe("buildPagedModuleTransformPayloads byte reuse", () => {
+    it("hashes only stabilized pages while preserving canonical digests and wire sizes", () => {
+        const body = {
+            method: "transform",
+            session_id: "stabilized-digest",
+            native_messages: Array.from({ length: 80 }, (_, i) => ({
+                z: "α😀".repeat(1_500),
+                a: i,
+            })),
+        };
+        const parse = spyOn(JSON, "parse");
+        try {
+            const pages = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES, true);
+            expect(pages.length).toBeGreaterThan(1);
+            expect(parse).toHaveBeenCalledTimes(pages.length);
+            for (const { page, bytes } of pages) {
+                const values = page.native_messages as { a: number; z: string }[];
+                // Explicit canonical key order for this fixture is independent
+                // of the production canonicalizer and its timing instrumentation.
+                const canonical = JSON.stringify({
+                    native_messages: values.map(({ a, z }) => ({ a, z })),
+                });
+                expect(page.transform_page_digest).toBe(
+                    createHash("sha256").update(canonical).digest("hex"),
+                );
+                expect(bytes).toBe(Buffer.byteLength(JSON.stringify(page)));
+            }
+            expect(pages.flatMap(({ page }) => page.native_messages)).toEqual(body.native_messages);
+        } finally {
+            parse.mockRestore();
+        }
+    });
+
+    it("bounds a forced one-page envelope including the transport reply capability", () => {
+        const body = { method: "transform", session_id: "boundary", input: [{ text: "" }] };
+        body.input[0]!.text = "x".repeat(
+            TEST_PAGE_MAX_BYTES - Buffer.byteLength(JSON.stringify(body)),
+        );
+        const pages = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES, true);
+        expect(pages.length).toBeGreaterThan(1);
+        for (const { page, bytes } of pages) {
+            expect(bytes).toBe(Buffer.byteLength(JSON.stringify(page)));
+            expect(
+                Buffer.byteLength(JSON.stringify({ ...page, accept_reply_pages: true })),
+            ).toBeLessThanOrEqual(TEST_PAGE_MAX_BYTES);
+        }
+    });
+
+    it("reserves the late transport capability on a full non-final page", () => {
+        const body = {
+            method: "transform",
+            session_id: "boundary",
+            input: [
+                { text: "x".repeat(TEST_PAGE_MAX_BYTES - 2_000) },
+                { text: "x".repeat(TEST_PAGE_MAX_BYTES) },
+            ],
+        };
+        const initial = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES, true);
+        // Fill the first page to ten bytes below the caller's cap, before the
+        // transport adds its 26-byte reply capability. This used to overrun it.
+        body.input[0]!.text += "x".repeat(TEST_PAGE_MAX_BYTES - initial[0]!.bytes - 10);
+        const pages = buildPagedModuleTransformPayloads(body, TEST_PAGE_MAX_BYTES, true);
+        expect(pages.length).toBeGreaterThan(1);
+        for (const { page } of pages) {
+            expect(
+                Buffer.byteLength(JSON.stringify({ ...page, accept_reply_pages: true })),
+            ).toBeLessThanOrEqual(TEST_PAGE_MAX_BYTES);
+        }
+    });
+
     it("pins the application page budget to the shared SUBC frame fixture", async () => {
         const fixture = (await Bun.file(
             new URL(

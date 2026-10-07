@@ -1,7 +1,7 @@
 import { For, Show } from "solid-js";
 import { ompModelIdToCanonical, piModelIdToCanonical } from "../../lib/model-ids";
-import LiveBadge from "./LiveBadge";
 import ModelSelect from "./ModelSelect";
+import VariantSelect from "./VariantSelect";
 
 export type Harness = "opencode" | "pi" | "omp";
 
@@ -78,6 +78,8 @@ function QualifierControl(props: {
   path: string;
   value: string | undefined;
   onChange: (value: string | undefined) => void;
+  model?: string;
+  variants?: Record<string, string[]>;
 }) {
   const qualifier = () => (props.harness === "opencode" ? "variant" : "thinking_level");
 
@@ -85,33 +87,19 @@ function QualifierControl(props: {
     <div class="config-field">
       <div class="config-field-header">
         <span class="config-field-label">{props.label}</span>
-        <LiveBadge path={props.path} />
-        <span class="config-field-key">{qualifier()}</span>
+        <span class="config-field-key">
+          {props.path}.{qualifier()}
+        </span>
       </div>
       <span class="config-field-desc">{props.description}</span>
-      <Show
-        when={props.harness === "opencode"}
-        fallback={
-          <select
-            class="config-input config-select"
-            value={props.value ?? ""}
-            onChange={(event) => props.onChange(event.currentTarget.value || undefined)}
-          >
-            <option value="">Use harness default</option>
-            <For each={thinkingLevelsForHarness(props.harness)}>
-              {(level) => <option value={level}>{level}</option>}
-            </For>
-          </select>
-        }
-      >
-        <input
-          class="config-input"
-          type="text"
-          value={props.value ?? ""}
-          placeholder="e.g. high"
-          onInput={(event) => props.onChange(event.currentTarget.value || undefined)}
-        />
-      </Show>
+      <VariantSelect
+        harness={props.harness}
+        model={props.model}
+        variants={props.variants}
+        label={props.label}
+        value={props.value}
+        onChange={props.onChange}
+      />
     </div>
   );
 }
@@ -122,6 +110,7 @@ interface HarnessModelFieldsProps {
   value: unknown;
   onChange: (value: Record<string, unknown>) => void;
   agent: "historian" | "dreamer";
+  variants?: Record<string, string[]>;
 }
 
 export default function HarnessModelFields(props: HarnessModelFieldsProps) {
@@ -145,11 +134,10 @@ export default function HarnessModelFields(props: HarnessModelFieldsProps) {
   };
 
   return (
-    <div class="harness-model-fields" data-harness={props.harness}>
+    <div class="harness-model-fields" data-harness={props.harness} data-agent={props.agent}>
       <div class="config-field">
         <div class="config-field-header">
           <span class="config-field-label">Model</span>
-          <LiveBadge path={`${props.agent}.${props.harness}.model`} />
           <span class="config-field-key">
             {props.agent}.{props.harness}.model
           </span>
@@ -171,6 +159,8 @@ export default function HarnessModelFields(props: HarnessModelFieldsProps) {
 
       <QualifierControl
         harness={props.harness}
+        model={model()}
+        variants={props.variants}
         label={`Primary ${label().toLowerCase()}`}
         description="Stored on this model entry and used only by this harness."
         path={`${props.agent}.${props.harness}.model`}
@@ -182,9 +172,11 @@ export default function HarnessModelFields(props: HarnessModelFieldsProps) {
 
       <QualifierControl
         harness={props.harness}
+        model={model()}
+        variants={props.variants}
         label={`Default ${label().toLowerCase()}`}
         description="Used when the primary entry does not specify its own qualifier."
-        path={`${props.agent}.${props.harness}.${qualifierKey()}`}
+        path={`${props.agent}.${props.harness}`}
         value={
           typeof block()[qualifierKey()] === "string"
             ? (block()[qualifierKey()] as string)
@@ -193,10 +185,9 @@ export default function HarnessModelFields(props: HarnessModelFieldsProps) {
         onChange={(next) => updateBlock({ [qualifierKey()]: next })}
       />
 
-      <div class="config-field">
+      <div class="config-field config-field-wide">
         <div class="config-field-header">
           <span class="config-field-label">Fallback Models</span>
-          <LiveBadge path={`${props.agent}.${props.harness}.fallback_models`} />
           <span class="config-field-key">
             {props.agent}.{props.harness}.fallback_models
           </span>
@@ -213,32 +204,31 @@ export default function HarnessModelFields(props: HarnessModelFieldsProps) {
             <For each={fallbacks()}>
               {(entry, index) => (
                 <div class="model-chain-item">
-                  <div style={{ flex: 1 }}>
-                    <ModelSelect
-                      models={props.models}
-                      value={modelId(entry)}
-                      onChange={(next) =>
-                        updateFallback(
-                          index(),
-                          modelEntryWithModel(entry, props.harness, next || undefined),
-                        )
-                      }
-                      placeholder="— Select fallback model —"
-                    />
-                    <QualifierControl
-                      harness={props.harness}
-                      label={`Fallback ${label().toLowerCase()}`}
-                      description="Optional qualifier for this fallback entry."
-                      path={`${props.agent}.${props.harness}.fallback_models`}
-                      value={modelQualifier(entry, props.harness)}
-                      onChange={(next) =>
-                        updateFallback(index(), modelEntryWithQualifier(entry, props.harness, next))
-                      }
-                    />
-                  </div>
+                  <ModelSelect
+                    models={props.models}
+                    value={modelId(entry)}
+                    onChange={(next) =>
+                      updateFallback(
+                        index(),
+                        modelEntryWithModel(entry, props.harness, next || undefined),
+                      )
+                    }
+                    placeholder="— Select fallback model —"
+                  />
+                  <VariantSelect
+                    harness={props.harness}
+                    model={modelId(entry)}
+                    variants={props.variants}
+                    label={`Fallback ${label().toLowerCase()}`}
+                    value={modelQualifier(entry, props.harness)}
+                    onChange={(next) =>
+                      updateFallback(index(), modelEntryWithQualifier(entry, props.harness, next))
+                    }
+                  />
                   <button
                     type="button"
-                    class="btn sm danger"
+                    class="config-icon-btn"
+                    aria-label={`Remove fallback ${modelId(entry)}`}
                     onClick={() => updateFallback(index(), undefined)}
                   >
                     ✕

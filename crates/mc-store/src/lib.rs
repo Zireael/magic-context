@@ -21,6 +21,8 @@ pub mod context_boundaries;
 pub use context_boundaries::ResolvedContextBoundary;
 pub mod context_writes;
 mod historian_claim;
+pub mod move_inventory;
+pub mod private_permissions;
 pub mod single_store_domain;
 pub mod single_store_schema;
 
@@ -302,6 +304,61 @@ impl Serialize for CkWireBlock {
 }
 
 impl CkWireBlock {
+    /// Internal projection replay constructor. The receiver is an already-validated typed
+    /// shell together with its own original JSON, not independently supplied parts. Replacing
+    /// scalar text updates both views; all other fields, including unknown JSON, are cloned
+    /// unchanged. This is not a way to bypass deserialization validation of a new block.
+    /// `None` replays the shell unchanged; an unsupported or missing text field returns `None`.
+    #[doc(hidden)]
+    pub fn replay_validated_shell(&self, scalar_text: Option<String>) -> Option<Self> {
+        let Some(text) = scalar_text else {
+            return Some(self.clone());
+        };
+        let path = match &self.kind {
+            CkKind::Text { .. } | CkKind::Reasoning { .. } => "/kind/text",
+            CkKind::RedactedReasoning { .. } => "/kind/data",
+            CkKind::ToolResult { output, .. } => match &output.kind {
+                CkOutputKind::Text { .. } | CkOutputKind::ErrorText { .. } => {
+                    "/kind/output/kind/text"
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let original_text = |value: &Value| {
+            path.split('/')
+                .skip(1)
+                .try_fold(value, |v, key| v.get(key))
+                .is_some_and(Value::is_string)
+        };
+        if self.original.as_ref().is_some_and(|v| !original_text(v)) {
+            return None;
+        }
+        let mut replay = self.clone();
+        if let Some(original) = &mut replay.original {
+            // These fixed schema keys contain no JSON-pointer escaping. Direct key lookup
+            // avoids allocating decoded pointer tokens for every message in a warm delta.
+            let field = path
+                .split('/')
+                .skip(1)
+                .try_fold(original, |v, key| v.get_mut(key))?;
+            *field = Value::String(text.clone());
+        }
+        match &mut replay.kind {
+            CkKind::Text { text: field }
+            | CkKind::Reasoning { text: field, .. }
+            | CkKind::RedactedReasoning { data: field } => *field = text,
+            CkKind::ToolResult { output, .. } => match &mut output.kind {
+                CkOutputKind::Text { text: field } | CkOutputKind::ErrorText { text: field } => {
+                    *field = text
+                }
+                _ => unreachable!("validated scalar output"),
+            },
+            _ => unreachable!("validated scalar kind"),
+        }
+        Some(replay)
+    }
+
     pub fn bare(kind: CkKind) -> Self {
         Self {
             kind,
@@ -4529,6 +4586,10 @@ fn one_f64() -> f64 {
 /// live tail rather than the full history.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TailHygieneBaseline {
+    /// Protected-tool keep counts saved by the last nudge measurement that
+    /// rebuilt the baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_tools_policy: Option<std::collections::BTreeMap<String, usize>>,
     pub baseline_u: i64,
     pub baseline_t: i64,
     pub turn_delta_u: i64,
@@ -4614,9 +4675,21 @@ pub struct FrozenDecisionCalibration {
     pub source: String,
 }
 
+/// Why the host chose this cache lifetime, with the built-in fallback kept for this session and model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheTtlPolicy {
+    pub value: String,
+    pub source: String,
+    pub model_key: Option<String>,
+    pub built_in_default: String,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
+    /// Idle-expiry policy only; it never changes rendered context or cached prompt text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_policy: Option<SessionCacheTtlPolicy>,
     /// Host ordinals and module block IDs used for rendering, only while the shared
     /// row's original IDs, block indices, and ordinals still match.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4869,6 +4942,11 @@ pub struct ModuleMeta {
     /// asynchronous reduction acknowledgements use the same floor as transforms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected_tokens_effective: Option<u64>,
+    /// Block IDs identified by selection as protected-tool results. Acknowledgements
+    /// use these IDs because tag rows store output text, not tool names. They guide
+    /// decisions but do not identify rendered content or trigger a cache bust.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub protected_tool_block_ids: std::collections::BTreeSet<String>,
     /// Decision calibration frozen at the last authorized bust. Absent legacy state stays
     /// neutral until the next bust so a binary table update cannot alter a defer decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7553,6 +7631,7 @@ pub fn migrate_store_to_pre_single_store(path: &Path) -> Result<u32, McStoreErro
         },
     };
     let inner = open_sqlite(&descriptor)?;
+    inner.with_conn(single_store_domain::set_synchronous_normal_if_wal)?;
     inner.with_conn(register_legacy_trigger_functions)?;
     let end = MIGRATIONS
         .iter()
@@ -7802,7 +7881,43 @@ impl McStore {
     }
 
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
+        Self::open_with_private_permissions(descriptor, true)
+    }
+
+    pub fn open_with_private_permissions(
+        descriptor: &StorageDescriptor,
+        enforce_private_permissions: bool,
+    ) -> Result<Self, McStoreError> {
+        let mut storage_root = None;
+        let mut before = private_permissions::TightenReport::default();
+        if let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend {
+            let path = Path::new(path);
+            let root = path.parent().unwrap_or_else(|| Path::new("."));
+            private_permissions::ensure_directory(root, true).map_err(|error| {
+                McStoreError::Serde(format!("storage directory unavailable: {error}"))
+            })?;
+            let root_tightening = private_permissions::tighten_directory(root, true);
+            let tree_tightening =
+                private_permissions::tighten_tree(root, enforce_private_permissions);
+            before = private_permissions::TightenReport {
+                tightened: root_tightening.tightened + tree_tightening.tightened,
+                failures: root_tightening.failures + tree_tightening.failures,
+            };
+            if !path.exists() {
+                match private_permissions::create_file(path, true) {
+                    Ok(file) => drop(file),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(McStoreError::Serde(format!(
+                            "storage file unavailable: {error}"
+                        )));
+                    }
+                }
+            }
+            storage_root = Some(root.to_path_buf());
+        }
         let inner = open_sqlite(descriptor)?;
+        inner.with_conn(single_store_domain::set_synchronous_normal_if_wal)?;
         // Registered before migrating: the older migrations of a store below v53 install
         // triggers that call these functions.
         inner.with_conn(register_legacy_trigger_functions)?;
@@ -7893,6 +8008,18 @@ impl McStore {
             route_identities_for_test: Mutex::new(HashMap::new()),
         };
         store.prune_transform_session_roots()?;
+        if let Some(root) = storage_root {
+            let after = if enforce_private_permissions {
+                private_permissions::tighten_tree(&root, true)
+            } else {
+                private_permissions::tighten_directory(&root, true)
+            };
+            tracing::info!(
+                tightened = before.tightened + after.tightened,
+                failures = before.failures + after.failures,
+                "mc-store: storage permission tightening"
+            );
+        }
         Ok(store)
     }
 
@@ -13514,6 +13641,14 @@ impl McStore {
             },
         };
         let write = context_writes::PendingContextWrite::Fold(fold);
+        // Deflate needs no database state. Prepare the identical payload before taking
+        // store.db's writer lock, but report any preparation error only after the publish
+        // predicates pass, preserving refusal precedence for stale producers.
+        let prepared_transcripts = if request.compartments.is_empty() {
+            Ok(None)
+        } else {
+            prepare_chunk_transcripts(request.chunk_transcript, request.raw_chunk_messages)
+        };
         let outcome = self.inner.with_conn_fenced(|tx| {
             let row = tx
                 .query_row(
@@ -13640,13 +13775,12 @@ impl McStore {
                 Err(e) => return Ok(PublishTxnOutcome::Serde(e)),
             };
             if request.chunk_transcript.is_some() || request.raw_chunk_messages.is_some() {
-                insert_chunk_transcripts_tx(
+                insert_prepared_chunk_transcripts_tx(
                     tx,
                     session_id,
                     first_appended_sequence,
                     request.compartments,
-                    request.chunk_transcript,
-                    request.raw_chunk_messages,
+                    prepared_transcripts?.as_ref(),
                 )?;
             }
             single_store_schema::write_compartment_dates(tx, session_id, &numbered)?;
@@ -14460,6 +14594,18 @@ impl McStore {
         project_path: &str,
         query: &str,
     ) -> Result<Vec<StoredMemorySearchRow>, McStoreError> {
+        self.search_visible_memory_contents_in_range(project_path, query, None, None)
+    }
+
+    /// Apply inclusive creation-date bounds before the candidate cap, so newer
+    /// out-of-range matches cannot hide an older matching memory.
+    pub fn search_visible_memory_contents_in_range(
+        &self,
+        project_path: &str,
+        query: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<Vec<StoredMemorySearchRow>, McStoreError> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -14470,6 +14616,8 @@ impl McStore {
         };
         let pattern = sql_like_pattern(query);
 
+        let (dates, date_binds) = search_date_filter(from_ms, to_ms);
+
         let rows = self.context_read(|conn| {
             let sql = format!(
                 "SELECT id, project_path, category, content, created_at, updated_at
@@ -14478,12 +14626,14 @@ impl McStore {
                     AND status IN ('active', 'permanent')
                     AND (expires_at IS NULL OR expires_at > CAST(strftime('%s', 'now') AS INTEGER) * 1000)
                     AND LOWER(content) LIKE ? ESCAPE '\\'
+                    {dates}
                   ORDER BY updated_at DESC, id ASC
                   LIMIT 100"
             );
             let mut stmt = conn.prepare(&sql)?;
             let mut all_binds = binds.clone();
             all_binds.push(rusqlite::types::Value::from(pattern));
+            all_binds.extend(date_binds.iter().cloned());
             let mapped = stmt
                 .query_map(rusqlite::params_from_iter(all_binds.iter()), |r| {
                     Ok(StoredMemorySearchRow {
@@ -14509,12 +14659,24 @@ impl McStore {
         session_id: &str,
         query: &str,
     ) -> Result<Vec<StoredCompartmentSearchRow>, McStoreError> {
+        self.search_compartments_like_in_range(session_id, query, None, None)
+    }
+
+    /// Search compartment text with inclusive dates applied before LIMIT 100.
+    pub fn search_compartments_like_in_range(
+        &self,
+        session_id: &str,
+        query: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<Vec<StoredCompartmentSearchRow>, McStoreError> {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
         let pattern = sql_like_pattern(query);
+        let (dates, date_binds) = search_date_filter(from_ms, to_ms);
         let rows = self.context_read(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT sequence, start_message, end_message, title, content, p1, p2, p3, p4, created_at
                    FROM compartments
                   WHERE session_id = ?1
@@ -14523,12 +14685,15 @@ impl McStore {
                       OR LOWER(COALESCE(p1, '')) LIKE ?2 ESCAPE '\\'
                       OR LOWER(COALESCE(p2, '')) LIKE ?2 ESCAPE '\\'
                       OR LOWER(COALESCE(p3, '')) LIKE ?2 ESCAPE '\\'
-                      OR LOWER(COALESCE(p4, '')) LIKE ?2 ESCAPE '\\')
+                       OR LOWER(COALESCE(p4, '')) LIKE ?2 ESCAPE '\\')
+                    {dates}
                   ORDER BY sequence DESC
                   LIMIT 100",
-            )?;
+            ))?;
+            let mut parameters = vec![SqlValue::Text(session_id.to_string()), SqlValue::Text(pattern.clone())];
+            parameters.extend(date_binds.iter().cloned());
             let mapped = stmt
-                .query_map(params![session_id, pattern], |r| {
+                .query_map(rusqlite::params_from_iter(parameters.iter()), |r| {
                     Ok(StoredCompartmentSearchRow {
                         sequence: r.get(0)?,
                         start_ordinal: r.get(1)?,
@@ -15351,6 +15516,18 @@ impl McStore {
         session_id: &str,
         query: &str,
     ) -> Result<Vec<StoredNoteSearchRow>, McStoreError> {
+        self.search_notes_like_in_range(project_path, session_id, query, None, None)
+    }
+
+    /// Search notes with inclusive dates applied before LIMIT 100.
+    pub fn search_notes_like_in_range(
+        &self,
+        project_path: &str,
+        session_id: &str,
+        query: &str,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<Vec<StoredNoteSearchRow>, McStoreError> {
         let terms = keyword_search_terms(query);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -15367,6 +15544,7 @@ impl McStore {
             })
             .collect::<Vec<_>>()
             .join(" OR ");
+        let (dates, date_binds) = search_date_filter(from_ms, to_ms);
         let sql = format!(
             "SELECT id, content, status, surface_condition, COALESCE(session_id, ''), anchor_ordinal,
                         created_at, updated_at
@@ -15375,6 +15553,7 @@ impl McStore {
                     AND (type = 'smart' OR session_id = ?2)
                     AND status IN ('active', 'pending', 'ready')
                     AND ({predicates})
+                    {dates}
                   ORDER BY updated_at DESC, id DESC
                   LIMIT 100"
         );
@@ -15387,6 +15566,7 @@ impl McStore {
                 .iter()
                 .map(|term| SqlValue::Text(sql_like_pattern(term))),
         );
+        parameters.extend(date_binds);
         let rows = self.context_read(|conn| {
             let mut stmt = conn.prepare(&sql)?;
             let mapped = stmt
@@ -15900,17 +16080,15 @@ fn next_compartment_sequence_tx(
     )
 }
 
-fn insert_chunk_transcripts_tx(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-    first_sequence: i64,
-    compartments: &[StoredCompartment],
+struct PreparedChunkTranscripts {
+    transcript: Vec<u8>,
+    raw_messages: Option<Vec<u8>>,
+}
+
+fn prepare_chunk_transcripts(
     transcript: Option<&str>,
     raw_messages: Option<&str>,
-) -> rusqlite::Result<()> {
-    if compartments.is_empty() {
-        return Ok(());
-    }
+) -> rusqlite::Result<Option<PreparedChunkTranscripts>> {
     let compressed = transcript.and_then(|transcript| {
         compress_transcript(transcript)
             .ok()
@@ -15921,12 +16099,31 @@ fn insert_chunk_transcripts_tx(
         .transpose()
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     if compressed.is_none() && raw_messages_compressed.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     // The original schema keeps transcript_deflate NOT NULL. A raw-only row still needs a
     // harmless condensed payload so durable raw recovery is not discarded with an oversized
     // historian transcript.
     let compressed = compressed.unwrap_or_else(|| compress_transcript("").unwrap_or_default());
+    Ok(Some(PreparedChunkTranscripts {
+        transcript: compressed,
+        raw_messages: raw_messages_compressed,
+    }))
+}
+
+fn insert_prepared_chunk_transcripts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    first_sequence: i64,
+    compartments: &[StoredCompartment],
+    prepared: Option<&PreparedChunkTranscripts>,
+) -> rusqlite::Result<()> {
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    if compartments.is_empty() {
+        return Ok(());
+    }
     for (idx, compartment) in compartments.iter().enumerate() {
         tx.execute(
             "INSERT OR REPLACE INTO mc_chunk_transcripts
@@ -15938,8 +16135,8 @@ fn insert_chunk_transcripts_tx(
                 first_sequence + idx as i64,
                 compartment.start_message,
                 compartment.end_message,
-                &compressed,
-                raw_messages_compressed.as_deref(),
+                &prepared.transcript,
+                prepared.raw_messages.as_deref(),
                 compartment.created_at,
             ],
         )?;
@@ -15952,31 +16149,33 @@ fn evict_chunk_transcripts_tx(
     session_id: &str,
 ) -> rusqlite::Result<()> {
     let empty_transcript = compress_transcript("").unwrap_or_default();
-    loop {
-        let total: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(LENGTH(transcript_deflate)), 0)
+    let mut total: i64 = tx.query_row(
+        "SELECT COALESCE(SUM(LENGTH(transcript_deflate)), 0)
                FROM mc_chunk_transcripts WHERE session_id = ?1",
-            params![session_id],
-            |r| r.get(0),
-        )?;
-        if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
-            return Ok(());
-        }
-        let victim: Option<(i64, bool)> = tx
-            .query_row(
-                "SELECT compartment_seq, raw_messages_deflate IS NOT NULL
+        params![session_id],
+        |r| r.get(0),
+    )?;
+    if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
+        return Ok(());
+    }
+    // Snapshot identities and lengths once, before changing the table. Subtract the
+    // exact reclaimed bytes in the same oldest-first order as the per-victim SUM loop.
+    let victims: Vec<(i64, bool, i64)> = tx
+        .prepare_cached(
+            "SELECT compartment_seq, raw_messages_deflate IS NOT NULL, LENGTH(transcript_deflate)
                    FROM mc_chunk_transcripts
                   WHERE session_id = ?1
                     AND (raw_messages_deflate IS NULL OR transcript_deflate <> ?2)
-                  ORDER BY created_at_ms ASC, compartment_seq ASC
-                  LIMIT 1",
-                params![session_id, &empty_transcript],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((victim, retains_raw_messages)) = victim else {
-            return Ok(());
-        };
+                   ORDER BY created_at_ms ASC, compartment_seq ASC",
+        )?
+        .query_map(params![session_id, &empty_transcript], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (victim, retains_raw_messages, length) in victims {
+        if total <= MAX_SESSION_TRANSCRIPT_COMPRESSED_BYTES {
+            break;
+        }
         if retains_raw_messages {
             // Full message recovery is durable by contract. Retain its raw payload and reclaim
             // only the optional condensed transcript when the legacy transcript budget fills.
@@ -15986,13 +16185,16 @@ fn evict_chunk_transcripts_tx(
                   WHERE session_id = ?1 AND compartment_seq = ?2",
                 params![session_id, victim, &empty_transcript],
             )?;
+            total -= length - empty_transcript.len() as i64;
         } else {
             tx.execute(
                 "DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq = ?2",
                 params![session_id, victim],
             )?;
+            total -= length;
         }
     }
+    Ok(())
 }
 
 fn compress_transcript(transcript: &str) -> std::io::Result<Vec<u8>> {
@@ -16142,12 +16344,24 @@ fn promote_facts_tx(
     now_ms: i64,
 ) -> rusqlite::Result<Vec<PromotedRef>> {
     let mut active_content = HashSet::new();
-    {
-        let mut stmt = tx.prepare(
-            "SELECT content FROM memories
-             WHERE project_path = ?1 AND status IN ('active', 'permanent')",
-        )?;
-        let rows = stmt.query_map(params![project_path], |r| r.get::<_, String>(0))?;
+    // Probe only this fold's exact contents. Large folds are split below SQLite's
+    // parameter limit; ordinary folds make one scan without copying the project pool.
+    let contents: Vec<&str> = facts
+        .iter()
+        .filter(|fact| !fact.category.trim().is_empty() && !fact.content.trim().is_empty())
+        .map(|fact| fact.content.as_str())
+        .collect();
+    for batch in contents.chunks(128) {
+        let sql = format!(
+            "SELECT content FROM memories WHERE project_path = ?1
+            AND status IN ('active', 'permanent') AND content IN ({})",
+            vec!["?"; batch.len()].join(",")
+        );
+        let mut stmt = tx.prepare_cached(&sql)?;
+        let values = std::iter::once(project_path).chain(batch.iter().copied());
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
+            r.get::<_, String>(0)
+        })?;
         for row in rows {
             active_content.insert(row?);
         }
@@ -16190,13 +16404,16 @@ fn promote_facts_tx(
             ],
         )?;
         let memory_id = tx.last_insert_rowid();
-        raise_embedding_watermark_tx(tx, project_path, memory_id, now_ms)?;
         active_content.insert(fact.content.clone());
         promoted.push(PromotedRef {
             memory_id,
             content: fact.content.clone(),
         });
         next_nonce += 1;
+    }
+
+    if let Some(last) = promoted.last() {
+        raise_embedding_watermark_tx(tx, project_path, last.memory_id, now_ms)?;
     }
 
     Ok(promoted)
@@ -17273,6 +17490,22 @@ fn keyword_search_terms(query: &str) -> Vec<String> {
     terms
 }
 
+/// Bounds are appended after the query's other placeholders and bound in the same
+/// order. An undated search adds no predicate and retains its existing matching cap.
+fn search_date_filter(from_ms: Option<i64>, to_ms: Option<i64>) -> (String, Vec<SqlValue>) {
+    let mut sql = String::new();
+    let mut binds = Vec::new();
+    if let Some(from) = from_ms {
+        sql.push_str(" AND created_at >= ?");
+        binds.push(SqlValue::Integer(from));
+    }
+    if let Some(to) = to_ms {
+        sql.push_str(" AND created_at <= ?");
+        binds.push(SqlValue::Integer(to));
+    }
+    (sql, binds)
+}
+
 fn sql_like_pattern(query: &str) -> String {
     let mut escaped = String::new();
     for ch in query.trim().to_lowercase().chars() {
@@ -17403,6 +17636,81 @@ fn capped_trace_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn projection_replay_constructor_matches_serde_for_validated_shells() {
+        let cases = [
+            (
+                serde_json::json!({"kind":{"type":"text","text":"雪\n\"text\"","future":17},"future_block":{"keep":true}}),
+                Some("/kind/text"),
+            ),
+            (
+                serde_json::json!({"kind":{"type":"reasoning","text":"think","signature":"signed","future":"kept"}}),
+                Some("/kind/text"),
+            ),
+            (
+                serde_json::json!({"kind":{"type":"redacted_reasoning","data":"redacted"}}),
+                Some("/kind/data"),
+            ),
+            (
+                serde_json::json!({"kind":{"type":"tool_call","id":"c","name":"work","input":{"x":1.5,"future":[true,"a"]}},"provider_extras":{"future":{"keep":7}}}),
+                None,
+            ),
+            (
+                serde_json::json!({"kind":{"type":"tool_result","id":"c","tool_name":"work","output":{"kind":{"type":"text","text":"done","future":7}},"provider_executed":false}}),
+                Some("/kind/output/kind/text"),
+            ),
+            (
+                serde_json::json!({"kind":{"type":"tool_result","id":"c","tool_name":"work","output":{"kind":{"type":"error_text","text":"failed"}}}}),
+                Some("/kind/output/kind/text"),
+            ),
+            (
+                serde_json::json!({"kind":{"type":"media","kind":"image","media_type":"image/png","source":{"type":"url","url":"https://example.invalid/image.png"},"future":9},"future_block":"kept"}),
+                None,
+            ),
+        ];
+        for (original, path) in cases {
+            let expected: CkWireBlock = serde_json::from_value(original.clone()).unwrap();
+            let mut shell_json = original;
+            let text = path.map(|path| {
+                let text = shell_json
+                    .pointer(path)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                *shell_json.pointer_mut(path).unwrap() = Value::String(String::new());
+                text
+            });
+            // Independently deserialize the empty shell; the constructor does not create its
+            // own oracle. Unknown fields and omitted defaults must survive in the original.
+            let shell: CkWireBlock = serde_json::from_value(shell_json).unwrap();
+            let replay = shell.replay_validated_shell(text).unwrap();
+            assert_eq!(replay, expected);
+            assert_eq!(
+                serde_json::to_vec(&replay).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert_eq!(
+                replay.retained_original_json(),
+                expected.retained_original_json()
+            );
+        }
+    }
+
+    #[test]
+    fn projection_replay_constructor_rejects_non_scalar_replacement() {
+        let shell = CkWireBlock::bare(CkKind::ToolCall {
+            id: "c".into(),
+            name: "work".into(),
+            input: serde_json::json!({"text":"argument"}),
+            provider_executed: false,
+        });
+        assert!(shell
+            .replay_validated_shell(Some("replacement".into()))
+            .is_none());
+        assert_eq!(shell.replay_validated_shell(None).unwrap(), shell);
+    }
+
+    #[test]
     fn attachment_stripped_drop_modes_seed_the_existing_canonical_reductions() {
         let skeleton = super::seeded_drop_unit("m1#0", "skeleton_stripped", None, false).unwrap();
         assert_eq!(skeleton.kind, "skeleton_real");
@@ -17449,7 +17757,26 @@ mod tests {
     // Adversarial gate over the claim-lane migration and the single-store marker
     // migration as one merged chain.
     mod gate_a1_b0;
+    mod perf_audit;
     mod tag_cache_migration;
+
+    #[test]
+    fn freshly_opened_cache_store_uses_wal_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                let journal: String =
+                    conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+                let synchronous: i64 =
+                    conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+                assert_eq!(journal, "wal");
+                assert_eq!(synchronous, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         StorageDescriptor {
@@ -19711,6 +20038,78 @@ mod tests {
             .remove("protected_tokens_effective");
         let legacy: ModuleMeta = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.protected_tokens_effective, None);
+    }
+
+    #[test]
+    fn protected_tool_selection_snapshot_round_trips_without_a_schema_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let expected = std::collections::BTreeSet::from(["result#0".to_string()]);
+        {
+            let store = McStore::open_for_test(&descriptor).unwrap();
+            let meta = ModuleMeta {
+                protected_tool_block_ids: expected.clone(),
+                ..ModuleMeta::default()
+            };
+            store
+                .commit("held-tool", None, &CoreState::default(), &meta)
+                .unwrap();
+        }
+        let restarted = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            restarted
+                .load("held-tool")
+                .unwrap()
+                .meta
+                .protected_tool_block_ids,
+            expected
+        );
+        let legacy: ModuleMeta =
+            serde_json::from_value(serde_json::to_value(ModuleMeta::default()).unwrap()).unwrap();
+        assert!(legacy.protected_tool_block_ids.is_empty());
+    }
+
+    #[test]
+    fn protected_nudge_policy_round_trips_in_the_existing_baseline_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let policy = std::collections::BTreeMap::from([("probe".to_string(), 2)]);
+        let baseline = TailHygieneBaseline {
+            protected_tools_policy: Some(policy.clone()),
+            ..TailHygieneBaseline::default()
+        };
+        {
+            let store = McStore::open_for_test(&descriptor).unwrap();
+            let meta = ModuleMeta {
+                tail_hygiene_baseline: Some(baseline.clone()),
+                ..ModuleMeta::default()
+            };
+            store
+                .commit("nudge-policy", None, &CoreState::default(), &meta)
+                .unwrap();
+        }
+        let store = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            store
+                .load("nudge-policy")
+                .unwrap()
+                .meta
+                .tail_hygiene_baseline
+                .unwrap()
+                .protected_tools_policy,
+            Some(policy)
+        );
+        let mut legacy = serde_json::to_value(baseline).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("protected_tools_policy");
+        assert_eq!(
+            serde_json::from_value::<TailHygieneBaseline>(legacy)
+                .unwrap()
+                .protected_tools_policy,
+            None
+        );
     }
 
     #[test]

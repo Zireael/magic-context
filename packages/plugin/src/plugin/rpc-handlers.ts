@@ -4,7 +4,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { chmodSync, createWriteStream, mkdirSync, rmSync } from "node:fs";
+import { closeSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { COMPACTION_ENABLED_PATH, isCompactionEnabled } from "../config/agent-disable";
@@ -14,6 +14,7 @@ import type { MagicContextConfig } from "../config/schema/magic-context";
 import {
     getFailingDreamTasks,
     getMostRecentTaskRunAt,
+    getSkippedDreamTasks,
 } from "../features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "../features/magic-context/dreamer/task-gates";
 import {
@@ -46,7 +47,7 @@ import { readSessionCacheTtl } from "../features/magic-context/session-cache-ttl
 import { getQuickJsNativeMemoryStats } from "../features/magic-context/smart-notes/sandbox-runner";
 import {
     type ContextDatabase as Database,
-    openDatabase,
+    openCurrentDatabase as openDatabase,
     setSessionWorkMetrics,
 } from "../features/magic-context/storage";
 import {
@@ -123,7 +124,13 @@ import type {
     StatusDetail,
 } from "../shared/rpc-types";
 import { getSqliteMemoryStats } from "../shared/sqlite";
-import { shouldEnforcePrivateStoragePermissions } from "../shared/storage-permissions";
+import { importPluginModule } from "../shared/stale-plugin-build";
+import {
+    createStorageWriteStream,
+    ensureStorageDirectorySync,
+    shouldEnforcePrivateStoragePermissions,
+    writeStorageFileAsync,
+} from "../shared/storage-permissions";
 import {
     resolveTailHygieneStatus,
     type WireTailHygieneBaseline,
@@ -498,6 +505,7 @@ export function buildSidebarSnapshot(
         let lastDreamerRunAt: number | null = null;
         let dreamerBacklog: DreamTaskBacklogMap | undefined;
         let dreamerFailures: DreamTaskFailureState[] | undefined;
+        let dreamerSkipped: string[] | undefined;
         const dreamerProgress = projectIdentity
             ? (liveSessionState?.dreamerProgressByProject?.get(projectIdentity) ?? null)
             : null;
@@ -517,6 +525,7 @@ export function buildSidebarSnapshot(
                 // A scheduled task can fail on every slot for weeks. Without this the
                 // only in-session trace is a backlog count that never falls.
                 dreamerFailures = getFailingDreamTasks(db, projectIdentity);
+                dreamerSkipped = getSkippedDreamTasks(db, projectIdentity);
             } catch {
                 // task_schedule_state may not exist on a pre-V2 DB
             }
@@ -681,6 +690,7 @@ export function buildSidebarSnapshot(
             dreamerBacklog,
             dreamerProgress,
             ...(dreamerFailures === undefined ? {} : { dreamerFailures }),
+            ...(dreamerSkipped === undefined ? {} : { dreamerSkipped }),
             compartmentTokens: calibrated.compartmentTokens,
             factTokens: calibrated.factTokens,
             memoryTokens: calibrated.memoryTokens,
@@ -800,6 +810,7 @@ export function buildStatusDetail(
               }
             : undefined;
     const liveConfig = currentPluginConfigReader(directory);
+    const liveTtlConfig = liveConfig?.poll().effective;
     const liveFailure = liveConfig?.lastFailure();
     const detail: StatusDetail = {
         ...base,
@@ -1003,8 +1014,11 @@ export function buildStatusDetail(
 
             const ttlDisplay = resolveCacheTtlDisplay({
                 frozen: readSessionCacheTtl(db, sessionId),
-                configured: (config.cache_ttl ?? "5m") as MagicContextConfig["cache_ttl"],
-                configuredExplicitly: config.cacheTtlConfigured === true,
+                configured: (liveTtlConfig?.cache_ttl ??
+                    config.cache_ttl ??
+                    "5m") as MagicContextConfig["cache_ttl"],
+                configuredExplicitly:
+                    (liveTtlConfig?.cacheTtlConfigured ?? config.cacheTtlConfigured) === true,
                 modelKey,
                 sessionValue: persistedCacheTtl,
                 sessionModelKey: persistedModelKey,
@@ -1283,7 +1297,7 @@ async function writeSnapshotJson(
     snapshot: Record<string, unknown>,
     enforcePrivatePermissions: boolean,
 ): Promise<void> {
-    const writer = createWriteStream(path, enforcePrivatePermissions ? { mode: 0o600 } : undefined);
+    const writer = createStorageWriteStream(path, enforcePrivatePermissions);
     const writeChunk = async (chunk: string): Promise<void> => {
         if (!writer.write(chunk)) await once(writer, "drain");
     };
@@ -1356,10 +1370,7 @@ async function generateDebugHeapSnapshot(
 
     const directory = join(storageDir, "heap-snapshots");
     const enforcePrivatePermissions = shouldEnforcePrivateStoragePermissions();
-    mkdirSync(
-        directory,
-        enforcePrivatePermissions ? { recursive: true, mode: 0o700 } : { recursive: true },
-    );
+    ensureStorageDirectorySync(directory);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const path = join(directory, `${timestamp}-${process.pid}.heapsnapshot`);
 
@@ -1381,7 +1392,7 @@ async function generateDebugHeapSnapshot(
     }
 
     if (typeof snapshot === "string") {
-        await Bun.write(path, snapshot);
+        await writeStorageFileAsync(path, snapshot, enforcePrivatePermissions);
     } else {
         await writeSnapshotJson(
             path,
@@ -1394,13 +1405,6 @@ async function generateDebugHeapSnapshot(
             },
             enforcePrivatePermissions,
         );
-    }
-    if (enforcePrivatePermissions) {
-        try {
-            chmodSync(path, 0o600);
-        } catch {
-            // A tightening failure does not invalidate the completed diagnostic capture.
-        }
     }
     return { ...memory, path, format, snapshotVersion };
 }
@@ -1448,6 +1452,9 @@ export function registerRpcHandlers(
         liveSessionState: LiveSessionState;
         rustModeModuleClient?: RustModeModuleClient;
         hiddenCompletionExecutor?: HiddenCompletionExecutor;
+        compactionMarkerStrategy?: ManagedRecompContext["compactionMarkerStrategy"];
+        /** Install the host's history source even before a reopened session's first pass. */
+        prepareHistorySession?: (sessionId: string) => void;
         storageDir?: string;
         getDebugMemoryHolders?: () => RuntimeDebugMemoryHolders | undefined;
         getDatabase?: () => Database | null;
@@ -1617,12 +1624,13 @@ export function registerRpcHandlers(
     const buildManagedCtx = async (
         db: NonNullable<ReturnType<typeof getDb>>,
     ): Promise<ManagedRecompContext> => {
-        const { deriveHistorianChunkTokens, resolveHistorianContextLimit } = await import(
-            "../hooks/magic-context/derive-budgets"
+        const { deriveHistorianChunkTokens, resolveHistorianContextLimit } =
+            await importPluginModule(() => import("../hooks/magic-context/derive-budgets"));
+        const { resolveHistorianModel } = await importPluginModule(
+            () => import("../shared/model-resolution"),
         );
-        const { resolveHistorianModel } = await import("../shared/model-resolution");
-        const { userMemoryCollectionEnabled } = await import(
-            "../features/magic-context/dreamer/task-config"
+        const { userMemoryCollectionEnabled } = await importPluginModule(
+            () => import("../features/magic-context/dreamer/task-config"),
         );
         const DEFAULT_HISTORIAN_TIMEOUT_MS = 10 * 60 * 1000;
         const runConfig = historianRunConfig(
@@ -1633,6 +1641,7 @@ export function registerRpcHandlers(
         return {
             client: args.client as ManagedRecompContext["client"],
             hiddenCompletionExecutor: args.hiddenCompletionExecutor,
+            compactionMarkerStrategy: args.compactionMarkerStrategy,
             db,
             liveSessionState,
             directory,
@@ -1646,6 +1655,7 @@ export function registerRpcHandlers(
             fallbackModels: historianModel.fallbacks,
             userMemoriesEnabled: userMemoryCollectionEnabled(runConfig.dreamer),
             historianTwoPass: runConfig.historian?.two_pass === true,
+            historianExpandTools: runConfig.historian?.expand_tools,
             getNotificationParams: (sessionId) =>
                 getLiveNotificationParams(
                     sessionId,
@@ -1667,9 +1677,11 @@ export function registerRpcHandlers(
         const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
 
-        const { runManagedRecomp } = await import("../hooks/magic-context/recomp-orchestrator");
-        const { sendIgnoredMessage } = await import(
-            "../hooks/magic-context/send-session-notification"
+        const { runManagedRecomp } = await importPluginModule(
+            () => import("../hooks/magic-context/recomp-orchestrator"),
+        );
+        const { sendIgnoredMessage } = await importPluginModule(
+            () => import("../hooks/magic-context/send-session-notification"),
         );
         log(`[rpc] recomp requested for session ${sessionId}`);
         // The historian needs a way to run hidden completions: OpenCode 1 opens
@@ -1683,6 +1695,7 @@ export function registerRpcHandlers(
             };
         }
         const ctx = await buildManagedCtx(db);
+        args.prepareHistorySession?.(sessionId);
         // Fire-and-forget. OpenCode 1 force-persists the outcome as a chat row so a
         // multi-minute recomp's result stays in scrollback instead of a 5s toast.
         // OpenCode 2 has no SDK client to write that row with, so the outcome goes
@@ -1767,7 +1780,9 @@ export function registerRpcHandlers(
         const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
 
-        const { runManagedWrapup } = await import("../hooks/magic-context/wrapup-orchestrator");
+        const { runManagedWrapup } = await importPluginModule(
+            () => import("../hooks/magic-context/wrapup-orchestrator"),
+        );
         const model = liveSessionState.liveModelBySession.get(sessionId);
         const contextLimit = model
             ? resolveContextLimit(model.providerID, model.modelID, { db, sessionID: sessionId })
@@ -1791,6 +1806,7 @@ export function registerRpcHandlers(
                 liveSessionState.pendingMaterializationSessions.has(sid),
         };
         log(`[rpc] wrapup requested for session ${sessionId} (keep ${messagesToKeep})`);
+        args.prepareHistorySession?.(sessionId);
         // Fire-and-forget: a wrapup runs the historian over the live tail and can
         // take minutes, which is far longer than an RPC caller can wait.
         void runManagedWrapup(ctx, sessionId, { messagesToKeep })

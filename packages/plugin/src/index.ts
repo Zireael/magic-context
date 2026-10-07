@@ -11,7 +11,10 @@ import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { createDreamerOutputCapSampler } from "./config/live-child-output-cap";
 import { dreamerRunConfig, historianRunConfig, pluginConfigReader } from "./config/live-run-config";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
-import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
+import {
+    createSubcCheckoutClaimGate,
+    openCodeEventSessionId,
+} from "./features/magic-context/checkout-claim";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import type {
@@ -32,7 +35,7 @@ import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smar
 import {
     getSchemaFenceRejection,
     isDatabasePersisted,
-    openDatabase,
+    openCurrentDatabase as openDatabase,
     setSqlitePragmaConfig,
 } from "./features/magic-context/storage-db";
 import { recordToolDefinition } from "./features/magic-context/tool-definition-tokens";
@@ -70,7 +73,10 @@ import { isDisposedInstanceDirectory } from "./plugin/instance-disposal";
 import { createMessagesTransformHandler } from "./plugin/messages-transform";
 import { disableNativeAutoCompaction } from "./plugin/native-compaction-guard";
 import { isDebugRpcEnabled, registerRpcHandlers } from "./plugin/rpc-handlers";
+import { bindStaleBuildNotice } from "./plugin/stale-build-notice";
+import { primaryOnlyToolIds } from "./plugin/subagent-tool-policy";
 import { createToolRegistry } from "./plugin/tool-registry";
+import { getMagicContextBuiltinCommands } from "./shared/builtin-commands";
 import { claimConfigParseFailuresOnce } from "./shared/config-diagnostics";
 import { buildOpenCodeConfigWarningBanner } from "./shared/config-warning-surface";
 import {
@@ -98,6 +104,7 @@ import {
 import { createPromptSurfaceRuntime } from "./shared/prompt-surface-runtime";
 import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
+import { importPluginModule } from "./shared/stale-plugin-build";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
 import { reloadWindowOverlay } from "./shared/window-geometry";
 import { CTX_MEMORY_LIST_TOOL_NAME } from "./tools/ctx-memory";
@@ -107,6 +114,7 @@ const BOOT_SERVER_DEADLINE_MS = 15_000;
 const RESOLVED_CONFIG_TIMEOUT_MS = 2_000;
 
 const server: Plugin = async (ctx) => {
+    bindStaleBuildNotice(ctx.client, import.meta.url);
     const bootStartedAt = performance.now();
     const bootBudget = createBootBudget(BOOT_SERVER_DEADLINE_MS, bootStartedAt);
     const storageBootTimings = { openMs: 0, guardMs: 0, migrateMs: 0 };
@@ -197,8 +205,8 @@ const server: Plugin = async (ctx) => {
         if (hasBannerEntries)
             setTimeout(async () => {
                 try {
-                    const { sendStatusNotification } = await import(
-                        "./hooks/magic-context/send-session-notification"
+                    const { sendStatusNotification } = await importPluginModule(
+                        () => import("./hooks/magic-context/send-session-notification"),
                     );
                     // Route the RPC warning to the first active session; never append a chat row.
                     // SDK types don't expose `session.list()`'s actual response shape (the
@@ -236,8 +244,8 @@ const server: Plugin = async (ctx) => {
         );
         setTimeout(async () => {
             try {
-                const { sendStatusNotification } = await import(
-                    "./hooks/magic-context/send-session-notification"
+                const { sendStatusNotification } = await importPluginModule(
+                    () => import("./hooks/magic-context/send-session-notification"),
                 );
                 type SessionListFn = () => Promise<
                     { data?: Array<{ id?: string }> } | Array<{ id?: string }>
@@ -425,6 +433,7 @@ const server: Plugin = async (ctx) => {
         promptSurfaceRuntime,
         registrationPromptSurface: loadedPluginConfig.registrationPromptSurface,
         includeDreamerOnlyTools: true,
+        internalChildSessions: liveSessionState.internalChildSessions,
     });
 
     // v22 deferred legacy-memory identity backfill. createSessionHooks() opens
@@ -704,13 +713,15 @@ const server: Plugin = async (ctx) => {
     {
         const fence = getSchemaFenceRejection();
         if (fence) {
-            void import("./plugin/conflict-warning-hook").then(({ sendSchemaFenceWarning }) =>
-                sendSchemaFenceWarning(
-                    ctx.client as unknown as Record<string, unknown>,
-                    ctx.directory,
-                    fence,
-                ),
-            );
+            void importPluginModule(() => import("./plugin/conflict-warning-hook"))
+                .then(({ sendSchemaFenceWarning }) =>
+                    sendSchemaFenceWarning(
+                        ctx.client as unknown as Record<string, unknown>,
+                        ctx.directory,
+                        fence,
+                    ),
+                )
+                .catch((error) => log("[magic-context] schema-fence warning unavailable:", error));
         }
     }
 
@@ -721,11 +732,11 @@ const server: Plugin = async (ctx) => {
             : typeof serverUrl === "string"
               ? serverUrl.replace(/\/$/, "")
               : undefined;
-    void import("./hooks/magic-context/send-session-notification").then(
-        ({ setNotificationServerUrl }) => {
+    void importPluginModule(() => import("./hooks/magic-context/send-session-notification"))
+        .then(({ setNotificationServerUrl }) => {
             setNotificationServerUrl(serverUrlStr);
-        },
-    );
+        })
+        .catch((error) => log("[magic-context] notification transport unavailable:", error));
 
     // Conflict warning / cleanup for Desktop mode.
     // TUI handles this via a startup dialog; this covers Desktop where we can't show dialogs.
@@ -767,7 +778,7 @@ const server: Plugin = async (ctx) => {
     // so a failure here can never block plugin startup.
     if (pluginConfig.enabled && !conflictResult?.hasConflict) {
         setTimeout(() => {
-            void import("./shared/announcement")
+            void importPluginModule(() => import("./shared/announcement"))
                 .then(
                     ({
                         shouldShowAnnouncement,
@@ -777,16 +788,17 @@ const server: Plugin = async (ctx) => {
                         markAnnouncementSeen,
                     }) => {
                         if (!shouldShowAnnouncement()) return;
-                        return import("./plugin/conflict-warning-hook").then(
-                            ({ sendStartupAnnouncement }) =>
-                                sendStartupAnnouncement(
-                                    ctx.client as unknown as Record<string, unknown>,
-                                    ctx.directory,
-                                    ANNOUNCEMENT_VERSION,
-                                    ANNOUNCEMENT_FEATURES,
-                                    ANNOUNCEMENT_FOOTER,
-                                    markAnnouncementSeen,
-                                ),
+                        return importPluginModule(
+                            () => import("./plugin/conflict-warning-hook"),
+                        ).then(({ sendStartupAnnouncement }) =>
+                            sendStartupAnnouncement(
+                                ctx.client as unknown as Record<string, unknown>,
+                                ctx.directory,
+                                ANNOUNCEMENT_VERSION,
+                                ANNOUNCEMENT_FEATURES,
+                                ANNOUNCEMENT_FOOTER,
+                                markAnnouncementSeen,
+                            ),
                         );
                     },
                 )
@@ -830,6 +842,24 @@ const server: Plugin = async (ctx) => {
         }),
     );
 
+    // The checkout claim: Magic Context must not write for a session whose agent
+    // another machine holds. Its first write for a session can come from the
+    // event stream (session.created), chat.message, or a transform pass, so
+    // each of those consults the gate first. The verdict is cached per session,
+    // so only a session's first sight (and each cache expiry) pays for a check.
+    // Nothing is written when the plugin is disabled, so nothing is checked.
+    const checkoutClaimGate = pluginConfig.enabled
+        ? createSubcCheckoutClaimGate(
+              "opencode",
+              () => pluginConfig.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+          )
+        : undefined;
+    const isCheckoutClaimRefused = async (sessionId: string | undefined): Promise<boolean> => {
+        if (!checkoutClaimGate || !sessionId) return false;
+        if (liveSessionState.internalChildSessions.has(sessionId)) return false;
+        return (await checkoutClaimGate.refusal(sessionId, ctx.directory)) !== null;
+    };
+
     return {
         tool: tools,
         event: createEventHandler({
@@ -838,6 +868,11 @@ const server: Plugin = async (ctx) => {
                     if (input.event.type === "session.deleted") {
                         const properties = input.event.properties as { info?: { id?: string } };
                         if (properties.info?.id) dreamerCap.delete(properties.info.id);
+                    } else if (await isCheckoutClaimRefused(openCodeEventSessionId(input.event))) {
+                        // The host's own deletion of a session still clears its local
+                        // state above; every other event of a session held elsewhere
+                        // is left for the machine that holds it.
+                        return;
                     }
                     await magicContextRuntime.magicContext?.event?.(input);
                 },
@@ -904,6 +939,26 @@ const server: Plugin = async (ctx) => {
             getMagicContext: () => magicContextRuntime.magicContext,
             failClosed,
             failClosedBlockingEnabled,
+            // Refuse before any write when another machine holds the session's
+            // agent; MC writes nothing when the plugin is disabled.
+            checkoutClaim: checkoutClaimGate
+                ? {
+                      gate: checkoutClaimGate,
+                      projectRoot: ctx.directory,
+                      onRefusal: async (sessionId, message) => {
+                          const { sendStatusNotification } = await importPluginModule(
+                              () => import("./hooks/magic-context/send-session-notification"),
+                          );
+                          const { abortSessionFailClosed } = await importPluginModule(
+                              () => import("./hooks/magic-context/transform-postprocess-phase"),
+                          );
+                          await sendStatusNotification(ctx.client, sessionId, message, {
+                              toastDurationMs: 15000,
+                          });
+                          await abortSessionFailClosed(ctx.client, sessionId);
+                      },
+                  }
+                : undefined,
             // Compaction-off mode (issue #266): fail_closed_blocking is inert
             // BY DESIGN in this mode — a failed transform degrades to
             // passthrough of the input messages instead of blocking the turn.
@@ -919,11 +974,11 @@ const server: Plugin = async (ctx) => {
                     } | null
                 )?.getRustReplayParticipant?.() ?? null,
             onStorageBusyRefusal: async (sessionId, message) => {
-                const { sendStatusNotification } = await import(
-                    "./hooks/magic-context/send-session-notification"
+                const { sendStatusNotification } = await importPluginModule(
+                    () => import("./hooks/magic-context/send-session-notification"),
                 );
-                const { abortSessionFailClosed } = await import(
-                    "./hooks/magic-context/transform-postprocess-phase"
+                const { abortSessionFailClosed } = await importPluginModule(
+                    () => import("./hooks/magic-context/transform-postprocess-phase"),
                 );
                 await sendStatusNotification(ctx.client, sessionId, message, {
                     toastDurationMs: 15000,
@@ -932,6 +987,9 @@ const server: Plugin = async (ctx) => {
             },
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
+            // The messages transform refuses such a turn loudly; this hook only
+            // has to stay out of the store.
+            if (await isCheckoutClaimRefused((input as { sessionID?: string }).sessionID)) return;
             await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(
                 input,
                 output,
@@ -962,6 +1020,8 @@ const server: Plugin = async (ctx) => {
                 provId && modId
                     ? { providerID: provId, modelID: modId, agentName: agent || "default" }
                     : null;
+            // The turn itself is refused by the messages transform, loudly.
+            if (await isCheckoutClaimRefused((input as { sessionID?: string }).sessionID)) return;
             await magicContextRuntime.magicContext?.["chat.message"]?.(input, output);
         },
         "tool.definition": async (input, output) => {
@@ -1006,6 +1066,16 @@ const server: Plugin = async (ctx) => {
                 if (pluginConfig.enabled !== true) {
                     return;
                 }
+                // The host applies these only when task creates a child session.
+                // Unlike agent permissions, this leaves the same agent's primary
+                // tool list unchanged and does not touch hidden maintenance runs.
+                const experimental = config.experimental as typeof config.experimental & {
+                    primary_tools?: string[];
+                };
+                config.experimental = {
+                    ...experimental,
+                    primary_tools: primaryOnlyToolIds(experimental?.primary_tools),
+                } as typeof config.experimental;
                 // In compaction-off mode native compaction is the user's chosen
                 // window manager, so it is left alone.
                 if (isCompactionEnabled(pluginConfig)) {

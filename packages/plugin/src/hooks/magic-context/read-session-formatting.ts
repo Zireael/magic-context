@@ -394,6 +394,12 @@ export function hasTokenizerForFit(): boolean {
     return getTokenizer() !== undefined;
 }
 
+/** Size check that keeps refusal-only estimates from expensive tokenization;
+ * shared estimates still tokenize whole texts. */
+export function tokenCountUsesByteBound(text: string): boolean {
+    return text.length > 1024 * 1024 || /[\p{L}\p{N}]{16385}/u.test(text);
+}
+
 export function estimateTokens(text: string): number {
     if (!text) return 0;
     const activeTokenizer = getTokenizer();
@@ -411,6 +417,75 @@ export function estimateTokens(text: string): number {
         warnTokenizerFallback(error);
         return estimateTokensHeuristically(text);
     }
+}
+
+/** Exact-content, bounded counts; fallback invalidates counts from the previous tokenizer. */
+export function createTokenCountMemo(
+    maxEntries: number,
+    maxBytes: number,
+): (text: string) => number {
+    const counts = new Map<
+        string,
+        { tokenizer: ReturnType<typeof getTokenizer>; tokens: number }
+    >();
+    let bytes = 0;
+    return (text) => {
+        const cached = counts.get(text);
+        if (cached && cached.tokenizer === getTokenizer()) return cached.tokens;
+        const tokens = estimateTokens(text);
+        if (cached) {
+            bytes -= text.length * 2;
+            counts.delete(text);
+        }
+        if (text.length * 2 <= maxBytes) {
+            while (counts.size >= maxEntries || bytes + text.length * 2 > maxBytes) {
+                const oldest = counts.keys().next().value;
+                if (oldest === undefined) break;
+                bytes -= oldest.length * 2;
+                counts.delete(oldest);
+            }
+            counts.set(text, { tokenizer: getTokenizer(), tokens });
+            bytes += text.length * 2;
+        }
+        return tokens;
+    };
+}
+
+const promptTokenCounts = new Map<
+    string,
+    { tokenizer: ReturnType<typeof getTokenizer>; tokens: number }
+>();
+let promptTokenCountBytes = 0;
+const PROMPT_TOKEN_COUNT_BYTES = 8 * 1024 * 1024;
+
+/** Count identical fixed historian prompts once, without borrowing counts after tokenizer fallback. */
+export function estimateFixedPromptTokens(text: string): number {
+    const activeTokenizer = getTokenizer();
+    const cached = promptTokenCounts.get(text);
+    if (cached && cached.tokenizer === activeTokenizer) {
+        promptTokenCounts.delete(text);
+        promptTokenCounts.set(text, cached);
+        return cached.tokens;
+    }
+    const tokens = estimateTokens(text);
+    if (cached) {
+        promptTokenCountBytes -= text.length * 2;
+        promptTokenCounts.delete(text);
+    }
+    if (text.length * 2 <= PROMPT_TOKEN_COUNT_BYTES) {
+        while (
+            promptTokenCounts.size >= 64 ||
+            promptTokenCountBytes + text.length * 2 > PROMPT_TOKEN_COUNT_BYTES
+        ) {
+            const oldest = promptTokenCounts.keys().next().value;
+            if (oldest === undefined) break;
+            promptTokenCountBytes -= oldest.length * 2;
+            promptTokenCounts.delete(oldest);
+        }
+        promptTokenCounts.set(text, { tokenizer: getTokenizer(), tokens });
+        promptTokenCountBytes += text.length * 2;
+    }
+    return tokens;
 }
 
 export function normalizeText(text: string): string {

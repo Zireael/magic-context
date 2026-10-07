@@ -672,6 +672,10 @@ export function loadPiConfigDetailed(
 	const recoveredTopLevelKeys: string[] = [];
 	const cacheTtlConfigured = Object.hasOwn(rawConfig, "cache_ttl");
 	const parsed = parsePiConfig(rawConfig, recoveredTopLevelKeys);
+	// This runtime-only flag records whether cache_ttl was present; do not expose it as a user setting.
+	Object.defineProperty(parsed.config, "cacheTtlConfigured", {
+		value: cacheTtlConfigured,
+	});
 	// An ignored invalid project value is still a config the user must fix, so
 	// keep reporting it as schema recovery (parity with the OpenCode loader).
 	for (const key of projectRestoredTopLevelKeys) {

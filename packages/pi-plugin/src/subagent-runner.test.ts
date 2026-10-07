@@ -34,7 +34,11 @@ import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-run
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
 import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
-import { __test, PiSubagentRunner } from "./subagent-runner";
+import {
+	__test,
+	configurePiSubagentHostTools,
+	PiSubagentRunner,
+} from "./subagent-runner";
 
 const baseOptions: SubagentRunOptions = {
 	agent: "historian",
@@ -66,6 +70,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	__setPiHarnessKindForTesting(undefined);
+	__test.resetHostToolState();
 	closeDatabase();
 	__resetSchemaFenceStateForTests();
 });
@@ -161,6 +166,7 @@ function runnerWith(
 		platform,
 		extraArgs,
 		subagentExtensions,
+		getHostToolNames,
 	}: {
 		piBinary?: string;
 		invocation?: {
@@ -172,6 +178,7 @@ function runnerWith(
 		platform?: NodeJS.Platform;
 		extraArgs?: readonly string[];
 		subagentExtensions?: readonly string[];
+		getHostToolNames?: () => readonly string[] | undefined;
 	} = {},
 ) {
 	const remainingChildren = Array.isArray(childOrChildren)
@@ -189,6 +196,7 @@ function runnerWith(
 		platform,
 		extraArgs,
 		subagentExtensions,
+		getHostToolNames,
 		spawnImpl: spawnImpl as never,
 	});
 	return { runner, spawnImpl };
@@ -1010,6 +1018,33 @@ describe("subagent-runner pure helpers", () => {
 			}
 			expect(new Set(resolved).size, agent).toBe(resolved.length);
 		}
+	});
+
+	it("intersects OMP built-ins with the host registry when grep or glob is disabled", () => {
+		const readOnlyTools = ["read", "grep", "find", "ls"];
+		expect(
+			__test.resolveHostToolAllowlist(readOnlyTools, true, ["read", "glob"]),
+		).toEqual(["read", "glob"]);
+		expect(
+			__test.resolveHostToolAllowlist(readOnlyTools, true, ["read", "grep"]),
+		).toEqual(["read", "grep"]);
+		expect(
+			__test.resolveHostToolAllowlist(readOnlyTools, false, [
+				"read",
+				"find",
+				"ls",
+			]),
+		).toEqual(["read", "find", "ls"]);
+		expect(__test.resolveHostToolAllowlist(readOnlyTools, true, [])).toEqual(
+			[],
+		);
+
+		const args = buildArgsForTest(
+			{ ...baseOptions, agent: "dreamer-memory-mapper" },
+			{ targetHarness: "omp", hostToolNames: [] },
+		);
+		expect(args).toContain("--no-tools");
+		expect(args).not.toContain("--tools");
 	});
 
 	it("locks base dreamer (curate) to the two memory tools, stripping all built-ins", () => {
@@ -3185,6 +3220,127 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		);
 	});
 
+	it("plain Pi never reads a loading-phase host tool registry", async () => {
+		const getTools = mock(() => {
+			throw new Error(
+				"Extension runtime not initialized. Action methods cannot be called during extension loading.",
+			);
+		});
+		configurePiSubagentHostTools(getTools);
+		for (const agent of [
+			"historian",
+			"historian-recomp",
+			"dreamer-memory-mapper",
+		]) {
+			const child = createMockChild();
+			const { runner, spawnImpl } = runnerWith(child, {
+				invocation: { command: "pi-test", prefixArgs: [], targetHarness: "pi" },
+				getHostToolNames: getTools,
+			});
+			const result = runner.run({ ...baseOptions, agent });
+			child.writeStdoutLine(
+				agentEnd([
+					{ role: "assistant", content: [{ type: "text", text: "done" }] },
+				]),
+			);
+			child.emitClose(0);
+			expect((await result).ok).toBe(true);
+			expect(spawnImpl).toHaveBeenCalledTimes(1);
+			if (agent === "dreamer-memory-mapper") {
+				const args = spawnImpl.mock.calls[0]?.[1] as string[];
+				expect(args[args.indexOf("--tools") + 1]).toBe(
+					"read,grep,find,ls,aft_outline,aft_zoom,aft_search",
+				);
+			}
+		}
+		expect(getTools).not.toHaveBeenCalled();
+	});
+
+	it("OMP launches with its normal tools when the host registry is not initialized", async () => {
+		configurePiSubagentHostTools(() => {
+			throw new Error(
+				"Extension runtime not initialized. Action methods cannot be called during extension loading.",
+			);
+		});
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			invocation: { command: "omp-test", prefixArgs: [], targetHarness: "omp" },
+		});
+		const result = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+		});
+		child.writeStdoutLine(
+			agentEnd([
+				{ role: "assistant", content: [{ type: "text", text: "done" }] },
+			]),
+		);
+		child.emitClose(0);
+		expect((await result).ok).toBe(true);
+		const args = spawnImpl.mock.calls[0]?.[1] as string[];
+		expect(args[args.indexOf("--tools") + 1]).toBe("read,grep,glob");
+	});
+
+	it("applies the host tool intersection to fallback child invocations", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		let spawnCount = 0;
+		const spawnImpl = mock(() => {
+			spawnCount += 1;
+			return (spawnCount === 1 ? first : second) as never;
+		});
+		const runner = new PiSubagentRunner({
+			invocation: {
+				command: "omp-test",
+				prefixArgs: [],
+				targetHarness: "omp",
+			},
+			getHostToolNames: () => ["read", "glob"],
+			spawnImpl: spawnImpl as never,
+		});
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+			model: "anthropic/primary",
+			fallbackModels: ["openai/fallback"],
+		});
+		first.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "primary failed" }],
+					stopReason: "error",
+				},
+			]),
+		);
+		first.emitClose(0);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "fallback succeeded" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+
+		expect(await resultPromise).toMatchObject({
+			ok: true,
+			assistantText: "fallback succeeded",
+		});
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		for (const [, argv] of spawnImpl.mock.calls) {
+			const args = argv as string[];
+			const toolsIndex = args.indexOf("--tools");
+			expect(toolsIndex).toBeGreaterThanOrEqual(0);
+			expect(args[toolsIndex + 1]).toBe("read,glob");
+			expect(args[toolsIndex + 1]).not.toContain("grep");
+		}
+	});
+
 	it("retries fallback models after empty assistant text", async () => {
 		const first = createMockChild();
 		const second = createMockChild();
@@ -3543,7 +3699,7 @@ describe("Pi dreamer prompt-token budget", () => {
 		prefixArgs: [],
 		targetHarness: "pi" as const,
 	};
-	async function started() {
+	async function started(tokenBudget = 100) {
 		const child = createMockChild();
 		const { runner, spawnImpl } = runnerWith(child, {
 			invocation,
@@ -3552,7 +3708,7 @@ describe("Pi dreamer prompt-token budget", () => {
 		const run = runner.run({
 			...baseOptions,
 			agent: "dreamer-memory-mapper",
-			tokenBudget: 100,
+			tokenBudget,
 		});
 		for (
 			let i = 0;
@@ -3564,6 +3720,39 @@ describe("Pi dreamer prompt-token budget", () => {
 		expect(spawnImpl.mock.calls[0]?.[1]).toContain("rpc");
 		return { child, run, spawnImpl };
 	}
+
+	it("finalizes the mapper before its step cap and retains a partial manifest below token budget", async () => {
+		const { child, run } = await started(3_000_000);
+		for (let step = 1; step <= 58; step++)
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					usage: { input: 1 },
+					stopReason: "toolUse",
+					content: [{ type: "toolCall", id: `read-${step}`, name: "read" }],
+				},
+			});
+		const steered = child.stdinText.includes("dreamer-finalize");
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 1 },
+				stopReason: "stop",
+				content: [
+					{ type: "text", text: '<verify><verified id="1"/></verify>' },
+				],
+			},
+		});
+		child.emitClose();
+		expect(await run).toMatchObject({
+			ok: true,
+			meta: { tokenBudget: { spent: 59, finalizeFired: true } },
+		});
+		expect(steered).toBe(true);
+		expect(child.stdinText.match(/dreamer-finalize/g)).toHaveLength(1);
+	});
 
 	it("does not steer a completed under-budget child", async () => {
 		const { child, run } = await started();

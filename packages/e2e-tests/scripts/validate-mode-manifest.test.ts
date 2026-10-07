@@ -21,7 +21,7 @@ describe("mode manifest validator", () => {
         // Bump this with the manifest whenever a tests/**/*.test.ts file is added or
         // removed. Moving a file between excluded and ts-only changes the invocation
         // counts and excluded list below, but not the total number of files.
-        expect(validation.files.length).toBe(158);
+        expect(validation.files.length).toBe(177);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -32,29 +32,36 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(47);
-        expect(rust).toHaveLength(56);
+        expect(ts).toHaveLength(62);
+        expect(rust).toHaveLength(57);
+        expect(rust).toContain("tests/idle-ttl-restart.test.ts");
         expect(rust).toContain("tests/subagent-behavior.test.ts");
-        expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(3);
-        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(35);
-        expect(filesForMode(validation, "ts", "pi")).toHaveLength(26);
-        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(28);
-        // These six OpenCode 2 files are ts-only with hosts ["opencode2"], so only the
+        expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(4);
+        expect(filesForMode(validation, "ts", "opencode")).toHaveLength(42);
+        expect(filesForMode(validation, "ts", "pi")).toHaveLength(29);
+        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(36);
+        // These OpenCode 2 files are ts-only with hosts ["opencode2"], so only the
         // OpenCode 2 host lane runs them; the other host lanes never select them.
         for (const path of [
+            "tests/opencode2/error-result-compaction.test.ts",
             "tests/opencode2/adapters-s2-contracts.test.ts",
             "tests/opencode2/adapters-s3-marker-policy.test.ts",
             "tests/opencode2/pins.test.ts",
             "tests/opencode2/reporter-emergency-drop.test.ts",
             "tests/opencode2/storage-busy.test.ts",
             "tests/opencode2/generate.test.ts",
+            "tests/opencode2/subagent-mode.test.ts",
+            "tests/opencode2/subagent-write-tools.test.ts",
+            "tests/opencode2/commands-s2-wrapup.test.ts",
+            "tests/opencode2/recomp-hidden-executor.test.ts",
+            "tests/opencode2/dream-schedule-timer.test.ts",
         ]) {
             expect(filesForMode(validation, "ts", "opencode2")).toContain(path);
             expect(filesForMode(validation, "ts", "opencode")).not.toContain(path);
         }
         // OMP hashes each request into its system header, breaking within-session byte identity
         // in cache-stability and long-running-session; their manifest entries declare the omission.
-        expect(filesForMode(validation, "ts", "omp")).toHaveLength(19);
+        expect(filesForMode(validation, "ts", "omp")).toHaveLength(21);
         const excluded = validation.manifest.entries
             .filter((entry) => entry.tier === "excluded")
             .map((entry) => entry.path);
@@ -62,6 +69,7 @@ describe("mode manifest validator", () => {
             "tests/adv-identical-bytes-hard.test.ts",
             "tests/degraded-pass-lock.test.ts",
             "tests/dreamer-host-timeout.test.ts",
+            "tests/dreamer-mapper-step-cap-pi.test.ts",
             "tests/dreamer-token-budget-oc1.test.ts",
             "tests/dreamer-verify-budget.test.ts",
             "tests/dreamer-verify-token-budget-oc1.test.ts",
@@ -79,7 +87,6 @@ describe("mode manifest validator", () => {
             "tests/opencode2/commands-s2-flush.test.ts",
             "tests/opencode2/commands-s2-host-registration.test.ts",
             "tests/opencode2/commands-s2-keymap.test.ts",
-            "tests/opencode2/commands-s2-wrapup.test.ts",
             "tests/opencode2/compaction-off-host-compaction.test.ts",
             "tests/opencode2/compartment-boundary-host-row.test.ts",
             "tests/opencode2/context-s2-lanes.test.ts",
@@ -89,6 +96,7 @@ describe("mode manifest validator", () => {
             "tests/opencode2/dreamer-s2-carrier.test.ts",
             "tests/opencode2/emergency-refusal-visible.test.ts",
             "tests/opencode2/entry-s2-context.test.ts",
+            "tests/opencode2/execute-threshold-model.test.ts",
             "tests/opencode2/execute-threshold-tokens.test.ts",
             "tests/opencode2/fold-s3-owner.test.ts",
             "tests/opencode2/fork-inheritance.test.ts",
@@ -99,6 +107,7 @@ describe("mode manifest validator", () => {
             "tests/opencode2/hidden-child-two-directories.test.ts",
             "tests/opencode2/hidden-step-limit.test.ts",
             "tests/opencode2/image-attachment.test.ts",
+            "tests/opencode2/mapper-step-finalize.test.ts",
             "tests/opencode2/marker-s3-runtime.test.ts",
             "tests/opencode2/missing-history-boundary.test.ts",
             "tests/opencode2/mural-media-schema.test.ts",
@@ -107,7 +116,6 @@ describe("mode manifest validator", () => {
             "tests/opencode2/overflow-reading-retention.test.ts",
             "tests/opencode2/probes.test.ts",
             "tests/opencode2/prompt-surface-s6.test.ts",
-            "tests/opencode2/recomp-hidden-executor.test.ts",
             "tests/opencode2/restart-system-prompt-change.test.ts",
             "tests/opencode2/rpc-s2-listener.test.ts",
             "tests/opencode2/runner.test.ts",
@@ -127,6 +135,9 @@ describe("mode manifest validator", () => {
             "tests/opencode2/ts-mode-on-migrated-real-store.test.ts",
             "tests/opencode2/v1-v2-reconversion.test.ts",
             "tests/rust-classify-host-runner.test.ts",
+            "tests/rust-full-sync-frame-cap.test.ts",
+            "tests/rust-plugin-stage-cache.test.ts",
+            "tests/system-prompt-change-order.test.ts",
             "tests/window-overlay-reload.test.ts",
         ]);
         expect(new Set([...ts, ...rust]).size).toBe(validation.files.length - excluded.length);

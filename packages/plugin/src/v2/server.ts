@@ -1,7 +1,7 @@
 import { loadPluginConfigDetailed } from "../config";
+import { bindStaleBuildNotice } from "../plugin/stale-build-notice";
 import { setHarness } from "../shared/harness";
 import { flushLogger, log } from "../shared/logger";
-import { registerContext } from "./hooks/context";
 import type { V2Context } from "./hooks/types";
 import { startUpdateChecks } from "./hooks/update-check";
 
@@ -44,7 +44,11 @@ export async function setup(context: V2Context) {
         );
         return async () => {};
     }
+    // The union entry is also imported and probed by OpenCode 1. Load the v2
+    // adapter only after the host-shape check, retaining the same setup callback.
+    const { registerContext } = await import("./hooks/context");
     setHarness("opencode2");
+    bindStaleBuildNotice({}, import.meta.url, "opencode2");
     const duties = await registerContext(context);
     const checks =
         loadPluginConfigDetailed(context.location.directory).config.auto_update === false

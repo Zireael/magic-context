@@ -18,7 +18,8 @@ import {
     __resetMessageIndexAsyncForTests,
     isSessionReconciled,
 } from "../../features/magic-context/message-index-async";
-import type { Scheduler } from "../../features/magic-context/scheduler";
+import { createScheduler, type Scheduler } from "../../features/magic-context/scheduler";
+import { readSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import {
     clearPendingOps,
     closeDatabase,
@@ -109,6 +110,78 @@ type TestMessage = {
 };
 
 const tempDirs: string[] = [];
+
+for (const generation of ["v1", "v2"] as const) {
+    for (const configured of [true, false]) {
+        it(`${generation} pass ${configured ? "applies live user TTL edits without a prompt or model change" : "keeps built-in TTL changes frozen"}`, async () => {
+            useTempDataHome(`ttl-${generation}-`);
+            const db = openDatabase()!;
+            const sessionId = `ttl-${generation}-${configured}`;
+            let ttl = configured ? "1h" : "5m";
+            const scheduler = createScheduler({ executeThresholdPercentage: 65 });
+            const decide = spyOn(scheduler, "shouldExecute");
+            const refresh = new Set<string>();
+            const materialize = new Set<string>();
+            const transform = createTransform({
+                db,
+                storeGeneration: generation,
+                tagger: createTagger(),
+                scheduler,
+                cacheTtlConfig: ttl,
+                cacheTtlConfigured: configured,
+                sampleCacheTtlConfig: () => ({ cache_ttl: ttl, cacheTtlConfigured: configured }),
+                liveModelBySession: new Map([
+                    [sessionId, { providerID: "anthropic", modelID: "opus" }],
+                ]),
+                contextUsageMap: new Map(),
+                historyRefreshSessions: refresh,
+                pendingMaterializationSessions: materialize,
+                lastHeuristicsTurnId: new Map(),
+                clearReasoningAge: 50,
+                protectedTokens: 0,
+            });
+            const raw: TestMessage[] = [
+                {
+                    info: { id: "u1", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "unchanged question" }],
+                },
+            ];
+            const pass = async () => {
+                const messages = structuredClone(raw);
+                await transform({}, { messages });
+                return JSON.stringify(messages);
+            };
+            try {
+                await pass();
+                updateSessionMeta(db, sessionId, {
+                    lastResponseTime: Date.now() - 2 * 60 * 60 * 1000,
+                });
+                ttl = configured ? "13h" : "10m";
+                const served = await pass();
+                expect(getOrCreateSessionMeta(db, sessionId).cacheTtl).toBe(
+                    configured ? "13h" : "5m",
+                );
+                expect(readSessionCacheTtl(db, sessionId)?.source).toBe(
+                    configured ? "config" : "default",
+                );
+                expect(decide.mock.results.at(-1)?.value).toBe(configured ? "defer" : "execute");
+                expect(refresh.size).toBe(0);
+                expect(materialize.size).toBe(0);
+                updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() });
+                if (configured) {
+                    ttl = "1m";
+                    expect(await pass()).toBe(served);
+                    expect(decide.mock.results.at(-1)?.value).toBe("defer");
+                    updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() - 120_000 });
+                    await pass();
+                    expect(decide.mock.results.at(-1)?.value).toBe("execute");
+                }
+            } finally {
+                decide.mockRestore();
+            }
+        });
+    }
+}
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const originalXdgCacheHome = process.env.XDG_CACHE_HOME;
 
@@ -668,8 +741,15 @@ describe("createTransform", () => {
             : options.sourceBoundaryMissing
               ? [source()[3]!]
               : source();
-        await transform({}, { messages });
+        const refusal = await transform({}, { messages }).then(
+            () => null,
+            (error: unknown) => {
+                if (options.applyOutcome !== "retryable-failure") throw error;
+                return error;
+            },
+        );
         return {
+            refusal,
             applyDeferred,
             db,
             deferredHistoryRefreshSessions,
@@ -729,6 +809,10 @@ describe("createTransform", () => {
         const result = await runMarkerBoundaryFixture({
             name: "persistence-failure",
             applyOutcome: "retryable-failure",
+        });
+        expect(result.refusal).toMatchObject({
+            name: "DegradedPassRefusalError",
+            site: "compaction-marker-drain-failure",
         });
         expect(result.applyDeferred).toHaveBeenCalledTimes(1);
         expect(getPendingCompactionMarkerState(result.db, result.sessionId)).not.toBeNull();
@@ -922,7 +1006,13 @@ describe("createTransform", () => {
                                     return (...params: Parameters<typeof stmt.all>) => {
                                         const rows = stmt.all(...params);
                                         replayRows.push(...(rows as Array<{ status: string }>));
-                                        replayChunkSizes.push(params.length - 1);
+                                        // Count requested ids, not SQLite binds: the cached
+                                        // statement carries each unchanged chunk as JSON.
+                                        replayChunkSizes.push(
+                                            sql.includes("json_each")
+                                                ? JSON.parse(String(params[1])).length
+                                                : params.length - 1,
+                                        );
                                         return rows;
                                     };
                                 }
@@ -1064,12 +1154,31 @@ describe("createTransform", () => {
         useTempDataHome("context-transform-hotpath-snapshot-");
         const realDb = openDatabase();
         const preparedSql: string[] = [];
+        const tokenQueryIds: string[][] = [];
         const db = new Proxy(realDb, {
             get(target, prop, receiver) {
                 if (prop === "prepare") {
                     return (sql: string) => {
                         preparedSql.push(sql);
-                        return target.prepare.call(target, sql);
+                        const statement = target.prepare.call(target, sql);
+                        if (
+                            !sql.includes("tags.reasoning_token_count") ||
+                            !sql.includes("status = 'active'")
+                        )
+                            return statement;
+                        // Observe executions rather than compiles: the prepared
+                        // exact-owner statement survives between transform passes.
+                        return new Proxy(statement, {
+                            get(stmt, key) {
+                                if (key === "all")
+                                    return (...params: Parameters<typeof stmt.all>) => {
+                                        tokenQueryIds.push(JSON.parse(String(params[0])));
+                                        return stmt.all(...params);
+                                    };
+                                const value = Reflect.get(stmt, key);
+                                return typeof value === "function" ? value.bind(stmt) : value;
+                            },
+                        });
                     };
                 }
                 const value = Reflect.get(target, prop, receiver);
@@ -1123,6 +1232,8 @@ describe("createTransform", () => {
 
         const first = structuredClone(input);
         await transform({}, { messages: first });
+        expect(tokenQueryIds).toHaveLength(1);
+        tokenQueryIds.length = 0;
         preparedSql.length = 0;
         const second = structuredClone(input);
         await transform({}, { messages: second });
@@ -1137,26 +1248,14 @@ describe("createTransform", () => {
         expect(preparedSql.some((sql) => sql.includes("SELECT last_response_time FROM"))).toBe(
             false,
         );
-        expect(
-            preparedSql.some(
-                (sql) =>
-                    sql.includes("SELECT type, message_id, tool_owner_message_id") &&
-                    sql.includes("status = 'active'"),
-            ),
-        ).toBe(false);
+        expect(tokenQueryIds).toHaveLength(0);
 
         clearMessageTokensCache(sessionId, "hotpath-0");
         preparedSql.length = 0;
         const afterRemovalInvalidation = structuredClone(input);
         await transform({}, { messages: afterRemovalInvalidation });
         expect(digest(afterRemovalInvalidation)).toBe(digest(second));
-        expect(
-            preparedSql.some(
-                (sql) =>
-                    sql.includes("SELECT type, message_id, tool_owner_message_id") &&
-                    sql.includes("status = 'active'"),
-            ),
-        ).toBe(true);
+        expect(tokenQueryIds).toEqual([["hotpath-0"]]);
     });
 
     it("refuses the pass and leaves the raw array untouched when session metadata is unreadable", async () => {

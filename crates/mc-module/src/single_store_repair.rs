@@ -237,6 +237,7 @@ fn open(options: &RepairOptions, writable: bool) -> Result<Connection, EngineErr
     };
     let conn =
         Connection::open_with_flags(&options.context_db, access | OpenFlags::SQLITE_OPEN_URI)?;
+    mc_store::single_store_domain::set_synchronous_normal_if_wal(&conn)?;
     conn.busy_timeout(std::time::Duration::from_millis(u64::from(
         CONTEXT_BUSY_TIMEOUT_MS,
     )))?;
@@ -939,6 +940,7 @@ fn verify_session(
 /// migration marks every session.
 fn reset_store_caches(options: &RepairOptions, work: &Work) -> Result<(), EngineError> {
     let conn = Connection::open_with_flags(&options.store_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    mc_store::single_store_domain::set_synchronous_normal_if_wal(&conn)?;
     conn.busy_timeout(std::time::Duration::from_millis(u64::from(
         CONTEXT_BUSY_TIMEOUT_MS,
     )))?;

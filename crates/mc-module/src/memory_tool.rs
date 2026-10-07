@@ -430,7 +430,12 @@ pub fn search_available_corpora_for_session_with_diagnostics(
     let mut ranked = Vec::new();
     let mut suppressed_visible_memory_ids = Vec::new();
     if options.include_memories {
-        for memory in store.search_visible_memory_contents(project_path, query)? {
+        for memory in store.search_visible_memory_contents_in_range(
+            project_path,
+            query,
+            options.from_ms,
+            options.to_ms,
+        )? {
             if !in_range(memory.created_at) {
                 continue;
             }
@@ -445,7 +450,12 @@ pub fn search_available_corpora_for_session_with_diagnostics(
         }
     }
     if options.include_messages {
-        for compartment in store.search_compartments_like(session_id, query)? {
+        for compartment in store.search_compartments_like_in_range(
+            session_id,
+            query,
+            options.from_ms,
+            options.to_ms,
+        )? {
             if !in_range(compartment.created_at) {
                 continue;
             }
@@ -455,7 +465,13 @@ pub fn search_available_corpora_for_session_with_diagnostics(
         }
     }
     if options.include_notes {
-        for note in store.search_notes_like(project_path, session_id, query)? {
+        for note in store.search_notes_like_in_range(
+            project_path,
+            session_id,
+            query,
+            options.from_ms,
+            options.to_ms,
+        )? {
             if !in_range(note.created_at_ms) {
                 continue;
             }

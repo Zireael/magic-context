@@ -124,15 +124,54 @@ function meter(system: string, prompt: string, text: string) {
     };
 }
 
-function toolLoopMessages(attempt: HiddenChildAttempt): unknown[] {
+/**
+ * The text a successful wire tool result carries: `{ type: "text", value }` for a single
+ * text part, `{ type: "content", value: [{ text }] }` for several. Error results
+ * (`{ error, content }`) yield nothing, so a failed call never reads as an applied one.
+ */
+function toolResultText(result: unknown): string | undefined {
+    if (typeof result !== "object" || result === null) return undefined;
+    const value = (result as { value?: unknown }).value;
+    if (typeof value === "string") return value;
+    if (!Array.isArray(value)) return undefined;
+    const text = value
+        .map((part) =>
+            typeof part === "object" &&
+            part !== null &&
+            typeof (part as { text?: unknown }).text === "string"
+                ? (part as { text: string }).text
+                : "",
+        )
+        .filter((part) => part.length > 0)
+        .join("\n");
+    return text.length > 0 ? text : undefined;
+}
+
+/**
+ * Rebuild the child's tool calls in the host message shape the dreamer validators read
+ * (`state.status`, `state.input`, `state.output`), matching what the OpenCode 1 transport
+ * returns. Curate counts an operation as applied only from its result text, so the text
+ * has to survive this conversion.
+ */
+export function toolLoopMessages(attempt: HiddenChildAttempt): unknown[] {
     const messages = attempt.observedMessages ?? [];
-    const results = new Map<string, { status: string }>();
+    const results = new Map<string, { status: string; output?: string }>();
     for (const message of messages) {
         if (message.role !== "tool") continue;
         for (const part of message.content) {
             if (part.type !== "tool-result" || typeof part.id !== "string") continue;
-            const result = part.result as { type?: unknown } | undefined;
-            results.set(part.id, { status: result?.type === "error" ? "error" : "completed" });
+            const result = part.result as { type?: unknown; error?: unknown } | undefined;
+            // The wire marks a failed call with `resultType: "error"` on the part and an
+            // `{ error, content }` result, not with `type: "error"` inside the result.
+            const failed =
+                result?.type === "error" ||
+                (part as { resultType?: unknown }).resultType === "error" ||
+                (typeof result === "object" && result !== null && "error" in result);
+            const output = failed ? undefined : toolResultText(result);
+            results.set(part.id, {
+                status: failed ? "error" : "completed",
+                ...(output === undefined ? {} : { output }),
+            });
         }
     }
     return messages.flatMap((message) => {
@@ -149,7 +188,11 @@ function toolLoopMessages(attempt: HiddenChildAttempt): unknown[] {
                 {
                     type: "tool",
                     tool: part.name,
-                    state: { status: result?.status ?? "pending", input: part.input },
+                    state: {
+                        status: result?.status ?? "pending",
+                        input: part.input,
+                        ...(result?.output === undefined ? {} : { output: result.output }),
+                    },
                 },
             ];
         });
@@ -238,7 +281,7 @@ function isProviderFailure(error: unknown): boolean {
 async function awaitAssistantRow(
     openReader: () => HiddenChildRows & { close?: () => void },
     readSessionError: () => Promise<unknown>,
-    stepLimit: () => HiddenAgentStepLimit | undefined,
+    localFailure: () => Error | undefined,
     childID: string,
     afterSeq: number,
     deadline: number,
@@ -251,8 +294,8 @@ async function awaitAssistantRow(
         }));
         const newAssistant = assistant && assistant.seq > afterSeq ? assistant : undefined;
         const newIdle = idle && idle.seq > afterSeq ? idle : undefined;
-        const capped = stepLimit();
-        if (capped) throw capped;
+        const refused = localFailure();
+        if (refused) throw refused;
         if (newIdle && (!newAssistant || newIdle.seq > newAssistant.seq)) {
             const outcome = newIdle.data.outcome;
             if (outcome === "failed" || outcome === "interrupted") {
@@ -524,6 +567,7 @@ export async function createV2HiddenCompletionExecutor(
                 identity: run.identity,
                 request,
                 shaped: false,
+                budget: run.budget,
             };
             options.hook.registerAttempt(marker, attempt);
             const deadline = Date.now() + run.identity.timeoutMs;
@@ -630,7 +674,7 @@ export async function createV2HiddenCompletionExecutor(
                                 return undefined;
                             }
                         },
-                        () => attempt.stepLimit,
+                        () => attempt.refusal ?? attempt.stepLimit,
                         run.child.id,
                         baseline,
                         deadline,
@@ -692,7 +736,8 @@ export async function createV2HiddenCompletionExecutor(
                 // Recorded for `keep_subagents` retention: this child now holds a settled run.
                 if (!run.child.ever_settled) run.child = lifecycle.markEverSettled(run.child);
             } catch (caught) {
-                const error = attempt.budgetExceeded ?? attempt.stepLimit ?? caught;
+                const error =
+                    attempt.budgetExceeded ?? attempt.stepLimit ?? attempt.refusal ?? caught;
                 run.failed = true;
                 if (!(error instanceof HiddenProviderError)) {
                     run.unsettledFailure = true;

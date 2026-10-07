@@ -9,6 +9,25 @@ import {
 } from "./magic-context";
 
 describe("MagicContextConfigSchema", () => {
+    it("documents that Rust transform mode always keeps the shared data directory private", () => {
+        const inputSchema = MagicContextConfigSchema._def.in as unknown as {
+            shape: {
+                storage: {
+                    unwrap: () => {
+                        shape: {
+                            enforce_private_permissions: { description?: string };
+                        };
+                    };
+                };
+            };
+        };
+        const description =
+            inputSchema.shape.storage.unwrap().shape.enforce_private_permissions.description ?? "";
+        expect(description).toContain("Rust transform mode");
+        expect(description).toContain("always keeps the shared data directory owner-only 0700");
+        expect(description).toContain("regardless of this setting");
+    });
+
     describe("defaults", () => {
         it("applies defaults for an empty config", () => {
             const result = MagicContextConfigSchema.parse({});
@@ -166,7 +185,7 @@ describe("MagicContextConfigSchema", () => {
 
             const result = MagicContextConfigSchema.parse(input);
 
-            expect(result).toEqual(input);
+            expect(result).toEqual({ ...input, protected_tools: { todowrite: 1, ctx_reduce: 3 } });
         });
 
         it("accepts a boolean storage permission policy and rejects non-booleans", () => {

@@ -84,7 +84,10 @@ import {
 	COMPARTMENT_AGENT_SYSTEM_PROMPT,
 	HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "@magic-context/core/hooks/magic-context/compartment-prompt";
-import { queueDropsForCompartmentalizedMessages } from "@magic-context/core/hooks/magic-context/compartment-runner-drop-queue";
+import {
+	prepareCompartmentDrops,
+	queuePreparedCompartmentDrops,
+} from "@magic-context/core/hooks/magic-context/compartment-runner-drop-queue";
 import {
 	buildHistorianFailureNotice,
 	buildHistorianRepairPrompt,
@@ -151,7 +154,7 @@ import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transa
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
 import {
-	convertEntriesToRawMessages,
+	iterateEntriesToRawMessageRange,
 	SYNTH_USER_ID_PREFIX,
 } from "./read-session-pi";
 import { isPiSystemEntry } from "./system-entry-pi";
@@ -434,6 +437,7 @@ export interface PiHistorianDeps {
 	 *  OpenCode's `historian.two_pass` config. Editor validation falls back
 	 *  to the first-pass result on failure. Default: false. */
 	twoPass?: boolean;
+	expandTools?: Record<string, string | false>;
 	/** Pi and OMP: explicit thinking level passed as --thinking <level> to
 	 *  historian subagent invocations. When unset, Pi's own resolution runs
 	 *  (works for most providers; may fail for e.g. github-copilot/gpt-5.4). */
@@ -815,6 +819,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				chunkTokens,
 				offset,
 				eligibleEndOrdinal,
+				{ expandTools: deps.expandTools },
 			);
 			const forceKeepLastCompartmentForChunk =
 				forceKeepLastCompartment === true && !chunk.hasMore;
@@ -871,9 +876,9 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			}
 
 			// v2 (E6 parity): bounded reference blocks replace the unbounded
-			// existing-state dump: 4 rotating cross-project seed examples
-			// (importance-band calibration) + the last 6 same-session
-			// compartments (continuity) + <project-memory> for fact dedup, so
+			// existing-state dump: 3 seeds + 3 diverse older + 4 recent session
+			// examples. Recent scores are hidden to prevent anchoring in
+			// one-compartment runs. Add <project-memory> for fact dedup, so
 			// memories written by OpenCode show up in this Pi historian run. The
 			// memory block is id-free because the historian dedups by content;
 			// byte-parity with the Rust port is pinned by the historian prompt
@@ -1405,6 +1410,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				lastNewEnd,
 				{ db },
 			);
+			const preparedDrops = prepareCompartmentDrops(
+				db,
+				sessionId,
+				lastNewEnd,
+				compartmentTagKeys,
+			);
 			let published = false;
 			db.exec("BEGIN IMMEDIATE");
 			const transactionStartedAt = performance.now();
@@ -1461,12 +1472,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					}
 				}
 
-				queueDropsForCompartmentalizedMessages(
-					db,
-					sessionId,
-					lastNewEnd,
-					compartmentTagKeys,
-				);
+				queuePreparedCompartmentDrops(db, preparedDrops);
 
 				clearHistorianFailureState(db, sessionId);
 				// Healthy historian progress clears the drain-failure backoff. Normal
@@ -1889,7 +1895,15 @@ export function findFirstKeptEntryId(
 	lastCompactedOrdinal: number,
 ): string | null {
 	const target = lastCompactedOrdinal + 1;
-	for (const message of convertEntriesToRawMessages(entries)) {
+	const afterOrdinal = Number.isNaN(lastCompactedOrdinal)
+		? 0
+		: Math.max(0, lastCompactedOrdinal);
+	for (const message of iterateEntriesToRawMessageRange(
+		entries,
+		afterOrdinal,
+		Number.MAX_SAFE_INTEGER,
+		Number.MAX_SAFE_INTEGER,
+	)) {
 		if (message.ordinal < target || isPiSystemEntry(message)) continue;
 		if (message.id.startsWith(SYNTH_USER_ID_PREFIX)) return null;
 		if (message.id.length === 0) continue;

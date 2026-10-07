@@ -41,6 +41,7 @@ import type {
 	HistorianConfig,
 	MagicContextConfig,
 } from "@magic-context/core/config/schema/magic-context";
+import { createSubcCheckoutClaimGate } from "@magic-context/core/features/magic-context/checkout-claim";
 import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
@@ -84,6 +85,7 @@ import {
 	resolveHistorianContextLimit,
 	resolveKnownHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
+import { getDefaultSubcConnectionFile } from "@magic-context/core/hooks/magic-context/module-transport";
 import {
 	clearNoteNudgeTriggerAndCooldown,
 	onNoteTrigger,
@@ -117,11 +119,16 @@ import {
 	createPromptSurfaceGuidanceEpochCache,
 	createPromptSurfaceRuntime,
 } from "@magic-context/core/shared/prompt-surface-runtime";
+import {
+	isSuccessfulProviderCompletion,
+	providerResponseFailed,
+} from "@magic-context/core/shared/provider-response-completion";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 import {
 	hasTrustedAbsoluteWall,
 	reloadWindowOverlay,
 } from "@magic-context/core/shared/window-geometry";
+import { gatePiEventsByCheckoutClaim } from "./checkout-claim-pi";
 import { handlePiCloneSessionStart } from "./clone-inheritance";
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
 import {
@@ -218,7 +225,7 @@ import {
 } from "./pi-proven-floor";
 import { abortInFlightRecomps, awaitInFlightRecomps } from "./pi-recomp-runner";
 import { handlePiProviderFailure } from "./provider-error-recovery-pi";
-import { readPiSessionMessages } from "./read-session-pi";
+import { bindStaleBuildNotice } from "./stale-build-notice";
 import {
 	notifyMagicContextStatusMutation,
 	registerStatusLine,
@@ -226,6 +233,7 @@ import {
 } from "./status-line";
 import { registerMagicContextStatusObservability } from "./status-observability";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
+import { registerPiSubagentHostTools } from "./subagent-host-tools";
 import {
 	configurePiSubagentExtensions,
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
@@ -388,6 +396,7 @@ export function persistPiMessageEndModelMeta(args: {
 	sessionId: string;
 	message: unknown;
 	cacheTtlConfig: MagicContextConfig["cache_ttl"];
+	cacheTtlConfigured?: boolean;
 }): void {
 	if (!args.message || typeof args.message !== "object") return;
 	const msg = args.message as {
@@ -412,6 +421,7 @@ export function persistPiMessageEndModelMeta(args: {
 		args.sessionId,
 		args.cacheTtlConfig,
 		modelKey,
+		args.cacheTtlConfigured,
 	).value;
 	const currentMeta = getOrCreateSessionMeta(args.db, args.sessionId);
 	updateSessionMeta(args.db, args.sessionId, {
@@ -833,16 +843,31 @@ export async function persistPiPressureFromMessageEnd(args: {
 	}> = {};
 	// last_response_time is the idle clock for the provider cache: the
 	// scheduler's TTL execute and the ttl_idle HARD fold both measure from it.
-	// Only a request the provider served refreshes that cache, and only such a
-	// request reports usage, so only an assistant message with provider usage
-	// moves the clock (the same rule as OpenCode's message.updated handler).
+	// Usage or successful terminal completion proves a served response. Pi's
+	// timestamp is the message start, so stamp at message_end, not at that start.
 	// Pi also emits message_end for the user's own prompt (before that
 	// prompt's context pass), for tool results, and for failed requests (a
 	// quota error arrives as an assistant message with zero usage). Stamping
 	// on those made a pass after a long idle look like it followed a fresh
 	// response, so it deferred and queued drops never applied.
-	if (unboundedPressure !== null) {
-		updates.lastResponseTime = Date.now();
+	const assistant =
+		args.message && typeof args.message === "object"
+			? (args.message as {
+					role?: unknown;
+					stopReason?: unknown;
+					errorMessage?: unknown;
+				})
+			: undefined;
+	const completion = {
+		finish: assistant?.stopReason,
+		error: assistant?.errorMessage,
+	};
+	if (
+		assistant?.role === "assistant" &&
+		!providerResponseFailed(completion) &&
+		(unboundedPressure !== null || isSuccessfulProviderCompletion(completion))
+	) {
+		updates.lastResponseTime = Math.max(meta.lastResponseTime, Date.now());
 	}
 
 	if (
@@ -1091,6 +1116,7 @@ export function resolveHistorianFromConfig(
 		// historian round-trip's latency and token cost. Enable for
 		// long sessions where chunk dedupe matters more than speed.
 		twoPass: historian?.two_pass === true,
+		expandTools: historian?.expand_tools,
 		// Pi and OMP: explicit thinking level for historian subagent invocations.
 		// When set, passed as --thinking <level> to Pi subprocess.
 		// Required for providers like GitHub Copilot that apply bad defaults.
@@ -1154,6 +1180,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		);
 		return;
 	}
+	registerPiSubagentHostTools(pi, PI_HARNESS_KIND);
 	const unregisterPiSubagentInitContext = registerPiSubagentInitContext(pi);
 	registerPiSubagentInitContextCleanup(pi, unregisterPiSubagentInitContext);
 
@@ -1264,10 +1291,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
  * runtime without requiring a process restart.
  */
 async function startPiMagicContextRuntime(
-	pi: ExtensionAPI,
+	hostPi: ExtensionAPI,
 	database: ContextDatabase,
 	dbPath: string,
 ): Promise<void> {
+	// One checkout-claim gate per runtime: Magic Context must not write for a
+	// session whose agent another machine holds. Session start and every context
+	// pass check it explicitly (session start tells the user, the context pass
+	// refuses the turn); every other event handler registered through `pi` below
+	// skips such a session. Verdicts are cached per session, so a pass pays for
+	// at most one check per cache period. The connection file is resolved per
+	// check, so the configured one applies once the config below has loaded.
+	let subcConnectionFile: string | undefined;
+	const checkoutClaim = createSubcCheckoutClaimGate(
+		"pi",
+		() => subcConnectionFile ?? getDefaultSubcConnectionFile(),
+	);
+	const pi = gatePiEventsByCheckoutClaim(hostPi, () => checkoutClaim);
 	const db = database;
 
 	// v22 deferred legacy-memory identity backfill. openDatabase() has already
@@ -1508,7 +1548,8 @@ async function startPiMagicContextRuntime(
 	): PiContextHandlerOptions => ({
 		db: database,
 		cacheTtlConfig: cfg.cache_ttl,
-		smartDrops: cfg.smart_drops === true,
+		cacheTtlConfigured: cfg.cacheTtlConfigured,
+		protectedTools: cfg.protected_tools,
 		protectedTokens: cfg.protected_tokens,
 		protectedTokenTierOverrides: getProtectedTokensTierOverrides(cfg) ?? {},
 		protectedTags: cfg.protected_tags ?? 20,
@@ -1713,7 +1754,12 @@ async function startPiMagicContextRuntime(
 			PI_HARNESS_KIND,
 			activeModelRegistry,
 		);
-		return { ...project.contextOptions, historian };
+		return {
+			...project.contextOptions,
+			historian,
+			cacheTtlConfig: sampled.cache_ttl,
+			cacheTtlConfigured: sampled.cacheTtlConfigured,
+		};
 	}
 
 	const bootProjectDeps = buildProjectDeps(
@@ -1727,6 +1773,7 @@ async function startPiMagicContextRuntime(
 		},
 	);
 	projectDepsByDir.set(projectDir, bootProjectDeps);
+	subcConnectionFile = config.subc?.connection_file;
 
 	function syncDreamerProjectRegistration(
 		current: ResolvedPiProjectDeps,
@@ -1793,6 +1840,7 @@ async function startPiMagicContextRuntime(
 	// project with a different value, users need `/reload` or a Pi restart for the
 	// tool/command/overlay surface to change, matching Pi's registration lifecycle.
 	registerMagicContextTools(pi, {
+		expandTools: config.historian?.expand_tools,
 		db,
 		ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 		// Main extension entry never gets the dreamer-only ctx_memory
@@ -1807,6 +1855,9 @@ async function startPiMagicContextRuntime(
 		// Dreamer tasks, a separate security concern.)
 		memoryToolEnabled: true,
 		protectedTags: config.protected_tags ?? 20,
+		protectedTools: config.protected_tools,
+		resolveProtectedTools: (ctx) =>
+			resolveCurrentProjectDeps(ctx).config.protected_tools,
 		resolveProtectedTags: (ctx) =>
 			resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
 		resolveProjectIdentity: (ctx) =>
@@ -1833,6 +1884,7 @@ async function startPiMagicContextRuntime(
 	);
 
 	pi.on("session_start", async (event, ctx) => {
+		bindStaleBuildNotice(ctx, import.meta.url);
 		// Pi emits session_start for new, resumed, and reloaded sessions. Re-read
 		// this cwd's config before setting the active tools so a memory.enabled
 		// change takes effect at the next session without restarting Pi.
@@ -1859,6 +1911,16 @@ async function startPiMagicContextRuntime(
 		}
 
 		const sessionId = resolveSessionId(ctx);
+		// Session start is Magic Context's first write for a session in this
+		// process. Skip every write below when another machine holds the
+		// session's agent; the first turn is then refused by the context handler.
+		if (sessionId) {
+			const claimRefusal = await checkoutClaim.refusal(sessionId, ctx.cwd);
+			if (claimRefusal) {
+				if (ctx.hasUI) ctx.ui.notify(claimRefusal.message, "error");
+				return;
+			}
+		}
 		const model = ctx.model;
 		if (sessionId && model?.provider && model.id) {
 			seedSessionCacheTtlIfUnsynced({
@@ -1901,7 +1963,9 @@ async function startPiMagicContextRuntime(
 	// Register the per-LLM-call transform pipeline. Tags eligible message
 	// parts via the shared Tagger and applies queued drops from
 	// `pending_ops` so /ctx-flush and ctx_reduce work against Pi sessions.
-	registerPiContextHandler(pi, bootProjectDeps.contextOptions);
+	registerPiContextHandler(pi, bootProjectDeps.contextOptions, {
+		checkoutClaim,
+	});
 	// Pi's model registry reaches the extension only with the first session
 	// context, so the chain the historian will actually use is logged by
 	// reportPiModelChains at session start. Logging the configured model here
@@ -1943,6 +2007,7 @@ async function startPiMagicContextRuntime(
 	const resolveCtxStatusDeps = (ctx: StatusDepsCtx) => {
 		const current = resolveCurrentProjectDeps(ctx);
 		const live = liveReaderFor(current.projectDir, current.config);
+		const fresh = live.poll().effective;
 		const failure = live.lastFailure();
 		return {
 			configGeneration: live.current().generation,
@@ -1988,8 +2053,8 @@ async function startPiMagicContextRuntime(
 				return `Pi model chain empty (no model found): ${parts.join("; ")}`;
 			})(),
 			activeProfile: current.config.profile,
-			cacheTtlConfig: current.config.cache_ttl,
-			cacheTtlConfigured: current.cacheTtlConfigured,
+			cacheTtlConfig: fresh.cache_ttl,
+			cacheTtlConfigured: fresh.cacheTtlConfigured,
 			configParseFailures: current.configParseFailures,
 			hasDeprecatedProtectedTags: current.hasDeprecatedProtectedTags,
 			compactionEnabled: isCompactionEnabled(current.config),
@@ -2776,13 +2841,20 @@ async function startPiMagicContextRuntime(
 					)?.getBranch?.();
 					return Array.isArray(branch) ? branch : undefined;
 				},
-				readMessages: () => readPiSessionMessages(ctx),
 			});
 			persistPiMessageEndModelMeta({
 				db,
 				sessionId,
 				message: event.message,
-				cacheTtlConfig: resolveCurrentProjectDeps(ctx).config.cache_ttl,
+				...(() => {
+					const project = resolveCurrentProjectDeps(ctx);
+					const fresh = liveReaderFor(project.projectDir, project.config).poll()
+						.effective;
+					return {
+						cacheTtlConfig: fresh.cache_ttl,
+						cacheTtlConfigured: fresh.cacheTtlConfigured,
+					};
+				})(),
 			});
 			// Compute pressure with OpenCode-equivalent semantics: pull
 			// the assistant's `usage` field, normalize inclusive OpenAI

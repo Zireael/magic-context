@@ -365,12 +365,10 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
             // behind — recomp now owns the boundary.
             if (lastCompartmentEnd > 0) {
                 afterPublish("compaction-marker", () => {
-                    const markerUpdated = updateCompactionMarkerAfterPublication(
-                        db,
-                        sessionId,
-                        lastCompartmentEnd,
-                        deps.directory,
-                    );
+                    const markerUpdated = (
+                        deps.compactionMarkerStrategy?.publish ??
+                        updateCompactionMarkerAfterPublication
+                    )(db, sessionId, lastCompartmentEnd, deps.directory);
                     // Only CAS-clear a stale pending marker blob when the direct
                     // update actually advanced the boundary. If the update failed
                     // (transient OpenCode DB write error on removal/injection), keep
@@ -443,6 +441,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 promptFit.chunkTokens,
                 offset,
                 protectedTailStart,
+                { expandTools: deps.historianExpandTools },
             );
             if (!chunk.text || chunk.messageCount === 0 || chunk.endIndex < offset) {
                 // Remaining messages before the protected tail are too few or all noise.
@@ -471,7 +470,8 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                 return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
             }
 
-            // v2 bounded reference model: 4 rotating seeds + last-6 recency
+            // Bounded calibration: 3 seeds + 3 diverse older + 4 recent examples.
+            // Recent scores are hidden to prevent anchoring in one-compartment runs
             // (the compartments built so far in THIS recomp run provide
             // continuity). Recomp is a structural rebuild and emits no durable
             // facts (see below), so <project-memory> is omitted — there's
@@ -547,6 +547,7 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
                         reducedBudget,
                         offset,
                         protectedTailStart,
+                        { expandTools: deps.historianExpandTools },
                     );
                     if (smallerChunk.messageCount > 0 && smallerChunk.endIndex < chunk.endIndex) {
                         await sendStatusNotification(
@@ -738,12 +739,9 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         // next incremental run may reprocess already-compartmentalized messages.
         if (lastCompartmentEnd > 0) {
             afterPublish("compaction-marker", () => {
-                const markerUpdated = updateCompactionMarkerAfterPublication(
-                    db,
-                    sessionId,
-                    lastCompartmentEnd,
-                    deps.directory,
-                );
+                const markerUpdated = (
+                    deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication
+                )(db, sessionId, lastCompartmentEnd, deps.directory);
                 // Only clear the stale pending blob when the boundary actually
                 // advanced — preserve it for the deferred-drain retry on failure.
                 if (markerUpdated) {

@@ -11,7 +11,7 @@ import {
 import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
 import type { Scheduler } from "../../features/magic-context/scheduler";
-import { parseCacheTtl } from "../../features/magic-context/scheduler";
+import { computeHardCacheExpired } from "../../features/magic-context/scheduler";
 import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import { sessionDecisionCalibration } from "../../features/magic-context/session-decision-calibration";
 import {
@@ -54,6 +54,7 @@ import {
     rebaseSessionCoordinatesAsync,
 } from "../../features/magic-context/store-generation-rebase";
 import type { Tagger } from "../../features/magic-context/tagger";
+import { observeTemporalDecisions } from "../../features/magic-context/temporal-decisions";
 import {
     clearOpenCodePendingTransformDecision,
     normalizeMaterializeReason,
@@ -75,7 +76,11 @@ import type { CavemanWordRules } from "./caveman";
 import { replayCavemanCompression } from "./caveman-cleanup";
 import { commitCompactionModeRecord, reconcileCompactionMode } from "./compaction-off-transition";
 import { getActiveCompartmentRun, startCompartmentAgent } from "./compartment-runner";
-import { buildTriggerInMemoryTail, checkCompartmentTrigger } from "./compartment-trigger";
+import {
+    buildTriggerInMemoryTail,
+    checkCompartmentTrigger,
+    getProactiveCompartmentTriggerPercentage,
+} from "./compartment-trigger";
 import {
     type CtxReduceAvailabilityVerdict,
     primeCtxReduceSpawnPermission,
@@ -92,16 +97,18 @@ import {
 } from "./ctx-reduce-nudge";
 import { DegradedPassRefusalError, degradedPassError } from "./degraded-pass-refusal";
 import { deriveTriggerBudget } from "./derive-budgets";
-import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { contextRefusalError, EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
     historyBudgetPolicyIdentity,
     resolveContextWindowGeometry,
     resolveExecuteThreshold,
+    resolveExecuteThresholdDetail,
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
 import {
+    createFinalWireUsageTracker,
     describeFinalWireTail,
     estimateFinalWireInputTokens,
     estimateMessageTokens,
@@ -146,7 +153,8 @@ import {
     snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
 } from "./strip-content";
-import { injectTemporalMarkers } from "./temporal-awareness";
+import { collectTemporalCandidates, injectTemporalMarkers } from "./temporal-awareness";
+import { readServedTemporalDecisions } from "./temporal-served-projection";
 import { createPreAdoptionToolSweepResolver, useScopedToolSweep } from "./tool-sweep-policy";
 import { historianJoinFailClosedMessage, runCompartmentPhase } from "./transform-compartment-phase";
 import {
@@ -298,36 +306,7 @@ export function __getMessageTokensCacheForTest(
     return getMessageTokensCache(sessionId);
 }
 
-/**
- * Compute whether the provider cache expired due to idle time.
- * Extracted so callers that don't run the full transform pipeline can still
- * evaluate the TTL idle window with the same parseCacheTtl semantics.
- *
- * Returns false when cacheTtl is "never" (Infinity) because any finite
- * elapsed time is < Infinity.
- *
- * @param onInvalid Optional callback invoked when cacheTtl fails to parse;
- *        the 5m fallback is applied AFTER the callback returns.
- */
-export function computeHardCacheExpired(
-    cacheTtl: string,
-    lastResponseTime: number,
-    now: number,
-    onInvalid?: (error: unknown) => void,
-): boolean {
-    let ttlMs: number;
-    try {
-        ttlMs = parseCacheTtl(cacheTtl);
-    } catch (error) {
-        onInvalid?.(error);
-        ttlMs = 5 * 60 * 1000;
-    }
-    // Strict > matches the Rust scheduler's predicate exactly: at elapsed == ttl
-    // both sides DEFER (one more pass at the boundary is safe; a premature HARD
-    // fold is a paid cache rebuild). Keep the comparators identical — the Rust
-    // doc comment asserts this parity and an audit caught them disagreeing.
-    return lastResponseTime > 0 && now - lastResponseTime > ttlMs;
-}
+export { computeHardCacheExpired } from "../../features/magic-context/scheduler";
 
 /**
  * Extract the provider/model from the last assistant message in the array.
@@ -417,6 +396,11 @@ export async function sendEmergencyRefusalNotice(
 
 export interface TransformDeps {
     cacheTtlConfig?: import("../../shared/model-cache-ttl").CacheTtlConfig;
+    cacheTtlConfigured?: boolean;
+    sampleCacheTtlConfig?: () => {
+        cache_ttl: import("../../shared/model-cache-ttl").CacheTtlConfig;
+        cacheTtlConfigured?: boolean;
+    };
     hiddenCompletionExecutor?: import("./compartment-runner-types").HiddenCompletionExecutor;
     /** Host marker lifecycle; omission preserves OpenCode 1 marker writes and replay. */
     compactionMarkerStrategy?: CompactionMarkerStrategy & {
@@ -463,6 +447,7 @@ export interface TransformDeps {
      *  later call supersedes, on top of the age-based auto-drop. Off → messages
      *  sent to the model are byte-identical to the age-based-only behavior. */
     smartDrops?: boolean;
+    protectedTools?: Readonly<Record<string, number>>;
     clearReasoningAge: number;
     /** Commit-cluster historian trigger config (`commit_cluster_trigger`). */
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
@@ -524,6 +509,7 @@ export interface TransformDeps {
         maxOutputTokens?: number;
         timeoutMs: number;
         twoPass: boolean;
+        expandTools?: Record<string, string | false>;
         autoPromote: boolean;
         userMemoriesEnabled: boolean;
         commitClusterTrigger?: { enabled: boolean; min_clusters: number };
@@ -583,6 +569,7 @@ export interface TransformDeps {
     /** When true, run a second editor pass after historian to clean U: lines.
      *  Enables the historian-editor agent. Controlled by `historian.two_pass` config. */
     historianTwoPass?: boolean;
+    historianExpandTools?: Record<string, string | false>;
     liveModelBySession?: LiveModelBySession;
     /**
      * Process-scoped cache of resolved session.directory values. When provided,
@@ -628,6 +615,11 @@ export interface TransformDeps {
     };
     /** Fire-and-forget active-session embed backfill after transform returns. */
     maybeAutoEmbedSession?: (sessionId: string) => void;
+    /**
+     * Called once per pass, before either renderer runs, with the session and the
+     * host's input messages: the request these messages belong to is being built.
+     */
+    onMessagesPassStarted?: (sessionId: string, messages: readonly MessageLike[]) => void;
     /** Resolved project mode. Rust mode bypasses every TS mutation below. */
     transformMode?: "ts" | "rust";
     /** Prompt-surface routing and USER description overrides forwarded to Rust mode. */
@@ -678,6 +670,7 @@ export function resolveTransformHostSeams(
 }
 
 export function createTransform(deps: TransformDeps) {
+    const finalWireUsage = createFinalWireUsageTracker();
     const host = resolveTransformHostSeams(deps);
     const loadedSessions = new Set<string>();
     // Sessions whose history was clearly over the model's window, with no
@@ -697,7 +690,12 @@ export function createTransform(deps: TransformDeps) {
                   memorySyncRequestedSessions: deps.rustMemorySyncRequestedSessions,
               })
             : undefined;
-    const projectEntry = createLkgEntryProjector();
+    let entryReuse: { reused: number; retained: number; retainedBytes: number } | undefined;
+    const projectEntry = createLkgEntryProjector({
+        onReuse: (stats) => {
+            entryReuse = stats;
+        },
+    });
     const deferredHistoryRefreshSessions = deps.deferredHistoryRefreshSessions ?? new Set<string>();
     const deferredMaterializationSessions =
         deps.deferredMaterializationSessions ?? new Set<string>();
@@ -730,12 +728,26 @@ export function createTransform(deps: TransformDeps) {
         if (!sessionId) {
             return;
         }
+        deps.onMessagesPassStarted?.(sessionId, messages);
+        const temporalCandidates = deps.experimentalTemporalAwareness
+            ? collectTemporalCandidates(messages)
+            : undefined;
+        const temporalReplayIds = temporalCandidates
+            ? messages.flatMap((message) => (message.info.id ? [message.info.id] : []))
+            : undefined;
         logTransformTiming(sessionId, "findSessionId", tSessionId, `messages=${messages.length}`);
         const tLkgEntry = performance.now();
         // The Rust adapter captures its own last-known-good input snapshot and returns
         // before the TypeScript capture, so it does not need this entry projection.
         const lkgInput = deps.transformMode === "rust" ? [] : projectEntry(sessionId, messages);
-        logTransformTiming(sessionId, "lkg.entryProjection", tLkgEntry);
+        logTransformTiming(
+            sessionId,
+            "lkg.entryProjection",
+            tLkgEntry,
+            deps.transformMode === "rust" || !entryReuse
+                ? undefined
+                : `reused=${entryReuse.reused} retained=${entryReuse.retained} retainedBytes=${entryReuse.retainedBytes}`,
+        );
         const resolvedSessionId = sessionId;
         const runNotificationParams = (sid: string) => {
             const params = deps.getNotificationParams?.(sid) ?? {};
@@ -829,11 +841,13 @@ export function createTransform(deps: TransformDeps) {
                 findNewestUserModel(messages) ??
                 deps.liveModelBySession?.get(sessionId) ??
                 findLastAssistantModel(messages);
+            const ttlConfig = deps.sampleCacheTtlConfig?.();
             sessionMeta.cacheTtl = resolveSessionCacheTtl(
                 db,
                 sessionId,
-                deps.cacheTtlConfig,
+                ttlConfig?.cache_ttl ?? deps.cacheTtlConfig,
                 ttlModel ? `${ttlModel.providerID}/${ttlModel.modelID}` : undefined,
+                ttlConfig?.cacheTtlConfigured ?? deps.cacheTtlConfigured,
             ).value;
         } catch (error) {
             sessionLog(sessionId, "transform failed reading session meta:", error);
@@ -1576,7 +1590,7 @@ export function createTransform(deps: TransformDeps) {
                 : contextUsageEarly.percentage > 0
                   ? contextUsageEarly.inputTokens / (contextUsageEarly.percentage / 100)
                   : undefined;
-        const effectiveExecuteThresholdPercentage = resolveExecuteThreshold(
+        const executeThresholdDetail = resolveExecuteThresholdDetail(
             deps.executeThresholdPercentage ?? 65,
             currentModelKeyForBoundary,
             65,
@@ -1585,6 +1599,11 @@ export function createTransform(deps: TransformDeps) {
                 contextLimit: thresholdContextLimit,
                 sessionId,
             },
+        );
+        const effectiveExecuteThresholdPercentage = executeThresholdDetail.percentage;
+        sessionLog(
+            sessionId,
+            `transform threshold: model=${currentModelKeyForBoundary ?? "unknown"} matchedModel=${executeThresholdDetail.matchedKey ?? "scalar"} mode=${executeThresholdDetail.mode} threshold=${effectiveExecuteThresholdPercentage}% proactiveFloor=${getProactiveCompartmentTriggerPercentage(effectiveExecuteThresholdPercentage)}%`,
         );
         const { forceMaterializationPercentage } = escalationBands(
             effectiveExecuteThresholdPercentage,
@@ -1790,6 +1809,7 @@ export function createTransform(deps: TransformDeps) {
                     historianRun?.userMemoriesEnabled ?? deps.experimentalUserMemories,
                 experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
                 historianTwoPass: historianRun?.twoPass ?? deps.historianTwoPass,
+                historianExpandTools: historianRun?.expandTools ?? deps.historianExpandTools,
                 // Issue #44: gate historian-driven memory promotion so users
                 // who disable the feature actually see no memories created.
                 memoryEnabled: deps.memoryConfig?.enabled,
@@ -2103,32 +2123,19 @@ export function createTransform(deps: TransformDeps) {
         let messageTagNumbers = new Map<MessageLike, number>();
         let batch: { finalize: () => void } | null = null;
         let hasRecentReduceCall = false;
-        // Inject temporal markers before tagging so the §N§ tag prefix wraps
-        // around our marker.
-        //
-        // Intentional — this runs on EVERY transform pass, including defer /
-        // cache-safe passes that are otherwise gated. Three invariants make
-        // that safe:
-        //   1. Idempotent: injectTemporalMarkers detects existing markers by
-        //      regex and will not double-prefix.
-        //   2. Deterministic: the marker value derives from immutable
-        //      message.time.created / time.completed timestamps — same input,
-        //      same output, every pass.
-        //   3. Required every pass: OpenCode rebuilds the messages array from
-        //      its DB for every transform, so markers must be re-applied on
-        //      each pass or they would disappear on defer passes. Skipping
-        //      defer passes here would cause the marker to flicker in/out and
-        //      bust cache when it reappeared.
-        //
-        // The retroactive-on-flag-flip behavior is the same mechanism — when
-        // the flag turns on, the first pass marks every eligible user message
-        // and subsequent passes just observe the already-marked content.
-        // Compaction-off: temporal markers/overlays are part of the gated
-        // compaction surface (additive but mode-owned), so the wire stays
-        // untouched in this mode.
+        // Replay before tagging. New choices wait for the independently priced
+        // rebuild permission in postprocess; a cut never recomputes an old gap.
+        let temporalObservedDecisions: ReadonlyMap<string, string> | undefined;
         if (deps.experimentalTemporalAwareness && !compactionOff) {
             const tTemporal = performance.now();
-            const injected = injectTemporalMarkers(messages);
+            temporalObservedDecisions = observeTemporalDecisions(
+                db,
+                sessionId,
+                temporalCandidates ?? new Map(),
+                (ids) => readServedTemporalDecisions(db, sessionId, "opencode", ids),
+                temporalReplayIds,
+            );
+            const injected = injectTemporalMarkers(messages, temporalObservedDecisions);
             if (injected > 0) {
                 sessionLog(sessionId, `temporal: injected ${injected} gap markers`);
             }
@@ -2410,6 +2417,7 @@ export function createTransform(deps: TransformDeps) {
                 historianRun?.userMemoriesEnabled ?? deps.experimentalUserMemories,
             experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
             historianTwoPass: historianRun?.twoPass ?? deps.historianTwoPass,
+            historianExpandTools: historianRun?.expandTools ?? deps.historianExpandTools,
             // Issue #44: forward memory gating so the normal historian path
             // (not just the recovery path above) honors memory.enabled and
             // memory.auto_promote.
@@ -2443,9 +2451,11 @@ export function createTransform(deps: TransformDeps) {
         // provider-side cache eviction, such as a model switch or system-block
         // change, plus the TTL idle window. The tool-set fingerprint is observed
         // alongside them but never folds m[0] because its process-global scope
-        // would create false-positive folds across sessions. Because system.transform
-        // runs after messages.transform, systemHash is the persisted last-turn hash,
-        // so system changes are detected on the next pass.
+        // would create false-positive folds across sessions. When system.transform
+        // follows messages.transform (OpenCode 1), systemHash is the persisted
+        // last-turn hash. The system hook then adopts a change on the request that
+        // first carries it (see system-prompt-hash.ts), so the next pass does not
+        // fold on it and the provider rewrites its cache once, not twice.
         const hardModel = deps.liveModelBySession?.get(sessionId);
         const hardModelKey = hardModel ? `${hardModel.providerID}/${hardModel.modelID}` : "";
         const hardToolSetHash = deps.getToolSetHash?.(sessionId) ?? "";
@@ -2629,6 +2639,9 @@ export function createTransform(deps: TransformDeps) {
             schedulerDecision,
             schedulerDeferReason,
             fullFeatureMode,
+            temporalCandidates,
+            temporalReplayIds,
+            temporalObservedDecisions,
             compactionOff,
             canRunCompartments,
             awaitedCompartmentRun,
@@ -2676,6 +2689,7 @@ export function createTransform(deps: TransformDeps) {
             // the primary agent that spawned them.
             cavemanTextCompression: !reducedMode ? deps.cavemanTextCompression : undefined,
             smartDrops: deps.smartDrops === true,
+            protectedTools: deps.protectedTools,
             // Pass the single resolved provider through to postprocess so every
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
@@ -2716,13 +2730,18 @@ export function createTransform(deps: TransformDeps) {
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (postTransformResult.bustedThisPass) {
             try {
-                finalWireEstimate = estimateFinalWireInputTokens({
-                    messages,
-                    systemPromptTokens: sessionMeta.systemPromptTokens,
-                    providerID: modelForBudget?.providerID,
-                    modelID: modelForBudget?.modelID,
-                    agentName: notificationParams.agent,
-                });
+                finalWireEstimate = finalWireUsage.estimate(
+                    sessionId,
+                    {
+                        messages,
+                        systemPromptTokens: sessionMeta.systemPromptTokens,
+                        providerID: modelForBudget?.providerID,
+                        modelID: modelForBudget?.modelID,
+                        agentName: notificationParams.agent,
+                        systemPromptHash: sessionMeta.systemPromptHash,
+                    },
+                    boundaryContextLimit,
+                );
             } catch {
                 sessionLog(
                     sessionId,
@@ -2740,14 +2759,19 @@ export function createTransform(deps: TransformDeps) {
                   : contextUsage.percentage;
             finalWireEstimate =
                 finalWireEstimate ??
-                (emergencyUsagePercentage >= 95
-                    ? estimateFinalWireInputTokens({
-                          messages,
-                          systemPromptTokens: sessionMeta.systemPromptTokens,
-                          providerID: modelForBudget?.providerID,
-                          modelID: modelForBudget?.modelID,
-                          agentName: notificationParams.agent,
-                      })
+                (emergencyUsagePercentage >= 95 || schedulerDecision === "execute"
+                    ? finalWireUsage.estimate(
+                          sessionId,
+                          {
+                              messages,
+                              systemPromptTokens: sessionMeta.systemPromptTokens,
+                              providerID: modelForBudget?.providerID,
+                              modelID: modelForBudget?.modelID,
+                              agentName: notificationParams.agent,
+                              systemPromptHash: sessionMeta.systemPromptHash,
+                          },
+                          boundaryContextLimit,
+                      )
                     : undefined);
             if (finalWireEstimate) {
                 sessionLog(
@@ -2870,6 +2894,12 @@ export function createTransform(deps: TransformDeps) {
                 foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
                 finalWireEstimate,
                 providerProvenLimitTokens,
+                contextLimitTokens: boundaryContextLimit,
+                protectedToolTokens: protectedToolTokenCount(
+                    getActiveTagsBySession(db, sessionId),
+                    deps.protectedTools,
+                    resolveDecisionCalibration(modelForBudget?.providerID, modelForBudget?.modelID),
+                ),
             });
             if (emergencyFailClosed.disarm) {
                 clearEmergencyRecovery(db, sessionId);
@@ -2879,6 +2909,9 @@ export function createTransform(deps: TransformDeps) {
                 );
             }
             if (emergencyFailClosed.shouldAbort) {
+                if (emergencyFailClosed.refusalMessage) {
+                    throw contextRefusalError(emergencyFailClosed.refusalMessage);
+                }
                 // The notice must finish before host refusal so recovery instructions survive interruption.
                 try {
                     await host.hostRefusalNotice(
@@ -2990,6 +3023,8 @@ export function createTransform(deps: TransformDeps) {
                 output: messages,
                 modelKey,
                 providerKey,
+                systemPromptTokens: sessionMeta.systemPromptTokens,
+                agentName: notificationParams?.agent,
             });
             if (captured) {
                 // Keep the durable snapshot in step with the TS-mode capture too:
@@ -3014,14 +3049,17 @@ export function createTransform(deps: TransformDeps) {
             );
         }
 
-        if (postTransformResult.bustedThisPass) {
+        // An idle-expired retry can replay a fold prepared by an aborted attempt.
+        // The provider still rebuilds the whole prefix, so record the expiry on
+        // the retry's own assistant even when this pass changed no message bytes.
+        if (postTransformResult.bustedThisPass || hardCacheExpired) {
             recordPendingTransformDecision(sessionId, {
                 tsMs: Date.now(),
                 decision: schedulerDecision,
                 materialized: postTransformResult.materialized,
                 materializeReason: normalizeMaterializeReason(
                     "opencode",
-                    postTransformResult.materializeReason,
+                    postTransformResult.materializeReason ?? (hardCacheExpired ? "ttl_idle" : null),
                     postTransformResult.materialized,
                 ),
                 systemHashPrev: postTransformResult.systemHashPrev,
@@ -3087,13 +3125,17 @@ export function createTransform(deps: TransformDeps) {
             string,
             { conversation: number; toolCall: number; hasNull: boolean }
         >();
-        const hasUncachedMessageId = messages.some((message) => {
+        const uncachedMessageIds = messages.flatMap((message) => {
             const messageId = (message.info as { id?: string }).id;
-            return messageId !== undefined && !msgTokens.has(messageId);
+            return messageId !== undefined && !msgTokens.has(messageId) ? [messageId] : [];
         });
-        if (hasUncachedMessageId) {
+        if (uncachedMessageIds.length > 0) {
             try {
-                storedByMessage = getActiveTagTokenTotalsByMessage(db, sessionId);
+                storedByMessage = getActiveTagTokenTotalsByMessage(
+                    db,
+                    sessionId,
+                    uncachedMessageIds,
+                );
             } catch {
                 storedByMessage = new Map();
             }
@@ -3207,6 +3249,15 @@ export function createTransform(deps: TransformDeps) {
                 `thinking binding recovery: stripped bound reasoning from ${bindingRecovery.messageIds.length} assistant(s) [${bindingRecovery.messageIds.join(",")}]; flag=${cleared ? "cleared" : "rearmed"}`,
             );
         }
+        if (passOutcome.captureEligible)
+            finalWireUsage.capture(sessionId, {
+                messages,
+                systemPromptTokens: sessionMeta.systemPromptTokens,
+                providerID: modelForBudget?.providerID,
+                modelID: modelForBudget?.modelID,
+                agentName: notificationParams.agent,
+                systemPromptHash: sessionMeta.systemPromptHash,
+            });
     };
 
     return Object.assign(transform, {
@@ -3285,3 +3336,6 @@ export function resolveHistoryBudgetTokens(
             historyBudgetPercentage,
     );
 }
+
+import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
+import { resolveDecisionCalibration } from "./decision-calibration";

@@ -7,7 +7,7 @@ import type { Database } from "../../../shared/sqlite";
 import { DEFAULT_MURAL_MEMORY_BUDGET } from "./mural-selection";
 import { planMuralRender, renderPlannedMural } from "./render-mural";
 import type { MuralWireOptions } from "./resolve-mural";
-import { getMuralCoverage, resolveMural } from "./resolve-mural";
+import { getMuralCoverage, readMuralPool, resolveMural } from "./resolve-mural";
 import { getMural, upsertMural } from "./storage-mural";
 
 /**
@@ -115,7 +115,8 @@ export function ensureMuralRendered(
     projectIdentity: string,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
 ): EnsureMuralResult {
-    const coverage = getMuralCoverage(db, projectIdentity);
+    const pool = readMuralPool(db, projectIdentity);
+    const coverage = getMuralCoverage(db, projectIdentity, pool);
     if (
         coverage.activeMemoryCount === 0 ||
         !muralCoverageGate(coverage.cuedMemoryCount, coverage.activeMemoryCount)
@@ -128,7 +129,7 @@ export function ensureMuralRendered(
         return { hasMural: false, rerendered: false, skipReason };
     }
 
-    const entries = resolveMural(db, projectIdentity, budgetTokens);
+    const entries = resolveMural(db, projectIdentity, budgetTokens, pool);
     if (entries.length === 0) {
         // Empty overflow pool → no mural block. Leave any stale stored row alone
         // so the dashboard can still show the last render.

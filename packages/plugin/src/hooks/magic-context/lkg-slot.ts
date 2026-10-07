@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { sessionLog } from "../../shared/logger";
+import { clearCapturedLkgMeasurement } from "./lkg-measured-request";
 import type { MessageLike } from "./transform-operations";
 
 export interface LkgSlot {
@@ -281,6 +282,49 @@ export interface LkgInputSnapshot {
     fields: readonly LkgContentField[];
 }
 
+const digestMemo = new Map<
+    string,
+    { fields: readonly LkgContentField[]; digest: string; bytes: number }
+>();
+const DIGEST_MEMO_MAX_BYTES = 16 * 1024 * 1024;
+let digestMemoBytes = 0;
+
+/** Share pristine digests across entry capture and projection after exact typed-field comparison. */
+export function memoizedLkgContentDigestFromFields(
+    id: string,
+    fields: readonly LkgContentField[],
+): string {
+    const prior = digestMemo.get(id);
+    if (prior && equalContentFields(fields, prior.fields)) {
+        digestMemo.delete(id);
+        digestMemo.set(id, prior);
+        return prior.digest;
+    }
+    const digest = lkgContentDigestFromFields(fields);
+    if (prior) {
+        digestMemo.delete(id);
+        digestMemoBytes -= prior.bytes;
+    }
+    const bytes =
+        128 +
+        id.length * 2 +
+        fields.reduce<number>(
+            (sum, field) => sum + 16 + (typeof field === "string" ? field.length * 2 : 0),
+            0,
+        );
+    if (bytes <= DIGEST_MEMO_MAX_BYTES) {
+        while (digestMemoBytes + bytes > DIGEST_MEMO_MAX_BYTES || digestMemo.size >= 20_000) {
+            const oldest = digestMemo.entries().next().value;
+            if (!oldest) break;
+            digestMemo.delete(oldest[0]);
+            digestMemoBytes -= oldest[1].bytes;
+        }
+        digestMemo.set(id, { fields: [...fields], digest, bytes });
+        digestMemoBytes += bytes;
+    }
+    return digest;
+}
+
 function equalContentFields(
     left: readonly LkgContentField[],
     right: readonly LkgContentField[],
@@ -532,12 +576,18 @@ export function getSlot(sessionId: string): LkgSlot | undefined {
     return copySlotForRead(entry.slot);
 }
 
-export function dropSlot(sessionId: string, _reason?: string): void {
+/** Evict only the process copy; durable replay authority is unchanged. */
+export function forgetInMemorySlot(sessionId: string): void {
     const entry = lkgHeapHolder.entries.get(sessionId);
     if (entry) {
         lkgHeapHolder.entries.delete(sessionId);
         totalBytes -= entry.bytes;
     }
+}
+
+export function dropSlot(sessionId: string, _reason?: string): void {
+    clearCapturedLkgMeasurement(sessionId);
+    forgetInMemorySlot(sessionId);
     // The durable row must follow the drop: a slot invalidated in memory
     // (model change, reshape, recovery arm, deletion) is equally invalid after
     // a restart. Clear best-effort; a missed clear still meets the replay fences.
@@ -561,9 +611,12 @@ export function noteEntry(sessionId: string, messages: MessageLike[]): LkgEntryN
     });
     const anchorIndex = entryInputIds.indexOf(slot.lastInputMessageId);
     if (anchorIndex < 0) return null;
-    const entryContentDigests = messages
-        .slice(0, anchorIndex + 1)
-        .map((message) => lkgContentDigest(message));
+    const entryContentDigests = messages.slice(0, anchorIndex + 1).map((message, index) => {
+        const fields = lkgContentFields(message);
+        return fields
+            ? memoizedLkgContentDigestFromFields(entryInputIds[index] ?? "", fields)
+            : null;
+    });
     if (entryContentDigests.some((digest) => digest === null)) return null;
     const pristineTail = structuredClone(messages.slice(anchorIndex + 1)) as MessageLike[];
     return {
@@ -575,6 +628,8 @@ export function noteEntry(sessionId: string, messages: MessageLike[]): LkgEntryN
 }
 
 export function resetLkgSlotsForTest(): void {
+    digestMemo.clear();
+    digestMemoBytes = 0;
     lkgHeapHolder.entries.clear();
     totalBytes = 0;
     persistenceBackend = undefined;

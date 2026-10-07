@@ -94,6 +94,9 @@ const MAX_MESSAGE_CACHE_KEY_BYTES = 64 * 1024 * 1024;
 const FNV1A_32_OFFSET = 0x811c9dc5;
 const FNV1A_32_PRIME = 0x01000193;
 const messageEstimateCache = new Map<string, CachedMessageEstimate>();
+// Invalidation historically matches any NUL-enclosed field, not just the id.
+// Index those exact fields so the ordinary message event never scans other keys.
+const messageEstimateKeysByField = new Map<string, Set<string>>();
 let messageEstimateCacheBytes = 0;
 
 const EMPTY_BREAKDOWN: TrueRawTokenBreakdown = {
@@ -344,6 +347,13 @@ function setCachedEstimate(key: string, breakdown: TrueRawTokenBreakdown): void 
     const keyEstimateBytes = key.length * 2 + 64;
     const existing = messageEstimateCache.get(key);
     if (existing) messageEstimateCacheBytes -= existing.keyEstimateBytes;
+    else {
+        for (const field of new Set(key.split("\0").slice(1, -1))) {
+            const keys = messageEstimateKeysByField.get(field) ?? new Set<string>();
+            keys.add(key);
+            messageEstimateKeysByField.set(field, keys);
+        }
+    }
     messageEstimateCache.set(key, { breakdown, keyEstimateBytes });
     messageEstimateCacheBytes += keyEstimateBytes;
     while (
@@ -352,9 +362,19 @@ function setCachedEstimate(key: string, breakdown: TrueRawTokenBreakdown): void 
     ) {
         const first = messageEstimateCache.keys().next().value;
         if (typeof first !== "string") break;
-        const removed = messageEstimateCache.get(first);
-        if (removed) messageEstimateCacheBytes -= removed.keyEstimateBytes;
-        messageEstimateCache.delete(first);
+        deleteCachedEstimate(first);
+    }
+}
+
+function deleteCachedEstimate(key: string): void {
+    const removed = messageEstimateCache.get(key);
+    if (!removed) return;
+    messageEstimateCacheBytes -= removed.keyEstimateBytes;
+    messageEstimateCache.delete(key);
+    for (const field of new Set(key.split("\0").slice(1, -1))) {
+        const keys = messageEstimateKeysByField.get(field);
+        keys?.delete(key);
+        if (keys?.size === 0) messageEstimateKeysByField.delete(field);
     }
 }
 
@@ -767,12 +787,17 @@ export function invalidateTrueRawTokenCache(args: {
 }): void {
     const sessionNeedle = args.sessionId ? `${args.sessionId}` : null;
     const messageNeedle = args.messageId ? `\0${args.messageId}\0` : null;
-    for (const [key, value] of messageEstimateCache) {
+    // Session invalidation uses a substring predicate, so keep that compatibility
+    // path. Ids containing a delimiter likewise cannot use a single-field lookup.
+    const keys =
+        args.messageId && !args.messageId.includes("\0")
+            ? (messageEstimateKeysByField.get(args.messageId) ?? [])
+            : messageEstimateCache.keys();
+    for (const key of keys) {
         const sessionMatches = sessionNeedle === null || key.includes(sessionNeedle);
         const messageMatches = messageNeedle === null || key.includes(messageNeedle);
         if (sessionMatches && messageMatches) {
-            messageEstimateCache.delete(key);
-            messageEstimateCacheBytes -= value.keyEstimateBytes;
+            deleteCachedEstimate(key);
         }
     }
     void args.reason;

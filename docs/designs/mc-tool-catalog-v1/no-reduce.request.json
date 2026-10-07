@@ -1,5 +1,5 @@
 {
-  "preset": "primary",
+  "preset": "head",
   "params": {
     "exclude": [
       "ctx_reduce"
@@ -102,10 +102,13 @@
           }
         ]
       }
-    ]
+    ],
+    "compaction": {
+      "provider": "magic-context"
+    }
   },
   "system_text": {
-    "preset": "primary",
+    "preset": "head",
     "params": {}
   }
 }

@@ -2,6 +2,8 @@ import {
     getCandidateToolOwners,
     pickNearestPriorOwner,
 } from "../../features/magic-context/storage-tags";
+import { expandToolPart } from "../../shared/historian-tool-expansions";
+import type { ToolExpansionMap } from "../../shared/historian-tool-template";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
 import type { Database } from "../../shared/sqlite";
 import { isSystemDirective } from "../../shared/system-directive";
@@ -29,13 +31,14 @@ import {
 import {
     countRawSessionMessageOrdinalsFromDb,
     countStoredRawSessionMessagesFromDb,
+    hasRawSessionMessageByIdFromDb,
     type RawMessage,
     type RawMessageOrdinalAnchor,
     type RawMessageOrdinalEntry,
     type RawMessageParts,
     readRawSeedTailFromDb,
     readRawSessionMessageByIdFromDb,
-    readRawSessionMessageIdOrdinalsFromDb,
+    readRawSessionMessageIdOrdinalsForRangeFromDb,
     readRawSessionMessageOrdinalByIdFromDb,
     readRawSessionMessageOrdinalPageFromDb,
     readRawSessionMessagePageFromDb,
@@ -222,18 +225,28 @@ export function setRawMessageProvider(sessionId: string, provider: RawMessagePro
     };
 }
 
+// One wrapper per bounded provider, so registering the same provider twice
+// reaches setRawMessageProvider with the same object and shares its lifetime
+// instead of replacing it.
+const boundedProviderWrappers = new WeakMap<BoundedRawMessageProvider, RawMessageProvider>();
+
 export function setBoundedRawMessageProvider(
     sessionId: string,
     provider: BoundedRawMessageProvider,
 ): () => void {
-    return setRawMessageProvider(sessionId, {
-        ...provider,
-        readMessages: () => {
-            throw new Error(
-                "Bounded raw-message providers cannot read complete history; full reads are reserved for store-generation conversion",
-            );
-        },
-    });
+    let wrapper = boundedProviderWrappers.get(provider);
+    if (!wrapper) {
+        wrapper = {
+            ...provider,
+            readMessages: () => {
+                throw new Error(
+                    "Bounded raw-message providers cannot read complete history; full reads are reserved for store-generation conversion",
+                );
+            },
+        };
+        boundedProviderWrappers.set(provider, wrapper);
+    }
+    return setRawMessageProvider(sessionId, wrapper);
 }
 
 /**
@@ -385,10 +398,11 @@ export function readRawSessionMessagePage(
     afterOrdinal: number,
     limit: number,
     finalWatermark: number,
+    after?: RawMessageOrdinalAnchor,
 ): RawMessage[] {
     const provider = sessionProviders.get(sessionId)?.provider;
     if (provider?.readMessagePage) {
-        return provider.readMessagePage(afterOrdinal, limit, finalWatermark);
+        return provider.readMessagePage(afterOrdinal, limit, finalWatermark, after);
     }
     if (provider) {
         return provider
@@ -400,7 +414,7 @@ export function readRawSessionMessagePage(
     }
     if (!openCodeDbExists()) return [];
     return withReadOnlySessionDb((db) =>
-        readRawSessionMessagePageFromDb(db, sessionId, afterOrdinal, limit, finalWatermark),
+        readRawSessionMessagePageFromDb(db, sessionId, afterOrdinal, limit, finalWatermark, after),
     );
 }
 
@@ -745,13 +759,16 @@ export function readRawSessionMessageIdOrdinalsForRange(
     if (provider?.readMessageIdOrdinalsForRange) {
         return provider.readMessageIdOrdinalsForRange(from, to);
     }
+    if (!provider) {
+        return !openCodeDbExists()
+            ? new Map()
+            : withReadOnlySessionDb((db) =>
+                  readRawSessionMessageIdOrdinalsForRangeFromDb(db, sessionId, from, to),
+              );
+    }
     const all = provider?.readMessageIdOrdinals
         ? provider.readMessageIdOrdinals()
-        : provider
-          ? new Map(provider.readMessages().map((message) => [message.id, message.ordinal]))
-          : !openCodeDbExists()
-            ? new Map<string, number>()
-            : withReadOnlySessionDb((db) => readRawSessionMessageIdOrdinalsFromDb(db, sessionId));
+        : new Map(provider.readMessages().map((message) => [message.id, message.ordinal]));
     return new Map([...all].filter(([, ordinal]) => ordinal >= from && ordinal <= to));
 }
 
@@ -780,6 +797,11 @@ export function readRawSessionMessagePartsById(
 export function hasRawSessionMessageById(sessionId: string, messageId: string): boolean {
     const provider = sessionProviders.get(sessionId)?.provider;
     if (provider?.hasMessageById) return provider.hasMessageById(messageId);
+    if (!provider)
+        return (
+            openCodeDbExists() &&
+            withReadOnlySessionDb((db) => hasRawSessionMessageByIdFromDb(db, sessionId, messageId))
+        );
     return readRawSessionMessageById(sessionId, messageId) !== null;
 }
 
@@ -989,12 +1011,14 @@ export async function getRawSessionTagKeysThrough(
         ? Math.max(1, Math.floor(options.fromMessageIndex ?? 1))
         : 1;
     let afterOrdinal = firstOrdinal - 1;
+    let after: RawMessageOrdinalAnchor | undefined;
     while (afterOrdinal < finalWatermark) {
         const messages = readRawSessionMessages.readPage(
             sessionId,
             afterOrdinal,
             pageSize,
             finalWatermark,
+            after,
         );
         if (messages.length === 0) break;
 
@@ -1043,6 +1067,8 @@ export async function getRawSessionTagKeysThrough(
 
         if (nextOrdinal <= afterOrdinal) break;
         afterOrdinal = nextOrdinal;
+        const last = messages.at(-1);
+        after = last ? { timeCreated: last.createdAt ?? 0, id: last.id } : undefined;
         if (afterOrdinal < finalWatermark) await yieldToEventLoop();
     }
 
@@ -1081,6 +1107,7 @@ export function readSessionChunk(
     tokenBudget: number,
     offset: number = 1,
     eligibleEndOrdinal?: number,
+    options: { expandTools?: ToolExpansionMap; expand?: boolean } = {},
 ): SessionChunk {
     // When a tail-only slice is primed, its length is not the absolute count.
     // Otherwise use the provider's SQL count and read only the chunk's eligible range.
@@ -1098,6 +1125,41 @@ export function readSessionChunk(
         Math.max(1, startOrdinal - 1),
         finalOrdinal,
     );
+    // Pi keeps invocations and results in different messages. Attach only the
+    // historian preview to the invocation; never alter the stored/raw parts.
+    const expandedParts = new Map<unknown, string | null>();
+    const expandedResults = new Set<unknown>();
+    if (options.expand !== false) {
+        const calls = new Map<string, Record<string, unknown>>();
+        for (const message of messages)
+            for (const part of message.parts) {
+                if (!part || typeof part !== "object") continue;
+                const p = part as Record<string, unknown>;
+                if (p.type !== "tool") continue;
+                const state = p.state as Record<string, unknown> | undefined;
+                if (state?.input !== undefined && typeof p.callID === "string")
+                    calls.set(p.callID, p);
+                expandedParts.set(part, expandToolPart(part, options.expandTools));
+                if (
+                    state?.input === undefined &&
+                    state?.output !== undefined &&
+                    typeof p.callID === "string"
+                ) {
+                    const call = calls.get(p.callID);
+                    if (call) {
+                        const expansion = expandToolPart(
+                            { ...call, state: { ...(call.state as object), output: state.output } },
+                            options.expandTools,
+                        );
+                        if (expansion !== null) {
+                            expandedParts.set(call, expansion);
+                            expandedResults.add(part);
+                        }
+                        calls.delete(p.callID);
+                    }
+                }
+            }
+    }
     const completedToolArcs = buildToolArcs(messages).flatMap((arc) =>
         arc.resOrdinal === null ? [] : [{ start: arc.invOrdinal, end: arc.resOrdinal }],
     );
@@ -1235,7 +1297,11 @@ export function readSessionChunk(
         // zero signal for compartment summaries — unless they contain tool results
         // with extractable descriptions.
         if (msg.role === "user" && !hasMeaningfulChunkUserText(msg.parts)) {
-            const tcSummaries = extractToolCallSummaries(msg.parts);
+            const tcSummaries = msg.parts.flatMap((part) => {
+                if (expandedResults.has(part)) return [];
+                const expansion = expandedParts.get(part) ?? null;
+                return expansion === null ? extractToolCallSummaries([part]) : [`TC: ${expansion}`];
+            });
             if (tcSummaries.length === 0) {
                 recordFilteredNoise(meta);
                 continue;
@@ -1287,8 +1353,26 @@ export function readSessionChunk(
 
         // For messages with no text content, extract tool-call descriptions as
         // lightweight summaries so historian sees what actions were taken.
-        const toolSummaries = textParts.length === 0 ? extractToolCallSummaries(msg.parts) : [];
-        const allParts = [...textParts, ...toolSummaries];
+        const allParts =
+            options.expand === false
+                ? [
+                      ...textParts,
+                      ...(textParts.length === 0 ? extractToolCallSummaries(msg.parts) : []),
+                  ]
+                : msg.parts.flatMap((part) => {
+                      if (expandedResults.has(part)) return [];
+                      const expansion = expandedParts.get(part) ?? null;
+                      if (expansion !== null) return [`TC: ${expansion}`];
+                      const texts = extractTexts([part])
+                          .map((t) => (msg.role === "user" ? cleanUserText(t) : t))
+                          .map(normalizeText)
+                          .filter(Boolean);
+                      return texts.length
+                          ? texts
+                          : textParts.length === 0
+                            ? extractToolCallSummaries([part])
+                            : [];
+                  });
 
         const compacted = compactTextForSummary(allParts.join(" / "), msg.role);
         const text = compacted.text;

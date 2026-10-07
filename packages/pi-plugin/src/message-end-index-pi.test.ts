@@ -2,7 +2,10 @@ import { describe, expect, it } from "bun:test";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import { schedulePiAssistantIndexOnMessageEnd } from "./message-end-index-pi";
-import { convertEntriesToRawMessages } from "./read-session-pi";
+import {
+	convertEntriesToRawMessages,
+	convertPiAssistantEntryById,
+} from "./read-session-pi";
 
 type Source =
 	| RawMessage
@@ -37,6 +40,54 @@ function harness() {
 }
 
 describe("schedulePiAssistantIndexOnMessageEnd", () => {
+	it("converts only the ended assistant and preserves its folded ordinal and metadata", () => {
+		const ended = {
+			role: "assistant",
+			content: [{ type: "text", text: "answer" }],
+			timestamp: 4,
+		};
+		const entries = [
+			{
+				type: "message",
+				id: "user",
+				message: { role: "user", content: "question", timestamp: 1 },
+			},
+			{
+				type: "message",
+				id: "tool",
+				message: {
+					role: "toolResult",
+					toolCallId: "call",
+					content: [{ type: "text", text: "result" }],
+					timestamp: 2,
+				},
+			},
+			{
+				type: "message",
+				id: "protocol",
+				message: { role: "bashExecution", content: "ignored", timestamp: 3 },
+			},
+			{
+				type: "message",
+				id: "assistant",
+				message: ended,
+				timestamp: "2026-01-01T00:00:00.000Z",
+			},
+		];
+		const expected = convertEntriesToRawMessages(entries).find(
+			(message) => message.id === "assistant",
+		);
+		let historicalReads = 0;
+		Object.defineProperty(entries[0].message, "content", {
+			get() {
+				historicalReads++;
+				return "question";
+			},
+		});
+		expect(convertPiAssistantEntryById(entries, "assistant")).toEqual(expected);
+		expect(historicalReads).toBe(0);
+		expect(convertPiAssistantEntryById(entries, "absent")).toBeNull();
+	});
 	it("indexes a Pi assistant message, which carries no id of its own", () => {
 		const { entries, scheduled, schedule, session, resolve } = harness();
 		// Pi's AssistantMessage has no `id`; the session entry id is assigned

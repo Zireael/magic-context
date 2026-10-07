@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { createRequire } from "node:module";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { Database } from "../../shared/sqlite";
@@ -22,6 +23,42 @@ function makeDb(): Database {
 }
 
 describe("computeM0BlockTokens", () => {
+    test("reuses exact block token counts and recounts a changed sidebar block", () => {
+        const db = makeDb();
+        // The estimator loads the CommonJS constructor; observe that same
+        // prototype rather than a second ESM copy of the tokenizer.
+        const tokenizerModule = createRequire(import.meta.url)("ai-tokenizer");
+        const Tokenizer = tokenizerModule.default ?? tokenizerModule.Tokenizer;
+        const encode = spyOn(Tokenizer.prototype, "encode");
+        const args = {
+            m0Text: "<project-docs>sidebar memo unique docs αβ</project-docs><user-profile>sidebar memo unique profile</user-profile><project-memory>sidebar memo unique memory</project-memory><session-history>sidebar memo unique history</session-history>",
+            m1Text: "<new-compartments>sidebar memo unique delta</new-compartments>",
+            projectIdentity: undefined,
+            injectionBudgetTokens: undefined,
+            memoryBlockCount: 0,
+        };
+        try {
+            const first = computeM0BlockTokens(db, SESSION_ID, args);
+            expect(encode).toHaveBeenCalledTimes(5);
+            encode.mockClear();
+            expect(computeM0BlockTokens(db, SESSION_ID, { ...args })).toEqual(first);
+            expect(encode).not.toHaveBeenCalled();
+            const changed = computeM0BlockTokens(db, SESSION_ID, {
+                ...args,
+                m0Text: args.m0Text.replace(
+                    "unique docs αβ",
+                    "unique docs with a longer revision 😀",
+                ),
+            });
+            expect(encode).toHaveBeenCalledTimes(1);
+            expect(changed.docsTokens).not.toBe(first.docsTokens);
+            expect(changed.compartmentTokens).toBe(first.compartmentTokens);
+        } finally {
+            encode.mockRestore();
+            db.close();
+        }
+    });
+
     test("measures each m[0] slice from the rendered bytes and retires Facts", () => {
         const db = makeDb();
         const m0Text = [

@@ -385,7 +385,8 @@ export class ToolMutationBatch {
 
         const scopedSweep = this.resolveScopedSweep();
         const removed = new Set<MessageLike>();
-        for (let i = this.messages.length - 1; i >= 0; i -= 1) {
+        let writeIndex = 0;
+        for (let i = 0; i < this.messages.length; i += 1) {
             // Tool removal must not delete unrelated reasoning-only turns. Existing
             // sessions switch from the old global scan only on a cache-busting pass,
             // because restoring previously removed messages also changes cached bytes.
@@ -394,9 +395,11 @@ export class ToolMutationBatch {
                 !this.messages[i].parts.some(hasMeaningfulPart)
             ) {
                 removed.add(this.messages[i]);
-                this.messages.splice(i, 1);
+            } else {
+                this.messages[writeIndex++] = this.messages[i];
             }
         }
+        this.messages.length = writeIndex;
         this.pruneServedRows(removed);
 
         this.partsToRemove.clear();

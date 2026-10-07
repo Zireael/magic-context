@@ -6,7 +6,7 @@ import { getProtectionWindowForSession } from "../features/magic-context/protect
 import {
     getDatabasePersistenceError,
     isDatabasePersisted,
-    openDatabase,
+    openCurrentDatabase as openDatabase,
 } from "../features/magic-context/storage";
 import { getObservedEpochFloor } from "../features/magic-context/storage-meta-persisted";
 import { setCtxReduceRegisteredGlobally } from "../hooks/magic-context/ctx-reduce-availability";
@@ -29,6 +29,7 @@ import { parameterDescriptionsFor } from "../tools/parameter-descriptions";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
 import type { RustToolBackends } from "./rust-tool-backends";
+import { guardSubagentTools } from "./subagent-tool-policy";
 import type { PluginContext } from "./types";
 
 /**
@@ -64,6 +65,7 @@ export function createToolRegistry(args: {
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     registrationPromptSurface?: PromptSurfaceConfig;
     includeDreamerOnlyTools?: boolean;
+    internalChildSessions?: ReadonlySet<string>;
 }): Record<string, ToolDefinition> {
     const { ctx, pluginConfig, rustToolBackends } = args;
 
@@ -142,6 +144,7 @@ export function createToolRegistry(args: {
             ? {}
             : createCtxReduceTools({
                   db,
+                  protectedTools: pluginConfig.protected_tools,
                   getProtectionWindow: (sessionId) =>
                       getProtectionWindowForSession(
                           db,
@@ -150,7 +153,7 @@ export function createToolRegistry(args: {
                       ),
                   rustToolBackends,
               })),
-        ...createCtxExpandTools({ db }),
+        ...createCtxExpandTools({ db, expandTools: pluginConfig.historian?.expand_tools }),
         ...createCtxNoteTools({
             db,
             dreamerEnabled: isDreamerRunnable(pluginConfig),
@@ -233,5 +236,9 @@ export function createToolRegistry(args: {
         normalizeToolArgSchemas(toolDefinition);
     }
 
-    return surfacedTools;
+    return guardSubagentTools(
+        surfacedTools,
+        db,
+        (id) => args.internalChildSessions?.has(id) === true,
+    );
 }

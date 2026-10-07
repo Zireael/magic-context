@@ -16,6 +16,25 @@
 
 #![forbid(unsafe_code)]
 
+// These clocks exist only in the opt-in, in-process profiling test. Production
+// builds keep the original timers and contain no additional clock reads.
+macro_rules! profile_start {
+    ($timer:ident, $stage:literal) => {
+        #[cfg(test)]
+        let $timer = crate::per_pass_profile::start($stage);
+    };
+}
+macro_rules! profile_end {
+    ($timer:ident) => {
+        #[cfg(test)]
+        crate::per_pass_profile::finish($timer);
+    };
+}
+#[cfg(test)]
+mod per_pass_profile;
+#[cfg(test)]
+mod private_permissions_source_test;
+
 pub mod boundary;
 pub mod caveman;
 pub mod ck_wire;
@@ -26,6 +45,7 @@ pub mod config;
 mod content_language;
 pub mod decay_render;
 pub mod decision_calibration;
+mod digest;
 pub mod divergence;
 pub mod healing;
 pub mod historian;
@@ -34,6 +54,7 @@ pub mod historian_host;
 pub mod historian_producer;
 pub mod historian_prompt;
 pub mod historian_runner;
+pub mod historian_tool_template;
 pub mod historian_validate;
 pub mod host_store;
 mod image_tokens;
@@ -193,6 +214,52 @@ fn apply_claude_code_config_controls(
     if config.prompt_surface_guidance_override.is_some() {
         request.prompt_surface_guidance_override = config.prompt_surface_guidance_override.clone();
     }
+}
+
+fn resolve_session_cache_ttl(
+    store: &McStore,
+    session_id: &str,
+    model_key: Option<&str>,
+    frozen: &McModuleConfig,
+    live: &McModuleConfig,
+) -> Result<(config::ResolvedCacheTtl, mc_store::SessionCacheTtlPolicy), McStoreError> {
+    let resolved = live.resolve_cache_ttl_with_provenance(model_key);
+    let configured = resolved.provenance != config::CacheTtlProvenance::Default;
+    let loaded = store.load_meta(session_id)?;
+    let built_in_default = loaded
+        .meta
+        .cache_ttl_policy
+        .as_ref()
+        .filter(|policy| policy.model_key.as_deref() == model_key)
+        .map(|policy| policy.built_in_default.clone())
+        .unwrap_or_else(|| {
+            let bound = frozen.resolve_cache_ttl_with_provenance(model_key);
+            if bound.provenance == config::CacheTtlProvenance::Default {
+                bound.value
+            } else {
+                McModuleConfig::default().resolve_cache_ttl(model_key)
+            }
+        });
+    let effective = config::ResolvedCacheTtl {
+        value: if configured {
+            resolved.value.clone()
+        } else {
+            built_in_default.clone()
+        },
+        provenance: resolved.provenance,
+    };
+    let policy = mc_store::SessionCacheTtlPolicy {
+        value: effective.value.clone(),
+        source: if configured {
+            "your config"
+        } else {
+            "built-in default, frozen for this session"
+        }
+        .to_string(),
+        model_key: model_key.map(str::to_string),
+        built_in_default,
+    };
+    Ok((effective, policy))
 }
 
 /// Normalize the OC host's already-rendered mural to the exact m0 input contract.
@@ -1427,11 +1494,13 @@ const STATE_IMPORT_MAX_PENDING: usize = 64;
 const STATE_IMPORT_STALE_AFTER: Duration = Duration::from_secs(5 * 60);
 const TRANSFORM_SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const BOUNDARY_TOKEN_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
-// Sized from the ASTRO-scale fixture (4,600 messages / 15,000 blocks): that
-// FlatProjection retains ~156 MiB, so one such session plus a smaller neighbor
-// fit without the native-attach 192 MiB entry cap evicting the projection.
-const PROJECTION_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-const PROJECTION_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+// Single-copy scalar text brings the 9,268-message / 118.8 MB synthetic fixture to 93 MiB
+// retained (formerly 201 MiB). Real sessions also carry JSON tool arguments and results,
+// which still keep their typed trees, so the ceilings stay at the levels that admitted the
+// largest live session before compaction (~224 MiB). Lower them once live admission
+// charges under compact retention have been measured. Native/output budgets are independent.
+const PROJECTION_CACHE_BUDGET_BYTES: usize = 384 * 1024 * 1024;
+const PROJECTION_CACHE_ENTRY_BUDGET_BYTES: usize = 288 * 1024 * 1024;
 const ACTIVE_SNAPSHOT_LEASE_BUDGET_BYTES: usize = TRANSFORM_SNAPSHOT_BUDGET_BYTES;
 const MAX_ACTIVE_SNAPSHOT_LEASES: usize = 8;
 /// InFlight snapshot markers have no byte charge, so they need their own count bound:
@@ -1595,6 +1664,14 @@ struct StateImportWire {
     batch_seq: usize,
     batch_count: usize,
     compartments: Vec<StateImportCompartmentWire>,
+}
+
+fn decode_state_import_wire(request: &Value) -> Result<StateImportWire, serde_json::Error> {
+    StateImportWire::deserialize(request)
+}
+
+fn decode_state_sync_wire(request: &Value) -> Result<ModuleStateSyncWire, serde_json::Error> {
+    ModuleStateSyncWire::deserialize(request)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3131,7 +3208,7 @@ const NATIVE_ATTACHMENT_CACHE_ENTRY_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 // the adapter for a full request. No cache may interpret another cache's presence as authority.
 // Keep the ordinary aggregate admission target explicit when any individual budget changes; an
 // oversized native delta core is the documented exception and remains honestly charged.
-const TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES: usize = 768 * 1024 * 1024;
+const TRANSFORM_SERVE_CACHE_COMBINED_BUDGET_BYTES: usize = 896 * 1024 * 1024;
 const _: () = assert!(
     transform::SERIALIZED_OUTPUT_CACHE_BUDGET_BYTES
         + NATIVE_ATTACHMENT_CACHE_BUDGET_BYTES
@@ -3478,10 +3555,20 @@ impl NativeAttachmentCache {
         stats: &mut NativeAttachmentCacheStats,
         served_bytes: usize,
     ) {
+        profile_start!(_perf_replace, "native_cache_replace");
+        profile_start!(perf_requested_charge, "native_cache_requested_charge");
         let requested_bytes = snapshot.retained_bytes(served_bytes);
+        profile_end!(perf_requested_charge);
+        profile_start!(perf_core_clone, "native_cache_core_clone");
         let mut core_snapshot = snapshot.clone();
+        profile_end!(perf_core_clone);
+        profile_start!(perf_degrade, "native_cache_degrade");
         let dropped_sidecar_trees = core_snapshot.discard_optional_sidecar_trees();
+        profile_end!(perf_degrade);
+        profile_start!(perf_core_charge, "native_cache_core_charge");
         let core_bytes = core_snapshot.retained_bytes(served_bytes);
+        profile_end!(perf_core_charge);
+        profile_start!(_perf_admit, "native_cache_admit");
 
         // The current session's old generation cannot compete with its replacement. Evict other
         // sessions before considering the optional sidecar so the structures that expand the next
@@ -3599,6 +3686,9 @@ struct ProjectionCacheSession {
 struct ProjectionCache {
     sessions: HashMap<String, ProjectionCacheSession>,
     lru: VecDeque<String>,
+    // Admission failures can recur every pass. Remember the warning until the last route closes,
+    // not until an LRU eviction or revert, so an uncacheable session cannot flood the fleet log.
+    admission_warned_sessions: HashSet<String>,
     retained_bytes: usize,
     max_retained_bytes: usize,
     max_entry_retained_bytes: usize,
@@ -3623,6 +3713,7 @@ impl ProjectionCache {
         Self {
             sessions: HashMap::new(),
             lru: VecDeque::new(),
+            admission_warned_sessions: HashSet::new(),
             retained_bytes: 0,
             max_retained_bytes,
             max_entry_retained_bytes: max_entry_retained_bytes.min(max_retained_bytes),
@@ -3636,15 +3727,24 @@ impl ProjectionCache {
         self.lru.retain(|candidate| candidate != session_id);
     }
 
+    fn forget_session(&mut self, session_id: &str) {
+        self.remove(session_id);
+        self.admission_warned_sessions.remove(session_id);
+    }
+
     fn snapshot(&mut self, session_id: &str, revert_epoch: u64) -> Option<ProjectionCacheSnapshot> {
         // TODO(memory-accounting): add an active-clone budget for this `Arc`, as identified by
         // the module-memory audit. A running transform can retain it after LRU eviction, so the
         // cache-only charge cannot bound that in-flight allocation.
-        if self
+        let reverted = self
             .sessions
             .get(session_id)
-            .is_some_and(|session| session.revert_epoch != revert_epoch)
-        {
+            .is_some_and(|session| session.revert_epoch != revert_epoch);
+        if reverted {
+            tracing::info!(
+                "projection-cache miss session={} reason=revert_epoch cached_epoch={} current_epoch={}",
+                session_id, self.sessions[session_id].revert_epoch, revert_epoch,
+            );
             self.remove(session_id);
         }
         let snapshot = self
@@ -3654,6 +3754,11 @@ impl ProjectionCache {
         if snapshot.is_some() {
             self.lru.retain(|candidate| candidate != session_id);
             self.lru.push_back(session_id.to_string());
+        } else if !reverted {
+            tracing::info!(
+                "projection-cache miss session={} reason=missing current_epoch={} retained_bytes={} entries={} total_budget={}",
+                session_id, revert_epoch, self.retained_bytes, self.sessions.len(), self.max_retained_bytes,
+            );
         }
         snapshot
     }
@@ -3664,6 +3769,16 @@ impl ProjectionCache {
             || retained_bytes > self.max_entry_retained_bytes
             || retained_bytes > self.max_retained_bytes
         {
+            if self
+                .admission_warned_sessions
+                .insert(session_id.to_string())
+            {
+                tracing::warn!(
+                    "projection-cache admission-rejected session={} byte_charge={} entry_budget={} total_budget={} previous_entry_kept={} consequence=full_sync_each_pass_unless_request_snapshot_available fallback=need_full_sync_then_full_request",
+                    session_id, retained_bytes, self.max_entry_retained_bytes, self.max_retained_bytes,
+                    self.sessions.contains_key(session_id),
+                );
+            }
             return;
         }
         self.remove(session_id);
@@ -3687,6 +3802,11 @@ impl ProjectionCache {
             }
             if let Some(session) = self.sessions.remove(&oldest) {
                 self.retained_bytes = self.retained_bytes.saturating_sub(session.retained_bytes);
+                tracing::info!(
+                    "projection-cache evicted session={} byte_charge={} retained_bytes={} total_budget={} admitted_session={} admitted_charge={} reason=projection_admission",
+                    oldest, session.retained_bytes, self.retained_bytes, self.max_retained_bytes,
+                    session_id, retained_bytes,
+                );
             }
         }
     }
@@ -3736,13 +3856,15 @@ pub struct McHandler {
     native_attachments: Mutex<NativeAttachmentCache>,
     projections: Mutex<ProjectionCache>,
     boundary_tokens: Mutex<BoundaryTokenCache>,
-    scheduler_observations: Mutex<HashMap<String, SchedulerObservation>>,
     guidance_dates: Mutex<HashMap<String, String>>,
     prompt_surface_epochs: Mutex<HashMap<String, PromptSurfaceSelection>>,
     /// Route channels whose consumer declared it speaks `tool-provider/v1` at bind
     /// (`role_versions`). Only those get the role's refusal codes; every other route
     /// keeps the legacy facade errors byte for byte.
     tool_provider_v1_channels: Mutex<HashSet<u16>>,
+    /// The last full catalog fetched with a composition for each bound session.
+    /// Preflight and digest probes cannot overwrite the session's admitted tools.
+    frozen_tool_catalogs: Mutex<HashMap<(PathBuf, String), tool_catalog::FrozenCatalog>>,
     #[cfg(test)]
     guidance_now_ms: Mutex<Option<i64>>,
     #[cfg(test)]
@@ -4300,12 +4422,6 @@ struct HistorianFiringTask {
     publication_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SchedulerObservation {
-    last_response_at_ms: i64,
-    observed_in_process: bool,
-}
-
 #[async_trait]
 impl HistorianProducerFactory for MissingProducerFactory {
     async fn connect(
@@ -4375,10 +4491,10 @@ impl McHandler {
             native_attachments: Mutex::new(NativeAttachmentCache::default()),
             projections: Mutex::new(ProjectionCache::default()),
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
-            scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
             prompt_surface_epochs: Mutex::new(HashMap::new()),
             tool_provider_v1_channels: Mutex::new(HashSet::new()),
+            frozen_tool_catalogs: Mutex::new(HashMap::new()),
             #[cfg(test)]
             guidance_now_ms: Mutex::new(None),
             #[cfg(test)]
@@ -4650,14 +4766,20 @@ impl McHandler {
     /// fails with the refusal that names why, before any request is served.
     async fn open_store_once(descriptor: &StorageDescriptor) -> Result<McStore, McStoreError> {
         let descriptor = descriptor.clone();
+        let enforce_private_permissions = crate::config::private_storage_permissions_enabled();
         let open = move || {
-            let store = McStore::open(&descriptor)?;
+            let store =
+                McStore::open_with_private_permissions(&descriptor, enforce_private_permissions)?;
             let store_path = match &descriptor.backend {
                 StorageBackend::Sqlite { path } => Some(PathBuf::from(path)),
                 StorageBackend::Postgres { .. } => None,
             };
             let context_path = single_store_reads::context_db_path_for(store_path.as_deref());
-            single_store_reads::attach(&store, &context_path)?;
+            single_store_reads::attach_with_private_permissions(
+                &store,
+                &context_path,
+                enforce_private_permissions,
+            )?;
             Ok(store)
         };
         match tokio::task::spawn_blocking(open).await {
@@ -4684,6 +4806,7 @@ impl McHandler {
                 cache_ttl_by_model: std::collections::BTreeMap::new(),
                 catalog: crate::config::CatalogConfigInputs::default(),
                 historian_temperature: None,
+                historian_expand_tools: Default::default(),
                 historian_runner: None,
                 dreamer_runner: None,
                 language: None,
@@ -4707,6 +4830,7 @@ impl McHandler {
                 temporal_awareness: true,
                 prompt_surface_guidance_override: None,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
             },
         )
@@ -4756,10 +4880,10 @@ impl McHandler {
             native_attachments: Mutex::new(NativeAttachmentCache::default()),
             projections: Mutex::new(ProjectionCache::default()),
             boundary_tokens: Mutex::new(BoundaryTokenCache::new(BOUNDARY_TOKEN_CACHE_BUDGET_BYTES)),
-            scheduler_observations: Mutex::new(HashMap::new()),
             guidance_dates: Mutex::new(HashMap::new()),
             prompt_surface_epochs: Mutex::new(HashMap::new()),
             tool_provider_v1_channels: Mutex::new(HashSet::new()),
+            frozen_tool_catalogs: Mutex::new(HashMap::new()),
             guidance_now_ms: Mutex::new(None),
             reduction_injection: Mutex::new(HashMap::new()),
             between_transform_and_prepare: Mutex::new(None),
@@ -4821,6 +4945,10 @@ impl McHandler {
         }
         let replacement_session = replacement.map(|previous| previous.session);
         if let Some(session_id) = replacement_session {
+            self.frozen_tool_catalogs
+                .lock()
+                .expect("frozen catalog mutex")
+                .retain(|(_, session), _| session != &session_id);
             self.state_sync_seeds
                 .lock()
                 .expect("state sync seed mutex")
@@ -5253,13 +5381,13 @@ impl McHandler {
             self.clear_note_evaluation_capability_if_unbound(&root);
         }
         if let Some(session) = last_session_route {
+            self.frozen_tool_catalogs
+                .lock()
+                .expect("frozen catalog mutex")
+                .retain(|(_, key_session), _| key_session != &session);
             if session.starts_with("mc-dreamer:") {
                 self.unregister_dreamer_run(&session);
             }
-            self.scheduler_observations
-                .lock()
-                .expect("scheduler observations mutex")
-                .remove(&session);
             self.runtime_store_errors
                 .lock()
                 .expect("runtime store errors mutex")
@@ -5288,7 +5416,7 @@ impl McHandler {
             self.projections
                 .lock()
                 .expect("projection cache mutex")
-                .remove(&session);
+                .forget_session(&session);
             self.boundary_tokens
                 .lock()
                 .expect("boundary token cache mutex")
@@ -5638,47 +5766,6 @@ impl McHandler {
             .contains_key(session_id)
     }
 
-    fn observed_last_response_at_ms(
-        &self,
-        store: &McStore,
-        session_id: &str,
-        entry_snapshot: &OnceLock<Option<mc_store::MetaSnapshot>>,
-    ) -> Option<i64> {
-        let mut observations = self
-            .scheduler_observations
-            .lock()
-            .expect("scheduler observations mutex");
-        if let Some(observation) = observations.get(session_id) {
-            return observation
-                .observed_in_process
-                .then_some(observation.last_response_at_ms);
-        }
-        let anchor = Self::handler_entry_state(store, session_id, entry_snapshot)
-            .map(|state| state.meta.last_committed_pass_at_ms)
-            .unwrap_or(0);
-        observations.insert(
-            session_id.to_string(),
-            SchedulerObservation {
-                last_response_at_ms: anchor,
-                observed_in_process: false,
-            },
-        );
-        None
-    }
-
-    fn record_response_observation(&self, session_id: &str, now: i64) {
-        self.scheduler_observations
-            .lock()
-            .expect("scheduler observations mutex")
-            .insert(
-                session_id.to_string(),
-                SchedulerObservation {
-                    last_response_at_ms: now,
-                    observed_in_process: true,
-                },
-            );
-    }
-
     fn guidance_now_ms(&self) -> i64 {
         #[cfg(test)]
         if let Some(now) = *self.guidance_now_ms.lock().expect("guidance clock mutex") {
@@ -5914,12 +6001,13 @@ impl McHandler {
                 drop(guard);
                 return Some("recovering");
             };
-            let chunk = historian_chunk::build_historian_chunk(
+            let chunk = historian_chunk::build_historian_chunk_with_expansions(
                 parsed.messages.as_slice(),
                 &live,
                 range.from_ordinal,
                 derive_historian_chunk_tokens(config.historian_context_limit_tokens),
                 range.to_ordinal.saturating_add(1),
+                &config.historian_expand_tools,
             );
             let prior_compartments = match store.load_compartments(&session_id) {
                 Ok(cs) => cs
@@ -6019,12 +6107,13 @@ impl McHandler {
                     drop(guard);
                     return Some("recovering");
                 };
-                let chunk = historian_chunk::build_historian_chunk(
+                let chunk = historian_chunk::build_historian_chunk_with_expansions(
                     parsed.messages.as_slice(),
                     &live,
                     range.from_ordinal,
                     derive_historian_chunk_tokens(config.historian_context_limit_tokens),
                     range.to_ordinal.saturating_add(1),
+                    &config.historian_expand_tools,
                 );
                 let prior_compartments = match store.load_compartments(&session_id) {
                     Ok(cs) => cs
@@ -6152,6 +6241,7 @@ impl McHandler {
         projection: &crate::ck_wire::FlatProjection,
         prepare: HistorianPrepareContext<'_>,
     ) -> PreparedHistorianAction {
+        profile_start!(_perf_trigger, "trigger_ms");
         let HistorianPrepareContext {
             now,
             snapshot_generation,
@@ -6263,18 +6353,22 @@ impl McHandler {
             return PreparedHistorianAction::Complete(diagnostics);
         }
         let boundary_build_started_at = Instant::now();
+        profile_start!(perf_boundary, "trigger_boundary_build");
         if let Some(tags) = tag_snapshot {
             self.boundary_tokens
                 .lock()
                 .expect("boundary token cache mutex")
                 .prime_from_persisted_tags(&parsed.session_id, tags.as_slice());
-        } else if let Ok(tags) = store.load_tags_for_session(&parsed.session_id) {
-            // Malformed-lineage and compaction-off paths return before normal tag hydration.
-            // Preserve their fail-open tokenization behavior rather than treating absence as empty.
-            self.boundary_tokens
-                .lock()
-                .expect("boundary token cache mutex")
-                .prime_from_persisted_tags(&parsed.session_id, &tags);
+        } else {
+            profile_start!(_perf_fallback, "rt19_fallback_tag_load");
+            if let Ok(tags) = store.load_tags_for_session(&parsed.session_id) {
+                // Malformed-lineage and compaction-off paths return before normal tag hydration.
+                // Preserve their fail-open tokenization behavior rather than treating absence as empty.
+                self.boundary_tokens
+                    .lock()
+                    .expect("boundary token cache mutex")
+                    .prime_from_persisted_tags(&parsed.session_id, &tags);
+            }
         }
         let CachedBoundaryMessages {
             messages: boundary_messages,
@@ -6284,6 +6378,7 @@ impl McHandler {
         } = boundary_messages(parsed, projection, &self.boundary_tokens);
         trigger_timer.timings.boundary_build_ms +=
             boundary_build_started_at.elapsed().as_secs_f64() * 1_000.0;
+        profile_end!(perf_boundary);
         trigger_timer.timings.token_cache_hits = trigger_timer
             .timings
             .token_cache_hits
@@ -6346,6 +6441,7 @@ impl McHandler {
             context_limit,
         );
         let trigger_eval_started_at = Instant::now();
+        profile_start!(perf_eval, "trigger_eval");
         let trigger = {
             let mut formatted_token_estimator =
                 |bytes: &str| token_cache_snapshot.formatted_token_count(bytes);
@@ -6388,13 +6484,16 @@ impl McHandler {
         };
         trigger_timer.timings.trigger_eval_ms +=
             trigger_eval_started_at.elapsed().as_secs_f64() * 1_000.0;
+        profile_end!(perf_eval);
         let cache_store_started_at = Instant::now();
+        profile_start!(perf_trigger_store, "trigger_cache_store");
         self.boundary_tokens
             .lock()
             .expect("boundary token cache mutex")
             .replace(&parsed.session_id, token_cache_snapshot);
         trigger_timer.timings.cache_store_ms +=
             cache_store_started_at.elapsed().as_secs_f64() * 1_000.0;
+        profile_end!(perf_trigger_store);
         decision_context.chunk_range = trigger.progress.as_ref().and_then(|progress| {
             (progress.protected_start_ordinal > progress.eligible_start_ordinal).then(|| {
                 HistorianChunkRange {
@@ -6613,11 +6712,13 @@ impl McHandler {
             &live,
             &projection.identity_by_mid,
             HistorianAssemblerConfig {
+                expand_tools: cfg.historian_expand_tools.clone(),
                 session_id: parsed.session_id.clone(),
                 project_path: project_path.to_string(),
                 project_slug: project_slug.clone(),
                 model_chain: model_chain.to_vec(),
                 model_limits: parsed.historian_model_limits.clone(),
+                model_variants: parsed.historian_model_variants.clone(),
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 historian_context_limit_tokens: cfg
                     .historian_context_limit_known
@@ -6851,11 +6952,13 @@ impl McHandler {
             &live,
             &projection.identity_by_mid,
             HistorianAssemblerConfig {
+                expand_tools: cfg.historian_expand_tools.clone(),
                 session_id: parsed.session_id.clone(),
                 project_path: project_path.clone(),
                 project_slug: project_slug.clone(),
                 model_chain,
                 model_limits: parsed.historian_model_limits.clone(),
+                model_variants: parsed.historian_model_variants.clone(),
                 token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
                 historian_context_limit_tokens: cfg
                     .historian_context_limit_known
@@ -7395,7 +7498,7 @@ impl McHandler {
             }
             Err(error) => return invalid_params_error(error.to_string()),
         };
-        let parsed: StateImportWire = match serde_json::from_value(request.clone()) {
+        let parsed: StateImportWire = match decode_state_import_wire(&request) {
             Ok(parsed) => parsed,
             Err(error) => {
                 if let Some(session_id) = raw_session_id.as_deref() {
@@ -7644,18 +7747,47 @@ impl McHandler {
             .map(|row| (row.tag_number, &row.block_id))
             .collect::<HashMap<_, _>>();
         let requested_numbers = numbers;
+        let cached_messages = self.cached_expand_messages(session_id);
+        let ctx_reduce_self_stamps = ctx_reduce_self_stamp_tag_numbers(
+            &tags,
+            &requested_numbers,
+            cached_messages.as_deref(),
+        );
+        let ctx_reduce_self_stamp_set = ctx_reduce_self_stamps
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
         let unknown_numbers = requested_numbers
             .iter()
             .copied()
             .filter(|number| !by_number.contains_key(&(*number as i64)))
             .collect::<Vec<_>>();
+        let accepted_tag_numbers = requested_numbers
+            .iter()
+            .copied()
+            .filter(|number| {
+                by_number.contains_key(&(*number as i64))
+                    && !ctx_reduce_self_stamp_set.contains(number)
+            })
+            .collect::<Vec<_>>();
         let mut drop_ids = requested_numbers
-            .into_iter()
+            .iter()
+            .copied()
+            .filter(|number| !ctx_reduce_self_stamp_set.contains(number))
             .filter_map(|number| by_number.get(&(number as i64)).map(|id| (*id).clone()))
             .collect::<Vec<_>>();
         drop_ids.sort();
         drop_ids.dedup();
         if drop_ids.is_empty() {
+            if !ctx_reduce_self_stamps.is_empty() && unknown_numbers.is_empty() {
+                let mut response = json!({ "ok": true, "queued": 0 });
+                add_ctx_reduce_stamp_fields(
+                    &mut response,
+                    &ctx_reduce_self_stamps,
+                    &accepted_tag_numbers,
+                );
+                return respond(response);
+            }
             return HandlerOutcome::Error {
                 code: "bad_request".to_string(),
                 message: format!(
@@ -7665,6 +7797,15 @@ impl McHandler {
             };
         }
 
+        let protected_tool_snapshot = match store.load_meta(session_id) {
+            Ok(snapshot) => snapshot.meta.protected_tool_block_ids,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "store_write_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
         match store.append_pending_agent_drops_with_command(
             session_id,
             Some(&command_id),
@@ -7673,13 +7814,36 @@ impl McHandler {
             false,
         ) {
             Ok(outcome) if outcome.duplicate => {
-                respond(json!({ "ok": true, "queued": 0, "duplicate": true }))
+                let mut response = json!({ "ok": true, "queued": 0, "duplicate": true });
+                add_ctx_reduce_stamp_fields(
+                    &mut response,
+                    &ctx_reduce_self_stamps,
+                    &accepted_tag_numbers,
+                );
+                respond(response)
             }
             Ok(outcome) => {
                 let mut resp = json!({ "ok": true, "queued": outcome.queued });
+                let (held, immediate): (Vec<_>, Vec<_>) = tags
+                    .iter()
+                    .filter(|tag| drop_ids.contains(&tag.block_id))
+                    .partition(|tag| protected_tool_snapshot.contains(&tag.block_id));
+                if !held.is_empty() {
+                    resp["held_tag_numbers"] =
+                        json!(held.iter().map(|tag| tag.tag_number).collect::<Vec<_>>());
+                    resp["immediate_tag_numbers"] = json!(immediate
+                        .iter()
+                        .map(|tag| tag.tag_number)
+                        .collect::<Vec<_>>());
+                }
                 if let Some(disposition) = &outcome.disposition {
                     resp["disposition"] = json!(disposition);
                 }
+                add_ctx_reduce_stamp_fields(
+                    &mut resp,
+                    &ctx_reduce_self_stamps,
+                    &accepted_tag_numbers,
+                );
                 respond(resp)
             }
             Err(error) => HandlerOutcome::Error {
@@ -9901,7 +10065,9 @@ impl McHandler {
         ticket: &TransformDispatchTicket<'_>,
     ) -> HandlerOutcome {
         let handler_started_at = Instant::now();
+        profile_start!(perf_handler, "handler_total");
         let request_decode_started_at = Instant::now();
+        profile_start!(perf_decode, "request_decode");
         let mut delta_expand_ms = 0.0;
         const REQUEST_OBSERVED_KEY: &str = "request_observed_at_ms";
         let request_attempt_id = request
@@ -9939,7 +10105,9 @@ impl McHandler {
             }
         };
         let request_decode_ms = request_decode_started_at.elapsed().as_secs_f64() * 1_000.0;
+        profile_end!(perf_decode);
         let handler_prepare_started_at = Instant::now();
+        profile_start!(perf_prepare, "handler_prepare");
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile);
         if serializer_profile.is_none() {
             return unknown_serializer_profile_error();
@@ -10070,8 +10238,10 @@ impl McHandler {
             .insert(lineage_root);
         let native_delta_frontier = if parsed.tail_delta.is_some() {
             let delta_expand_started_at = Instant::now();
+            profile_start!(perf_delta, "delta_expand");
             let expanded = self.expand_transform_tail_delta(&mut parsed);
             delta_expand_ms = delta_expand_started_at.elapsed().as_secs_f64() * 1_000.0;
+            profile_end!(perf_delta);
             let frontier = match expanded {
                 Ok(frontier) => frontier,
                 Err(reason) => return need_full_sync_response(&parsed, reason),
@@ -10226,19 +10396,29 @@ impl McHandler {
         // handler entry. The snapshot is initialized only if neither in-memory fast path answers.
         let handler_entry_state = OnceLock::new();
         let run_transform = || {
-            let resolved_cache_ttl = parsed.cache_ttl.clone().map_or_else(
-                || {
-                    binding
-                        .config
-                        .resolve_cache_ttl_with_provenance(parsed.model_key.as_deref())
-                },
-                |value| config::ResolvedCacheTtl {
-                    value,
-                    // Host-resolved TTLs remain host-side; only a per-model config match may
-                    // instruct the Claude Code marker owner.
-                    provenance: config::CacheTtlProvenance::Default,
-                },
-            );
+            profile_start!(perf_context, "transform_context");
+            let (resolved_cache_ttl, cache_ttl_policy) =
+                if let Some(value) = parsed.cache_ttl.clone() {
+                    (
+                        config::ResolvedCacheTtl {
+                            value,
+                            // The host uses its resolved cache lifetime only for scheduling; Claude
+                            // Code adds provider cache markers only when a per-model config entry matches.
+                            provenance: config::CacheTtlProvenance::Default,
+                        },
+                        None,
+                    )
+                } else {
+                    resolve_session_cache_ttl(
+                        &store,
+                        &parsed.session_id,
+                        parsed.model_key.as_deref(),
+                        &binding.config,
+                        &self.effective_config(&binding.project_root),
+                    )
+                    .map(|(resolved, policy)| (resolved, Some(policy)))
+                    .map_err(transform::TransformError::Store)?
+                };
             let producer_ctx = transform::ProducerContext {
                 project_path: &project_path,
                 note_project_path: &note_project_path,
@@ -10274,16 +10454,19 @@ impl McHandler {
                 // additive-only memory/docs transform for every consumer profile.
                 compaction_enabled: binding.config.compaction_enabled,
                 smart_drops: binding.config.smart_drops,
+                protected_tools: binding.config.protected_tools.clone(),
                 // OpenCode/Pi send their host-resolved value. Claude Code omits it, so resolve the
                 // request's model while retaining whether the walk actually matched an entry.
                 cache_ttl: resolved_cache_ttl.value,
                 cache_ttl_provenance: resolved_cache_ttl.provenance,
+                cache_ttl_policy,
                 model_key: binding.model_key.clone(),
-                observed_last_response_at_ms: self.observed_last_response_at_ms(
-                    &store,
-                    &parsed.session_id,
-                    &handler_entry_state,
-                ),
+                // Only the host knows whether the provider actually completed a reply.
+                // A local transform response merely prepares the next provider request.
+                observed_last_response_at_ms: parsed
+                    .prev_response_completed_at_ms
+                    .filter(|timestamp| *timestamp > 0)
+                    .and_then(|timestamp| i64::try_from(timestamp).ok()),
                 guidance_date: Some(self.guidance_date_for_transform(&parsed.session_id, pass_now)),
                 historian_active: self.historian_active(
                     &store,
@@ -10302,6 +10485,7 @@ impl McHandler {
                     .remove(&parsed.session_id)
                     .unwrap_or_default(),
             };
+            profile_end!(perf_context);
             transform_with_projection_cached(
                 &store,
                 &parsed,
@@ -10313,6 +10497,11 @@ impl McHandler {
         let reject_transform = |e: crate::transform::TransformError| {
             let code = if matches!(e, crate::transform::TransformError::AssistantTerminalRetry) {
                 "assistant_terminal_retry"
+            } else if matches!(
+                e,
+                crate::transform::TransformError::ProtectedToolResultsOverLimit
+            ) {
+                crate::transform::PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE
             } else {
                 "transform_failed"
             };
@@ -10342,7 +10531,9 @@ impl McHandler {
             }
         };
         let handler_prepare_ms = handler_prepare_started_at.elapsed().as_secs_f64() * 1_000.0;
+        profile_end!(perf_prepare);
         let transform_execute_started_at = Instant::now();
+        profile_start!(perf_execute, "transform_execute");
         let mut result = match run_transform() {
             Ok(result) => {
                 self.runtime_store_errors
@@ -10354,7 +10545,9 @@ impl McHandler {
             Err(e) => return reject_transform(e),
         };
         let transform_execute_ms = transform_execute_started_at.elapsed().as_secs_f64() * 1_000.0;
+        profile_end!(perf_execute);
         let handler_followup_started_at = Instant::now();
+        profile_start!(perf_followup, "handler_followup");
         let mut emergency_pre_floor = (result.scheduler_pass
             == scheduler::PassDecision::Emergency95)
             .then_some(result.publication_floor_ordinal)
@@ -10561,7 +10754,9 @@ impl McHandler {
             }
         }
         let handler_followup_ms = handler_followup_started_at.elapsed().as_secs_f64() * 1_000.0;
+        profile_end!(perf_followup);
         let post_attach_started_at = Instant::now();
+        profile_start!(perf_post, "post_attach");
         let revert_epoch = result.revert_epoch;
         let reasoning_clear_units = &result.reasoning_clear_units;
         let transition_consumed = result.transition_consumed;
@@ -10600,6 +10795,7 @@ impl McHandler {
         }
         response.historian = Some(diagnostics);
         let native_attach_started_at = Instant::now();
+        profile_start!(perf_native, "native_attach");
         let native_cache_stats = if parsed.serve_native {
             attach_native_messages_incremental(
                 &mut response,
@@ -10641,13 +10837,11 @@ impl McHandler {
             native_cache_stats,
         );
         let native_attach_ms = native_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
+        profile_end!(perf_native);
         let trace_complete_started_at = Instant::now();
         let _ = store.trace_pass_completed(&parsed.session_id, &request_attempt_id, now_ms());
         let trace_complete_ms = trace_complete_started_at.elapsed().as_secs_f64() * 1_000.0;
-        let response_observation_started_at = Instant::now();
-        self.record_response_observation(&parsed.session_id, now_ms());
-        let response_observation_ms =
-            response_observation_started_at.elapsed().as_secs_f64() * 1_000.0;
+        // Preparing this request cannot refresh the provider's idle cache clock.
         // Tail deltas have already been expanded at this point. Charge the retained request tree,
         // not the much smaller inbound suffix, so the ready LRU and active-lease budget describe
         // the same object their `Arc`s keep alive.
@@ -10684,7 +10878,7 @@ impl McHandler {
             timings.projection_cache_store = projection_cache_store_ms;
             timings.native_attach = native_attach_ms;
             timings.trace_complete = trace_complete_ms;
-            timings.response_observation = response_observation_ms;
+            timings.response_observation = 0.0;
             timings.retained_size = retained_size_ms;
             timings.snapshot_store = snapshot_store_ms;
             timings.trigger_ms = trigger_timings.elapsed_ms;
@@ -10701,6 +10895,8 @@ impl McHandler {
             timings.native_cache_reencode_drift = native_cache_stats.reencode_drift;
             timings.post_attach = post_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         }
+        profile_end!(perf_post);
+        profile_end!(perf_handler);
         respond_transform(&parsed, response)
     }
 
@@ -10778,7 +10974,7 @@ impl McHandler {
             .iter()
             .filter(|field| request.get(**field).is_some())
             .count();
-        let parsed: ModuleStateSyncWire = match serde_json::from_value(request.clone()) {
+        let parsed: ModuleStateSyncWire = match decode_state_sync_wire(&request) {
             Ok(req) => req,
             Err(error) => {
                 if envelope_fields_present > 0 {
@@ -11524,12 +11720,20 @@ impl McHandler {
         if !page_complete
             && request.as_object().is_some_and(|object| {
                 object.keys().any(|key| {
-                    !["method", "session_id", "shadow_generation"]
-                        .into_iter()
-                        .chain(TRANSFORM_PAGE_FIELDS)
-                        .chain(TRANSFORM_PAGE_ARRAY_FIELDS)
-                        .chain(TRANSFORM_PAGE_MAP_FIELDS)
-                        .any(|allowed| allowed == key.as_str())
+                    // `accept_reply_pages` is the caller's reply-paging capability. The plugin's
+                    // transport adds it to every request body, so it arrives on non-final pages
+                    // too; it changes only how the final reply is delivered, never the input.
+                    ![
+                        "method",
+                        "session_id",
+                        "shadow_generation",
+                        "accept_reply_pages",
+                    ]
+                    .into_iter()
+                    .chain(TRANSFORM_PAGE_FIELDS)
+                    .chain(TRANSFORM_PAGE_ARRAY_FIELDS)
+                    .chain(TRANSFORM_PAGE_MAP_FIELDS)
+                    .any(|allowed| allowed == key.as_str())
                 })
             })
         {
@@ -11862,6 +12066,32 @@ impl McHandler {
                 message: "dreamer.run_task requires the host-resolved model_chain".to_string(),
             };
         };
+        // Optional `model_variants` maps a chain model to its host-configured variant
+        // (for example an OpenCode reasoning variant), sent to the runner as
+        // `model.variant`. Older hosts omit it and their sends keep naming no variant.
+        let model_variants: BTreeMap<String, String> = match request.get("model_variants") {
+            None | Some(Value::Null) => BTreeMap::new(),
+            Some(Value::Object(entries)) => {
+                let mut variants = BTreeMap::new();
+                for (model, variant) in entries {
+                    let Some(variant) = variant.as_str() else {
+                        return invalid_params_error(
+                            "dreamer.run_task model_variants values must be strings",
+                        );
+                    };
+                    if variant.trim().is_empty() || variant.len() > 256 {
+                        return invalid_params_error(
+                            "dreamer.run_task model_variants values must be 1-256 bytes",
+                        );
+                    }
+                    variants.insert(model.clone(), variant.to_string());
+                }
+                variants
+            }
+            Some(_) => {
+                return invalid_params_error("dreamer.run_task model_variants must be an object");
+            }
+        };
         let classify_system_prompt = historian_prompt::with_content_language_directive(
             CLASSIFY_SYSTEM_PROMPT,
             binding.config.language.as_deref(),
@@ -11979,6 +12209,7 @@ impl McHandler {
                     classify_system_prompt.as_ref(),
                     prompt_body,
                     model,
+                    model_variants.get(model).map(String::as_str),
                     CLASSIFY_MAX_OUTPUT_TOKENS,
                     CLASSIFY_TEMPERATURE,
                 )
@@ -12005,7 +12236,9 @@ impl McHandler {
                     // envelope remains; the host parser rejects malformed contents.
                     record_attempt("manifest", String::new());
                     output = Some((model.clone(), result, child_session.clone()));
-                    producer.purge_session(&child_session).await;
+                    // Cleanup reports unsupported runner deletion and closes routes.
+                    // The classify result is independent of snapshot retention.
+                    let _ = producer.purge_session(&child_session).await;
                     break;
                 }
                 Ok(_) => record_attempt(
@@ -12014,7 +12247,7 @@ impl McHandler {
                 ),
                 Err(error) => record_attempt("failed", error.to_string()),
             }
-            producer.purge_session(&child_session).await;
+            let _ = producer.purge_session(&child_session).await;
         }
         if output.is_none() {
             let failure = if attempt_errors.is_empty() {
@@ -12466,6 +12699,9 @@ impl McHandler {
         let Some(name) = request.get("name").and_then(Value::as_str) else {
             return unrecognized_request_error(&request);
         };
+        if let Err(outcome) = self.check_catalog_call(channel, name, &request) {
+            return outcome;
+        }
         match name {
             "memory.set_classification" => {
                 self.handle_memory_set_classification(channel, &request)
@@ -12520,9 +12756,96 @@ impl McHandler {
         let config = tool_catalog::CatalogConfig::from_module_config(&binding.config);
         let arguments = request.get("arguments").unwrap_or(&Value::Null);
         match tool_catalog::catalog_answer_bytes(arguments, &config) {
-            Ok(bytes) => HandlerOutcome::Response(bytes),
+            Ok(bytes) => {
+                if arguments.get("composition").is_some_and(Value::is_object)
+                    && arguments.get("digest_only") != Some(&Value::Bool(true))
+                {
+                    // These bytes were just produced by the catalog, not supplied
+                    // by a caller. Retain only the facts needed to admit calls.
+                    let answer: Value = serde_json::from_slice(&bytes).expect("catalog JSON");
+                    let tools = answer["tools"]
+                        .as_array()
+                        .expect("catalog tools")
+                        .iter()
+                        .map(|tool| {
+                            tool["name"]
+                                .as_str()
+                                .expect("catalog tool name")
+                                .to_string()
+                        })
+                        .collect();
+                    self.frozen_tool_catalogs
+                        .lock()
+                        .expect("frozen catalog mutex")
+                        .insert(
+                            (binding.project_root, binding.session),
+                            tool_catalog::FrozenCatalog {
+                                compacting: tool_catalog::compacts_session(arguments)
+                                    .expect("validated composition"),
+                                tools,
+                            },
+                        );
+                }
+                HandlerOutcome::Response(bytes)
+            }
             Err(error) => error.into_outcome(),
         }
+    }
+
+    /// Apply role-catalog admission only when a call carries a preset or the
+    /// session has fetched a frozen catalog. Legacy plugin and Claude Code MCP
+    /// calls do neither; declaring the role's version alone cannot move them
+    /// onto a different tool set or disable their transform-backed reduction.
+    fn check_catalog_call(
+        &self,
+        channel: u16,
+        name: &str,
+        request: &Value,
+    ) -> Result<(), HandlerOutcome> {
+        if !name.starts_with("ctx_") {
+            return Ok(());
+        }
+        let preset = match request.get("preset") {
+            Some(Value::String(name)) => {
+                Some(tool_catalog::Preset::parse(name).ok_or_else(|| {
+                    tool_catalog::CatalogError::unserved_preset(name).into_outcome()
+                })?)
+            }
+            Some(_) => {
+                return Err(tool_catalog::CatalogError::Invalid {
+                    field: "preset".to_string(),
+                    message: "preset must be a string".to_string(),
+                }
+                .into_outcome())
+            }
+            None => None,
+        };
+        let frozen = self.facade_binding(channel).ok().and_then(|binding| {
+            self.frozen_tool_catalogs
+                .lock()
+                .expect("frozen catalog mutex")
+                .get(&(binding.project_root, binding.session))
+                .cloned()
+        });
+        if preset.is_none() && frozen.is_none() {
+            return Ok(());
+        }
+        let compacting = frozen.as_ref().is_some_and(|catalog| catalog.compacting);
+        let served = preset
+            .unwrap_or(tool_catalog::Preset::Head)
+            .serves(name, compacting)
+            && frozen
+                .as_ref()
+                .is_none_or(|catalog| catalog.tools.contains(name));
+        if !served {
+            let body = cortexkit_role_tool_provider::errors::unknown_tool(name);
+            return Err(HandlerOutcome::ErrorWithDetail {
+                code: body.code,
+                message: body.message,
+                detail: body.detail.unwrap_or(Value::Null),
+            });
+        }
+        Ok(())
     }
 
     /// Remember whether the route's consumer declared it speaks `tool-provider/v1`.
@@ -12713,6 +13036,14 @@ impl McHandler {
             .iter()
             .map(|tag| (tag.tag_number as u64, tag))
             .collect::<HashMap<_, _>>();
+        let cached_messages = self.cached_expand_messages(session_id);
+        let ctx_reduce_self_stamps =
+            ctx_reduce_self_stamp_tag_numbers(&tags, &requested, cached_messages.as_deref());
+        let ctx_reduce_self_stamp_set = ctx_reduce_self_stamps
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let ctx_reduce_self_stamp_note = ctx_reduce_self_stamp_notes(&ctx_reduce_self_stamps);
         let pending_ids = pending
             .iter()
             .map(|drop| drop.target_id.as_str())
@@ -12725,6 +13056,7 @@ impl McHandler {
         let already_queued = requested
             .iter()
             .copied()
+            .filter(|number| !ctx_reduce_self_stamp_set.contains(number))
             .filter(|number| {
                 by_number
                     .get(number)
@@ -12734,6 +13066,7 @@ impl McHandler {
         let queueable = requested
             .iter()
             .copied()
+            .filter(|number| !ctx_reduce_self_stamp_set.contains(number))
             .filter(|number| {
                 by_number
                     .get(number)
@@ -12741,15 +13074,26 @@ impl McHandler {
             })
             .collect::<Vec<_>>();
         if queueable.is_empty() {
+            if !ctx_reduce_self_stamp_note.is_empty()
+                && unknown.is_empty()
+                && already_queued.is_empty()
+            {
+                return mcp_text_result(ctx_reduce_self_stamp_note, false);
+            }
             let reason = ctx_reduce_ack_details(&unknown, &already_queued);
-            return tool_error_result(format!(
+            let mut refusal = format!(
                 "Refused: no valid tags to queue. {}",
                 if reason.is_empty() {
                     "No requested tags are available for delivery.".to_string()
                 } else {
                     reason
                 }
-            ));
+            );
+            if !ctx_reduce_self_stamp_note.is_empty() {
+                refusal.push(' ');
+                refusal.push_str(&ctx_reduce_self_stamp_note);
+            }
+            return tool_error_result(refusal);
         }
 
         let loaded = match store.load(session_id) {
@@ -12780,6 +13124,9 @@ impl McHandler {
                     .tag_numbers
                     .tag_numbers
                     .contains(&protection_window::TagNumber(*number as i64))
+                    || by_number.get(number).is_some_and(|tag| {
+                        loaded.meta.protected_tool_block_ids.contains(&tag.block_id)
+                    })
             });
         let mut details = Vec::new();
         if !immediate.is_empty() {
@@ -12803,6 +13150,10 @@ impl McHandler {
             reply.push_str(&ctx_reduce_held_reply(&deferred));
         }
         reply.push_str(" Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later.");
+        if !ctx_reduce_self_stamp_note.is_empty() {
+            reply.push(' ');
+            reply.push_str(&ctx_reduce_self_stamp_note);
+        }
         mcp_text_result(reply, false)
     }
 
@@ -14203,6 +14554,10 @@ fn json_type_name(value: &Value) -> &'static str {
 /// first materialization freezes it into meta); every later pass reads the frozen value,
 /// never this, so expiry never drifts the rendered bytes between passes.
 fn now_ms() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = tests::per_pass_fixed_now_ms() {
+        return now;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -14588,12 +14943,15 @@ fn encode_full_native_messages(
 ) -> Vec<Value> {
     let served = response.messages();
     let native_reasoning_keep_mids = &response.native_reasoning_keep_mids;
+    profile_start!(perf_decode, "native_reference_decode");
     let sidecar = request
         .native_messages
         .as_deref()
         .map(codec::decode_opencode)
         .map(|decoded| decoded.sidecar)
         .unwrap_or_else(|| codec::DecodeSidecar::new("opencode"));
+    profile_end!(perf_decode);
+    profile_start!(perf_prepare, "native_reference_prepare");
     let served_messages = served
         .iter()
         .map(|message| message.deref().clone())
@@ -14604,6 +14962,8 @@ fn encode_full_native_messages(
         .collect::<Vec<_>>();
     let reasoning_exempt_mid =
         transform::latest_assistant_reasoning_mutation_exempt_mid(&request.messages);
+    profile_end!(perf_prepare);
+    profile_start!(perf_encode, "native_reference_encode");
     let mut native_messages =
         codec::opencode::encode_opencode_with_transition_state_and_reasoning_exemption(
             &served_messages,
@@ -14613,6 +14973,8 @@ fn encode_full_native_messages(
             reasoning_exempt_mid,
             transition_consumed,
         );
+    profile_end!(perf_encode);
+    profile_start!(_perf_reasoning, "native_reference_reasoning");
     if let Some(profile) = SerializerProfile::parse(&request.serializer_profile) {
         transform::clear_served_native_reasoning_with_tags(
             profile,
@@ -14698,6 +15060,10 @@ fn native_ingress_chunks(
 static NATIVE_ATTACHMENT_DIFFERENTIAL: OnceLock<bool> = OnceLock::new();
 
 fn native_attachment_differential_enabled() -> bool {
+    #[cfg(test)]
+    if tests::per_pass_differentials_disabled() {
+        return false;
+    }
     cfg!(test)
         || *NATIVE_ATTACHMENT_DIFFERENTIAL.get_or_init(|| {
             std::env::var("MC_NATIVE_ATTACHMENT_DIFFERENTIAL").as_deref() == Ok("1")
@@ -14722,6 +15088,7 @@ fn attach_native_messages_incremental(
         return NativeAttachmentCacheStats::default();
     }
 
+    profile_start!(perf_snapshot, "native_snapshot_validate");
     let mut cached = cache
         .lock()
         .expect("native attachment cache mutex")
@@ -14730,7 +15097,11 @@ fn attach_native_messages_incremental(
         .as_ref()
         .map(|snapshot| validated_native_prefix(request, snapshot, native_delta_frontier))
         .unwrap_or(0);
+    profile_end!(perf_snapshot);
+    profile_start!(perf_decode, "native_sidecar_decode");
     let mut sidecar = native_sidecar(request, cached.as_ref(), trusted_prefix);
+    profile_end!(perf_decode);
+    profile_start!(perf_indexes, "native_indexes");
     let sidecar_positions = sidecar
         .order
         .iter()
@@ -14778,6 +15149,8 @@ fn attach_native_messages_incremental(
         .map(|snapshot| std::mem::take(&mut snapshot.sidecar_sizes))
         .unwrap_or_default();
     let cleared_mids = transform::reasoning_native_clear_mids(reasoning_clear_units);
+    profile_end!(perf_indexes);
+    profile_start!(perf_keys, "native_message_keys");
     let mut message_keys = Vec::with_capacity(response.messages().len());
     for (position, served) in response.messages().iter().enumerate() {
         let meta = codec::sidecar::meta_for_ck(&sidecar, served, position);
@@ -14847,6 +15220,8 @@ fn attach_native_messages_incremental(
             mode,
         ));
     }
+    profile_end!(perf_keys);
+    profile_start!(perf_remaining_hashes, "native_remaining_hashes");
     for (slot, meta) in &sidecar.messages {
         if sidecar_sizes.contains_key(slot) {
             continue;
@@ -14857,6 +15232,8 @@ fn attach_native_messages_incremental(
     }
     sidecar_hashes.retain(|slot, _| sidecar_positions.contains_key(slot.as_str()));
     sidecar_sizes.retain(|slot, _| sidecar_positions.contains_key(slot.as_str()));
+    profile_end!(perf_remaining_hashes);
+    profile_start!(perf_frontier, "native_reuse_frontier");
 
     let cache_compatible = cached
         .as_ref()
@@ -14895,6 +15272,8 @@ fn attach_native_messages_incremental(
             })
             .unwrap_or(0)
     };
+    profile_end!(perf_frontier);
+    profile_start!(perf_suffix_prepare, "native_suffix_prepare");
 
     let mut chunks = if cache_compatible {
         cached
@@ -14926,6 +15305,8 @@ fn attach_native_messages_incremental(
             sidecar_sizes.insert(slot, retained_bytes);
         }
     }
+    profile_end!(perf_suffix_prepare);
+    profile_start!(perf_encode, "native_suffix_encode");
     let encoded_suffix = codec::opencode::encode_opencode_chunks_with_transition_state(
         &served_suffix,
         &sidecar,
@@ -14938,6 +15319,8 @@ fn attach_native_messages_incremental(
         transition_consumed,
         suffix_start,
     );
+    profile_end!(perf_encode);
+    profile_start!(perf_reasoning, "native_suffix_reasoning");
     let mut suffix_values = encoded_suffix
         .iter()
         .map(|chunk| chunk.value.clone())
@@ -14959,6 +15342,8 @@ fn attach_native_messages_incremental(
         &sidecar,
         &response.native_reasoning_keep_mids,
     );
+    profile_end!(perf_reasoning);
+    profile_start!(perf_drift, "native_reencode_drift");
     let reencode_drift = if cache_compatible {
         let previous = cached
             .as_ref()
@@ -14982,6 +15367,8 @@ fn attach_native_messages_incremental(
             first.1,
         );
     }
+    profile_end!(perf_drift);
+    profile_start!(perf_assemble, "native_output_assemble_validate");
     chunks.extend(
         encoded_suffix
             .into_iter()
@@ -14998,10 +15385,14 @@ fn attach_native_messages_incremental(
         .iter()
         .map(|chunk| Arc::clone(&chunk.value))
         .collect::<Vec<_>>();
+    profile_end!(perf_assemble);
+    profile_start!(perf_ingress, "native_ingress_chunks");
     let (ingress_chunks, ingress_chunk_retained_bytes) =
         native_ingress_chunks(request, &chunks, native_delta_frontier);
+    profile_end!(perf_ingress);
 
     if native_attachment_differential_enabled() {
+        profile_start!(_perf_differential, "native_differential");
         let full = encode_full_native_messages(
             response,
             request,
@@ -15011,6 +15402,7 @@ fn attach_native_messages_incremental(
             lineage_anchor_mid,
             transition_consumed,
         );
+        profile_start!(_perf_bytes, "native_differential_bytes");
         let full_bytes = serde_json::to_vec(&full).expect("full native output must serialize");
         let incremental_bytes =
             serde_json::to_vec(&native_messages).expect("incremental native output must serialize");
@@ -15020,6 +15412,7 @@ fn attach_native_messages_incremental(
         );
     }
 
+    profile_start!(perf_publish, "native_publish");
     let request_native_retained_bytes = request.native_messages.as_ref().map_or(0, |messages| {
         messages
             .capacity()
@@ -15063,6 +15456,7 @@ fn attach_native_messages_incremental(
             served_bytes,
         );
     response.native_messages = Some(native_messages);
+    profile_end!(perf_publish);
     stats
 }
 
@@ -15985,7 +16379,12 @@ fn invalid_params_error(message: impl Into<String>) -> HandlerOutcome {
 
 const MAX_FACADE_FRAME_BYTES: usize =
     subc_protocol::MAX_FRAME_BODY_LEN as usize - SUBC_FRAME_BODY_HEADROOM_BYTES;
-const MAX_TRANSFORM_FRAME_BYTES: usize = MAX_FACADE_FRAME_BYTES;
+/// Plugins size transform pages to the facade cap and the transport then appends a
+/// few capability bytes (`accept_reply_pages`), so a full page can arrive slightly
+/// over it. Transform-class frames get a 64 KiB allowance, still far inside the
+/// 16 MiB headroom below the real subc frame limit; agent tool calls keep the cap.
+const TRANSFORM_FRAME_ALLOWANCE_BYTES: usize = 64 * 1024;
+const MAX_TRANSFORM_FRAME_BYTES: usize = MAX_FACADE_FRAME_BYTES + TRANSFORM_FRAME_ALLOWANCE_BYTES;
 
 /// Minimal probe deserialized from an oversized body ONLY to pick the right byte
 /// cap. serde ignores every other field, so this stays cheap relative to a full
@@ -15996,12 +16395,23 @@ struct RequestMethodProbe {
     method: Option<String>,
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    transform_page_index: Option<u64>,
+    #[serde(default)]
+    transform_page_total: Option<u64>,
+    #[serde(default)]
+    transform_page_id: Option<String>,
 }
 
 impl RequestMethodProbe {
     fn is_transform_class(&self) -> bool {
         let named = |value: &Option<String>, name: &str| value.as_deref() == Some(name);
         named(&self.kind, "transform")
+            // Non-final transform pages carry the page envelope but not `kind`,
+            // which travels with the scalar fields on the final page.
+            || self.transform_page_id.is_some()
             // A single state-sync row can exceed the facade cap, so this live module
             // path uses the transform-class ceiling as well.
             || named(&self.method, "state_sync")
@@ -16016,9 +16426,20 @@ fn enforce_request_byte_cap(body: &[u8]) -> Result<(), HandlerOutcome> {
     if body.len() <= MAX_FACADE_FRAME_BYTES {
         return Ok(());
     }
-    let transform_class = serde_json::from_slice::<RequestMethodProbe>(body)
-        .map(|probe| probe.is_transform_class())
-        .unwrap_or(false);
+    let probe = serde_json::from_slice::<RequestMethodProbe>(body).ok();
+    // Record only envelope metadata, never message or tool content. A late
+    // transport field can overrun a page by just a few bytes; log the actual
+    // received length and zero-based index to distinguish that from assembly.
+    tracing::warn!(
+        "mc-request-byte-cap refused bytes={} cap={} method={:?} kind={:?} session={:?} page_index={:?} page_total={:?}",
+        body.len(), MAX_FACADE_FRAME_BYTES,
+        probe.as_ref().and_then(|p| p.method.as_deref()),
+        probe.as_ref().and_then(|p| p.kind.as_deref()),
+        probe.as_ref().and_then(|p| p.session_id.as_deref()),
+        probe.as_ref().and_then(|p| p.transform_page_index),
+        probe.as_ref().and_then(|p| p.transform_page_total),
+    );
+    let transform_class = probe.is_some_and(|probe| probe.is_transform_class());
     if transform_class {
         if body.len() <= MAX_TRANSFORM_FRAME_BYTES {
             return Ok(());
@@ -16648,6 +17069,63 @@ fn ctx_reduce_ack_details(unknown: &[u64], already_queued: &[u64]) -> String {
     details.join("; ")
 }
 
+const CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE: &str =
+    "§N§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.";
+
+fn ctx_reduce_self_stamp_message(tag_number: u64) -> String {
+    CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE.replace("§N§", &format!("§{tag_number}§"))
+}
+
+fn cached_tool_name_for_tag(
+    messages: Option<&[ck_wire::CkIngressMessage]>,
+    block_id: &str,
+) -> Option<String> {
+    let messages = messages?;
+    let (mid, block_index) = ck_wire::split_block_id(block_id)?;
+    let message = messages.iter().find(|message| message.mid == mid)?;
+    let block = message.ck.content.get(block_index)?;
+    match &block.kind {
+        ck_wire::CkKind::ToolCall { name, .. } => Some(name.clone()),
+        ck_wire::CkKind::ToolResult { tool_name, .. } => Some(tool_name.clone()),
+        _ => None,
+    }
+}
+
+fn ctx_reduce_self_stamp_tag_numbers(
+    tags: &[McTagRow],
+    requested: &[u64],
+    cached_messages: Option<&[ck_wire::CkIngressMessage]>,
+) -> Vec<u64> {
+    let mut refused = Vec::new();
+    for number in requested {
+        let Some(tag) = tags.iter().find(|tag| tag.tag_number == *number as i64) else {
+            continue;
+        };
+        if cached_tool_name_for_tag(cached_messages, &tag.block_id)
+            .is_some_and(|tool_name| tool_name == "ctx_reduce")
+            && !refused.contains(number)
+        {
+            refused.push(*number);
+        }
+    }
+    refused
+}
+
+fn ctx_reduce_self_stamp_notes(numbers: &[u64]) -> String {
+    numbers
+        .iter()
+        .map(|number| ctx_reduce_self_stamp_message(*number))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn add_ctx_reduce_stamp_fields(response: &mut Value, refused: &[u64], accepted: &[u64]) {
+    if !refused.is_empty() {
+        response["ctx_reduce_self_stamps"] = json!(refused);
+        response["ctx_reduce_queued_tags"] = json!(accepted);
+    }
+}
+
 fn format_plain_tag_numbers(numbers: &[u64]) -> String {
     numbers
         .iter()
@@ -17218,6 +17696,19 @@ fn format_glance_row(note: &StoredNote, now_ms: i64) -> String {
     if note.status != "active" {
         markers.push(note.status.as_str());
     }
+    let parked;
+    if note.type_name == "smart"
+        && note.status == "pending"
+        && note.check_status.as_deref() == Some("parked")
+    {
+        parked = format!(
+            "parked: {}",
+            note.ready_reason
+                .as_deref()
+                .unwrap_or("Condition can't be checked")
+        );
+        markers.push(parked.as_str());
+    }
     if now_ms - touched_at >= STALE_AFTER_MS {
         markers.push("stale");
     }
@@ -17733,34 +18224,40 @@ fn facade_command_outcome(result: Result<FacadeMutationOutcome, McStoreError>) -
 }
 
 fn canonical_value(value: &Value) -> String {
+    let mut output = Vec::new();
+    write_canonical_value(value, &mut output);
+    String::from_utf8(output).expect("canonical JSON is UTF-8")
+}
+
+fn write_canonical_value(value: &Value, output: &mut Vec<u8>) {
     match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(v) => v.to_string(),
-        Value::Number(n) => canonical_number(n),
-        Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()),
+        Value::Null => output.extend_from_slice(b"null"),
+        Value::Bool(value) => output.extend_from_slice(if *value { b"true" } else { b"false" }),
+        Value::Number(number) => output.extend_from_slice(canonical_number(number).as_bytes()),
+        Value::String(text) => serde_json::to_writer(output, text).expect("JSON strings serialize"),
         Value::Array(values) => {
-            let inner = values
-                .iter()
-                .map(canonical_value)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("[{inner}]")
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                write_canonical_value(value, output);
+            }
+            output.push(b']');
         }
         Value::Object(map) => {
+            output.push(b'{');
             let mut entries = map.iter().collect::<Vec<_>>();
             entries.sort_by_key(|(key, _)| *key);
-            let inner = entries
-                .into_iter()
-                .map(|(key, value)| {
-                    format!(
-                        "{}:{}",
-                        serde_json::to_string(key).unwrap_or_default(),
-                        canonical_value(value)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{inner}}}")
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key).expect("JSON keys serialize");
+                output.push(b':');
+                write_canonical_value(value, output);
+            }
+            output.push(b'}');
         }
     }
 }
@@ -18012,7 +18509,7 @@ fn boundary_block_tokens(
     block: &crate::ck_wire::FlatBlock,
     cache_snapshot: &mut BoundaryTokenCacheSnapshot,
 ) -> usize {
-    if let crate::ck_wire::CkKind::Media(media) = &block.wire.kind {
+    if let crate::ck_wire::CkKind::Media(media) = &block.wire_shape().kind {
         if let Some(tokens) = crate::image_tokens::media_image_tokens(media) {
             return tokens;
         }
@@ -18557,6 +19054,8 @@ pub fn manifest_with_route_targets(
         sub_supervises: false,
     }])
     .consumes(vec![ConsumerRole::ServiceClient {
+        // ServiceClient is a route declaration, not a capability requirement. The provider
+        // runner may be absent: only an incoming provider call needs its callback/read route.
         of: route_targets(resolved_routes),
     }])
     .build()
@@ -18592,6 +19091,17 @@ mod tests {
     mod gate_a1_b0_baseline_probe;
     mod gate_a2;
     mod guidance_get_golden;
+    mod per_pass_cost;
+    mod perf_audit_canonical;
+    mod perf_audit_wire;
+    // Only the profiling harness can construct the scoped override. Differential
+    // predicates can read it without exposing a switch to other test suites.
+    pub(crate) fn per_pass_differentials_disabled() -> bool {
+        per_pass_cost::differentials_disabled()
+    }
+    pub(crate) fn per_pass_fixed_now_ms() -> Option<i64> {
+        per_pass_cost::fixed_now_ms()
+    }
     mod single_store_drill;
     mod tool_catalog;
     mod tool_catalog_conformance;
@@ -18638,10 +19148,10 @@ mod tests {
         assert_eq!(
             hosted.consumes,
             vec![ConsumerRole::ServiceClient {
-                of: vec!["thalamus".to_string()],
+                of: vec!["thalamus".to_string(), "broca".to_string()],
             }]
         );
-        // Self-signals drop out with the runner target, but the field stays declared
+        // Self-signals drop out with the background-completion target, but the field stays declared
         // ("examined, none").
         assert_eq!(hosted.self_signals, Some(vec![]));
         assert_eq!(
@@ -20126,7 +20636,7 @@ mod tests {
         let line = supported_fences_line();
         assert_eq!(
             line,
-            format!("context.db=94 store.db={LATEST_MIGRATION_VERSION}")
+            format!("context.db=95 store.db={LATEST_MIGRATION_VERSION}")
         );
     }
 
@@ -20648,6 +21158,20 @@ mod tests {
         assert!(
             enforce_request_byte_cap(&pad("transform", "kind", MAX_TRANSFORM_FRAME_BYTES)).is_err()
         );
+        // A full transform page plus the transport's late capability field is
+        // admitted, including a non-final page that only carries the page envelope.
+        let just_over_facade = MAX_FACADE_FRAME_BYTES + 32;
+        assert!(enforce_request_byte_cap(&pad("transform", "kind", just_over_facade)).is_ok());
+        assert!(
+            enforce_request_byte_cap(&pad("abc", "transform_page_id", just_over_facade)).is_ok()
+        );
+        assert!(enforce_request_byte_cap(&pad("ctx_memory", "method", just_over_facade)).is_err());
+        assert!(
+            enforce_request_byte_cap(&pad("transform", "method", MAX_FACADE_FRAME_BYTES)).is_err()
+        );
+        assert!(
+            enforce_request_byte_cap(&pad("ctx_memory", "name", MAX_FACADE_FRAME_BYTES)).is_err()
+        );
     }
 
     #[test]
@@ -20831,6 +21355,8 @@ mod tests {
         prompts: Mutex<Vec<String>>,
         systems: Mutex<Vec<String>>,
         models: Mutex<Vec<String>>,
+        /// The `model.variant` each variant-carrying start named, in attempt order.
+        variants: Mutex<Vec<Option<String>>>,
         /// The provider session each start ran under, in attempt order.
         sessions: Mutex<Vec<String>>,
         on_await_output: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -20871,6 +21397,41 @@ mod tests {
         async fn bind_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
             self.state.binds.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn start_with_temperature(
+            &mut self,
+            session_id: &str,
+            system: &str,
+            prompt: &str,
+            model: &str,
+            variant: Option<&str>,
+            _temperature: Option<f64>,
+        ) -> Result<RunHandle, HistorianProducerError> {
+            self.state
+                .variants
+                .lock()
+                .expect("variants mutex")
+                .push(variant.map(str::to_string));
+            self.start(session_id, system, prompt, model).await
+        }
+
+        async fn start_with_generation(
+            &mut self,
+            session_id: &str,
+            system: &str,
+            prompt: &str,
+            model: &str,
+            variant: Option<&str>,
+            _max_output_tokens: u32,
+            _temperature: f64,
+        ) -> Result<RunHandle, HistorianProducerError> {
+            self.state
+                .variants
+                .lock()
+                .expect("variants mutex")
+                .push(variant.map(str::to_string));
+            self.start(session_id, system, prompt, model).await
         }
 
         async fn start(
@@ -21032,6 +21593,63 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         handler.bind_route(7, binding(project.to_str().unwrap(), "ses"));
         (handler, store, dir, project)
+    }
+
+    fn cache_last_served_test_messages(
+        handler: &McHandler,
+        session_id: &str,
+        messages: Vec<CkIngressMessage>,
+    ) {
+        let request = serde_json::from_value::<TransformRequest>(json!({
+            "serializer_profile": "opencode",
+            "session_id": session_id,
+            "render_config": "",
+            "messages": messages,
+        }))
+        .expect("test transform request");
+        let mut snapshots = handler.transform_snapshots.lock().unwrap();
+        let generation = snapshots.begin(session_id);
+        snapshots.finish_ready(session_id, generation, Arc::new(request), 0, 1);
+    }
+
+    fn cached_tool_result(mid: &str, tool_name: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "tool",
+                vec![CkWireBlock::bare(CkKind::ToolResult {
+                    id: format!("call-{mid}"),
+                    tool_name: tool_name.to_string(),
+                    output: CkToolOutput::bare(CkOutputKind::Text {
+                        text: "tool output".to_string(),
+                    }),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        }
+    }
+
+    fn cached_tool_call(mid: &str, tool_name: &str) -> CkIngressMessage {
+        CkIngressMessage {
+            mid: mid.to_string(),
+            ordinal: 1,
+            ck: CkWireMessage::from_parts(
+                "assistant",
+                vec![CkWireBlock::bare(CkKind::ToolCall {
+                    id: format!("call-{mid}"),
+                    name: tool_name.to_string(),
+                    input: json!({}),
+                    provider_executed: false,
+                })],
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            ),
+        }
     }
 
     /// The project key the claim lane resolves for a channel bound to this project
@@ -21207,7 +21825,7 @@ mod tests {
             let mut wire = request(vec![ck("tail", 1, "raw tail")]);
             wire["serializer_profile"] = json!("claude-code-anthropic");
             wire["model_key"] = json!(model);
-            handler.record_response_observation("ses", now_ms());
+            wire["prev_response_completed_at_ms"] = json!(now_ms());
             wire["usage"] =
                 json!({"current_total_input_tokens": usage, "context_limit_tokens": 100_000});
             if let Some(host) = host {
@@ -21219,6 +21837,104 @@ mod tests {
         assert!(handler.threshold_logged_routes.lock().unwrap().contains(&7));
         handler.bind_route(7, route);
         assert!(!handler.threshold_logged_routes.lock().unwrap().contains(&7));
+    }
+
+    #[tokio::test]
+    async fn issue_610_preparation_does_not_spend_host_completion_clock() {
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let mut wire = request_with_usage(vec![ck("tail", 1, "raw tail")], 1_000, 50_000);
+        call_transform_request(&handler, wire.clone()).await;
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.expiry_cutoff_ms = 1;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        wire["prev_response_completed_at_ms"] = json!(2);
+        let expired = call_transform_request(&handler, wire.clone()).await;
+        assert_eq!(expired["action"], "HARD");
+        let retry = call_transform_request(&handler, wire.clone()).await;
+        assert_eq!(retry["action"], "SOFT+");
+        assert_eq!(retry["scheduler_decision"], "execute");
+        assert_eq!(retry["materialize_reason"], "ttl_idle");
+        // Usage-less served completion is still supplied by the host clock owner.
+        wire["prev_response_completed_at_ms"] = json!(now_ms());
+        wire.as_object_mut().unwrap().remove("usage");
+        let served = call_transform_request(&handler, wire).await;
+        assert_eq!(served["scheduler_decision"], "defer");
+    }
+
+    #[tokio::test]
+    async fn session_cache_ttl_reload_only_rebuilds_through_normal_idle_expiry() {
+        let mut config = default_test_config();
+        config.cache_ttl = "1h".to_string();
+        config
+            .cache_ttl_by_model
+            .insert("default".to_string(), "1h".to_string());
+        let (mut handler, store, _dir, _) =
+            handler_with_store(Arc::new(ProducerState::default()), config.clone());
+        let mut wire = request_with_usage(vec![ck("tail", 1, "unchanged raw tail")], 1_000, 50_000);
+        wire["model_key"] = json!("anthropic/opus");
+        wire["prev_response_completed_at_ms"] = json!(now_ms());
+        let original = call_transform_request(&handler, wire.clone()).await;
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.expiry_cutoff_ms = now_ms() - 3 * 3_600_000;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        config.cache_ttl = "13h".to_string();
+        handler.fixed_config = Some(config.clone());
+        wire["prev_response_completed_at_ms"] = json!(now_ms() - 2 * 3_600_000);
+        let raised = call_transform_request(&handler, wire.clone()).await;
+        assert_eq!(raised["scheduler_decision"], "defer");
+        assert_ne!(raised["action"], "HARD");
+        assert_eq!(raised["ck_messages"], original["ck_messages"]);
+        config.cache_ttl = "1m".to_string();
+        handler.fixed_config = Some(config);
+        wire["prev_response_completed_at_ms"] = json!(now_ms());
+        let lowered_warm = call_transform_request(&handler, wire.clone()).await;
+        assert_eq!(lowered_warm["scheduler_decision"], "defer");
+        assert_eq!(lowered_warm["ck_messages"], raised["ck_messages"]);
+        wire["prev_response_completed_at_ms"] = json!(now_ms() - 120_000);
+        let lowered_idle = call_transform_request(&handler, wire).await;
+        assert_eq!(lowered_idle["scheduler_decision"], "execute");
+        assert_eq!(lowered_idle["action"], "HARD");
+        assert_eq!(lowered_idle["materialize_reason"], "ttl_expiry");
+        assert_eq!(
+            store
+                .load_meta("ses")
+                .unwrap()
+                .meta
+                .cache_ttl_policy
+                .unwrap()
+                .source,
+            "your config"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cache_ttl_builtin_reload_keeps_the_original_idle_decision() {
+        let config = default_test_config();
+        let (mut handler, store, _dir, _) =
+            handler_with_store(Arc::new(ProducerState::default()), config.clone());
+        let mut wire = request_with_usage(vec![ck("tail", 1, "raw tail")], 1_000, 50_000);
+        wire["prev_response_completed_at_ms"] = json!(now_ms());
+        call_transform_request(&handler, wire.clone()).await;
+        handler.fixed_config = Some(McModuleConfig {
+            cache_ttl: "10m".to_string(),
+            ..config
+        });
+        wire["prev_response_completed_at_ms"] = json!(now_ms() - 7 * 60_000);
+        let response = call_transform_request(&handler, wire).await;
+        assert_eq!(response["scheduler_decision"], "execute");
+        let policy = store
+            .load_meta("ses")
+            .unwrap()
+            .meta
+            .cache_ttl_policy
+            .unwrap();
+        assert_eq!(policy.value, "5m");
+        assert_eq!(policy.source, "built-in default, frozen for this session");
     }
 
     #[test]
@@ -21269,6 +21985,7 @@ mod tests {
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             catalog: crate::config::CatalogConfigInputs::default(),
             historian_temperature: None,
+            historian_expand_tools: Default::default(),
             historian_runner: None,
             dreamer_runner: None,
             language: None,
@@ -21292,6 +22009,7 @@ mod tests {
             temporal_awareness: true,
             prompt_surface_guidance_override: None,
             smart_drops: false,
+            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
         }
     }
@@ -21451,7 +22169,7 @@ mod tests {
             .collect()
     }
 
-    fn big_messages() -> Vec<CkIngressMessage> {
+    pub(super) fn big_messages() -> Vec<CkIngressMessage> {
         big_messages_from(1)
     }
 
@@ -21491,7 +22209,7 @@ mod tests {
 
     const TEST_HISTORIAN_MODEL: &str = "test/model";
 
-    fn request(messages: Vec<CkIngressMessage>) -> Value {
+    pub(super) fn request(messages: Vec<CkIngressMessage>) -> Value {
         request_with_usage(messages, 45_000, 50_000)
     }
 
@@ -23662,6 +24380,258 @@ mod tests {
     }
 
     #[test]
+    fn projection_admission_rejection_warns_once_per_session_at_warn_level() {
+        use tracing_subscriber::prelude::*;
+
+        let logs = tempfile::tempdir().unwrap();
+        let mut config = cortexkit_log::Config::in_dir("magic-context", logs.path());
+        config.spec = Some("warn".to_string());
+        let (layer, log) = cortexkit_log::layer(config).unwrap();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let request = native_cache_request("uncacheable", vec![ck("m1", 1, "one")], vec![], "fp");
+        let snapshot = ProjectionCacheSnapshot {
+            context: projection_cache_context(&request),
+            full_array_fingerprint: request.full_array_fingerprint.clone(),
+            projection: Arc::new(crate::ck_wire::project_messages(&request.messages).unwrap()),
+            message_retained_bytes: Arc::new(vec![0]),
+        };
+        let mut cache = ProjectionCache::with_limits(1, 1);
+        tracing::subscriber::with_default(subscriber, || {
+            cache.replace("uncacheable", 0, snapshot.clone());
+            cache.replace("uncacheable", 0, snapshot.clone());
+            assert!(cache.snapshot("uncacheable", 1).is_none());
+            cache.replace("uncacheable", 1, snapshot.clone());
+            cache.replace("other-session", 0, snapshot.clone());
+        });
+        let lines = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(
+            lines.matches("projection-cache admission-rejected").count(),
+            2
+        );
+        assert_eq!(lines.matches("session=uncacheable ").count(), 1);
+        assert_eq!(lines.matches("session=other-session ").count(), 1);
+        assert_eq!(lines.matches(" WARN ").count(), 2);
+        assert!(lines.contains("byte_charge="));
+        assert!(lines.contains("entry_budget=1 total_budget=1 previous_entry_kept=false"));
+        assert!(lines.contains("fallback=need_full_sync_then_full_request"));
+        assert!(lines.contains("consequence=full_sync_each_pass_unless_request_snapshot_available"));
+        assert_eq!(cache.retained_bytes, 0);
+        assert_eq!(cache.admission_warned_sessions.len(), 2);
+        cache.forget_session("uncacheable");
+        assert!(!cache.admission_warned_sessions.contains("uncacheable"));
+        assert!(cache.admission_warned_sessions.contains("other-session"));
+    }
+
+    #[test]
+    fn projection_entry_ceiling_still_enforces_total_lru_budget() {
+        let request = native_cache_request("large", vec![ck("m1", 1, "one")], vec![], "fp");
+        let snapshot = ProjectionCacheSnapshot {
+            context: projection_cache_context(&request),
+            full_array_fingerprint: request.full_array_fingerprint.clone(),
+            projection: Arc::new(crate::ck_wire::project_messages(&request.messages).unwrap()),
+            message_retained_bytes: Arc::new(vec![0]),
+        };
+        let charge = snapshot.retained_bytes("large");
+        let mut cache = ProjectionCache::with_limits(charge * 2 - 1, charge);
+        cache.replace("small", 0, snapshot.clone());
+        cache.replace("large", 0, snapshot.clone());
+        assert!(!cache.sessions.contains_key("small"));
+        assert!(cache.sessions.contains_key("large"));
+        assert_eq!(cache.retained_bytes, charge);
+        assert!(cache.retained_bytes <= cache.max_retained_bytes);
+
+        // An oversized replacement must not eject an unrelated admitted entry or erase its own
+        // last usable generation. A later fingerprint mismatch still asks for full sync.
+        let mut oversized = snapshot;
+        oversized.message_retained_bytes = Arc::new(vec![0; charge]);
+        cache.replace("large", 0, oversized);
+        assert_eq!(cache.sessions["large"].retained_bytes, charge);
+        assert_eq!(cache.retained_bytes, charge);
+    }
+
+    #[test]
+    fn alf_scale_projection_is_retained_and_next_pass_accepts_tail_delta() {
+        const SESSION: &str = "alf-projection";
+        const MESSAGES: usize = 9_268;
+        // Unlike the frame-cap sidecar fixture, put the bulk in canonical blocks. Deserialization
+        // also retains lossless block JSON, as it does for a real full-sync request.
+        let (typed, served) = native_cache_fixture(SESSION, MESSAGES, 30_000, 57_000_000);
+        drop(served);
+        let wire = serde_json::to_vec(&typed).unwrap();
+        drop(typed);
+        let request: TransformRequest = serde_json::from_slice(&wire).unwrap();
+        let wire_bytes = wire.len();
+        drop(wire);
+        let projection = Arc::new(crate::ck_wire::project_messages(&request.messages).unwrap());
+        // Only canonical bytes own the scalar payload. The lossless and typed wire shells
+        // retain empty strings, and the payload view shares that canonical allocation.
+        let mut payload_allocations = 0;
+        for block in &projection.blocks {
+            let CkKind::Text { text } = &block.wire_shape().kind else {
+                panic!("text fixture");
+            };
+            let original = block.wire_shape().retained_original_json().unwrap()["kind"]["text"]
+                .as_str()
+                .unwrap();
+            assert_eq!(text.capacity(), 0);
+            assert!(original.is_empty());
+            let payload = block.scalar_text().unwrap();
+            assert!(matches!(payload, std::borrow::Cow::Borrowed(_)));
+            assert!(payload.as_ptr() >= block.bytes.as_ptr());
+            assert!(payload.as_ptr() < block.bytes.as_ptr().wrapping_add(block.bytes.len()));
+            payload_allocations += block.bytes.len();
+        }
+        let charge = ProjectionCacheSnapshot {
+            context: projection_cache_context(&request),
+            full_array_fingerprint: request.full_array_fingerprint.clone(),
+            message_retained_bytes: Arc::new(vec![0; MESSAGES]),
+            projection: Arc::clone(&projection),
+        }
+        .retained_bytes(SESSION);
+        eprintln!("alf-projection messages={MESSAGES} blocks=30000 request_wire_bytes={wire_bytes} projection_byte_charge={charge}");
+        let canonical = projection
+            .blocks
+            .iter()
+            .map(|b| b.bytes.len())
+            .sum::<usize>();
+        let wire_charge = projection
+            .blocks
+            .iter()
+            .map(|b| b.wire.retained_bytes())
+            .sum::<usize>();
+        let original = projection
+            .blocks
+            .iter()
+            .map(|b| {
+                b.wire_shape()
+                    .retained_original_json()
+                    .map_or(0, crate::retained_size::value_retained_bytes)
+            })
+            .sum::<usize>();
+        eprintln!(
+            "alf-breakdown canonical={canonical} typed_wire={} original={original} other={}",
+            wire_charge - original,
+            charge - canonical - wire_charge
+        );
+        let mut delta_times = Vec::new();
+        for _ in 0..9 {
+            let started = Instant::now();
+            let mut messages = projection.reattach_messages_prefix(MESSAGES).unwrap();
+            messages.push(ck("benchmark-tail", (MESSAGES + 1) as u64, "new tail"));
+            let next =
+                crate::ck_wire::project_messages_incremental(&messages, &projection, MESSAGES)
+                    .unwrap();
+            std::hint::black_box(&next);
+            delta_times.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        delta_times.sort_by(f64::total_cmp);
+        eprintln!(
+            "alf-delta reattach_and_project_median_ms={:.3} samples={delta_times:?}",
+            delta_times[4]
+        );
+        assert!(charge >= payload_allocations);
+        assert!(
+            charge - payload_allocations < 40 * 1024 * 1024,
+            "structural overhead is bounded"
+        );
+        assert!(
+            charge <= wire_bytes * 11 / 10,
+            "text-heavy projection must stay below 1.1x wire"
+        );
+        assert!(
+            charge <= PROJECTION_CACHE_ENTRY_BUDGET_BYTES,
+            "fixture must fit the entry ceiling"
+        );
+
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        handler.bind_route(7, binding(project.to_str().unwrap(), SESSION));
+        // The former ~73 MiB constructed-text neighbor is now ~36 MiB. The compact budget
+        // must still admit both sessions so alternating passes do not force full syncs.
+        let neighbor = native_cache_request(
+            "neighbor",
+            vec![ck("neighbor-1", 1, &"n".repeat(36 * 1024 * 1024))],
+            vec![],
+            "neighbor-fp",
+        );
+        handler.store_projection_cache(
+            &neighbor,
+            0,
+            Arc::new(crate::ck_wire::project_messages(&neighbor.messages).unwrap()),
+            None,
+        );
+        drop(neighbor);
+        handler.store_projection_cache(&request, 0, Arc::clone(&projection), None);
+        assert!(
+            handler
+                .projections
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key(SESSION),
+            "ALF-size projection must survive admission"
+        );
+        assert!(
+            handler
+                .projections
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key("neighbor"),
+            "the measured large-session working set must coexist rather than alternate evictions"
+        );
+        // Keep only ingress native state: the served-output cache is not a delta authority.
+        let (response, _) = run_native_cache_pass(
+            &handler.native_attachments,
+            &request,
+            Vec::new(),
+            &BTreeMap::new(),
+            false,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        drop(response);
+        assert!(handler
+            .transform_snapshots
+            .lock()
+            .unwrap()
+            .ready_delta_request(SESSION)
+            .is_none());
+
+        let after = request.full_array_fingerprint.clone().unwrap();
+        drop(request);
+        let tail = ck("alf-tail", (MESSAGES + 1) as u64, "new tail");
+        let mut delta = native_cache_request(
+            SESSION,
+            vec![tail],
+            vec![native_text_message("alf-tail", "user", "new tail")],
+            "alf-next",
+        );
+        delta.tail_delta = Some(json!({
+            "after": after, "replace_from": MESSAGES, "native_replace_from": MESSAGES,
+        }));
+        let frontier = handler
+            .expand_transform_tail_delta(&mut delta)
+            .expect("next ordinary tail delta must not require full sync");
+        let cached = frontier
+            .projection_cache
+            .expect("delta must reuse the projection core");
+        assert_eq!(cached.replace_from, MESSAGES);
+        assert_eq!(delta.messages.len(), MESSAGES + 1);
+        assert_eq!(delta.native_messages.as_ref().unwrap().len(), MESSAGES + 1);
+        let incremental = crate::ck_wire::project_messages_incremental(
+            &delta.messages,
+            &cached.projection,
+            cached.replace_from,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &incremental.blocks[0].wire,
+            &projection.blocks[0].wire
+        ));
+    }
+
+    #[test]
     fn astro_scale_projection_cache_reuses_on_the_second_pass() {
         const ASTRO_MESSAGE_COUNT: usize = 4_600;
         const ASTRO_BLOCK_COUNT: usize = 15_000;
@@ -25809,6 +26779,171 @@ mod tests {
     /// never registered a keep for it. The next deferred passes, where that assistant is already
     /// demoted, must still replay the bytes the provider cached, until a priced pass.
     #[tokio::test(flavor = "current_thread")]
+    async fn compact_projection_multi_pass_served_bytes_match_baseline() {
+        let mut config = default_test_config();
+        config.temporal_awareness = false;
+        config.inject_docs = false;
+        config.memory_enabled = false;
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), config.clone());
+        let (reference, reference_store, _reference_dir, reference_project) =
+            handler_with_store(Arc::new(ProducerState::default()), config);
+        let mut native = vec![
+            json!({"info":{"id":"u0","role":"user"},"parts":[{"type":"text","text":"start \"quoted\" \\ path\n雪"}]}),
+            json!({"info":{"id":"a0","role":"assistant"},"parts":[{"type":"text","text":"first answer"}]}),
+        ];
+        for pass in 0..5 {
+            if pass == 4 {
+                for (store, project) in [(&store, &project), (&reference_store, &reference_project)]
+                {
+                    let mut loaded = store.load("ses").unwrap();
+                    let selected = ["u0", "a0"]
+                        .into_iter()
+                        .map(|mid| mc_store::HistorianSelectedMessageIdentity {
+                            mid: mid.into(),
+                            block_identities: loaded.meta.block_identity_by_mid[mid].clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let predicate = mc_store::HistorianPublishPredicate {
+                        firing_seq: 1,
+                        producer_run_id: "compact-replay-run".into(),
+                        producer_attempt: 0,
+                        chunk_fingerprint: "compact-replay-chunk".into(),
+                        selected_range_identities: selected.clone(),
+                        compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
+                    };
+                    loaded.meta.historian = HistorianDurableState {
+                        state: HistorianPhase::Publishing,
+                        firing_seq: 1,
+                        producer_run_id: Some(predicate.producer_run_id.clone()),
+                        producer_session_id: Some("compact-replay-producer".into()),
+                        chunk_range: Some(HistorianChunkRange {
+                            from_ordinal: 1,
+                            to_ordinal: 2,
+                        }),
+                        chunk_fingerprint: predicate.chunk_fingerprint.clone(),
+                        selected_range_identities: selected,
+                        expected_revert_epoch: loaded.meta.revert_epoch,
+                        ..Default::default()
+                    };
+                    store
+                        .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                        .unwrap();
+                    let loaded = store.load("ses").unwrap();
+                    store
+                        .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                            harness: None,
+                            session_id: "ses",
+                            expected_row_version: loaded.row_version,
+                            expected_revert_epoch: loaded.meta.revert_epoch,
+                            predicate: &predicate,
+                            project_path: project.to_str().unwrap(),
+                            compartments: &[stored_comp(
+                                1,
+                                1,
+                                2,
+                                "a0",
+                                "compact replay published summary",
+                            )],
+                            facts: &[],
+                            promote_facts: false,
+                            events: &[],
+                            primer_candidates: &[],
+                            user_memory_candidates: &[],
+                            publication_floor_ordinal: 2,
+                            chunk_transcript: None,
+                            raw_chunk_messages: None,
+                        })
+                        .unwrap();
+                    assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+                }
+            }
+            if pass > 0 {
+                native.push(json!({"info":{"id":format!("step-{pass}"),"role":"assistant"},"parts":[
+                    {"type":"reasoning","text":format!("adaptive step {pass}\n雪"),"metadata":{"anthropic":{"signature":format!("signature-{pass}")}}},
+                    {"type":"tool","tool":"work","callID":format!("call-{pass}"),"state":{"status":"completed","input":{"action":"show","path":"a\\b"},"output":format!("done {pass}\n\"quoted\"")}},
+                    {"type":"text","text":format!("answer {pass}")}
+                ]}));
+            }
+            let decoded = codec::decode_opencode(&native);
+            let mut req = request(decoded.messages);
+            req["serializer_profile"] = json!("opencode-aisdk");
+            req["serve_native"] = json!(true);
+            req["tool_present"] = json!(true);
+            req["provider_id"] = json!("anthropic");
+            req["model_key"] = json!("claude-fable-5-1");
+            req["mid_turn"] = json!(false);
+            req["native_messages"] = json!(native);
+            req["historian_model_chain"] = json!([]);
+            req["full_array_fingerprint"] = json!(format!("compact-pass-{pass}"));
+            if pass > 0 && pass < 3 {
+                let prefix = native.len() - 1;
+                req["messages"] = json!([req["messages"].as_array().unwrap().last().unwrap()]);
+                req["native_messages"] = json!([native.last().unwrap()]);
+                req["tail_delta"] = json!({"after":format!("compact-pass-{}", pass - 1),"replace_from":prefix,"native_replace_from":prefix});
+            }
+            if pass >= 3 {
+                req["render_config"] = json!("priced-config-change");
+            }
+            let reference_served = {
+                let _guard = crate::ck_wire::UncompactedProjectionGuard::enter();
+                call_transform_request(&reference, req.clone()).await
+            };
+            let served = call_transform_request(&handler, req).await;
+            assert_eq!(served["status"], "ok", "{served}");
+            assert_eq!(
+                served["action"],
+                if pass == 0 || pass >= 3 {
+                    "HARD"
+                } else {
+                    "SOFT+"
+                }
+            );
+            if pass == 1 || pass == 2 {
+                assert_eq!(
+                    served["timings"]["projection_reused_messages"],
+                    native.len() - 1
+                );
+            }
+            let bytes =
+                serde_json::to_vec(&(&served["ck_messages"], &served["native_messages"])).unwrap();
+            let reference_bytes = serde_json::to_vec(&(
+                &reference_served["ck_messages"],
+                &reference_served["native_messages"],
+            ))
+            .unwrap();
+            assert_eq!(
+                bytes, reference_bytes,
+                "retention differential on pass {pass}"
+            );
+            if pass == 4 {
+                assert!(
+                    String::from_utf8_lossy(&bytes).contains("compact replay published summary")
+                );
+            }
+            eprintln!(
+                "compact-replay pass={pass} bytes={} sha256={:x}",
+                bytes.len(),
+                Sha256::digest(&bytes)
+            );
+            // Captured on the pre-compaction implementation with the identical fixture.
+            let baseline = [
+                "44e6c96da02972ffb728ac3e84cbcc7367e7cc907a80dc348bfb520f5b1d2ee3",
+                "48be75604d237c4c5d166ce849670b9c6ca0f1441349e403b9bf74bd4bf3b789",
+                "0545fea19343e3bb11358897ff80fa974b5b37992515617423c22b6493e87e15",
+                "b7405b3032dd3b08e721edc579173ac316385a80d626f7937173a9b084cbe217",
+            ];
+            if pass < 4 {
+                assert_eq!(
+                    format!("{:x}", Sha256::digest(&bytes)),
+                    baseline[pass],
+                    "served byte drift on pass {pass}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn defer_after_failed_pass_holds_fallback_served_signed_reasoning_until_priced_pass() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -26709,6 +27844,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_protected_results_over_limit_is_a_typed_refusal_not_passthrough() {
+        let producer = Arc::new(ProducerState::default());
+        let mut config = default_test_config();
+        config.protected_tools.insert("bash".into(), 8);
+        let (handler, store, _dir, project) = handler_with_store(producer, config.clone());
+        let mut route = binding_with_harness(project.to_str().unwrap(), "claude-code", "ses");
+        route.config = config;
+        handler.bind_route(7, route);
+        let mut messages = vec![];
+        for n in 0..8 {
+            messages.push(assistant_tool_call(&format!("call-{n}"), n * 2 + 1));
+            messages.push(tool_result(
+                &format!("result-{n}"),
+                n * 2 + 2,
+                &"word ".repeat(20000),
+            ));
+        }
+        let mut request = request_with_usage(messages, 200000, 50000);
+        request["serializer_profile"] = json!("claude-code-anthropic");
+        request["usage"]["final_wire_trusted"] = json!(true);
+        request["usage"]["final_wire_input_tokens"] = json!(200000);
+        let before = store.load("ses").unwrap().row_version;
+        let (code, message) = error_frame(call_transform_outcome(&handler, request.clone()).await);
+        let golden: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/protected-tool-refusal.json"
+        ))
+        .unwrap();
+        assert_eq!(code, golden["code"].as_str().unwrap());
+        assert_eq!(message, golden["message"].as_str().unwrap());
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+        request["usage"]["final_wire_trusted"] = json!(false);
+        assert!(matches!(
+            call_transform_outcome(&handler, request).await,
+            HandlerOutcome::Response(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn transform_success_records_received_and_completed_trace() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -27431,6 +28604,44 @@ mod tests {
         )
         .await;
         assert_eq!(guidance_full_repeat, guidance_full);
+    }
+
+    #[test]
+    fn session_cache_ttl_user_edits_are_live_and_default_changes_are_frozen() {
+        let (_, store, _dir, _) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let frozen = McModuleConfig::default();
+        let mut live = frozen.clone();
+        let model_key = "anthropic/claude-opus-5-5";
+        let model = Some(model_key);
+        let resolve_and_save = |session: &str, bound: &McModuleConfig, live: &McModuleConfig| {
+            let (resolved, policy) =
+                resolve_session_cache_ttl(&store, session, model, bound, live).unwrap();
+            let mut loaded = store.load_meta(session).unwrap();
+            loaded.meta.cache_ttl_policy = Some(policy);
+            store
+                .commit_meta(session, loaded.row_version, &loaded.meta)
+                .unwrap();
+            resolved
+        };
+        live.cache_ttl_by_model
+            .insert(model_key.to_string(), "1h".to_string());
+        assert_eq!(resolve_and_save("user-ttl", &frozen, &live).value, "1h");
+        live.cache_ttl_by_model
+            .insert(model_key.to_string(), "13h".to_string());
+        assert_eq!(resolve_and_save("user-ttl", &frozen, &live).value, "13h");
+        assert_eq!(
+            resolve_and_save("builtin-ttl", &frozen, &frozen).value,
+            "5m"
+        );
+        let changed_default = McModuleConfig {
+            cache_ttl: "10m".to_string(),
+            ..McModuleConfig::default()
+        };
+        assert_eq!(
+            resolve_and_save("builtin-ttl", &changed_default, &changed_default).value,
+            "5m"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -28643,6 +29854,38 @@ mod tests {
             .id
     }
 
+    #[test]
+    fn note_facade_parked_reason_is_visible_in_glance_and_body() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (_handler, store, _dir, _project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let now = now_ms();
+        let mut note = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "/repo",
+                route_project_root: None,
+                session_id: Some("session"),
+                content: "Watch schema",
+                surface_condition: Some("schema appears"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: now,
+            })
+            .unwrap();
+        note.check_status = Some("parked".to_string());
+        note.ready_reason = Some(
+            "Condition can't be checked: source is not publicly readable; rewrite it".to_string(),
+        );
+        assert_eq!(format_glance_row(&note, now), "#1 · 0m · Watch schema · pending · parked: Condition can't be checked: source is not publicly readable; rewrite it");
+        assert_eq!(format_note_body(&note, now), "- **#1** · 0m · pending: Watch schema\n  Condition: schema appears\n  Condition can't be checked: source is not publicly readable; rewrite it");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn note_facade_glance_lists_one_row_per_note_with_age_and_stale_markers() {
         let producer = Arc::new(ProducerState::default());
@@ -29477,6 +30720,257 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ctx_reduce_self_stamp_message_matches_typescript_golden() {
+        let golden =
+            include_str!("../../../packages/plugin/src/tools/ctx-reduce/self-stamp-message.golden")
+                .trim_end();
+        assert_eq!(CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE, golden);
+        assert_eq!(
+            ctx_reduce_self_stamp_message(41),
+            golden.replace("§N§", "§41§")
+        );
+        let cached_calls = vec![cached_tool_call("call-mid", "ctx_reduce")];
+        assert_eq!(
+            cached_tool_name_for_tag(Some(&cached_calls), "call-mid#0").as_deref(),
+            Some("ctx_reduce")
+        );
+        assert_eq!(
+            cached_tool_name_for_tag(Some(&cached_calls), "other-mid#0"),
+            None,
+            "a same-position block in another message is not evidence",
+        );
+        assert_eq!(cached_tool_name_for_tag(None, "call-mid#0"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn facade_ctx_reduce_skips_its_own_cached_call_but_applies_other_tags() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        store
+            .seed_tags_for_test(
+                "ses",
+                &[
+                    TagMintInput {
+                        block_id: "m1#0".to_string(),
+                        kind: "tool_result".to_string(),
+                        token_count: 100,
+                        source_bytes: b"self output".to_vec(),
+                    },
+                    TagMintInput {
+                        block_id: "m2#0".to_string(),
+                        kind: "tool_result".to_string(),
+                        token_count: 100,
+                        source_bytes: b"sibling output".to_vec(),
+                    },
+                    TagMintInput {
+                        block_id: "stale#0".to_string(),
+                        kind: "tool_result".to_string(),
+                        token_count: 100,
+                        source_bytes: b"cache-miss output".to_vec(),
+                    },
+                ],
+                1_000,
+            )
+            .unwrap();
+        cache_last_served_test_messages(
+            &handler,
+            "ses",
+            vec![
+                cached_tool_result("m1", "ctx_reduce"),
+                cached_tool_result("m2", "read"),
+            ],
+        );
+
+        let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1,2,3" })).await);
+        assert!(
+            ack.contains("Held: §2§, §3§ are inside the protected working set"),
+            "{ack}"
+        );
+        assert!(!ack.contains("drop §1§"), "{ack}");
+        assert!(
+            ack.contains(
+                "§1§ is a ctx_reduce call; leave those alone, they are cleaned up automatically."
+            ),
+            "{ack}"
+        );
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+        assert_eq!(
+            tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1" })).await),
+            "§1§ is a ctx_reduce call; leave those alone, they are cleaned up automatically."
+        );
+
+        let delivered = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "1,2,3",
+                "command_id": "self-stamp-delivery",
+            }),
+        );
+        let delivered = tool_body(delivered);
+        assert_eq!(delivered["queued"], json!(2));
+        assert_eq!(delivered["ctx_reduce_self_stamps"], json!([1]));
+        assert_eq!(delivered["ctx_reduce_queued_tags"], json!([2, 3]));
+        assert_eq!(
+            store
+                .load_pending_agent_drops("ses")
+                .unwrap()
+                .into_iter()
+                .map(|drop| drop.target_id)
+                .collect::<Vec<_>>(),
+            vec!["m2#0", "stale#0"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_agent_self_stamp_shared_fixture() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            label: String,
+            tools: Vec<String>,
+            drop: usize,
+            protected_tools: std::collections::BTreeMap<String, usize>,
+            #[serde(default)]
+            agent_self_stamp: bool,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/protected-tool-holds.json"))
+                .unwrap();
+        for case in cases.into_iter().filter(|case| case.agent_self_stamp) {
+            let resolver =
+                FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+            let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+                Arc::new(ProducerState::default()),
+                default_test_config(),
+                resolver,
+            );
+            let mut tags = case
+                .tools
+                .iter()
+                .enumerate()
+                .map(|(i, _)| TagMintInput {
+                    block_id: format!("m{}#0", i + 1),
+                    kind: "tool_result".to_string(),
+                    token_count: 10,
+                    source_bytes: b"result".to_vec(),
+                })
+                .collect::<Vec<_>>();
+            for i in 100..103 {
+                tags.push(TagMintInput {
+                    block_id: format!("m{i}#0"),
+                    kind: "tool_result".to_string(),
+                    token_count: 8000,
+                    source_bytes: b"padding".to_vec(),
+                });
+            }
+            store.seed_tags_for_test("ses", &tags, 1000).unwrap();
+            let mut loaded = store.load("ses").unwrap();
+            loaded.meta.protected_tokens_effective = Some(8000);
+            if case.protected_tools.get("ctx_reduce").copied().unwrap_or(3) > 0 {
+                loaded
+                    .meta
+                    .protected_tool_block_ids
+                    .insert(format!("m{}#0", case.drop));
+            }
+            store
+                .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+            cache_last_served_test_messages(
+                &handler,
+                "ses",
+                case.tools
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| cached_tool_result(&format!("m{}", i + 1), name))
+                    .collect(),
+            );
+            let ack = tool_text(
+                call_facade(
+                    &handler,
+                    "ctx_reduce",
+                    json!({"drop":case.drop.to_string()}),
+                )
+                .await,
+            );
+            assert_eq!(
+                ack,
+                ctx_reduce_self_stamp_message(case.drop as u64),
+                "{}",
+                case.label
+            );
+            let delivered = tool_body(handler.handle_agent_drops_value(
+                7,
+                json!({
+                    "method":"agent_drops.append", "session_id":"ses", "drop":case.drop.to_string(),
+                    "command_id":case.label,
+                }),
+            ));
+            assert_eq!(delivered["queued"], json!(0));
+            assert_eq!(delivered["ctx_reduce_self_stamps"], json!([case.drop]));
+            assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_mixed_reply_orders_free_held_and_self_stamp() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let tags = (1..=6)
+            .map(|i| TagMintInput {
+                block_id: format!("m{i}#0"),
+                kind: "tool_result".to_string(),
+                token_count: if i > 3 { 8000 } else { 10 },
+                source_bytes: b"result".to_vec(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &tags, 1000).unwrap();
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.protected_tokens_effective = Some(8000);
+        loaded
+            .meta
+            .protected_tool_block_ids
+            .insert("m1#0".to_string());
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        cache_last_served_test_messages(
+            &handler,
+            "ses",
+            vec![
+                cached_tool_result("m1", "custom"),
+                cached_tool_result("m2", "ctx_reduce"),
+                cached_tool_result("m3", "read"),
+            ],
+        );
+        let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({"drop":"2,1,3"})).await);
+        assert_eq!(ack, "Queued: drop §3§. Held: §1§ is inside the protected working set; it applies once newer work displaces it. Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later. §2§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.");
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+        let delivered = tool_body(handler.handle_agent_drops_value(7, json!({
+            "method":"agent_drops.append", "session_id":"ses", "drop":"2,1,3", "command_id":"mixed-reply",
+        })));
+        assert_eq!(delivered["ctx_reduce_self_stamps"], json!([2]));
+        assert_eq!(delivered["ctx_reduce_queued_tags"], json!([1, 3]));
+        assert_eq!(
+            store
+                .load_pending_agent_drops("ses")
+                .unwrap()
+                .into_iter()
+                .map(|drop| drop.target_id)
+                .collect::<Vec<_>>(),
+            vec!["m1#0", "m3#0"]
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn facade_ctx_reduce_ack_validates_unknown_queued_and_protected_tags_without_committing()
     {
@@ -29658,6 +31152,45 @@ mod tests {
             assert!(!properties.contains_key("reduced"));
             assert!(!properties.contains_key("summary"));
         }
+    }
+
+    #[tokio::test]
+    async fn protected_tool_ctx_reduce_ack_reuses_selection_snapshot() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let tags = (1..=6)
+            .map(|number| TagMintInput {
+                block_id: format!("m{number}#0"),
+                kind: "tool_result".to_string(),
+                token_count: 8000,
+                source_bytes: b"output".to_vec(),
+            })
+            .collect::<Vec<_>>();
+        store.seed_tags_for_test("ses", &tags, 1000).unwrap();
+        let mut loaded = store.load("ses").unwrap();
+        loaded
+            .meta
+            .protected_tool_block_ids
+            .insert("m2#0".to_string());
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({"drop":"2"})).await);
+        assert!(
+            ack.contains("Held: §2§ is inside the protected working set"),
+            "{ack}"
+        );
+        let delivery = tool_body(handler.handle_agent_drops_value(
+            7,
+            json!({"session_id":"ses", "drop":"2", "command_id":"held-tool-command"}),
+        ));
+        assert_eq!(delivery["held_tag_numbers"], json!([2]));
+        assert_eq!(delivery["queued"], 1);
+        assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
     }
 
     #[test]
@@ -30391,6 +31924,94 @@ mod tests {
             .iter()
             .all(|system| system
                 .contains("Write human-readable prose you author in: Turkish (Türkçe).")));
+    }
+
+    /// Each classify attempt sends its own model's host-configured variant, and an
+    /// attempt whose model has no entry sends none: a fallback must not inherit the
+    /// primary's reasoning variant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_sends_each_attempt_its_own_model_variant() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .expect("await results mutex")
+            .extend([
+                Ok(ProducerOutput {
+                    text: "no manifest".to_string(),
+                    length_capped: false,
+                    usage: None,
+                }),
+                Ok(ProducerOutput {
+                    text: "<classify></classify>".to_string(),
+                    length_capped: false,
+                    usage: None,
+                }),
+            ]);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_root, "ses"));
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": "variant-command",
+                    "model_chain": ["test/primary", "test/fallback"],
+                    "model_variants": { "test/primary": "high" },
+                    "payload": { "prompt_body": "classify", "items": [] },
+                }),
+            )
+            .await;
+        assert!(
+            matches!(outcome, HandlerOutcome::Response(_)),
+            "dreamer run failed: {outcome:?}"
+        );
+        assert_eq!(
+            producer.models.lock().expect("models mutex").as_slice(),
+            ["test/primary", "test/fallback"]
+        );
+        assert_eq!(
+            producer.variants.lock().expect("variants mutex").as_slice(),
+            [Some("high".to_string()), None]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_rejects_a_non_string_model_variant() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_root, "ses"));
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": "bad-variant-command",
+                    "model_chain": ["test/primary"],
+                    "model_variants": { "test/primary": 3 },
+                    "payload": { "prompt_body": "classify", "items": [] },
+                }),
+            )
+            .await;
+        match outcome {
+            HandlerOutcome::Error { message, .. } => assert!(
+                message.contains("model_variants values must be strings"),
+                "{message}"
+            ),
+            other => panic!("expected invalid params, got {other:?}"),
+        }
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
     }
 
     /// The classify response carries the runner's token spend so the host can record it
@@ -32050,7 +33671,7 @@ mod tests {
         }
     }
 
-    fn historian_output_for_prompt(prompt: &str) -> String {
+    pub(super) fn historian_output_for_prompt(prompt: &str) -> String {
         let (start, end) = prompt_ordinal_range(prompt).unwrap_or((1, 3));
         historian_output(start, end, "autonomous summary")
     }
@@ -35632,8 +37253,10 @@ mod tests {
                 protected_tokens_provenance: "derived",
                 compaction_enabled: true,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
+                cache_ttl_policy: None,
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
@@ -36355,6 +37978,36 @@ mod tests {
         );
     }
 
+    /// The transform's per-model variant map reaches the historian's Broca send for the
+    /// model that actually runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn transform_historian_model_variant_reaches_the_broca_send() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let mut transform = request(big_messages());
+        transform["serializer_profile"] = json!("opencode-aisdk");
+        transform["historian_model_chain"] =
+            json!(["openai/profile-historian", "anthropic/profile-fallback"]);
+        transform["historian_model_variants"] = json!({
+            "openai/profile-historian": "high",
+            "anthropic/profile-fallback": "low",
+        });
+
+        let response = call_transform_request(&handler, transform).await;
+        assert_eq!(response["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+        assert_eq!(
+            producer.models.lock().expect("models mutex").as_slice(),
+            ["openai/profile-historian"]
+        );
+        assert_eq!(
+            producer.variants.lock().expect("variants mutex").as_slice(),
+            [Some("high".to_string())]
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn handler_expired_backoff_refires_and_success_clears_failure_state() {
         let producer = Arc::new(ProducerState::default());
@@ -36615,8 +38268,10 @@ mod tests {
                 protected_tokens_provenance: "derived",
                 compaction_enabled: true,
                 smart_drops: false,
+                protected_tools: crate::selection::default_protected_tools(),
                 cache_ttl: "5m".to_string(),
                 cache_ttl_provenance: config::CacheTtlProvenance::Default,
+                cache_ttl_policy: None,
                 model_key: None,
                 observed_last_response_at_ms: None,
                 guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
@@ -37569,6 +39224,8 @@ mod tests {
         );
 
         let mut defer_request = request_with_usage(messages, 1_000, 50_000);
+        // The preceding provider reply was served; preparation alone is not a clock source.
+        defer_request["prev_response_completed_at_ms"] = json!(now_ms());
         defer_request["todo_verdict_probed"] = json!(true);
         defer_request["todo_tool_present"] = json!(true);
         let defer = call_transform_request(&soft_handler, defer_request).await;
@@ -37632,8 +39289,9 @@ mod tests {
         assert_eq!(after.meta.coverage_ordinal, Some(0));
         assert!(!after.meta.bootstrap_seed_fold_pending);
 
-        let replay =
-            call_transform_request(&handler, request_with_usage(live, 1_000, 50_000)).await;
+        let mut replay_request = request_with_usage(live, 1_000, 50_000);
+        replay_request["prev_response_completed_at_ms"] = json!(now_ms());
+        let replay = call_transform_request(&handler, replay_request).await;
         assert_eq!(replay["scheduler_decision"], json!("defer"), "{replay}");
         assert_eq!(replay["decision"], json!("SOFT+"));
         assert_eq!(replay["ck_messages"], folded["ck_messages"]);
@@ -38112,6 +39770,50 @@ mod tests {
             let response = handler.dispatch_value(channel, final_page).await;
             assert!(matches!(response, HandlerOutcome::Response(_)));
         }
+    }
+
+    /// The plugin's transport adds `accept_reply_pages` to every request body it sends,
+    /// including each page of a paged transform. A non-final page carrying it must be
+    /// staged, not refused as a protocol mismatch: that refusal sent every large Rust-mode
+    /// session to last-known-good replay on every pass.
+    #[tokio::test]
+    async fn non_final_transform_pages_accept_the_reply_paging_capability() {
+        let state = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) = handler_with_store(state, default_test_config());
+        handler.bind_route(8, binding(project.to_str().unwrap(), "authority-a"));
+        let mut first = paged_transform_page(
+            "transform",
+            "authority-a",
+            "page-reply-capability",
+            0,
+            0,
+            2,
+            false,
+            vec![json!({"mid": "a0", "ordinal": 0, "ck": ck("a0", 0, "first").ck})],
+        );
+        first["accept_reply_pages"] = json!(true);
+        match handler.dispatch_value(8, first).await {
+            HandlerOutcome::Response(bytes) => {
+                let reply: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(reply["staged"], json!(true), "{reply}");
+            }
+            other => panic!("non-final page with accept_reply_pages was refused: {other:?}"),
+        }
+        let mut final_page = paged_transform_page(
+            "transform",
+            "authority-a",
+            "page-reply-capability",
+            0,
+            1,
+            2,
+            true,
+            vec![json!({"mid": "a1", "ordinal": 1, "ck": ck("a1", 1, "final").ck})],
+        );
+        final_page["accept_reply_pages"] = json!(true);
+        assert!(matches!(
+            handler.dispatch_value(8, final_page).await,
+            HandlerOutcome::Response(_)
+        ));
     }
 
     #[tokio::test]
@@ -39774,3 +41476,6 @@ fn render_tag_expand(tag: &mc_store::McTagRow, messages: &[ck_wire::CkIngressMes
         .collect::<Vec<_>>()
         .join("\n")
 }
+#[cfg(test)]
+#[path = "../tests/support/perf_audit.rs"]
+mod perf_audit;

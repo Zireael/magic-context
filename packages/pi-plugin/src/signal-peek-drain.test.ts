@@ -310,7 +310,10 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 		expect(code).toContain(
 			"schedulePiAssistantIndexOnMessageEnd(db, sessionId, event.message",
 		);
-		expect(code).toContain("readMessages: () => readPiSessionMessages(ctx)");
+		expect(code).toContain("readBranch: () => {");
+		expect(code).not.toContain(
+			"readMessages: () => readPiSessionMessages(ctx)",
+		);
 	});
 
 	test("runtime project identity resolves from ctx.cwd and tracks prompt path sessions", () => {
