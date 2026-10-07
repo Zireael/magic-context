@@ -69,9 +69,11 @@ import {
 	decodeCachedM0UpgradeIdentity,
 	encodeCachedM0UpgradeIdentity,
 	MEMORY_RENDER_FORMAT_EPOCH,
+	readCachedM0MemoryIds,
 	renderBudgetIdentityChanged,
 	renderedBudgetShrinkReason,
 	renderedBudgetSnapshot,
+	withCachedM0MemoryIds,
 } from "@magic-context/core/hooks/magic-context/compartment-render-epoch";
 import {
 	DEFAULT_HISTORY_BUDGET_TOKENS,
@@ -1747,14 +1749,16 @@ export function materializeM0Pi(
 
 	const steps = new WriteTransactionSteps();
 	snapshotMarkers.materializedAt = foldMaterializedAt;
-	const renderedIdsJson = JSON.stringify(renderedMemoryIds);
-	const upgradeIdentity = encodeCachedM0UpgradeIdentity(
-		snapshotMarkers.upgradeState,
-		snapshotMarkers.compartmentRenderEpoch,
-		snapshotMarkers.muralEnabled,
-		snapshotMarkers.renderBudgetIdentity,
-		snapshotMarkers.memoryRenderEpoch,
-		snapshotMarkers.renderedBudgets ?? null,
+	const upgradeIdentity = withCachedM0MemoryIds(
+		encodeCachedM0UpgradeIdentity(
+			snapshotMarkers.upgradeState,
+			snapshotMarkers.compartmentRenderEpoch,
+			snapshotMarkers.muralEnabled,
+			snapshotMarkers.renderBudgetIdentity,
+			snapshotMarkers.memoryRenderEpoch,
+			snapshotMarkers.renderedBudgets ?? null,
+		),
+		renderedMemoryIds,
 	);
 	steps.mark("pre_metadata");
 	state.beforeCacheCommitForTest?.();
@@ -1810,6 +1814,10 @@ export function materializeM0Pi(
 			renderedMemoryIds,
 		);
 		const m1Bytes = Buffer.from(m1Render.text, "utf8");
+		const visibleMemoryIds = [
+			...new Set([...renderedMemoryIds, ...m1Render.renderedMemoryIds]),
+		];
+		const visibleIdsJson = JSON.stringify(visibleMemoryIds);
 		steps.mark("m1Render");
 		persistCachedM0(db, state.sessionId, {
 			m0Bytes,
@@ -1841,8 +1849,8 @@ export function materializeM0Pi(
 		db.prepare(
 			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
 		).run(
-			renderedMemoryIds.length,
-			renderedIdsJson,
+			visibleMemoryIds.length,
+			visibleIdsJson,
 			snapshotMarkers.lastBaselineEndMessageId,
 			state.sessionId,
 		);
@@ -2012,6 +2020,7 @@ function renderMemoryUpdatesBlockPi(args: {
 interface RenderM1PiResult {
 	text: string;
 	memoryUpdateCount: number;
+	renderedMemoryIds: number[];
 }
 
 function renderM1PiWithMetadata(
@@ -2143,6 +2152,7 @@ function renderM1PiWithMetadata(
 		return {
 			text: PI_M1_PLACEHOLDER,
 			memoryUpdateCount: memoryUpdates.count,
+			renderedMemoryIds: [],
 		};
 	}
 	// Join with "\n" (single newline) to match OpenCode renderM1 exactly — the
@@ -2152,6 +2162,9 @@ function renderM1PiWithMetadata(
 			? `<knowledge-updates>\n${sections.join("\n")}\n</knowledge-updates>`
 			: `<session-history-since>\n${sections.join("\n")}\n</session-history-since>`,
 		memoryUpdateCount: memoryUpdates.count,
+		renderedMemoryIds: newMemoriesBlock
+			? deltaMemories.map((memory) => memory.id)
+			: [],
 	};
 }
 
@@ -2495,14 +2508,23 @@ function softRefreshCachedM1Pi(args: {
 		// Read the delta and its trim boundary together under the writer. A pass
 		// snapshot taken before admission may have stale in-place history ranges.
 		const compartments = getRenderableCompartmentsPi(args.db, args.state);
+		const renderedM0Ids = readCachedM0MemoryIds(
+			row.cached_m0_upgrade_state,
+			parseMemoryBlockIds(row.memory_block_ids),
+			markers.maxMemoryId,
+		);
 		const rendered = renderM1PiWithMetadata(
 			args.state,
 			args.db,
 			markers,
-			parseMemoryBlockIds(row.memory_block_ids),
+			renderedM0Ids,
 			compartments,
 		);
 		const m1Bytes = Buffer.from(rendered.text, "utf8");
+		const visibleMemoryIds = [
+			...new Set([...renderedM0Ids, ...rendered.renderedMemoryIds]),
+		];
+		const visibleIdsJson = JSON.stringify(visibleMemoryIds);
 		const latest = compartments.at(-1);
 		const advancedBoundary =
 			latest?.endMessageId && latest.endMessageId.length > 0
@@ -2512,9 +2534,17 @@ function softRefreshCachedM1Pi(args: {
 
 		args.db
 			.prepare(
-				"UPDATE session_meta SET cached_m1_bytes = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
+				`UPDATE session_meta SET cached_m1_bytes = ?, cached_m0_last_baseline_end_message_id = ?,
+				 memory_block_count = ?, memory_block_ids = ?, cached_m0_upgrade_state = ? WHERE session_id = ?`,
 			)
-			.run(m1Bytes, advancedBoundary, args.state.sessionId);
+			.run(
+				m1Bytes,
+				advancedBoundary,
+				visibleMemoryIds.length,
+				visibleIdsJson,
+				withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
+				args.state.sessionId,
+			);
 		steps.mark("sessionMeta");
 		args.db.exec("COMMIT");
 		steps.mark("commit");
