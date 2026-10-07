@@ -50,7 +50,7 @@ Tables fall into two groups:
 - **Session-scoped** tables carry a `harness` column (`opencode`, `opencode2`, `pi`, `omp`) so hosts never confuse each other's sessions.
 - **Project-scoped** tables (memories, git commits, workspaces and similar) are shared across hosts on purpose: a memory written from Pi is visible in OpenCode for the same project.
 
-`context.db` and the Rust module's `store.db` (same directory, own migration chain in `crates/mc-store`) are one consistency unit. Authority and mirror state in each refers to the other, so restore both from the same backup or neither.
+`context.db` is the domain-state database; the Rust module's `store.db` (same directory, with its own migration chain in `crates/mc-store`) holds rebuildable private session/cache state. The module attaches to `context.db`, and the pair is one consistency unit: back up and restore both together.
 
 ## WAL durability boundary
 
