@@ -21,6 +21,7 @@ pub mod context_boundaries;
 pub use context_boundaries::ResolvedContextBoundary;
 pub mod context_writes;
 mod historian_claim;
+pub mod move_inventory;
 pub mod private_permissions;
 pub mod single_store_domain;
 pub mod single_store_schema;

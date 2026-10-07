@@ -2555,12 +2555,10 @@ pub mod compaction {
                     id,
                     provider_executed: false,
                     ..
-                } => {
-                    if !open_calls.remove(id.as_str()) {
-                        return Err(TransformError::LineageProtocol(
-                            "compaction range starts inside a tool arc".to_string(),
-                        ));
-                    }
+                } if !open_calls.remove(id.as_str()) => {
+                    return Err(TransformError::LineageProtocol(
+                        "compaction range starts inside a tool arc".to_string(),
+                    ));
                 }
                 _ => {}
             }

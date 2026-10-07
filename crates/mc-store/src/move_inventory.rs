@@ -2654,20 +2654,13 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
+    /// The repository root: the migration scripts below run the TypeScript
+    /// schema from `packages/plugin`, two levels above this crate.
     fn root() -> PathBuf {
-        let source = PathBuf::from(file!());
-        let absolute = if source.is_absolute() {
-            source
-        } else {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(source)
-        };
-        absolute
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
             .canonicalize()
             .unwrap()
-            .ancestors()
-            .nth(4)
-            .unwrap()
-            .to_path_buf()
     }
 
     // Each test runs the real migration chains in a throwaway root, not a copy
