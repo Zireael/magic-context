@@ -5,6 +5,7 @@
 //!   cargo run --release --bin bench_cache_poll -- --harness opencode --polls 10
 //!   cargo run --release --bin bench_cache_poll -- --harness all --dump out.json
 //!
+//! `--events <session id>` prints one session's event window as JSON.
 //! `--dump` instead writes one listing and the full event window of every
 //! listed session as JSON, so two builds can be compared for identical output.
 //!
@@ -298,6 +299,14 @@ fn main() {
         None | Some("all") => None,
         Some(name) => Some(name.parse().expect("harness")),
     };
+    if let Some(session) = arg("--events") {
+        // One session's event window exactly as the Cache tab receives it.
+        let harness = harness.unwrap_or(Harness::Broca);
+        let limit = arg("--limit").map_or(1000, |n| n.parse().expect("limit"));
+        let events = db::get_session_cache_events(harness, &session, Some(limit), None);
+        println!("{}", serde_json::to_string(&events).unwrap());
+        return;
+    }
     if let Some(path) = arg("--dump") {
         let sessions = db::get_session_cache_stats_from_db(50, false, true, harness);
         let windows: Vec<_> = sessions

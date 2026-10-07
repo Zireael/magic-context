@@ -51,9 +51,16 @@ const HEADER_LEN: usize = 4 + 1 + 8 + 8 + 32;
 const RECORD_VERSION: u8 = 1;
 const LINEAGE_VERSION: u8 = 2;
 const GATED_VERSION: u8 = 3;
+/// Broca's own table (`KNOWN_FEATURES` in broca-wal's framing.rs). A name
+/// missing here stops the session at the first frame that requires it: a
+/// missing `restart-pause/v1` cut every mason run Broca paused for a daemon
+/// restart at the pause, hiding every step after the resume. Each name below
+/// only adds a field or a record type this reader does not use.
 const KNOWN_FEATURES: &[&str] = &[
-    "scope/v1",
+    "flow-scopes/v1",
     "plan-manifest/v1",
+    "restart-pause/v1",
+    "scope/v1",
     "steer-queue/v1",
     "archive-index/v2",
     "dispatch-module/v1",
@@ -163,6 +170,10 @@ pub(crate) struct WalRun {
     pub ts_ms: Option<i64>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// The context window the run was admitted with
+    /// (`run_started.config.context_limit`: the caller's override, else the
+    /// catalog's window for the model), frozen for the whole run.
+    pub context_limit: Option<i64>,
     pub steps: Vec<WalStep>,
     /// True once the run's `run_finished` record has been read.
     pub finished: bool,
@@ -470,6 +481,11 @@ impl Fold {
             let model_id = model.and_then(|model| {
                 string_field(model, "model_id").or_else(|| string_field(model, "model"))
             });
+            let context_limit = record
+                .get("config")
+                .and_then(|config| config.get("context_limit"))
+                .and_then(non_negative_int)
+                .filter(|limit| *limit > 0);
             self.step_started_ts.clear();
             self.attempt_ts.clear();
             self.runs.push(WalRun {
@@ -477,6 +493,7 @@ impl Fold {
                 ts_ms: envelope_ts,
                 provider,
                 model: model_id,
+                context_limit,
                 steps: Vec::new(),
                 finished: false,
             });
@@ -1614,6 +1631,117 @@ pub(crate) mod tests {
             push(json!({"type": "step_started", "step_id": steps.len() as u64 + 1}));
         }
         bytes
+    }
+
+    /// WAL bytes holding `payloads` in order: a payload with a `requires` key
+    /// is written as a gated (version 3) frame, any other as a plain record.
+    pub(crate) fn wal_bytes(payloads: &[Value]) -> Vec<u8> {
+        let mut bytes = lineage();
+        for (index, payload) in payloads.iter().enumerate() {
+            let version = if payload.get("requires").is_some() {
+                3
+            } else {
+                1
+            };
+            bytes.extend(frame(
+                version,
+                index as u64 + 1,
+                1,
+                payload.to_string().as_bytes(),
+            ));
+        }
+        bytes
+    }
+
+    /// A mason run cut by a daemon restart, shaped like the live one: Broca
+    /// pauses the run in a gated `run_paused` frame (`restart-pause/v1`),
+    /// then resumes the same run id without a new `run_started`, and step ids
+    /// carry on from where they stopped.
+    pub(crate) fn restart_resumed_wal() -> Vec<u8> {
+        let run = "run-sid-restart";
+        wal_bytes(&[
+            json!({"type": "run_started", "run_id": run, "ts_ms": 1_000,
+                   "session": {"project_root": "/work", "harness": "broca", "session": "alfonso:bg_mason"},
+                   "config": {"model": {"provider_module_id": "openai", "model_id": "gpt-6.1-sol"},
+                              "context_limit": 1_050_000},
+                   "input": [], "origin": {"kind": "fresh"}}),
+            step_started(1),
+            attempt(1, 1_100),
+            step_finished(
+                1,
+                json!({"input_tokens": 3_928, "cached_input_tokens": 13_056,
+                                    "cache_write_tokens": 0, "output_tokens": 89}),
+            ),
+            step_started(2),
+            attempt(2, 1_200),
+            step_finished(
+                2,
+                json!({"input_tokens": 260, "cached_input_tokens": 16_896,
+                                    "cache_write_tokens": 0, "output_tokens": 135}),
+            ),
+            json!({"requires": ["restart-pause/v1"],
+                   "record": {"type": "run_paused", "run_id": run, "ts_ms": 1_300, "reason": "restart"}}),
+            json!({"type": "resume_started", "episode": run, "resumed_from_seq": 8,
+                   "replayed": {"messages": 4, "model_steps": 2, "tool_results": 0},
+                   "redone": [], "indeterminate": []}),
+            step_started(3),
+            attempt(3, 2_000),
+            step_finished(
+                3,
+                json!({"input_tokens": 485, "cached_input_tokens": 89_600,
+                                    "cache_write_tokens": 0, "output_tokens": 780}),
+            ),
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 2_100,
+                   "usage": {"input_tokens": 4_673, "cached_input_tokens": 119_552,
+                             "cache_write_tokens": 0, "output_tokens": 1_004}}),
+        ])
+    }
+
+    #[test]
+    fn a_run_resumed_after_a_restart_pause_keeps_every_step() {
+        let mut cursor = WalCursor::default();
+        let bytes = restart_resumed_wal();
+        cursor.advance(
+            &mut std::io::Cursor::new(&bytes),
+            bytes.len() as u64,
+            bytes.len(),
+        );
+        assert_eq!(cursor.failed, None);
+        assert_eq!(cursor.fold.activity_note, None);
+        let runs = cursor.fold.runs;
+        assert_eq!(
+            step_ids(&runs),
+            [
+                ("run-sid-restart".to_string(), 1),
+                ("run-sid-restart".to_string(), 2),
+                ("run-sid-restart".to_string(), 3)
+            ]
+        );
+        assert!(runs[0].finished);
+    }
+
+    /// Every feature name Broca 0.3.189 writes (`KNOWN_FEATURES` in
+    /// broca-wal's framing.rs), spelled out rather than taken from this
+    /// reader's own list, so a name Broca adds and this reader lacks shows up
+    /// here instead of silently truncating sessions.
+    #[test]
+    fn every_feature_broca_writes_is_understood() {
+        for feature in [
+            "flow-scopes/v1",
+            "plan-manifest/v1",
+            "restart-pause/v1",
+            "scope/v1",
+            "steer-queue/v1",
+            "archive-index/v2",
+            "dispatch-module/v1",
+        ] {
+            let bytes = wal_bytes(&[
+                json!({"requires": [feature], "record": run_started("r1", 1)}),
+                step_finished(1, usage(1, 2, 3, 4)),
+            ]);
+            let runs = decode(&bytes).unwrap_or_else(|e| panic!("{feature}: {e}"));
+            assert_eq!(step_ids(&runs), [("r1".to_string(), 1)], "{feature}");
+        }
     }
 
     #[test]

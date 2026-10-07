@@ -3329,7 +3329,10 @@ fn broca_wal_step_rows(
             finish: step.finish_reason.clone(),
             // Every step of one run answers the same prompt, so the run is the turn.
             native_turn_id: Some(run.run_id.clone()),
-            context_limit: None,
+            // The window the run was admitted with; Magic Context records no
+            // limit for Broca sessions, so without it the timeline scaled each
+            // session by its own largest prompt.
+            context_limit: run.context_limit,
             provider,
             model,
             broca: Some(BrocaRow {
@@ -12666,6 +12669,7 @@ mod broca_cache_tests {
             ts_ms: Some(ts_ms),
             provider: Some("anthropic".to_string()),
             model: Some("claude-opus-5".to_string()),
+            context_limit: None,
             steps,
             finished: true,
         }
@@ -13413,6 +13417,61 @@ mod broca_cache_tests {
             .find(|row| row.session_id == gather_id)
             .unwrap();
         assert_eq!(row.last_activity_ms, started);
+    }
+
+    /// A Broca step's fill is its prompt over the context window its run was
+    /// admitted with (`run_started.config.context_limit`, the caller's
+    /// override or the catalog's window). Without it the timeline fell back
+    /// to the largest prompt in view, so every session's biggest step read
+    /// 100% full: a 90k prompt in a 1.05M window showed as a full window.
+    /// The run here is a mason run Broca paused for a restart and resumed;
+    /// every step after the resume must be shown too.
+    #[test]
+    fn broca_steps_are_scaled_by_the_runs_frozen_context_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = serde_json::json!({"project_root": "/work", "harness": "broca",
+                                         "session": "alfonso:bg_mason"});
+        write_live_wal(
+            dir.path(),
+            &session,
+            &broca_wal::tests::restart_resumed_wal(),
+            2_100,
+        );
+        let runs = broca_wal::WalCache::default()
+            .session_runs(
+                dir.path(),
+                &broca_wal::SessionIdentity::from_json(&session.to_string()).unwrap(),
+            )
+            .unwrap();
+        let events = build_db_cache_events(
+            load_broca_cache_events_from_conn(
+                &store(),
+                &session.to_string(),
+                Some(&runs),
+                None,
+                None,
+            )
+            .unwrap(),
+            false,
+        );
+        for event in &events {
+            assert_eq!(event.context_limit, 1_050_000, "{}", event.message_id);
+            assert!(!event.context_limit_estimated, "{}", event.message_id);
+        }
+        assert_eq!(
+            ids(&events),
+            [
+                "run-sid-restart#1",
+                "run-sid-restart#2",
+                "run-sid-restart#3"
+            ]
+        );
+        // Fill counts fresh input, cache reads and cache writes.
+        let last = events.last().unwrap();
+        assert_eq!(
+            last.input_tokens + last.cache_read + last.cache_write,
+            90_085
+        );
     }
 
     #[test]
