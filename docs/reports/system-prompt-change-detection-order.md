@@ -149,6 +149,16 @@ A late completion event for a reply the messages pass already saw does not clear
 mark. If no comparable id is available, the mark is cleared, so ambiguous cases
 fall back to the old flush.
 
+Review follow-up: the marker is session-keyed and carries no request identity. It
+means "a messages pass ran since the last consumption or newer completion", not
+"this request's messages pass ran". On a system-first host, a previous request
+that ends without a completed-assistant event leaves the marker set, and the next
+system hook reads true before its own messages transform. The unit test
+"LIMITATION: without a request-correlation seam, an unfinished previous request
+makes a system-first request look messages-final" pins that sequence. The helper
+is therefore valid only where messages run before system for every main request
+(stock OpenCode 1). OpenCode 2 and Pi deliberately do not wire it.
+
 In `system-prompt-hash.ts`, `adoptSystemChange = idleCacheExpired ||
 requestMessagesFinal` replaces `idleCacheExpired` in the two places the issue-610
 idle adoption already used: no history/systemPrompt/materialization refresh flags,
@@ -248,4 +258,9 @@ PATH=$ROOT/bin/oc-1.18.35:$PATH MC_E2E_MODE=rust bun test --timeout 1200000 test
 ```
 
 `SYSTEM_ORDER_EVIDENCE=<dir>` writes the per-request table and the captured request
-bodies.
+bodies. The suite runs only when the `opencode` executable on `PATH` matches a pinned
+npm `opencode-darwin-arm64` executable: 1.18.30 `2d0c9c33…4eddc62` or 1.18.35
+`8c3c351b…72c79d82`. Otherwise it skips and prints the binary and its hash. Its
+expectations (drops still queued after the edited request, one rewrite per edit)
+hold only on a messages-first host. A system-first host folds on the edited request
+itself, which is also correct but needs different expectations.

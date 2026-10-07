@@ -17,6 +17,15 @@
  * later. This scenario edits AGENTS.md and, separately, a configured
  * `instructions` file, and requires exactly one prefix rewrite per edit.
  *
+ * The expectations assume that messages-first order: the queued drops must still
+ * be pending after the edited request, and the only allowed rewrite is that
+ * request's system change. A host that runs the system hook first folds on the
+ * edited request itself, which is also correct but needs different expectations.
+ * So the suite runs only against reference hosts pinned by executable hash (see
+ * REFERENCE_HOSTS) and skips, with a message naming the binary and its hash, on
+ * any other `opencode` on PATH. A version string alone is not enough: a locally
+ * placed build reporting 1.18.30 was observed to fold on the edited request.
+ *
  * Runs in the TypeScript transform by default and in the Rust transform with
  * MC_E2E_MODE=rust. Set SYSTEM_ORDER_EVIDENCE to a directory to dump the
  * per-request table used by docs/reports/system-prompt-change-detection-order.md.
@@ -31,6 +40,42 @@ import { openTestDb } from "../src/test-db";
 import type { CapturedRequest } from "../src/mock-provider/server";
 
 const RUST = process.env.MC_E2E_MODE === "rust";
+
+/**
+ * SHA-256 of the `opencode` executable inside each npm `opencode-darwin-arm64`
+ * package this fixture was validated against. Both were checked to run the
+ * messages transform before the system transform on every main request.
+ */
+const REFERENCE_HOSTS: Record<string, string> = {
+    // npm opencode-darwin-arm64@1.18.30, tarball sha256
+    // 25b722fcdc8c46aebcb6501e1156dc1dc5a392492cc278c65b7775311674e7f8
+    "2d0c9c339bb91046c6ea951c97664bc2f8a8eaca707f31fbfbb7bc73c4eddc62":
+        "opencode-darwin-arm64@1.18.30 (npm)",
+    // npm opencode-darwin-arm64@1.18.35, tarball sha256
+    // b626543f4427cbd7a59756c24045f6f32dbc4cf7347ab5a8613f5c9fd6b0eeb3
+    "8c3c351b138cfe35905ab11846a1373f1beea590aee7eda412fb765b72c79d82":
+        "opencode-darwin-arm64@1.18.35 (npm)",
+};
+
+/** The harness spawns `opencode` from this process's PATH; hash that binary. */
+function resolveReferenceHost(): { ok: true; label: string } | { ok: false; reason: string } {
+    const binary = Bun.which("opencode", { PATH: process.env.PATH ?? "" });
+    if (!binary) return { ok: false, reason: "no `opencode` executable on PATH" };
+    const sha256 = createHash("sha256").update(readFileSync(binary)).digest("hex");
+    const label = REFERENCE_HOSTS[sha256];
+    if (!label) {
+        return {
+            ok: false,
+            reason: `${binary} (sha256 ${sha256}) is not a pinned messages-first reference host; put the npm opencode-darwin-arm64 1.18.30 or 1.18.35 executable first on PATH`,
+        };
+    }
+    return { ok: true, label };
+}
+
+const referenceHost = resolveReferenceHost();
+if (!referenceHost.ok) {
+    console.warn(`[system-prompt-change-order] SKIPPED: ${referenceHost.reason}`);
+}
 const EXTRA_INSTRUCTIONS = "extra-instructions.md";
 // Replies large enough that an early reply leaves the protected tail, so a queued
 // drop of it changes request bytes when a fold applies it.
@@ -212,7 +257,7 @@ function pendingDropCount(h: TestHarness, sessionId: string): number {
     ).n;
 }
 
-describe(`system prompt change detection order (${RUST ? "rust" : "ts"} transform)`, () => {
+describe.skipIf(!referenceHost.ok)(`system prompt change detection order (${RUST ? "rust" : "ts"} transform)`, () => {
     let h: TestHarness;
 
     beforeAll(async () => {
@@ -282,7 +327,7 @@ describe(`system prompt change detection order (${RUST ? "rust" : "ts"} transfor
                 return `${row.label.padEnd(22)} sys=${row.systemSha}(${row.systemBytes}B${row.systemChanged ? ",CHANGED" : ""}) msg0=${row.msg0Sha} msg1=${row.msg1Sha} kept=${row.retainedPrefix}/${row.previousCount} msgs=${row.messageCount} bytes=${row.requestBytes} rewrite=${row.rewrite} mc=${decision ? `${decision.decision} ${decision.detail}` : "?"}`;
             });
             const report = [
-                `mode=${RUST ? "rust" : "ts"} pending_at_agents_edit=${pendingAtAgentsEdit} pending_at_instructions_edit=${pendingAtInstructionsEdit} pending_at_end=${pendingDropCount(h, sessionId)}`,
+                `host=${referenceHost.ok ? referenceHost.label : "?"} mode=${RUST ? "rust" : "ts"} pending_at_agents_edit=${pendingAtAgentsEdit} pending_at_instructions_edit=${pendingAtInstructionsEdit} pending_at_end=${pendingDropCount(h, sessionId)}`,
                 ...lines,
                 "-- system hash log --",
                 ...hashLog,

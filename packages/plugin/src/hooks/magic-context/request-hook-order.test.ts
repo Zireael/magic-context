@@ -17,7 +17,7 @@ describe("request hook order", () => {
         expect(order.consumeMessagesPrepared("s")).toBe(false);
     });
 
-    it("reports system-first when a reply landed between the messages pass and the system hook", () => {
+    it("clears the marker when a newer reply completes between the messages pass and the system hook", () => {
         const order = createRequestHookOrder();
         expect(order.consumeMessagesPrepared("s")).toBe(false);
         order.messagesPrepared("s", history);
@@ -38,6 +38,24 @@ describe("request hook order", () => {
         order.messagesPrepared("s", history);
         order.assistantCompleted("s", undefined);
         expect(order.consumeMessagesPrepared("s")).toBe(false);
+    });
+
+    // Pins a known limitation, not a desired behaviour. The marker is session-keyed
+    // and has no request identity. On a system-first host, request A's messages pass
+    // sets it, A ends without a completed-assistant event (or the event is late), and
+    // request B's system hook, which runs BEFORE B's messages transform, still reads
+    // true. That is why the helper is wired only into stock OpenCode 1, where the
+    // messages transform runs before the system hook for every main request. Wiring
+    // it into a system-first host needs a seam that ties both hooks to one request;
+    // when such a seam exists, this test should flip to expect false.
+    it("LIMITATION: without a request-correlation seam, an unfinished previous request makes a system-first request look messages-final", () => {
+        const order = createRequestHookOrder();
+        // system(A) on a system-first host: no messages pass yet.
+        expect(order.consumeMessagesPrepared("s")).toBe(false);
+        // messages(A) runs; A then ends with no completion event observed.
+        order.messagesPrepared("s", [{ info: { id: "msg_0002", role: "assistant" } }]);
+        // system(B) runs before messages(B), yet the stale marker reads true.
+        expect(order.consumeMessagesPrepared("s")).toBe(true);
     });
 
     it("keeps sessions apart and forgets cleared sessions", () => {
