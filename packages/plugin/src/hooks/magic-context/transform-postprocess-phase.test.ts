@@ -1789,6 +1789,91 @@ describe("deferred compaction marker representation", () => {
         });
         expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryOrdinal).toBe(20);
         expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
+
+        // Pause a legacy publication until the response's target transaction
+        // commits, then publish through a different connection before the drain
+        // rereads pending. The response still represents only ordinal 10.
+        db.close();
+        const home = createTestTempDirFromPath(join(tmpdir(), "rust-publication-interleave-"));
+        tempDirs.push(home);
+        db = new Database(join(home, "context.db"));
+        initializeDatabase(db);
+        const racingSession = `${sessionId}-paused`;
+        createOpenCodeDbWithoutMessages("rust-publication-raw-");
+        const raw = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        for (const ordinal of [1, 10, 11, 20])
+            raw.prepare("INSERT INTO message VALUES (?, ?, ?, ?, ?)").run(
+                `m${ordinal}`,
+                racingSession,
+                ordinal,
+                ordinal,
+                JSON.stringify({ role: "user" }),
+            );
+        raw.close();
+        appendCompartments(db, racingSession, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 10,
+                startMessageId: "m1",
+                endMessageId: "m10",
+                startBlockIndex: 0,
+                endBlockIndex: 0,
+                title: "served",
+                content: "served",
+            },
+        ]);
+        const publisher = new Database(join(home, "context.db"));
+        const newer = { ...pending, injectAttempts: 4 };
+        const prepare = db.prepare.bind(db);
+        let pendingReads = 0;
+        const publication = spyOn(db, "prepare").mockImplementation((sql) => {
+            if (
+                String(sql).includes("SELECT pending_compaction_marker_state") &&
+                ++pendingReads === 2
+            ) {
+                publisher
+                    .transaction(() => {
+                        appendCompartments(publisher, racingSession, [
+                            {
+                                sequence: 1,
+                                startMessage: 11,
+                                endMessage: 20,
+                                startMessageId: "m11",
+                                endMessageId: "m20",
+                                startBlockIndex: 0,
+                                endBlockIndex: 0,
+                                title: "published later",
+                                content: "published later",
+                            },
+                        ]);
+                        setPendingCompactionMarkerState(publisher, racingSession, newer);
+                    })
+                    .immediate();
+            }
+            return prepare(sql);
+        });
+        let fences = 0;
+        try {
+            applyRustModeDeferredCompactionMarker({
+                db,
+                sessionId: racingSession,
+                cacheBustingPass: true,
+                admissionProven: true,
+                boundary: { rowVersion: 7, ordinal: 10, endMessageId: "m10" },
+                beforeApply: () => {
+                    fences++;
+                },
+            });
+            expect(pendingReads).toBe(2);
+            expect(fences).toBe(0);
+            expect(getPersistedCompactionMarkerState(db, racingSession)).toBeNull();
+            expect(getPendingCompactionMarkerState(db, racingSession)).toEqual(newer);
+            expect(getCompactionMarkerHealth(db, racingSession).attempts).toBe(4);
+        } finally {
+            publication.mockRestore();
+            publisher.close();
+        }
     });
 
     it("genuine rebuild without fresh coordinates retires the cleared marker in the same cycle", () => {
@@ -6871,6 +6956,37 @@ describe("final message representation", () => {
             resolvedProviderID: "anthropic",
         });
         expect(JSON.stringify(lkgReplay)).toBe(replayBytes);
+    });
+
+    it("supported false permission captures the newest-tail decision while unsupported permission holds it", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        for (const permission of [false, undefined, null, "true", 1, {}]) {
+            const sessionId = `ses-newest-tail-${String(permission)}`;
+            const messages = [
+                {
+                    info: { id: "newest", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "already served tail" }],
+                },
+            ] as MessageLike[];
+            runRustModePostprocess({
+                db,
+                sessionId,
+                messages,
+                cacheBustingPass: false,
+                prefixPermissionSupported: typeof permission === "boolean",
+                fullFeatureMode: true,
+                resolvedProviderID: "anthropic",
+                trailingBlankSourceDecisions: new Map([["newest", "strip"]]),
+                trailingBlankNewestAssistantId: "newest",
+                tagger: createTagger(),
+                ctxReduceAvailability: { callable: false, frozen: true },
+            });
+            expect(getTrailingBlankDecisions(db, sessionId).get("newest")).toBe(
+                permission === false ? "strip" : undefined,
+            );
+            expect(messages[0]!.parts).toEqual([{ type: "text", text: "already served tail" }]);
+        }
     });
 
     it("lets Rust module trailing-blank output outrank host keep decisions", () => {

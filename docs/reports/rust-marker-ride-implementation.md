@@ -17,12 +17,24 @@ without enabling host first applications. An armed admission fence requires a
 supported rebuilding response after the real recovery flush; an old producer
 must be upgraded, not repaired by deleting the fence.
 
+Error envelopes and unsuccessful native statuses are rejected before host
+processing. An uncertain retryable host write (including a failed context mirror
+after the OpenCode transaction committed) refuses the turn and retains the fence;
+only typed definitely-no-cut outcomes can preserve the safely available old slot.
+
 The immutable producer permission governs target extraction (independently of
 scheduler execute), marker admission/drain, marker reconciliation, reasoning
-bust strips, note-nudge eligibility, new trailing-blank decisions and synthetic
+bust strips, note-nudge eligibility and synthetic
 todo-anchor adoption. Frozen-release pricing remains separate and never grants
 marker authority. This boundary also supplies `moduleDecisionBusts` for subsequent
 frozen-replay adoption-policy work.
+
+The newest-assistant trailing-blank capture is a first-serve decision, not a
+prefix first-mutation. Supported true **and false** responses preserve this
+existing ingress-race capture; unsupported responses hold it. Absorbing strip
+does not rewrite already-served bytes, and host replay never manufactures keep
+bytes. The real-host paired trailing-blank control establishes why delaying this
+capture until a prefix bust would change historical replay.
 
 Coverage and permission are independent. Fresh targets still require a commit
 and valid response coordinates. Retained retries require the actual served
@@ -43,3 +55,30 @@ assertions and monotonic/cooldown note-nudge controls remain. Lock fixtures now
 expect a newer, unconsumed target not to be attempted; fake served responses
 explicitly identify their supported permission instead of relying on a production
 label fallback. Frozen-release policy itself is not changed in this patch.
+
+## Verification boundaries
+
+The mixed fixture uses generated user/assistant history, completed tool parts with
+large JSON outputs, tied timestamps in the covered head, seven sparse gaps and an
+assistant end whose preceding user remains the host boundary. It records actual
+transform payload bytes separately from the raw-history API bytes, sampled peak
+RSS summed across host/daemon/module, successful output fit, host writer acquire
+and hold times, the first smaller full send and subsequent append delta. Provider
+equality compares distinct intercepted HTTP system/messages objects, not hashes
+of a single object.
+
+Fault coverage includes scheduler-defer after-marker, capture, late bookkeeping,
+context-mirror and final-fit failures, a held real SQLite host writer with typed
+definitely-no-cut rollback, and SIGKILL of an adapter process immediately after
+its real host-store commit and before admission. The SIGKILL fixture is a Bun
+adapter/SQLite process, not an OpenCode server OS-kill or provider-ack test. The
+real OpenCode recovery control separately exercises actual session.flush transport.
+The paused publication control uses two real context connections and commits
+legacy pending work between response recording and the drain's reread; it does
+not claim an in-flight Rust historian publication writes legacy pending blobs.
+
+Throwaway-HOME full package suites expose unrelated existing HOME/homedir
+assumptions in the plugin config-variable and Pi dreamer-home tests. Those files
+and claims are not changed. The e2e TypeScript project also has existing errors
+outside the marker fixture; package source/scripts typechecks pass and the edited
+marker fixture has no TypeScript diagnostics.

@@ -935,6 +935,14 @@ function assertNativeBoundary(output: unknown[], sessionId: string, boundaryId: 
 }
 
 function responseValue(response: unknown): Record<string, unknown> {
+    if (
+        isRecord(response) &&
+        (response.ok === false || response.isError === true || response.error != null)
+    ) {
+        throw new RustTransformProtocolError(
+            "rust transform wire invariant failed: error envelope cannot permit host mutations",
+        );
+    }
     if (isRecord(response) && isRecord(response.result)) return response.result;
     if (isRecord(response)) return response;
     throw new Error("module transform returned a non-object response");
@@ -3849,6 +3857,16 @@ export function createRustModeTransform(
                     throw new Error("rust module omitted native content after a full-array retry");
                 }
             }
+            if (
+                response.ok === false ||
+                response.isError === true ||
+                response.error != null ||
+                (response.status !== undefined && response.status !== "ok")
+            ) {
+                throw new RustTransformProtocolError(
+                    "rust transform wire invariant failed: unsuccessful native response cannot permit host mutations",
+                );
+            }
             const explicitDecision =
                 typeof response.decision === "string" && response.decision.length > 0
                     ? response.decision
@@ -3936,6 +3954,7 @@ export function createRustModeTransform(
                         : undefined,
                 );
                 let appliedMessages = moduleMessages;
+                let markerStrategyFailure: Error | undefined;
                 let replayedFrozenRepresentation = false;
                 const boundaryId = response.boundary_id;
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
@@ -4140,6 +4159,9 @@ export function createRustModeTransform(
                             } else {
                                 markerSafeSnapshot = undefined;
                                 fenceMarkerAdmission(sessionId, state);
+                                if (outcome.kind === "retryable-failure") {
+                                    markerStrategyFailure = outcome.error;
+                                }
                             }
                         },
                         compactionMarkerStrategy: deps.compactionMarkerStrategy,
@@ -4151,6 +4173,7 @@ export function createRustModeTransform(
                             model?.modelID,
                         ),
                         cacheBustingPass: moduleDecisionBusts,
+                        prefixPermissionSupported: permissionSupported,
                         moduleReasoningTrimOnly: response.reasoning_trim_only === true,
                         // A frozen session hands the strip gate the last-served array on
                         // every pass that reaches postprocess. That includes a module bust
@@ -4173,6 +4196,10 @@ export function createRustModeTransform(
                     });
                     thinkingBindingRecovery = postprocess.thinkingBindingRecovery;
                     markerAt = postprocess.markerAt;
+                    // A possibly committed host write with unfinished mirror/CAS
+                    // work is not an admitted cut, even if fresh native output fits.
+                    // Keep the durable fence until a supported recovery repairs it.
+                    if (markerStrategyFailure) throw markerStrategyFailure;
                 }
                 if (typeof boundaryId === "string" && boundaryId.length > 0) {
                     assertNativeBoundary(appliedMessages, sessionId, boundaryId);

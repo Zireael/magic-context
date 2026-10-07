@@ -1,8 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { listSessionCompactionMarkers } from "../../features/magic-context/compaction-marker";
@@ -37,6 +38,7 @@ import {
     getPersistedCompactionMarkerState,
     getPersistedNoteNudge,
     getThinkingBindingRecoveryTarget,
+    getTrailingBlankDecisions,
     recordDetectedContextLimit,
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
@@ -44,7 +46,10 @@ import {
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { bumpProjectMemoryEpoch } from "../../features/magic-context/storage-project-state";
-import { isRustMarkerAdmissionFenced } from "../../features/magic-context/storage-replay-document";
+import {
+    isRustMarkerAdmissionFenced,
+    setRustMarkerAdmissionFence,
+} from "../../features/magic-context/storage-replay-document";
 import { createTagger } from "../../features/magic-context/tagger";
 import {
     __resetToolDefinitionMeasurements,
@@ -352,7 +357,15 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 
 describe("Rust mode authority adapter", () => {
     function markerFaultFixture(
-        fault: "fence" | "after-marker" | "capture" | "bookkeeping" | "host-lock-capture",
+        fault:
+            | "fence"
+            | "after-marker"
+            | "capture"
+            | "bookkeeping"
+            | "host-lock-capture"
+            | "mirror"
+            | "final-fit"
+            | "os-cut",
         queueOldCapture = false,
         noCutOutcome?: MarkerUpdateOutcome,
         admissionEstimator?: Parameters<
@@ -465,19 +478,45 @@ describe("Rust mode authority adapter", () => {
                     if (noCutOutcome) fail = false;
                     throw new Error("injected late overflow bookkeeping failure");
                 }
+                if (
+                    fault === "mirror" &&
+                    fail &&
+                    step >= 2 &&
+                    String(sql).startsWith("UPDATE session_meta SET compaction_marker_state")
+                ) {
+                    throw new Error("injected post-cut context mirror failure");
+                }
                 return originalPrepare(sql);
             });
             const deps = makeDeps(db, moduleClient);
             deps.tagger = createTagger();
             deps.compactionMarkerStrategy = {
                 applyDeferred: (...args) => {
+                    expect(isRustMarkerAdmissionFenced(db, sid)).toBe(true);
                     const outcome = noCutOutcome ?? applyDeferredCompactionMarker(...args);
                     markerOutcomes.push(outcome);
+                    if (fault === "os-cut" && fail && outcome.kind === "applied") {
+                        const record = process.env.MC_RUST_MARKER_OS_CUT_RECORD;
+                        if (!record) throw new Error("missing isolated crash record path");
+                        writeFileSync(
+                            record,
+                            JSON.stringify({ sid, path, dataHome: process.env.XDG_DATA_HOME }),
+                        );
+                        process.kill(process.pid, "SIGKILL");
+                    }
                     if (fault === "after-marker" && fail && outcome.kind === "applied")
                         throw new Error("injected after irreversible marker write");
                     return outcome;
                 },
-                reconcile: reconcileMarkerRepresentation,
+                reconcile: (...args) => {
+                    reconcileMarkerRepresentation(...args);
+                    if (fault === "final-fit" && fail && step >= 2) {
+                        args[0].push({
+                            info: { id: "over-limit", role: "user", sessionID: sid },
+                            parts: [{ type: "text", text: "x".repeat(2_000_000) }],
+                        } as MessageLike);
+                    }
+                },
             };
             return createRustModeTransform(deps, {
                 moduleClient,
@@ -579,6 +618,106 @@ describe("Rust mode authority adapter", () => {
         }
     });
 
+    it("an error response cannot grant host authority even with true permission and native messages", async () => {
+        const sessionId = `rust-error-permission-${Date.now()}`;
+        sessions.push(sessionId);
+        installRawProvider(sessionId);
+        const db = makeDb();
+        const pending = { ordinal: 1, endMessageId: "m1", publishedAt: 1, injectAttempts: 3 };
+        setPendingCompactionMarkerState(db, sessionId, pending);
+        let writes = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          status: "error",
+                          decision: "HARD",
+                          prefix_bust_permitted: true,
+                          committed: true,
+                          row_version: 7,
+                          coverage_ordinal: 1,
+                          boundary_id: "m1#0",
+                          native_messages: [
+                              {
+                                  info: { role: "user", sessionID: sessionId },
+                                  parts: [
+                                      {
+                                          type: "text",
+                                          text: "<session-history>invalid response</session-history>",
+                                          synthetic: true,
+                                      },
+                                  ],
+                              },
+                              ...makeMessages(sessionId),
+                          ],
+                      }
+                    : { ok: true },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.tagger = createTagger();
+        deps.compactionMarkerStrategy = {
+            applyDeferred: () => {
+                writes++;
+                return { kind: "applied", markerOrdinal: 1 };
+            },
+            reconcile: reconcileMarkerRepresentation,
+        };
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = makeMessages(sessionId);
+        await expect(
+            transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId)),
+        ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(writes).toBe(0);
+        expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+        transform.dispose();
+    });
+
+    it("supported false wire permission captures newest-tail replay while unsupported wire permission holds", async () => {
+        for (const permission of [false, undefined, null, 1, "true", {}]) {
+            const sessionId = `rust-wire-tail-${String(permission)}-${Date.now()}`;
+            sessions.push(sessionId);
+            installRawProvider(sessionId);
+            const db = makeDb();
+            const input = [
+                ...makeMessages(sessionId),
+                {
+                    info: { id: "newest", role: "assistant", sessionID: sessionId },
+                    parts: [{ type: "text", text: "already served tail" }],
+                },
+            ] as MessageLike[];
+            input[0]!.info.model = { providerID: "anthropic", modelID: "mock-sonnet" };
+            input[1]!.info.providerID = "anthropic";
+            input[1]!.info.modelID = "mock-sonnet";
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method }) =>
+                    method === "transform"
+                        ? {
+                              decision: "SOFT+",
+                              ...(permission === undefined
+                                  ? {}
+                                  : { prefix_bust_permitted: permission }),
+                              row_version: 1,
+                              native_messages: structuredClone(input),
+                          }
+                        : { ok: true },
+            };
+            const deps = makeDeps(db, moduleClient);
+            deps.liveModelBySession?.set(sessionId, {
+                providerID: "anthropic",
+                modelID: "mock-sonnet",
+            });
+            deps.getModelKey = () => "anthropic/mock-sonnet";
+            const transform = createRustModeTransform(deps, { moduleClient });
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+            expect(getTrailingBlankDecisions(db, sessionId).get("newest")).toBe(
+                permission === false ? "strip" : undefined,
+            );
+            expect(output.messages).toEqual(input);
+            transform.dispose();
+        }
+    });
+
     it("all host first applications hold without an actual boolean permission", async () => {
         for (const wireValue of [undefined, null, false, 1, "true", "false", {}]) {
             const sessionId = `rust-permission-${String(wireValue)}-${Date.now()}`;
@@ -646,16 +785,43 @@ describe("Rust mode authority adapter", () => {
             expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
             expect(calls).not.toContain("session.flush");
             expect(getSlot(sessionId)).toBeDefined();
+            setRustMarkerAdmissionFence(db, sessionId, true);
+            await expect(
+                transform.run(sessionId, input, { messages: [...input] }, makeMeta(db, sessionId)),
+            ).rejects.toBeInstanceOf(EmergencyFailClosedError);
+            expect(isRustMarkerAdmissionFenced(db, sessionId)).toBe(true);
+            expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+            expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
             transform.dispose();
         }
     });
 
+    it.skipIf(process.env.MC_RUST_MARKER_OS_CUT_CHILD !== "1")("marker OS cut child", async () => {
+        const fixture = markerFaultFixture("os-cut", false, undefined, undefined, "defer");
+        await fixture.serve();
+        await fixture.serve();
+        throw new Error("the crash probe did not reach the committed host cut");
+    });
+
     it("defer HARD failed admission remains fenced across restart", async () => {
-        for (const fault of ["after-marker", "capture", "bookkeeping"] as const) {
+        for (const fault of [
+            "after-marker",
+            "capture",
+            "bookkeeping",
+            "mirror",
+            "final-fit",
+        ] as const) {
             const fixture = markerFaultFixture(fault, false, undefined, undefined, "defer");
             try {
                 await fixture.serve();
                 await expect(fixture.serve()).rejects.toBeInstanceOf(EmergencyFailClosedError);
+                expect(listSessionCompactionMarkers(fixture.sid)).toHaveLength(1);
+                if (fault === "mirror")
+                    expect(getPersistedCompactionMarkerState(fixture.db, fixture.sid)).toBeNull();
+                else
+                    expect(
+                        getPersistedCompactionMarkerState(fixture.db, fixture.sid)?.boundaryOrdinal,
+                    ).toBe(1);
                 expect(isRustMarkerAdmissionFenced(fixture.db, fixture.sid)).toBe(true);
                 expect(loadPersistedLkgSlot(fixture.db, fixture.sid)).toBeUndefined();
                 fixture.restart();
@@ -671,11 +837,93 @@ describe("Rust mode authority adapter", () => {
                 fixture.dispose();
             }
         }
+        const home = createTestTempDirFromPath(join(tmpdir(), "marker-os-cut-"));
+        const recordPath = join(home, "crash.json");
+        const child = spawnSync(
+            process.execPath,
+            ["test", import.meta.path, "-t", "marker OS cut child"],
+            {
+                env: {
+                    ...process.env,
+                    MC_RUST_MARKER_OS_CUT_CHILD: "1",
+                    MC_RUST_MARKER_OS_CUT_RECORD: recordPath,
+                },
+                encoding: "utf8",
+                timeout: 30_000,
+                windowsHide: true,
+            },
+        );
+        expect(child.signal).toBe("SIGKILL");
+        const record = JSON.parse(readFileSync(recordPath, "utf8")) as {
+            sid: string;
+            path: string;
+            dataHome: string;
+        };
+        sessions.push(record.sid);
+        availabilityDataHomes.push(record.dataHome, home, dirname(record.path));
+        process.env.XDG_DATA_HOME = record.dataHome;
+        installRawProvider(record.sid);
+        const recoveredDb = new Database(record.path) as ContextDatabase;
+        databases.push(recoveredDb);
+        registerLkgPersistence(createDbLkgPersistence(recoveredDb));
+        expect(listSessionCompactionMarkers(record.sid)).toHaveLength(1);
+        expect(isRustMarkerAdmissionFenced(recoveredDb, record.sid)).toBe(true);
+        expect(loadPersistedLkgSlot(recoveredDb, record.sid)).toBeUndefined();
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          decision: "HARD",
+                          prefix_bust_permitted: true,
+                          committed: true,
+                          row_version: 3,
+                          coverage_ordinal: 1,
+                          boundary_id: "m1#0",
+                          native_messages: [
+                              {
+                                  info: { role: "user", sessionID: record.sid },
+                                  parts: [
+                                      {
+                                          type: "text",
+                                          text: "<session-history>new admitted prefix</session-history>",
+                                          synthetic: true,
+                                      },
+                                  ],
+                              },
+                              ...makeMessages(record.sid),
+                          ],
+                      }
+                    : { ok: true },
+        };
+        const deps = makeDeps(recoveredDb, moduleClient);
+        deps.tagger = createTagger();
+        const transform = createRustModeTransform(deps, { moduleClient });
+        try {
+            const input = makeMessages(record.sid);
+            await transform.run(
+                record.sid,
+                input,
+                { messages: [...input] },
+                makeMeta(recoveredDb, record.sid),
+            );
+            expect(isRustMarkerAdmissionFenced(recoveredDb, record.sid)).toBe(false);
+            expect(loadPersistedLkgSlot(recoveredDb, record.sid)?.jsonPrefix).toContain(
+                "new admitted prefix",
+            );
+        } finally {
+            transform.dispose();
+        }
     });
 
     // Allow time for the separate process's seven-second SQLite write lock to release.
     it("a busy host cut followed by priced capture failure retains still-safe LKG across restart", async () => {
-        const fixture = markerFaultFixture("host-lock-capture");
+        const fixture = markerFaultFixture(
+            "host-lock-capture",
+            false,
+            undefined,
+            undefined,
+            "defer",
+        );
         try {
             const old = await fixture.serve();
             expect(await fixture.serveAliased()).toBe(old);
@@ -2234,6 +2482,64 @@ describe("Rust mode authority adapter", () => {
                 false,
             ),
         ).toBeUndefined();
+    });
+
+    it("deferred rebuilding extraction preserves every durable coordinate guard", () => {
+        const valid = {
+            committed: true,
+            scheduler_decision: "defer",
+            row_version: 12,
+            coverage_ordinal: 9590,
+            boundary_id: "msg_boundary#3",
+        };
+        expect(__rustModeTransformTest.materializedCompactionBoundary(valid, true)).toEqual({
+            rowVersion: 12,
+            ordinal: 9590,
+            endMessageId: "msg_boundary",
+        });
+        expect(
+            __rustModeTransformTest.materializedCompactionBoundary(valid, false),
+        ).toBeUndefined();
+        for (const patch of [
+            ...[undefined, false, 1, "true"].map((committed) => ({ committed })),
+            ...[
+                undefined,
+                0,
+                -1,
+                1.5,
+                Number.POSITIVE_INFINITY,
+                Number.NaN,
+                Number.MAX_SAFE_INTEGER + 1,
+                "12",
+            ].map((row_version) => ({ row_version })),
+            ...[
+                undefined,
+                -1,
+                1.5,
+                Number.POSITIVE_INFINITY,
+                Number.NaN,
+                Number.MAX_SAFE_INTEGER + 1,
+                "9590",
+            ].map((coverage_ordinal) => ({ coverage_ordinal })),
+            ...[
+                undefined,
+                null,
+                "",
+                "missing-hash",
+                "#0",
+                "msg#",
+                "msg#-1",
+                "msg#abc",
+                "msg#1.5",
+                "msg# 1",
+            ].map((boundary_id) => ({ boundary_id })),
+        ])
+            expect(
+                __rustModeTransformTest.materializedCompactionBoundary(
+                    { ...valid, ...patch },
+                    true,
+                ),
+            ).toBeUndefined();
     });
 
     it("arms the deferred-note nudge only when a module fold advances the published sequence", async () => {

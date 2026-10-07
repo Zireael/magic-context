@@ -1059,6 +1059,8 @@ export function runRustModePostprocess(args: {
      * authority. A permitted pass may freeze thinking invalidated by its edit.
      */
     cacheBustingPass?: boolean;
+    /** Whether the response carried an actual boolean prefix-bust capability. */
+    prefixPermissionSupported?: boolean;
     /**
      * The module reports that this busting pass edited nothing before newer
      * signed thinking except removing reasoning from a contiguous oldest prefix
@@ -1176,7 +1178,15 @@ export function runRustModePostprocess(args: {
                 trailingBlankDecisions,
                 { sourceDecisions: args.trailingBlankSourceDecisions },
             ).filter(([id]) => id === args.trailingBlankNewestAssistantId);
-            if (args.cacheBustingPass === true && candidates.length > 0) {
+            // Deciding about the newest assistant on its first serve is a
+            // first-serve decision, not a prefix first-mutation. Absorbing strip
+            // never rewrites already-served bytes; postponing this capture until
+            // a prefix bust lets late provider blanks change historical replay.
+            // Unsupported producers still hold all new host decisions.
+            if (
+                (args.prefixPermissionSupported ?? args.cacheBustingPass === true) &&
+                candidates.length > 0
+            ) {
                 const persisted = addTrailingBlankDecisions(args.db, args.sessionId, candidates, {
                     overwriteMessageId: args.trailingBlankNewestAssistantId,
                 });
