@@ -30,7 +30,7 @@ Confirm isolation with `lsof -p <pid>` on the probe's `ck-mc` and `ck-subc`: eve
 
 ## The proposed migration 63
 
-`migcheck/` holds the exact migration text (`migration63.sql`) and a Rust probe that runs it with the SQLite ck-mc links (3.46.0, through `rusqlite =0.32.1` with `bundled`). The crate is outside the repository's Cargo workspace; build it from a copy so no `Cargo.lock` or `target/` lands here:
+`migcheck/` holds the exact migration text (`migration63.sql`) and a Rust probe that runs it with the SQLite ck-mc links (3.46.0, through `rusqlite =0.32.1` with `bundled`). The crate is outside the repository's Cargo workspace, and its committed `Cargo.lock` pins that dependency resolution. Build it from a copy so no build output lands here:
 
 ```sh
 W=$TMPDIR/magic-context/ckmc-writes-r2
