@@ -2,6 +2,13 @@
 
 ## Result
 
+**Host-side follow-up:** the correlated all-session plugin-log gaps narrow the
+remaining hypothesis to OpenCode's event loop/receipt side. The host-targeted
+sampling addendum below records native stacks and machine memory pressure;
+neither RSS nor a quiet log alone identifies a particular plugin or proves GC.
+Its background observer completed two captures in 265.56 s. Both began at the
+edge of recovery, so no causal MC fix is proved by those samples either.
+
 **No production fix implemented: the specific 55 s root cause is not proved.**
 The observer ran from 10:29:05 to 11:32:18 (63 min, with short observer-only
 restart gaps), capturing four candidates: a genuine 15.7 s SQL/I/O pass, two
@@ -445,3 +452,262 @@ the live stores remain unchanged.
   exact 55 s timer. No SQLite transaction state or lock owner was observable
   from `lsof`, and no native sample identifies a suspended async per-route
   owner. These are limits of the conclusion, not evidence for a guessed fix.
+
+## OpenCode-targeted follow-up
+
+The follow-up targets `opencode serve` PID **11009**, version **1.18.30**,
+executable `~/.opencode/bin/opencode`. The new observer started at
+**11:43:14.395 UTC**, in the background with a 90-minute bound, and stopped
+automatically at **11:47:39.960**, after the requested two captures. Sampling
+was triggered after more than five seconds with no size/mtime change in either
+`magic-context.log` or its rotated predecessor. Each capture concurrently
+executed `sample 11009 5`, `vm_stat`, `sysctl vm.swapusage`, `ps`, and a
+read-only `lsof -nP -p 11009 -Fn`. It never opens a database or triggers an
+in-process heap snapshot/forced GC. Raw evidence has the prefix
+`node_modules/.cache/ckmc-stall-watch/opencode-stall-*`.
+
+### Why the host is the next suspect
+
+The plugin log has no timestamped records for **any** session between
+10:11:20.487 and 10:12:14.076, and the later response-wait example similarly
+has an all-session gap around 11:31:52-11:32:09. That is stronger evidence for
+lost JS-event-loop/host-receipt progress than a Rust-only log gap, especially
+given the already-completed Rust handler in live capture 4. It still is not a
+native stack showing the blocked frame.
+An independent read of both current/rotated logs confirmed per-second counts:
+**38 lines at 10:11:20, zero at 10:11:21 through 10:12:13, 21 at 10:12:14**;
+**zero at 11:31:52 through 11:32:08, 18 at 11:32:09**.
+
+There is a necessary logging caveat: `packages/plugin/src/shared/logger.ts`
+buffers records and flushes on a 500 ms timer or at 50 lines (11-12,185-190,
+207-214). Timestamped lines can reach disk after they were produced; silence
+in file **growth** can exceed silence in actual JS log calls. The flush itself
+is synchronous: `appendFileSync` at line 169 and bounded synchronous log
+rotation at 107-145. A logger/file-I/O stall can also stop the JS thread.
+Neither ordinary buffering nor rotation by itself explains a 54 s gap without
+corroborating evidence. The new watcher therefore records both observed file
+growth and the timestamps surrounding each sample.
+
+### Host capture 1: mostly recovery, not a demonstrated long GC
+
+```text
+11:43:48.544  last file growth observed
+11:43:49.443  final timestamped plugin line before the gap (visible later)
+11:43:53.563  silence detector fires: 5.02 s of observed file silence
+11:43:53.659  macOS sample starts (13:43:53.659 local)
+11:43:53.697  timestamped message.updated records resume
+11:44:02.508  observer capture finishes; all five commands exit 0
+```
+
+The sample has **2,406 samples per thread**, physical footprint **4.1 GB**,
+peak **6.1 GB**; simultaneous ps reports RSS **3,876,560 KiB**. System swap is
+**7,223.94 / 8,192 MiB used**. `vm_stat` reports 16,384-byte pages, 19,063 free
+pages (~298 MiB), 3,521,425 compressor-resident pages (~53.73 GiB), and
+5,094,116 pages stored in the compressor (~77.73 GiB uncompressed). The
+compression, page-in and swap counters are **cumulative machine counters**,
+not per-host faults or a measured fault rate during this sample.
+
+Trimmed native stacks:
+
+```text
+main / Thread_24446801 (2406 samples):
+  opencode +0x178840 -> +0x3397bc -> +0x33ca20 -> +0x33e410
+    -> kevent64                                      836 samples
+  other paths: anonymous executable/JIT frames; brief libsqlite3 calls:
+    sqlite3_step -> sqlite3VdbeExec -> vdbeCommit -> pagerWalFrames
+      -> unixWrite -> seekAndWrite -> guarded_pwrite_np
+    sqlite3_step -> vdbeColumnFromOverflow -> accessPayload
+      -> unixRead -> seekAndRead -> pread
+
+Heap Helper Thread / Thread_30723483:
+  2355 / 2406 samples: opencode +0x2f45fc -> +0x2f62ec -> +0x2f9018
+    -> _pthread_cond_wait -> __psynch_cvwait
+  51 samples outside that idle branch
+Heap Helper Thread / Thread_30723484:
+  2356 / 2406 samples in the same idle branch
+JSCWarmUp: 2406 / 2406 in the condition-variable idle branch
+```
+
+SQLite leaves and heap-helper activity during recovery do not identify the
+operation that caused the preceding silence. This first capture begins only
+38 ms before timestamped JS activity resumes. Do not call its mostly idle heap
+helpers a five-second stop-the-world collection.
+
+### Host capture 2: synchronous SQLite on JS main during recovery; plugin unknown
+
+```text
+11:47:27.203  final timestamped plugin line before gap:
+               sqlite writer BEGIN IMMEDIATE background hold_ms=253, committed
+11:47:27.349  last file growth observed
+11:47:32.378  detector fires: 5.03 s of observed file silence
+11:47:32.518  sample starts
+11:47:32.519  message.updated timestamps resume
+11:47:32.757  AFT Rust pass transport returns: 5993.2 ms; handler=1383.5 ms
+11:47:38.956  capture finishes; all five commands exit 0
+11:47:39.960  background observer exits 0 (265.56 s, two captures)
+```
+
+The second sample has **1,506 samples per thread**, footprint **4.2 GB**, peak
+**6.1 GB**; simultaneous RSS is **3,309,008 KiB** and `%CPU` **139.6** (ps's
+measurement, not a five-second CPU average). Swap remains **7,223.94 / 8,192
+MiB used**. Free pages fall to 5,185 (~81 MiB); compressor-resident pages are
+4,202,621 (~64.13 GiB), representing 5,885,375 stored pages (~89.80 GiB).
+
+```text
+main / Thread_24446801:
+  anonymous JIT caller -> opencode +0xafb5e4 [0x1054475e4]
+    -> sqlite3_step -> sqlite3VdbeExec -> sqlite3VdbeHalt -> vdbeCommit
+    -> sqlite3BtreeCommitPhaseOne -> sqlite3PagerCommitPhaseOne
+    -> pagerWalFrames -> unixWrite -> seekAndWrite -> guarded_pwrite_np
+      92 samples in this one branch
+  sqlite3_step -> sqlite3BtreeNext -> moveToChild -> getPageNormal
+    -> unixRead -> seekAndRead -> pread
+  sqlite3_step -> vdbeColumnFromOverflow -> accessPayload -> pread
+
+main-thread totals (inclusive SQLite frames; other counts are leaf samples):
+  sqlite3_step 271 / 1506 (~18.0%); guarded_pwrite_np 124 / 1506;
+  pread 67 / 1506; kevent64 140 / 1506
+
+Heap Helper Thread / Thread_30723483 and Thread_30723484:
+  each: 1464 / 1506 in opencode +0x2f45fc -> +0x2f62ec -> +0x2f9018
+    -> _pthread_cond_wait -> __psynch_cvwait
+```
+
+Thus **synchronous SQLite reads and WAL writes on the JS main thread are
+observed**, but they occupy a fraction of a recovery sample; the stack does
+not show a busy-timeout sleep or a checkpoint waiting five seconds. Main also
+runs numerous unidentified native/JIT paths. The Bun pool has substantial
+filesystem activity (`lstat`, `__rename`), while the named heap helpers are
+mostly idle. None of this proves that a specific SQLite query or GC caused
+the preceding five-second gap: the first resumed JS timestamp is just **1 ms
+after sample start**. The same 52 Prefrontal, two MC, and six OpenCode numeric
+DB descriptors remain open.
+
+The two VM samples, ~219 s apart, show machine-wide decompressions increasing
+by 3,982,390 and swapins by 839; compressor occupancy increases by 681,196
+pages (~10.39 GiB). This supports significant system memory/compression churn
+between observations, **not** a per-process page-fault rate or proof of a
+page-fault-heavy blocking read inside OpenCode. A low free-page count includes
+reclaimable/compressed memory policy effects; it is not an OOM diagnosis.
+
+### Native symbolication and attribution limits
+
+The executable's runtime/JSC frames and JIT code have no usable function names
+in `sample`. `nm -n` lists just one defined text symbol,
+`__mh_execute_header`; `atos` on sampled addresses returns address/offset
+labels, not named Bun/JSC functions. For example live address `0x10557fb98`
+maps only to image address `0x100c33b98 + 92`. The sample retains exact
+addresses for later symbolication with a matching dSYM; these addresses cannot
+honestly be labelled JSON, regex, or a JSC collector from the current evidence.
+Likewise the brief `sqlite3_step` frames do not include a JS filename or SQLite
+handle, so attributing them to MC, AFT or Prefrontal would be a guess.
+
+Numeric database descriptors in the capture (excluding `txt` mappings):
+
+| Database | Host descriptors |
+| --- | ---: |
+| `~/.local/share/cortexkit/prefrontal-core/data.db` | **52** |
+| `~/.local/share/cortexkit/magic-context/context.db` | **2** |
+| `~/.local/share/opencode/opencode.db` | **6** |
+
+The high Prefrontal connection count is a concrete resource/lifecycle lead,
+not proof that a sampled SQLite step used that DB, a measured SQLite cache
+size, or a JS retained-heap attribution. No other plugin's code was changed.
+
+### MC heap drivers identifiable from source, not measured dominators
+
+These are source-level candidates in the investigation checkout, not a census
+of the live host's retained objects or proof of its installed MC bundle version.
+
+- `MagicContextRustHeapHolder.wireCaches` is an ordinary session `Map`
+  (`rust-mode-transform.ts:329-330,4513`). Each entry retains the raw content
+  field snapshots and acknowledged native output (`310-327,4138`). It has no
+  byte/session eviction bound in that adapter; deletion/invalidation clears
+  individual entries (`1962-1972,4781-4804`). Session churn can retain native
+  arrays and raw strings longer than the active pass. The separate `states`
+  Map (`1668`) retains ordinal metadata and `lkgAcceptedCapture.inputs`
+  (`434-438,2368`), likewise until lifecycle cleanup. These are candidates for
+  retained memory, not evidence that they dominate the running 4 GB host.
+- LKG slots already have a 64 MiB aggregate charged bound and 24 MiB
+  single-slot bound (`lkg-slot.ts:31-32`); the digest memo is separately
+  bounded at 16 MiB (`289-316`). The entry projector uses a 64 MiB bound and
+  at most 16 prior sessions (`lkg-replay.ts:84,141-145`). Do not describe those
+  caches as unbounded or sum their charged bytes as if they were actual RSS.
+- Transient native/LKG JSON parse/stringify and field-array construction can
+  raise allocation pressure (`rust-mode-transform.ts:1339,1382,2294,3433`).
+  `getHeapStats` itself stringifies retained native arrays to estimate bytes
+  (`346-373,4825-4841`), so it was not invoked inside an already pressured
+  host. No heap dump or explicit collection was triggered.
+- The existing [session storage inventory](session-snapshot-size-2026-10-07.md)
+  quantifies durable row-value bytes, not heap. Its large histories cannot be
+  converted into JS-retained bytes without proving which rows are loaded.
+
+### Host conclusion and smallest supported fix proposal
+
+The all-session gaps plus the already-completed Rust response make **host-side
+event-loop/receipt starvation the better next target** than changing ck-mc's
+checkpointing. The new samples establish system pressure and synchronous
+SQLite work on that host's JS main thread, but **do not establish GC as the
+blocking frame, identify a plugin's SQLite call site, or name a JSON/regex
+frame**. The first sample is mostly recovery; the second begins exactly at
+recovery. The stripped executable prevents useful native symbolication, and
+JIT callers do not expose JS filenames. This is an attribution limit, not a
+license to name MC or Prefrontal as the culprit.
+
+**Smallest causal next step:** obtain matching OpenCode/Bun native symbols
+and JS-profile/source attribution during a blackout. A diagnostic recording
+must start earlier than the edge of a short five-second silence (for example
+a low-cost pre-trigger ring), or it will repeat these recovery-only samples.
+Distinguish absence of JS execution from missing input traffic and delayed log
+flush. Do not change the live host's inspector configuration or generate a
+multi-gigabyte heap snapshot merely to fill this report; neither was done here.
+
+**Smallest fix candidates, only after attribution:**
+
+- If MC's synchronous query/maintenance transaction owns the blackout, move
+  that exact operation onto the existing worker/admission path, or bound its
+  batch and yield between batches. An `async` wrapper or `setImmediate` alone
+  still runs `bun:sqlite` on main and is not a fix. Red-first proof must hold a
+  real temporary-DB lock or realistic large query while an event-loop
+  heartbeat and unrelated Rust reply progress; preserve transaction/CAS and
+  priced-LKG durability semantics. No such operation was identified, so no
+  query or test was changed.
+- If retained MC arrays cause long collection/memory stalls, the narrow source
+  change to evaluate is an aggregate byte/session bound on **wireCaches**
+  (and, separately, accepted-input/ordinal state lifecycle), not tightening the
+  already-bounded LKG slot store. Evict only replayable wire state and request
+  a full native reply/full wire on the next pass; never discard the durable
+  priced prefix. Prove bounded retained state over session churn and exact
+  replay after eviction before claiming a latency fix. Live dominator sizes
+  were not measured, so this remains a proposal.
+- Ask the Prefrontal owner to account for **52 simultaneously open data.db
+  descriptors** and close/reuse handles if their lifecycle is leaking. This
+  is a concrete independent resource lead, not attribution of the sampled
+  SQLite step or an authorization to edit another plugin here.
+
+No production MC change is made in this follow-up. A more specific fix would
+require a frame/operation or heap-retainer attribution not present in these
+captures.
+
+### Host evidence fingerprints and verification
+
+All raw artifacts remain in the ignored worktree evidence directory; no live
+store copy or heap snapshot is included. SHA-256:
+
+```text
+opencode-stall-1.sample.txt 44d43a1936879f240ebc2b2006897bcd6004b0092ef4431fd9c97d22c8bbbe1b
+opencode-stall-1.vm-stat.txt 80c7ef5e6c378a019cd3331dc16f4102d60f9fde31d4c616581038c613c7c4da
+opencode-stall-1.swap.txt 034977d18cfaa3865e3df8c4ed737054e959c7eac937bd11d321bccd175ba4dc
+opencode-stall-1.lsof.txt ff48887c9e901ddc8017a49e97070e9a33f338bf7c623151fac2e8ede02cef8f
+opencode-stall-2.sample.txt 0267bdc116421e634071af5124109115ff03710e4d836b5fb9acae68f6e6c536
+opencode-stall-2.vm-stat.txt 8864bbda4ab7399e17e2ced08fd23f263a11ceef247dd477076d8902d433fc95
+opencode-stall-2.swap.txt 034977d18cfaa3865e3df8c4ed737054e959c7eac937bd11d321bccd175ba4dc
+opencode-stall-2.lsof.txt 17e2d545b8a5c203dfd9077f3237d4121ed36593ccd410ec3b2e880c2c876b69
+```
+
+The observer is Python 3.9.6; both sets of five commands returned exit 0 with
+nonempty evidence. Sample version/OS headers match the prior captures. Native
+symbol probes (`opencode --version`, `nm`, `atos`) completed without modifying
+the host; failed function-name resolution is reported as a limitation, not a
+successful frame attribution. This remains a documentation-only delivery;
+typecheck/build/test exemptions above are unchanged.
