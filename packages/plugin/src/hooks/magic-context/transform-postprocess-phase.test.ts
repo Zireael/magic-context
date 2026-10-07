@@ -953,7 +953,11 @@ describe("tail hygiene last-writer guard", () => {
             return result;
         };
         const originalNodeEnv = process.env.NODE_ENV;
+        const originalDebugAssertions = process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
         process.env.NODE_ENV = "production";
+        // This control isolates the production structural guard. The separate
+        // debug-assertion test deliberately enables the exact-content walk.
+        delete process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
         const sessionLog = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
 
         try {
@@ -973,6 +977,8 @@ describe("tail hygiene last-writer guard", () => {
             sessionLog.mockRestore();
             if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
             else process.env.NODE_ENV = originalNodeEnv;
+            if (originalDebugAssertions === undefined) delete process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
+            else process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS = originalDebugAssertions;
         }
     });
 });

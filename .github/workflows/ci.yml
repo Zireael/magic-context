@@ -84,6 +84,8 @@ jobs:
         run: bun crates/mc-module/gen/gen-historian-prompt-golden.ts --check
 
       - name: Test
+        env:
+          MAGIC_CONTEXT_DEBUG_ASSERTIONS: "1"
         run: bun run test
 
       # Exercise the node:sqlite branch of shared/sqlite.ts under REAL Node —
@@ -143,6 +145,8 @@ jobs:
         run: bun run --cwd packages/pi-plugin build
 
       - name: Test
+        env:
+          MAGIC_CONTEXT_DEBUG_ASSERTIONS: "1"
         run: bun run --cwd packages/pi-plugin test
 
   check-dashboard:
