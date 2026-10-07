@@ -15,6 +15,7 @@ import {
   cacheWriteLabel,
   selectWorstCacheEvent,
 } from "../../lib/cache-format";
+import { livePollDue } from "../../lib/live-poll";
 import type { DbCacheEvent, Harness, SessionCacheStats } from "../../lib/types";
 import HarnessBadge from "../HarnessBadge";
 import CacheTimeline from "../shared/CacheTimeline";
@@ -563,10 +564,23 @@ export default function CacheDiagnostics() {
 
   // Single 1s reconciliation loop: cheap cache-stats re-list + incremental
   // per-session fetches (only for sessions whose activity advanced). In-flight
-  // latched so a slow pass can't stack.
+  // latched so a slow pass can't stack. Backs off while the window is in the
+  // background and stops while it is hidden (see lib/live-poll.ts); coming
+  // back to the window refreshes at once.
   let reconcileInFlight = false;
-  const tick = async () => {
+  let ticksSinceRefresh = 0;
+  const tick = async (force = false) => {
     if (paused() || reconcileInFlight) return;
+    ticksSinceRefresh += 1;
+    const due =
+      force ||
+      livePollDue({
+        hidden: document.visibilityState === "hidden",
+        focused: document.hasFocus(),
+        ticksSinceRefresh,
+      });
+    if (!due) return;
+    ticksSinceRefresh = 0;
     reconcileInFlight = true;
     try {
       await reconcile();
@@ -577,7 +591,16 @@ export default function CacheDiagnostics() {
     }
   };
   const tickInterval = setInterval(() => void tick(), 1000);
-  onCleanup(() => clearInterval(tickInterval));
+  const refreshOnReturn = () => {
+    if (document.visibilityState !== "hidden") void tick(true);
+  };
+  document.addEventListener("visibilitychange", refreshOnReturn);
+  window.addEventListener("focus", refreshOnReturn);
+  onCleanup(() => {
+    clearInterval(tickInterval);
+    document.removeEventListener("visibilitychange", refreshOnReturn);
+    window.removeEventListener("focus", refreshOnReturn);
+  });
 
   // Selection helper. Ensures the newly-selected session has a window (loads it
   // immediately if not already held) so its chart appears without a poll lag.
