@@ -595,6 +595,33 @@ describe("frozen recovery admission", () => {
         });
     }
 
+    it("refuses known-over frozen bytes when native fit is unproven without an emergency", async () => {
+        const s = reviewSession("native-unproven", OPUS, 8 * 1024 * 1024);
+        const input = [s.user("m1", "question")];
+        await s.run(input, "HARD");
+        await s.run(input, "throw");
+        input.push(assistant(s.sessionId, "a1"), s.user("m2", "word ".repeat(300_000)));
+        const unknown = s.user("native", "small native output");
+        unknown.parts.push({ type: "future-provider-part" } as never);
+        s.setModuleOutput(() => [unknown]);
+        await expect(s.run(input, "SOFT+")).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+        expect(s.transform.getState(s.sessionId).failureCount).toBe(1);
+    });
+
+    it("CONTROL: unproven frozen fit still holds even when native output fits", async () => {
+        const s = reviewSession("frozen-unproven");
+        const input = [s.user("m1", "question")];
+        await s.run(input, "HARD");
+        const frozen = await s.run(input, "throw");
+        const tail = s.user("m2", "unknown tail");
+        tail.parts.push({ type: "future-provider-part" } as never);
+        input.push(assistant(s.sessionId, "a1"), tail);
+        s.setModuleOutput(() => [s.user("m1", "small native output")]);
+        expect(await s.run(input, "SOFT+")).toEqual([...frozen, ...input.slice(1)]);
+        expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+    });
+
     it("CONTROL: frozen replay measured under the limit still sends despite an over-budget prefix estimate", async () => {
         const s = reviewSession("measured-under", OPUS, 8 * 1024 * 1024);
         const modelKey = "anthropic/claude-opus-5-5";
