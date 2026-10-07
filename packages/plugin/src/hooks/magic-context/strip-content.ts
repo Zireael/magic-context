@@ -320,12 +320,9 @@ export function clearOldReasoning(
     messages: MessageLike[],
     reasoningByMessage: Map<MessageLike, ThinkingLikePart[]>,
     messageTagNumbers: Map<MessageLike, number>,
-    clearReasoningAge: number,
+    cutoff: number,
 ): number {
-    const maxTag = findMaxTag(messageTagNumbers);
-    if (maxTag === 0) return 0;
-
-    const ageCutoff = maxTag - clearReasoningAge;
+    const ageCutoff = cutoff;
     let cleared = 0;
 
     for (const message of messages) {
@@ -351,14 +348,6 @@ export function clearOldReasoning(
     }
 
     return cleared;
-}
-
-function findMaxTag(messageTagNumbers: Map<MessageLike, number>): number {
-    let max = 0;
-    for (const tag of messageTagNumbers.values()) {
-        if (tag > max) max = tag;
-    }
-    return max;
 }
 
 const CLEARED_REASONING_TYPES = new Set(["thinking", "reasoning"]);
@@ -409,12 +398,9 @@ const INLINE_THINKING_PATTERN = /<(?:thinking|think)>[\s\S]*?<\/(?:thinking|thin
 export function stripInlineThinking(
     messages: MessageLike[],
     messageTagNumbers: Map<MessageLike, number>,
-    clearReasoningAge: number,
+    cutoff: number,
 ): number {
-    const maxTag = findMaxTag(messageTagNumbers);
-    if (maxTag === 0) return 0;
-
-    const ageCutoff = maxTag - clearReasoningAge;
+    const ageCutoff = cutoff;
     let stripped = 0;
 
     for (const message of messages) {

@@ -740,6 +740,8 @@ pub struct TransformRequest {
     /// complete signed thinking block. This mirrors the TS `clear_reasoning_age` setting.
     #[serde(default = "default_clear_reasoning_age")]
     pub clear_reasoning_age: u64,
+    /// Host-resolved retention budget; deprecated age is accepted but ignored.
+    pub keep_reasoning_tokens_effective: Option<u64>,
     /// TS-resolved per-model TTL (session_meta.cacheTtl). None when the consumer does
     /// not resolve TTLs (CC leg); the module's own config resolves then. Until this
     /// field existed the adapter's value was silently dropped by serde, leaving every
@@ -1031,6 +1033,8 @@ struct TransformRequestWire {
     #[serde(default = "default_clear_reasoning_age")]
     clear_reasoning_age: u64,
     #[serde(default)]
+    keep_reasoning_tokens_effective: Option<u64>,
+    #[serde(default)]
     cache_ttl: Option<String>,
     /// Broca's name for the cache TTL, in milliseconds. Used only when `cache_ttl` is absent.
     #[serde(default)]
@@ -1180,6 +1184,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             provider_id: wire.provider_id,
             model_key: wire.model_key,
             clear_reasoning_age: wire.clear_reasoning_age,
+            keep_reasoning_tokens_effective: wire.keep_reasoning_tokens_effective,
             cache_ttl: wire.cache_ttl.or_else(|| {
                 wire.cache_ttl_ms
                     .map(|milliseconds| milliseconds.to_string())
@@ -5455,11 +5460,17 @@ fn apply_once(
         planned_age_basis,
         ctx.caveman_english_word_rules,
     );
+    let reasoning_scope = ReasoningBudgetScope {
+        coverage: loaded.meta.coverage_ordinal.unwrap_or(0),
+        anchor: lineage_anchor_mid,
+    };
     let planned_reasoning_cutoff = reasoning_clear_cutoff_with_tags(
         req,
         serializer_profile,
         non_tool_bust_opportunity,
         &tag_numbers,
+        &loaded.core,
+        reasoning_scope,
     );
     let planned_strip_units = new_frozen_strip_units(
         &loaded.core,
@@ -5467,7 +5478,14 @@ fn apply_once(
         &tag_numbers,
         planned_reasoning_cutoff,
         non_tool_bust_opportunity,
-        lineage_anchor_mid,
+        StripSelectionScope {
+            reasoning: reasoning_scope,
+            image_watermark: processed_image_watermark(
+                &tag_rows,
+                &loaded.core.frozen_units,
+                &selected_reductions,
+            ),
+        },
         &selection_outcome.protected_tool_block_ids,
     );
     let reclaim_pending_now = reductions_pending_now
@@ -5793,8 +5811,14 @@ fn apply_once(
         }
     }
     timings.user_hint = elapsed_ms(user_hint_started_at);
-    let reasoning_clear_cutoff =
-        reasoning_clear_cutoff_with_tags(req, serializer_profile, is_bust_pass, &tag_numbers);
+    let reasoning_clear_cutoff = reasoning_clear_cutoff_with_tags(
+        req,
+        serializer_profile,
+        is_bust_pass,
+        &tag_numbers,
+        &loaded.core,
+        reasoning_scope,
+    );
     if let Some(cutoff) = reasoning_clear_cutoff {
         meta.reasoning_cleared_through_tag = meta.reasoning_cleared_through_tag.max(cutoff);
         // Keep the legacy ordinal watermark populated so readers that predate the tag-number
@@ -13636,12 +13660,42 @@ fn tag_number_by_message(tags: &[McTagRow]) -> BTreeMap<String, u64> {
     output
 }
 
-fn tag_age_cutoff(req: &TransformRequest, tag_numbers: &BTreeMap<String, u64>) -> Option<u64> {
-    let max_tag = tag_numbers.values().copied().max().unwrap_or(0);
-    Some(max_tag.saturating_sub(req.clear_reasoning_age))
-}
+include!("transform/reasoning_budget.rs");
 
 include!("transform/reasoning_clear.rs");
+
+#[derive(Clone, Copy)]
+struct StripSelectionScope<'a> {
+    reasoning: ReasoningBudgetScope<'a>,
+    image_watermark: u64,
+}
+
+/// Processed images follow the shared dropped-tag watermark, not reasoning retention.
+/// Planned drops count only on the rebuilding pass that commits them with these strips.
+fn processed_image_watermark(
+    rows: &[McTagRow],
+    frozen: &[FrozenUnit],
+    planned: &[ReductionDecision],
+) -> u64 {
+    let dropped =
+        |kind: &str| matches!(kind, "drop" | "skeleton" | "skeleton_real" | "edit_marker");
+    let targets: HashSet<&str> = frozen
+        .iter()
+        .filter(|unit| dropped(&unit.kind))
+        .filter_map(|unit| unit.key.strip_prefix(RED_KEY_PREFIX))
+        .chain(
+            planned
+                .iter()
+                .filter(|decision| dropped(&decision.kind))
+                .map(|decision| decision.target_id.as_str()),
+        )
+        .collect();
+    rows.iter()
+        .filter(|row| targets.contains(row.block_id.as_str()))
+        .filter_map(|row| u64::try_from(row.tag_number).ok())
+        .max()
+        .unwrap_or(0)
+}
 
 fn new_frozen_strip_units(
     core: &CoreState,
@@ -13649,12 +13703,14 @@ fn new_frozen_strip_units(
     tag_numbers: &BTreeMap<String, u64>,
     reasoning_clear_cutoff: Option<u64>,
     is_bust_pass: bool,
-    lineage_anchor_mid: Option<&str>,
+    selection_scope: StripSelectionScope<'_>,
     protected_tools: &HashSet<String>,
 ) -> Vec<FrozenUnit> {
     if !is_bust_pass {
         return Vec::new();
     }
+    let scope = selection_scope.reasoning;
+    let lineage_anchor_mid = scope.anchor;
     let sentinel = provider_sentinel_text(req);
     let existing_keys: HashSet<&str> = core
         .frozen_units
@@ -13666,7 +13722,7 @@ fn new_frozen_strip_units(
         .messages
         .len()
         .saturating_sub(STRUCTURAL_PROTECTED_MESSAGE_COUNT);
-    let age_cutoff = tag_age_cutoff(req, tag_numbers);
+    let age_cutoff = Some(reasoning_budget_cutoff(req, tag_numbers, core, scope));
     let reasoning_mutation_exempt_mid =
         latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
     let profile = SerializerProfile::parse(&req.serializer_profile);
@@ -13685,7 +13741,7 @@ fn new_frozen_strip_units(
         && (!request_accepts_empty_content(req)
             || is_prefix_bound_thinking_model(req.model_key.as_deref()))
     {
-        opencode_reasoning_removal_mids(req, tag_numbers, age_cutoff, &existing_keys)
+        opencode_reasoning_removal_mids(req, tag_numbers, age_cutoff, &existing_keys, scope)
     } else {
         HashSet::new()
     };
@@ -13744,6 +13800,7 @@ fn new_frozen_strip_units(
             // this already-busting pass and replays unchanged on defers; selection.rs continues to
             // exclude every reasoning block from ReductionDecision targets.
             let cc_aged = message.ck.role == "assistant"
+                && scope.visible(message)
                 && reasoning_mutation_exempt_mid != Some(message.mid.as_str())
                 && cc_reasoning_cutoff.is_some_and(|cutoff| {
                     let tag = message_tag_number(message, tag_numbers);
@@ -13786,11 +13843,12 @@ fn new_frozen_strip_units(
         }
         if has_assistant_response
             && request_accepts_empty_content(req)
-            && age_cutoff.is_some_and(|cutoff| {
+            && selection_scope.image_watermark > 0
+            && {
                 // Missing tags are age zero in the TypeScript lane. This decision is still
                 // minted only on a bust and then frozen by message/block id for stable replay.
-                message_tag_number(message, tag_numbers) <= cutoff
-            })
+                message_tag_number(message, tag_numbers) <= selection_scope.image_watermark
+            }
             && blocks.iter().any(image_block_is_large)
         {
             let marker = strip_unit("processed_image", &message.mid, &sentinel);
@@ -13858,6 +13916,7 @@ fn opencode_reasoning_removal_mids<'a>(
     tag_numbers: &BTreeMap<String, u64>,
     age_cutoff: Option<u64>,
     existing_keys: &HashSet<&str>,
+    scope: ReasoningBudgetScope<'_>,
 ) -> HashSet<&'a str> {
     let mut selected = HashSet::new();
     let Some(cutoff) = age_cutoff.filter(|cutoff| *cutoff > 0) else {
@@ -13896,13 +13955,16 @@ fn opencode_reasoning_removal_mids<'a>(
         .collect();
     for message in &req.messages {
         if message.ck.meta.synthetic
+            || !scope.visible(message)
             || message.ck.role != "assistant"
             || !message.ck.content.iter().any(is_reasoning_block)
         {
             continue;
         }
         let mid = message.mid.as_str();
-        if existing_keys.contains(format!("strip:reasoning_age:{mid}").as_str()) {
+        if existing_keys.contains(format!("strip:reasoning_age:{mid}").as_str())
+            || existing_keys.contains(format!("strip:merged_reasoning:{mid}").as_str())
+        {
             continue;
         }
         let tag = message_tag_number(message, tag_numbers);
@@ -13910,6 +13972,7 @@ fn opencode_reasoning_removal_mids<'a>(
             && !openrouter_shaped.contains(mid)
             && Some(mid) != newest
             && Some(mid) != exempt
+            && Some(mid) != scope.anchor
             && tag > 0
             && tag <= cutoff
             && message.ck.content.iter().any(has_meaningful_content);
@@ -16355,6 +16418,8 @@ fn reasoning_clear_cutoff_with_tags(
     profile: Option<SerializerProfile>,
     is_bust_pass: bool,
     tag_numbers: &BTreeMap<String, u64>,
+    core: &CoreState,
+    scope: ReasoningBudgetScope<'_>,
 ) -> Option<u64> {
     // Prefix-bound models never take this watermark lane: it skips an ineligible message
     // instead of stopping there, so it could remove a block from the middle and invalidate
@@ -16370,7 +16435,7 @@ fn reasoning_clear_cutoff_with_tags(
         _ => false,
     };
     if profile_supported {
-        tag_age_cutoff(req, tag_numbers)
+        Some(reasoning_budget_cutoff(req, tag_numbers, core, scope))
     } else {
         None
     }
@@ -19292,11 +19357,50 @@ pub(crate) mod tests {
             ),
         };
         let assistant = wire_item("assistant", "image-answer", 2, &["processed"]);
-        let mut request = req("untagged-image", "cfg0", vec![image, assistant]);
+        let mut request = req(
+            "untagged-image",
+            "cfg0",
+            vec![
+                item("head", 0, "older history"),
+                image,
+                assistant,
+                item("dropper", 3, "spent"),
+            ],
+        );
         request.provider_id = Some("anthropic".to_string());
         request.protected_tags = 0;
 
-        let bust = run(&store, &request, &spine());
+        let baseline = run(&store, &request, &spine());
+        assert!(
+            baseline
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("image-user"))
+                .unwrap()
+                .content
+                .iter()
+                .any(image_block_is_large),
+            "an answer alone is not a dropped-tag watermark"
+        );
+        store
+            .seed_tags_for_test(
+                "untagged-image",
+                &[mc_store::TagMintInput {
+                    block_id: "dropper#0".into(),
+                    kind: "message".into(),
+                    token_count: 1,
+                    source_bytes: b"spent".to_vec(),
+                }],
+                0,
+            )
+            .unwrap();
+        let drops = vec![ReductionDecision {
+            target_id: "dropper#0".into(),
+            kind: "drop".into(),
+            payload: String::new(),
+        }];
+        request.render_config = "cfg1".into();
+        let bust = run(&store, &request, &drops);
         assert_eq!(bust.action, "HARD");
         assert_eq!(tail_bytes(&bust, "image-user"), "");
         let frozen = store.load("untagged-image").unwrap();
@@ -19529,6 +19633,7 @@ pub(crate) mod tests {
             provider_id: None,
             model_key: None,
             clear_reasoning_age: DEFAULT_CLEAR_REASONING_AGE,
+            keep_reasoning_tokens_effective: None,
             caveman_enabled: false,
             caveman_min_chars: DEFAULT_CAVEMAN_MIN_CHARS,
             tool_input_key_orders: BTreeMap::new(),
@@ -29537,7 +29642,8 @@ pub(crate) mod tests {
             let mut request = active_opencode_req("reasoning-batch", "cfg0", messages);
             request.provider_id = Some("anthropic".to_string());
             request.serve_native = true;
-            request.clear_reasoning_age = 3;
+            request.keep_reasoning_tokens_effective =
+                Some(2 * mc_tokenizer::estimate_tokens("thinking-assistant-a") as u64);
             with_usage(request, 70, 100)
         }
 
@@ -29587,8 +29693,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .meta
                 .reasoning_cleared_through_tag,
-            2,
-            "the bootstrap HARD records its pre-reasoning cutoff while preserving newer signatures"
+            0,
+            "the bootstrap HARD fits both assistant steps, so it records no removal"
         );
 
         messages.push(item("gap-c", 6, "separator"));
@@ -29631,8 +29737,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .meta
                 .reasoning_cleared_through_tag,
-            6,
-            "the fold captures every current-pass tag in one cutoff"
+            5,
+            "the fold captures the first non-fitting assistant step in one cutoff"
         );
 
         drop(db);
@@ -29665,8 +29771,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .meta
                 .reasoning_cleared_through_tag,
-            6,
-            "a restart must replay the prior bust cutoff instead of deriving maxTag-age"
+            5,
+            "a restart must replay the prior bust cutoff instead of reselecting a budget"
         );
     }
 
@@ -29726,7 +29832,11 @@ pub(crate) mod tests {
                 signed_assistant("latest", 4),
             ];
             let mut request = active_cc_req("cc-reasoning-age", config, messages);
-            request.clear_reasoning_age = clear_reasoning_age;
+            request.keep_reasoning_tokens_effective = Some(if clear_reasoning_age == 100 {
+                100_000
+            } else {
+                0
+            });
             request
         }
 

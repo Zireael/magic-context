@@ -1120,7 +1120,7 @@ export function resolveHistorianFromConfig(
 		executeThresholdTokens: config.execute_threshold_tokens,
 		commitClusterTrigger: config.commit_cluster_trigger,
 		protectedTags: config.protected_tags,
-		clearReasoningAge: config.clear_reasoning_age,
+		keepReasoningTokens: config.keep_reasoning_tokens,
 		historyBudgetPercentage: config.history_budget_percentage,
 		memoryEnabled: config.memory.enabled,
 		autoPromote: config.memory.auto_promote,
@@ -1563,7 +1563,7 @@ async function startPiMagicContextRuntime(
 						wordRules: cavemanWordRulesForLanguage(cfg.language),
 					}
 				: undefined,
-			clearReasoningAge: cfg.clear_reasoning_age,
+			keepReasoningTokens: cfg.keep_reasoning_tokens,
 		},
 		injection: {
 			memoryEnabled: cfg.memory.enabled,

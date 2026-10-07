@@ -468,6 +468,7 @@ fn reasoning_clear_merged_assistant_whitespace_sentinels_replay_one_wire_shape()
         .insert(0, json!({"id":"old-blank","type":"text","text":"   "}));
     // The changed source belongs to a new session; no old source-identity pin is reused.
     request.session_id = "combined-reasoning".to_string();
+    request.keep_reasoning_tokens_effective = Some(0);
     request.messages =
         crate::codec::decode_opencode(request.native_messages.as_ref().unwrap()).messages;
     let mut ctx = pctx("git:fixture", "/nonexistent-docs", 0);

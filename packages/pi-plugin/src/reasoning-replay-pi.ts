@@ -36,7 +36,16 @@
 
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
-import type { TagTarget } from "@magic-context/core/hooks/magic-context/tag-messages";
+import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import {
+	reasoningBudgetCutoff,
+	reasoningStepCost,
+} from "@magic-context/core/hooks/magic-context/reasoning-budget";
+import type {
+	MessageLike,
+	TagTarget,
+} from "@magic-context/core/hooks/magic-context/tag-messages";
+import { isRecord } from "@magic-context/core/shared/record-type-guard";
 
 type PiTextContent = { type: "text"; text: string };
 type PiThinkingContent = {
@@ -55,6 +64,8 @@ type PiAssistantContent = PiTextContent | PiThinkingContent | PiToolCall;
 type PiAssistantMessage = {
 	role: "assistant";
 	content: PiAssistantContent[];
+	usage?: { reasoning?: number };
+	providerPayload?: { items?: unknown[] };
 	timestamp?: number;
 };
 
@@ -108,6 +119,36 @@ export function buildMessageIdToMaxTag(
 	return out;
 }
 
+/** Diagnostic adapter only; evaluated on /ctx-status, never to select on defer. */
+export function piReasoningStatusMessages(messages: unknown[]): MessageLike[] {
+	return messages.filter(isRecord).map((message) => {
+		const usage = isRecord(message.usage) ? message.usage : {};
+		const parts = Array.isArray(message.content)
+			? message.content.filter(isRecord).map((part) =>
+					part.type === "thinking"
+						? {
+								...part,
+								type: part.redacted === true ? "redacted_thinking" : "thinking",
+							}
+						: part,
+				)
+			: [];
+		const payload = isRecord(message.providerPayload)
+			? message.providerPayload
+			: undefined;
+		if (
+			payload &&
+			Array.isArray(payload.items) &&
+			payload.items.some((item) => isRecord(item) && item.type === "reasoning")
+		)
+			parts.push({ type: "reasoning", text: "", metadata: {} });
+		return {
+			info: { role: message.role, tokens: { reasoning: usage.reasoning } },
+			parts,
+		} as unknown as MessageLike;
+	});
+}
+
 /**
  * Highest tag the typed-reasoning clear (and the inline strip that shares its
  * watermark) may cover on this execute pass. Replay re-clears every assistant
@@ -122,27 +163,93 @@ export function buildMessageIdToMaxTag(
 export function piReasoningClearCutoff(args: {
 	messages: unknown[];
 	messageIdToMaxTag: Map<string, number>;
-	clearReasoningAge: number;
+	keepReasoningTokens: number;
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 	prefixBound: boolean;
+	proseRatio?: number;
 	/** Entries whose thinking another strip already removed for good. */
 	alreadyGone?: (id: string) => boolean;
 }): number {
 	if (args.prefixBound) return piPrefixBoundReasoningCutoff(args);
-	let maxTag = 0;
-	for (const t of args.messageIdToMaxTag.values()) if (t > maxTag) maxTag = t;
-	let cutoff = maxTag - args.clearReasoningAge;
-	if (maxTag === 0 || cutoff <= 0) return 0;
+	return piBudgetCutoff(args);
+}
 
-	for (let i = args.messages.length - 1; i >= 0; i--) {
-		const raw = args.messages[i] as { role?: unknown } | null;
-		if (!raw || typeof raw !== "object" || raw.role !== "assistant") continue;
-		const id = args.piMessageStableId(raw, i);
-		const newestTag = id ? (args.messageIdToMaxTag.get(id) ?? 0) : 0;
-		if (newestTag > 0) cutoff = Math.min(cutoff, newestTag - 1);
-		break;
-	}
-	return Math.max(0, cutoff);
+export function piBudgetCutoff(args: {
+	messages: unknown[];
+	messageIdToMaxTag: ReadonlyMap<string, number>;
+	keepReasoningTokens: number;
+	piMessageStableId: (msg: unknown, index: number) => string | undefined;
+	alreadyGone?: (id: string) => boolean;
+	proseRatio?: number;
+}): number {
+	const assistants = args.messages
+		.map((message, index) => ({ message, index }))
+		.filter((entry): entry is { message: PiAssistantMessage; index: number } =>
+			isAssistantWithContent(entry.message),
+		);
+	const newest = assistants.at(-1);
+	const exempt = [...assistants]
+		.reverse()
+		.find((entry) =>
+			entry.message.content.some(
+				(part) => part.type !== "text" || part.text.trim() !== "",
+			),
+		);
+	return reasoningBudgetCutoff(
+		assistants.map((entry) => {
+			const id = args.piMessageStableId(entry.message, entry.index);
+			return {
+				tag: id ? (args.messageIdToMaxTag.get(id) ?? 0) : 0,
+				exempt: entry === newest || entry === exempt,
+				alreadyRemoved:
+					id !== undefined &&
+					args.alreadyGone?.(id) === true &&
+					!hasInlineThinkingMarkup(entry.message),
+				cost: () => {
+					let text = "";
+					let inlineText = "";
+					let opaque = false;
+					const typedGone = id !== undefined && args.alreadyGone?.(id) === true;
+					for (const part of typedGone
+						? []
+						: thinkingParts(entry.message).filter(isLiveThinking)) {
+						if (part.redacted) opaque = true;
+						else text += part.thinking;
+						opaque ||= !!part.thinkingSignature && !part.thinking;
+					}
+					for (const part of entry.message.content) {
+						if (part.type !== "text") continue;
+						for (const match of part.text.matchAll(
+							/<(?:think|thinking)>([\s\S]*?)<\/(?:think|thinking)>/gi,
+						))
+							inlineText += match[1];
+					}
+					opaque ||=
+						!typedGone &&
+						entry.message.providerPayload?.items?.some(
+							(item) => isRecord(item) && item.type === "reasoning",
+						) === true;
+					if (!text && !opaque && !inlineText) return 0;
+					const reported = entry.message.usage?.reasoning;
+					const typed =
+						text || opaque
+							? reported !== undefined && reported > 0
+								? reported
+								: reasoningStepCost(
+										reported,
+										estimateTokens(text) * (args.proseRatio ?? 1),
+										opaque,
+									)
+							: 0;
+					return (
+						typed +
+						Math.ceil(estimateTokens(inlineText) * (args.proseRatio ?? 1))
+					);
+				},
+			};
+		}),
+		args.keepReasoningTokens,
+	);
 }
 
 function isAssistantWithContent(raw: unknown): raw is PiAssistantMessage {
@@ -207,14 +314,13 @@ function hasInlineThinkingMarkup(msg: PiAssistantMessage): boolean {
 export function piPrefixBoundReasoningCutoff(args: {
 	messages: unknown[];
 	messageIdToMaxTag: Map<string, number>;
-	clearReasoningAge: number;
+	keepReasoningTokens: number;
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 	alreadyGone?: (id: string) => boolean;
+	proseRatio?: number;
 }): number {
-	let maxTag = 0;
-	for (const t of args.messageIdToMaxTag.values()) if (t > maxTag) maxTag = t;
-	const ageCutoff = maxTag - args.clearReasoningAge;
-	if (maxTag === 0 || ageCutoff <= 0) return 0;
+	const ageCutoff = piBudgetCutoff(args);
+	if (ageCutoff <= 0) return 0;
 
 	let newestIndex = -1;
 	for (let i = args.messages.length - 1; i >= 0; i--) {
@@ -284,23 +390,15 @@ export function piPrefixBoundReasoningCutoff(args: {
 export function clearOldReasoningPi(args: {
 	messages: unknown[];
 	messageIdToMaxTag: Map<string, number>;
-	clearReasoningAge: number;
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
-	/** Upper bound from piReasoningClearCutoff; omitted means age only. */
-	maxCutoff?: number;
+	/** Frozen cutoff selected by piReasoningClearCutoff on this execute pass. */
+	maxCutoff: number;
 }): { cleared: number; newWatermark: number } {
-	const { messages, messageIdToMaxTag, clearReasoningAge, piMessageStableId } =
-		args;
+	const { messages, messageIdToMaxTag, piMessageStableId } = args;
 
-	let maxTag = 0;
-	for (const t of messageIdToMaxTag.values()) if (t > maxTag) maxTag = t;
-	if (maxTag === 0) return { cleared: 0, newWatermark: 0 };
-
-	const ageCutoff = Math.min(
-		maxTag - clearReasoningAge,
-		args.maxCutoff ?? Number.POSITIVE_INFINITY,
-	);
-	if (ageCutoff <= 0) return { cleared: 0, newWatermark: 0 };
+	const ageCutoff = args.maxCutoff;
+	if (!Number.isFinite(ageCutoff) || ageCutoff <= 0)
+		return { cleared: 0, newWatermark: 0 };
 
 	let cleared = 0;
 	let newWatermark = 0;
@@ -362,23 +460,15 @@ export function clearOldReasoningPi(args: {
 export function stripInlineThinkingPi(args: {
 	messages: unknown[];
 	messageIdToMaxTag: Map<string, number>;
-	clearReasoningAge: number;
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
-	/** Upper bound from piReasoningClearCutoff; omitted means age only. */
-	maxCutoff?: number;
+	/** Frozen cutoff selected by piReasoningClearCutoff on this execute pass. */
+	maxCutoff: number;
 }): { stripped: number; newWatermark: number } {
-	const { messages, messageIdToMaxTag, clearReasoningAge, piMessageStableId } =
-		args;
+	const { messages, messageIdToMaxTag, piMessageStableId } = args;
 
-	let maxTag = 0;
-	for (const t of messageIdToMaxTag.values()) if (t > maxTag) maxTag = t;
-	if (maxTag === 0) return { stripped: 0, newWatermark: 0 };
-
-	const ageCutoff = Math.min(
-		maxTag - clearReasoningAge,
-		args.maxCutoff ?? Number.POSITIVE_INFINITY,
-	);
-	if (ageCutoff <= 0) return { stripped: 0, newWatermark: 0 };
+	const ageCutoff = args.maxCutoff;
+	if (!Number.isFinite(ageCutoff) || ageCutoff <= 0)
+		return { stripped: 0, newWatermark: 0 };
 
 	let stripped = 0;
 	let newWatermark = 0;

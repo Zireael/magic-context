@@ -2358,7 +2358,7 @@ describe("registerPiContextHandler", () => {
 				registerPiContextHandler(fake.pi as never, {
 					db,
 					protectedTags: 0,
-					heuristics: { clearReasoningAge: 1 },
+					heuristics: { keepReasoningTokens: 0 },
 				});
 				const handler = fake.handlers.get("context") as (
 					event: { messages: never[] },
@@ -4143,7 +4143,7 @@ describe("registerPiContextHandler", () => {
 				executeThresholdTokens: { default: 40_000 },
 				commitClusterTrigger: { enabled: false, min_clusters: 9 },
 				protectedTags: 3,
-				clearReasoningAge: 11,
+				keepReasoningTokens: 1100,
 			};
 
 			const small = resolvePiHistorianTriggerInputs({
@@ -4165,7 +4165,7 @@ describe("registerPiContextHandler", () => {
 				executeThresholdPercentage: 40,
 				triggerBudget: 5000,
 				protectedTags: 3,
-				clearReasoningAge: 11,
+				keepReasoningTokens: 1100,
 				commitClusterTrigger: { enabled: false, min_clusters: 9 },
 				// ceiling = contextLimit(100k) × execThreshold(40%) = 40000
 				emergencyCeilingTokens: 40_000,
@@ -4203,7 +4203,7 @@ describe("registerPiContextHandler", () => {
 				executeThresholdPercentage,
 				commitClusterTrigger: { enabled: true, min_clusters: 3 },
 				protectedTags: 20,
-				clearReasoningAge: 50,
+				keepReasoningTokens: 10000,
 			};
 			const piInputs = resolvePiHistorianTriggerInputs({
 				db,
@@ -4237,7 +4237,7 @@ describe("registerPiContextHandler", () => {
 						0,
 						piInputs.executeThresholdPercentage,
 						piInputs.triggerBudget,
-						piInputs.clearReasoningAge,
+						piInputs.keepReasoningTokens,
 						piInputs.commitClusterTrigger,
 					);
 
@@ -4401,7 +4401,7 @@ describe("registerPiContextHandler", () => {
 				protectedTags: 0,
 				heuristics: {
 					caveman: { enabled: true, minChars: 20 },
-					clearReasoningAge: 1,
+					keepReasoningTokens: 0,
 				},
 				scheduler: { executeThresholdPercentage: 80 },
 			});
@@ -4485,7 +4485,7 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				heuristics: { clearReasoningAge: 1 },
+				heuristics: { keepReasoningTokens: 0 },
 				scheduler: { executeThresholdPercentage: 80 },
 			});
 			let handler = fake.handlers.get("context") as (
@@ -4536,7 +4536,7 @@ describe("registerPiContextHandler", () => {
 			clearContextHandlerSession(sessionId);
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				heuristics: { clearReasoningAge: 100 },
+				heuristics: { keepReasoningTokens: 100000 },
 				scheduler: { executeThresholdPercentage: 80 },
 			});
 			handler = fake.handlers.get("context") as typeof handler;
@@ -4562,7 +4562,7 @@ describe("registerPiContextHandler", () => {
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				heuristics: { clearReasoningAge: 1 },
+				heuristics: { keepReasoningTokens: 0 },
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -8044,7 +8044,7 @@ describe("Pi proactive strip of invalidated thinking", () => {
 		try {
 			registerPiContextHandler(fake.pi as never, {
 				db,
-				heuristics: { clearReasoningAge: 4 },
+				heuristics: { keepReasoningTokens: 200 },
 			});
 			const handler = fake.handlers.get("context") as (
 				event: { messages: never[] },
@@ -8065,9 +8065,10 @@ describe("Pi proactive strip of invalidated thinking", () => {
 				for (let turn = 0; turn < turns; turn++) {
 					messages.push(userMessage(`request ${turn}`, turn * 2 + 1));
 					entryIds.push(`entry-u${turn}`);
-					messages.push(
-						opusAssistant(`thought ${turn}`, `answer ${turn}`, turn * 2 + 2),
-					);
+					messages.push({
+						...opusAssistant(`thought ${turn}`, `answer ${turn}`, turn * 2 + 2),
+						usage: { reasoning: 100 },
+					});
 					entryIds.push(`entry-a${turn}`);
 				}
 				return { messages, entryIds };

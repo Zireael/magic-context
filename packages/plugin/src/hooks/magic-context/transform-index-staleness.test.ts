@@ -77,7 +77,7 @@ function createTestTransform(sessionId: string) {
         historyRefreshSessions: new Set<string>(),
         pendingMaterializationSessions,
         lastHeuristicsTurnId: new Map<string, string>(),
-        clearReasoningAge: 2,
+        keepReasoningTokens: 0,
         protectedTokens: 0,
     });
     return { transform, shouldExecute, pendingMaterializationSessions };

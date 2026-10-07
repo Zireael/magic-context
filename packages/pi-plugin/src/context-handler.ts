@@ -204,6 +204,11 @@ import {
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { invalidateTrueRawTokenCache } from "@magic-context/core/hooks/magic-context/read-session-true-raw-tokens";
 import {
+	DEFAULT_KEEP_REASONING_TOKENS,
+	resolveKeepReasoningTokens,
+} from "@magic-context/core/hooks/magic-context/reasoning-budget";
+import { captureOpencodeReasoningBudgetStatus } from "@magic-context/core/hooks/magic-context/reasoning-budget-status";
+import {
 	modelAcceptsEmptyContent,
 	variantChangeBustsProviderCache,
 } from "@magic-context/core/hooks/magic-context/sentinel";
@@ -343,6 +348,7 @@ import {
 	buildMessageIdToMaxTag,
 	clearOldReasoningPi,
 	piReasoningClearCutoff,
+	piReasoningStatusMessages,
 	replayClearedReasoningPi,
 	replayStrippedInlineThinkingPi,
 	stripInlineThinkingPi,
@@ -530,13 +536,6 @@ export const __test = {
 		};
 	},
 };
-
-/**
- * Default `clear_reasoning_age` when neither the Pi caller nor the user
- * config specifies one. Matches OpenCode's schema default
- * (`packages/plugin/src/config/schema/magic-context.ts:303` → `.default(50)`).
- */
-const DEFAULT_CLEAR_REASONING_AGE = 50;
 
 /**
  * Current Pi message stable-id scheme version. Bump when the durable message
@@ -1194,6 +1193,7 @@ export interface PiHistorianOptions {
 	commitClusterTrigger?: { enabled: boolean; min_clusters: number };
 	protectedTags?: number;
 	clearReasoningAge?: number;
+	keepReasoningTokens?: number | Record<string, number>;
 	/** Fraction of executable context reserved for rendered <session-history>. */
 	historyBudgetPercentage?: number;
 }
@@ -1225,6 +1225,7 @@ export interface PiHeuristicsOptions {
 	 * cleared reasoning more aggressively than the user configured.
 	 */
 	clearReasoningAge?: number;
+	keepReasoningTokens?: number | Record<string, number>;
 }
 
 /** <session-history> injection config — writes compartments+facts+memories into message[0]. */
@@ -3485,9 +3486,10 @@ export function registerPiContextHandler(
 				},
 				isCacheBusting,
 				reasoningClearing: {
-					clearReasoningAge:
-						options.heuristics?.clearReasoningAge ??
-						DEFAULT_CLEAR_REASONING_AGE,
+					keepReasoningTokens: resolveKeepReasoningTokens(
+						options.heuristics?.keepReasoningTokens,
+						resolvePiContextModelKey(ctx),
+					),
 					nativeReasoningMayClear: canClearNativeReasoning(ctx.model),
 					prefixBound: isPrefixBoundThinkingModel(
 						typeof ctx.model?.provider === "string"
@@ -4112,6 +4114,16 @@ export function registerPiContextHandler(
 				});
 			}
 			capturePiServedArray(sessionId, outputMessages, { serializedOutput });
+			captureOpencodeReasoningBudgetStatus(
+				sessionId,
+				piReasoningStatusMessages(outputMessages),
+				resolveKeepReasoningTokens(
+					options.heuristics?.keepReasoningTokens,
+					resolvePiContextModelKey(ctx),
+				),
+				isPrefixBoundThinkingModel(ctx.model?.provider, ctx.model?.id),
+				sessionDecisionCalibration(options.db, sessionId).proseRatio,
+			);
 			if (thinkingBindingRecoveryApplied) {
 				try {
 					clearThinkingBindingRecoveryIf(
@@ -4309,7 +4321,7 @@ export function resolvePiHistorianTriggerInputs(args: {
 	executeThresholdPercentage: number;
 	triggerBudget: number;
 	protectedTags: number | undefined;
-	clearReasoningAge: number;
+	keepReasoningTokens: number;
 	commitClusterTrigger: { enabled: boolean; min_clusters: number } | undefined;
 	contextLimit: number;
 	/** ceiling = contextLimit × executeThreshold% (tiered emergency drop). */
@@ -4343,8 +4355,10 @@ export function resolvePiHistorianTriggerInputs(args: {
 			executeThresholdPercentage,
 		),
 		protectedTags: args.historian.protectedTags,
-		clearReasoningAge:
-			args.historian.clearReasoningAge ?? DEFAULT_CLEAR_REASONING_AGE,
+		keepReasoningTokens: resolveKeepReasoningTokens(
+			args.historian.keepReasoningTokens,
+			args.modelKey,
+		),
 		commitClusterTrigger: args.historian.commitClusterTrigger,
 		contextLimit,
 		emergencyCeilingTokens: Math.floor(
@@ -5021,7 +5035,7 @@ function maybeFireHistorian(args: {
 			0, // _previousPercentage — unused by current trigger logic
 			triggerInputs.executeThresholdPercentage,
 			triggerInputs.triggerBudget,
-			triggerInputs.clearReasoningAge,
+			triggerInputs.keepReasoningTokens,
 			triggerInputs.commitClusterTrigger,
 			args.activeTags,
 			boundaryContextLimit,
@@ -5249,7 +5263,9 @@ interface RunPipelineArgs {
 	 * needed prior reasoning preserved no longer reject the request.
 	 */
 	reasoningClearing?: {
-		clearReasoningAge: number;
+		keepReasoningTokens?: number;
+		/** Deprecated caller input, ignored. */
+		clearReasoningAge?: number;
 		nativeReasoningMayClear: boolean;
 		preserveReasoningToolArcs: boolean;
 		/** Model binds signed thinking to the request prefix (Fable 5.1, Opus 5.5, Sonnet 5.5). */
@@ -6652,6 +6668,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// wire on a pass that already dropped tools (inconsistent + a missed
 	// same-pass mutation). shouldRunHeuristics is the broader, correct set.
 	let reasoningPersistenceFailed = false;
+	let reasoningBudgetCutoffThisPass = 0;
 	if (args.reasoningClearing && shouldRunHeuristics && routineCleanupApplied) {
 		const rollbackReasoning = captureReasoningMutationRollback(workingMessages);
 		try {
@@ -6664,18 +6681,26 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			const bindingStripped = prefixBound
 				? frozenBindingEntryIds(args.db, args.sessionId)
 				: new Set<string>();
+			const nativeGone = getNativeReplayState(
+				args.db,
+				args.sessionId,
+			).reasoningIds;
 			const maxCutoff = piReasoningClearCutoff({
 				messages: workingMessages,
 				messageIdToMaxTag,
-				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
+				keepReasoningTokens:
+					args.reasoningClearing.keepReasoningTokens ??
+					DEFAULT_KEEP_REASONING_TOKENS,
+				proseRatio: sessionDecisionCalibration(args.db, args.sessionId)
+					.proseRatio,
 				piMessageStableId: stableIdResolver,
 				prefixBound,
-				alreadyGone: (id) => bindingStripped.has(id),
+				alreadyGone: (id) => bindingStripped.has(id) || nativeGone.has(id),
 			});
+			reasoningBudgetCutoffThisPass = maxCutoff;
 			const clearOutcome = clearOldReasoningPi({
 				messages: workingMessages,
 				messageIdToMaxTag,
-				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
 				piMessageStableId: stableIdResolver,
 				maxCutoff,
 			});
@@ -6685,7 +6710,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			const stripOutcome = stripInlineThinkingPi({
 				messages: workingMessages,
 				messageIdToMaxTag,
-				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
 				piMessageStableId: stableIdResolver,
 				maxCutoff: prefixBound ? 0 : maxCutoff,
 			});
@@ -6924,7 +6948,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						messageIdToMaxTag,
 						stableId: stableIdResolver,
 						localWatermark: args.sessionMeta.clearedReasoningThroughTag ?? 0,
-						clearReasoningAge: args.reasoningClearing.clearReasoningAge,
+						budgetCutoff: reasoningBudgetCutoffThisPass,
 						omissionAllowed: args.reasoningClearing.nativeReasoningMayClear,
 						canApply: isCacheBustingPass && !reasoningPersistenceFailed,
 						detectAged: shouldRunHeuristics && routineCleanupApplied,

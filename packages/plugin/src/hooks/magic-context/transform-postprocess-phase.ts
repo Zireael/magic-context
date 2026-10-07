@@ -60,8 +60,8 @@ import {
     getReasoningRemovalState,
     markDropLeavesReasoning,
 } from "../../features/magic-context/storage-reasoning-removal";
-
 import {
+    getReasoningTokenEstimatesByMessage,
     getTagNumberByMessageId,
     markTagsCompactedByMessageIds,
     updateTagStatus,
@@ -144,6 +144,8 @@ import {
     postprocessTailTags,
 } from "./postprocess-read-cache";
 import { estimateTokens } from "./read-session-formatting";
+import { DEFAULT_KEEP_REASONING_TOKENS, opencodeReasoningBudgetCutoff } from "./reasoning-budget";
+import { captureOpencodeReasoningBudgetStatus } from "./reasoning-budget-status";
 import {
     type DroppedReasoningMode,
     removeReasoningParts,
@@ -1549,7 +1551,9 @@ interface RunPostTransformPhaseArgs {
     deferredHistoryRefreshSessions: Set<string>;
     deferredMaterializationSessions: Set<string>;
     lastHeuristicsTurnId: Map<string, string>;
-    clearReasoningAge: number;
+    keepReasoningTokens?: number;
+    /** Deprecated caller input, ignored. */
+    clearReasoningAge?: number;
     /** Canonical token-window membership consumed by pending-operation application. */
     protectedTagIds: ReadonlySet<number>;
     /** Canonical token-window membership in tag-number space. */
@@ -2575,13 +2579,38 @@ export async function runPostTransformPhase(
             // a block from the middle and invalidate every newer one. They take
             // the oldest-prefix removal below instead.
             const ageLaneAllowed = !prefixBoundModel;
+            const bindingStrippedIds = new Set<string>();
+            if (routineCleanupApplied && prefixBoundModel) {
+                for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
+                    if (id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) {
+                        bindingStrippedIds.add(
+                            id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length),
+                        );
+                    }
+                }
+            }
+            const budgetCutoff = routineCleanupApplied
+                ? opencodeReasoningBudgetCutoff({
+                      messages: args.messages,
+                      messageTagNumbers: args.messageTagNumbers,
+                      budget: args.keepReasoningTokens ?? DEFAULT_KEEP_REASONING_TOKENS,
+                      alreadyRemoved: removedReasoningIds,
+                      alsoGone: bindingStrippedIds,
+                      countNeutralized: reasoningRemovalSelectable,
+                      textEstimateByMessageId: getReasoningTokenEstimatesByMessage(
+                          args.db,
+                          args.sessionId,
+                          sessionDecisionCalibration(args.db, args.sessionId).proseRatio,
+                      ),
+                  })
+                : 0;
             const clearedReasoning =
                 routineCleanupApplied && canUseEmptySentinels && ageLaneAllowed
                     ? clearOldReasoning(
                           args.messages,
                           args.reasoningByMessage,
                           args.messageTagNumbers,
-                          args.clearReasoningAge,
+                          budgetCutoff,
                       )
                     : 0;
             if (routineCleanupApplied && canUseEmptySentinels) {
@@ -2592,11 +2621,7 @@ export async function runPostTransformPhase(
             // models it stays off too (Pi caps both lanes with one cutoff).
             const strippedInline =
                 routineCleanupApplied && ageLaneAllowed
-                    ? stripInlineThinking(
-                          args.messages,
-                          args.messageTagNumbers,
-                          args.clearReasoningAge,
-                      )
+                    ? stripInlineThinking(args.messages, args.messageTagNumbers, budgetCutoff)
                     : 0;
             // Fresh caveman compression above rebuilds text from its original source,
             // which brings back inline thinking that the replay at the start of this
@@ -2622,18 +2647,10 @@ export async function runPostTransformPhase(
                 // The binding-mismatch set holds assistants whose reasoning an
                 // earlier strip already took off the wire; the prefix walk
                 // passes over them instead of stopping there.
-                const bindingStrippedIds = new Set<string>();
-                if (prefixBoundModel) {
-                    for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
-                        if (!id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
-                        const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
-                        if (messageId.length > 0) bindingStrippedIds.add(messageId);
-                    }
-                }
                 const newIds = selectReasoningRemovals({
                     messages: args.messages,
                     messageTagNumbers: args.messageTagNumbers,
-                    clearReasoningAge: args.clearReasoningAge,
+                    cutoff: budgetCutoff,
                     alreadyRemoved: removedReasoningIds,
                     prefixBound: prefixBoundModel,
                     alsoGone: bindingStrippedIds,
@@ -2678,11 +2695,7 @@ export async function runPostTransformPhase(
             if (clearedReasoning > 0 || strippedInline > 0) {
                 // Compute and persist the reasoning watermark so future defer passes
                 // can replay the same clearing without re-computing the cutoff.
-                let maxTag = 0;
-                for (const tag of args.messageTagNumbers.values()) {
-                    if (tag > maxTag) maxTag = tag;
-                }
-                const newWatermark = maxTag - args.clearReasoningAge;
+                const newWatermark = budgetCutoff;
                 const currentWatermark = args.sessionMeta?.clearedReasoningThroughTag ?? 0;
                 if (newWatermark > currentWatermark) {
                     updateSessionMeta(args.db, args.sessionId, {
@@ -4057,6 +4070,14 @@ export async function runPostTransformPhase(
     const removedReasoningParts = reasoningRemovalEnabled
         ? removeReasoningParts(args.messages, removedReasoningIds, args.resolvedProviderID)
         : 0;
+    const reasoningStatusRatio = sessionDecisionCalibration(args.db, args.sessionId).proseRatio;
+    captureOpencodeReasoningBudgetStatus(
+        args.sessionId,
+        args.messages,
+        args.keepReasoningTokens ?? DEFAULT_KEEP_REASONING_TOKENS,
+        prefixBoundModel,
+        reasoningStatusRatio,
+    );
 
     sessionLog(
         args.sessionId,

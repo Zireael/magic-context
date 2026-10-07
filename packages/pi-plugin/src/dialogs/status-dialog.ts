@@ -53,6 +53,7 @@ import { resolveExecuteThresholdDetail } from "@magic-context/core/hooks/magic-c
 import { countCompartmentsNeedingUpgrade } from "@magic-context/core/hooks/magic-context/legacy-compartments";
 import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0-token-breakdown";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import { reasoningBudgetStatusLine } from "@magic-context/core/hooks/magic-context/reasoning-budget-status";
 import {
 	formatCacheTtlDisplay,
 	resolveCacheTtlDisplay,
@@ -124,6 +125,7 @@ export interface StatusDialogDeps {
 }
 
 export interface StatusDialogDetail {
+	reasoningBudgetLine?: string;
 	sessionId: string;
 	activeProfile: string | null;
 	configGeneration?: number;
@@ -405,39 +407,40 @@ function piStatusWarnings(s: StatusDialogDetail): UserFacingFailureKey[] {
 
 /** Chat-text status for a Pi host without an interactive UI to draw a dialog on. */
 export function formatPiStatusSummary(s: StatusDialogDetail): string {
-	const summary = renderUserStatusSummary(
-		{
-			inputTokens: s.inputTokens,
-			usableContextTokens: s.contextLimit,
-			usagePercentage: s.usagePercentage,
-			cacheLifetime: formatCacheTtlDisplay({
-				value: s.cacheTtl,
-				source: s.cacheTtlSource,
-				modelKey: s.cacheTtlModelKey,
-			}).replace(/^Cache TTL:\s*/, ""),
-			automaticCompressionThreshold: s.compactionEnabled
-				? s.executeThreshold
-				: null,
-			compression: {
-				state: s.historianRunning
-					? "compressing"
-					: s.compartmentCount > 0
-						? "ready"
-						: "waiting",
-				historyBlockCount: s.compartmentCount,
+	const summary =
+		renderUserStatusSummary(
+			{
+				inputTokens: s.inputTokens,
+				usableContextTokens: s.contextLimit,
+				usagePercentage: s.usagePercentage,
+				cacheLifetime: formatCacheTtlDisplay({
+					value: s.cacheTtl,
+					source: s.cacheTtlSource,
+					modelKey: s.cacheTtlModelKey,
+				}).replace(/^Cache TTL:\s*/, ""),
+				automaticCompressionThreshold: s.compactionEnabled
+					? s.executeThreshold
+					: null,
+				compression: {
+					state: s.historianRunning
+						? "compressing"
+						: s.compartmentCount > 0
+							? "ready"
+							: "waiting",
+					historyBlockCount: s.compartmentCount,
+				},
+				reclaimable: {
+					toolOutputCount: s.tailHygiene?.reclaimableToolOutputCount ?? 0,
+					tokens: s.tailHygiene?.u ?? 0,
+				},
+				memoryCount: s.memoryCount,
+				noteCount: s.sessionNoteCount + s.readySmartNoteCount,
+				embedding: s.embedding,
+				warnings: piStatusWarnings(s),
+				dreamerSkipped: s.dreamer.skipped,
 			},
-			reclaimable: {
-				toolOutputCount: s.tailHygiene?.reclaimableToolOutputCount ?? 0,
-				tokens: s.tailHygiene?.u ?? 0,
-			},
-			memoryCount: s.memoryCount,
-			noteCount: s.sessionNoteCount + s.readySmartNoteCount,
-			embedding: s.embedding,
-			warnings: piStatusWarnings(s),
-			dreamerSkipped: s.dreamer.skipped,
-		},
-		"plain",
-	);
+			"plain",
+		) + (s.reasoningBudgetLine ? `\n${s.reasoningBudgetLine}` : "");
 	return s.configGeneration === undefined
 		? summary
 		: `${summary}\nConfig generation: ${s.configGeneration} (adopted ${s.configAdoptedAt ? new Date(s.configAdoptedAt).toLocaleString() : "unknown"})${s.configReloadFailure ? `\nConfig reload failed ${s.configReloadFailure.path}: ${s.configReloadFailure.message}` : ""}`;
@@ -588,6 +591,8 @@ export function renderPiStatusOverlay(
 		),
 	);
 	if (view.windowLine) lines.push(theme.fg("muted", view.windowLine));
+	if (s.reasoningBudgetLine)
+		lines.push(theme.fg("muted", s.reasoningBudgetLine));
 
 	const bar = renderBar(view.bar, innerWidth);
 	if (bar) lines.push(bar);
@@ -897,6 +902,7 @@ export function buildPiStatusDetail(
 
 	return {
 		sessionId,
+		reasoningBudgetLine: reasoningBudgetStatusLine(sessionId),
 		activeProfile: deps.activeProfile ?? null,
 		configGeneration: deps.configGeneration,
 		configAdoptedAt: deps.configAdoptedAt,

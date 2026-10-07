@@ -4816,6 +4816,7 @@ impl McHandler {
                 execute_threshold_project_config: None,
                 protected_tokens_user: None,
                 protected_tokens_project: None,
+                keep_reasoning_tokens: None,
                 compaction_enabled: true,
                 memory_enabled: true,
                 auto_search: crate::config::AutoSearchConfig::default(),
@@ -10324,6 +10325,13 @@ impl McHandler {
                 }
             }
             _ => {}
+        }
+        if parsed.keep_reasoning_tokens_effective.is_none() {
+            parsed.keep_reasoning_tokens_effective = Some(
+                binding
+                    .config
+                    .resolve_keep_reasoning_tokens(parsed.model_key.as_deref()),
+            );
         }
         let parsed = Arc::new(parsed);
         let projection_cache_lookup_started_at = Instant::now();
@@ -21995,6 +22003,7 @@ mod tests {
             execute_threshold_project_config: None,
             protected_tokens_user: None,
             protected_tokens_project: None,
+            keep_reasoning_tokens: None,
             compaction_enabled: true,
             memory_enabled: true,
             auto_search: crate::config::AutoSearchConfig::default(),
