@@ -1,5 +1,6 @@
 import type { ProtectedTokensTierOverrides } from "../../config/project-security";
 import { deriveDefaultProtectedTokens } from "../../config/schema/magic-context";
+import { isAutoSearchHintPending } from "../../shared/auto-search-hint-fence";
 import {
     type ContextLimitProvenance,
     normalizeContextLimitProvenance,
@@ -1577,7 +1578,11 @@ export function getAutoSearchHintDecisions(
     const row = db
         .prepare("SELECT auto_search_hint_decisions FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { auto_search_hint_decisions?: string | null } | undefined;
-    return parseJsonArray(row?.auto_search_hint_decisions, isValidAutoSearchHintDecision);
+    return parseJsonArray(row?.auto_search_hint_decisions, isValidAutoSearchHintDecision).filter(
+        (decision) =>
+            decision.decision !== "hint" ||
+            !isAutoSearchHintPending(db, sessionId, decision.messageId),
+    );
 }
 
 function casUpdateJsonArrayColumn<T>(
@@ -1735,6 +1740,35 @@ export function appendAutoSearchHintDecision(
         return { ok: false, kind: "cas-exhausted" };
     }
     return { ok: true, kind: committed.kind, decision: committed.decision };
+}
+
+/** A worker committed this hint but missed its served-turn deadline. Undo only
+ * its exact entry; never erase a different decision written by another owner. */
+export function retireUnservedAutoSearchHintDecision(
+    db: Database,
+    sessionId: string,
+    entry: AutoSearchHintDecision,
+): boolean {
+    return casUpdateJsonArrayColumn(
+        db,
+        sessionId,
+        "auto_search_hint_decisions",
+        isValidAutoSearchHintDecision,
+        (current) =>
+            current.map((decision) =>
+                decision.messageId === entry.messageId &&
+                decision.decision === "hint" &&
+                entry.decision === "hint" &&
+                decision.text === entry.text
+                    ? {
+                          messageId: entry.messageId,
+                          decision: "no-hint" as const,
+                          reason: "timeout" as const,
+                      }
+                    : decision,
+            ),
+        { ensureRow: false },
+    );
 }
 
 export function pruneNoteNudgeAnchors(
@@ -3024,6 +3058,10 @@ export function loadPostprocessReplaySnapshot(
         autoSearchHintDecisions: parseJsonArray(
             row?.auto_search_hint_decisions,
             isValidAutoSearchHintDecision,
+        ).filter(
+            (decision) =>
+                decision.decision !== "hint" ||
+                !isAutoSearchHintPending(db, sessionId, decision.messageId),
         ),
         todoPermissionDenied,
         todoSyntheticAnchor: parsePersistedTodoSyntheticAnchor(row),

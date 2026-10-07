@@ -3535,6 +3535,7 @@ export async function runPostTransformPhase(
 
     let autoSearchHintsBefore = 0;
     let autoSearchHintAppendedThisPass = false;
+    let autoSearchCompletedThisPass = false;
     if (args.fullFeatureMode && args.autoSearch?.enabled && args.projectPath) {
         // Resolve memory ids currently rendered in the <session-history>
         // block. The auto-search runner drops hint fragments for memories the
@@ -3560,6 +3561,7 @@ export async function runPostTransformPhase(
                     wordRules: args.autoSearch.wordRules,
                 },
             });
+            autoSearchCompletedThisPass = autoSearchOutcome.ok;
             if (!autoSearchOutcome.ok) {
                 args.passOutcome?.record(`auto-search-${autoSearchOutcome.kind}`);
             }
@@ -3570,6 +3572,9 @@ export async function runPostTransformPhase(
             sessionLog(args.sessionId, "auto-search runner failed:", error);
         }
         autoSearchHintAppendedThisPass =
+            // A provisional database row is not a served hint. A skipped deadline
+            // must not trigger thinking strips or any other prefix-edit handling.
+            autoSearchCompletedThisPass &&
             countAutoSearchHints(args.db, args.sessionId) !== autoSearchHintsBefore;
         logTransformTiming(args.sessionId, "pp.autoSearchHint", tAutoSearch);
     }

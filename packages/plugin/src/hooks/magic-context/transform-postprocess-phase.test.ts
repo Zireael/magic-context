@@ -11489,6 +11489,61 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
         );
     });
 
+    it("timeout skips do not treat provisional hint rows as served prefix edits", async () => {
+        openDb();
+        let provisional = false;
+        const spy = spyOn(autoSearchRunner, "runAutoSearchHint").mockImplementation(
+            async ({ sessionId }) => {
+                if (provisional)
+                    replayStorage.appendAutoSearchHintDecision(db, sessionId, {
+                        messageId: "fresh-user",
+                        decision: "hint",
+                        text: "\n\n<ctx-search-hint>unserved row</ctx-search-hint>",
+                    });
+                return { ok: false, kind: "timeout" };
+            },
+        );
+        try {
+            const outputs: string[] = [];
+            for (const writeRow of [false, true]) {
+                provisional = writeRow;
+                const sessionId = `ses-skip-provisional-${writeRow}`;
+                const warm = boundLoop(sessionId, 8);
+                warm.messages.push({
+                    info: { id: "fresh-user", role: "user" },
+                    parts: [{ type: "text", text: "new question" }],
+                } as unknown as MessageLike);
+                await serve(sessionId, warm, { clearReasoningAge: 999 });
+                const pass = boundLoop(sessionId, 8);
+                pass.messages.push({
+                    info: { id: "fresh-user", role: "user" },
+                    parts: [{ type: "text", text: "new question" }],
+                } as unknown as MessageLike);
+                const result = await serve(sessionId, pass, {
+                    force: true,
+                    clearReasoningAge: 999,
+                    overrides: {
+                        projectPath: "git:throwaway",
+                        autoSearch: { enabled: true, scoreThreshold: 0, minPromptChars: 1 },
+                    },
+                });
+                expect(result.proactiveThinkingStrip).toBeNull();
+                outputs.push(
+                    JSON.stringify(
+                        pass.messages.map((message) => ({
+                            role: message.info.role,
+                            parts: message.parts,
+                        })),
+                    ),
+                );
+            }
+            expect(outputs[1]).toBe(outputs[0]);
+            expect(outputs[1]).toContain("signed 7");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     it("Rust-mode host keeps newer blocks on a module bust whose only edit is the oldest-prefix trim, and strips them otherwise", () => {
         openDb();
         const postprocess = (

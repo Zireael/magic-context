@@ -7,6 +7,7 @@ import {
 	appendCompartments,
 	getCompartments,
 } from "@magic-context/core/features/magic-context/compartment-storage";
+import * as embeddingModule from "@magic-context/core/features/magic-context/memory/embedding";
 import {
 	__resetProjectIdentityForTests,
 	__setProjectIdentityTestHooks,
@@ -16,7 +17,6 @@ import {
 	isSessionReconciled,
 } from "@magic-context/core/features/magic-context/message-index-async";
 import { readEpochFloorSnapshot } from "@magic-context/core/features/magic-context/protection-window";
-import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
 	acquireWrapupInProgress,
 	addNote,
@@ -52,6 +52,8 @@ import {
 	setPersistedNoteNudgeTriggerMessageId,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
+import { autoSearchTestSnapshot } from "@magic-context/core/hooks/magic-context/auto-search-snapshot.fixture";
+import * as searchModule from "@magic-context/core/hooks/magic-context/auto-search-worker-client";
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import { resolveExecuteThreshold } from "@magic-context/core/hooks/magic-context/event-resolvers";
@@ -2683,7 +2685,11 @@ describe("registerPiContextHandler", () => {
 
 	it("appends an auto-search hint to the latest user message when the threshold is met", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const snapshot = spyOn(
+			embeddingModule,
+			"getProjectEmbeddingSnapshot",
+		).mockImplementation(autoSearchTestSnapshot);
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () =>
 				[
 					{
@@ -2725,6 +2731,7 @@ describe("registerPiContextHandler", () => {
 				"<ctx-search-hint>",
 			);
 		} finally {
+			snapshot.mockRestore();
 			spy.mockRestore();
 			closeQuietly(db);
 		}
@@ -2732,7 +2739,11 @@ describe("registerPiContextHandler", () => {
 
 	it("clearContextHandlerSession preserves persisted auto-search decisions", async () => {
 		const db = createTestDb();
-		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+		const snapshot = spyOn(
+			embeddingModule,
+			"getProjectEmbeddingSnapshot",
+		).mockImplementation(autoSearchTestSnapshot);
+		const spy = spyOn(searchModule, "searchAutoHint").mockImplementation(
 			async () => [],
 		);
 		try {
@@ -2770,6 +2781,7 @@ describe("registerPiContextHandler", () => {
 
 			expect(spy).toHaveBeenCalledTimes(1);
 		} finally {
+			snapshot.mockRestore();
 			spy.mockRestore();
 			closeQuietly(db);
 		}
