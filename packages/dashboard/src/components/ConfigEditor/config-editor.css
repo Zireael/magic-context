@@ -81,7 +81,7 @@
 .config-segmented button.active {
   background: var(--bg-active);
   color: var(--text-primary);
-  box-shadow: 0 1px 4px #0004;
+  box-shadow: var(--shadow-segment);
 }
 .config-save {
   min-width: 110px;
@@ -322,7 +322,7 @@
 }
 
 .config-restart-badge {
-  border: 1px solid #59401f;
+  border: 1px solid var(--restart-border);
   border-radius: var(--radius-sm);
   padding: 1px 5px;
   color: var(--amber);
@@ -357,7 +357,7 @@
   background: var(--bg-panel);
   border: 1px solid var(--border-light);
   border-radius: var(--radius-lg);
-  box-shadow: 0 8px 30px #0008;
+  box-shadow: var(--shadow-help);
   color: var(--text-primary);
   font-size: 12px;
 }

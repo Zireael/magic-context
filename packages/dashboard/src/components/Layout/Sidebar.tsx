@@ -1,3 +1,4 @@
+import type { ThemePreference } from "../../lib/theme";
 import type { NavSection } from "../../lib/types";
 
 const NAV_ITEMS: { id: NavSection; icon: string; label: string }[] = [
@@ -9,9 +10,17 @@ const NAV_ITEMS: { id: NavSection; icon: string; label: string }[] = [
   { id: "logs", icon: "📋", label: "Logs" },
 ];
 
+const THEME_OPTIONS: { id: ThemePreference; label: string; title: string }[] = [
+  { id: "system", label: "System", title: "Follow the operating system appearance" },
+  { id: "light", label: "Light", title: "Always use the light theme" },
+  { id: "dark", label: "Dark", title: "Always use the dark theme" },
+];
+
 interface Props {
   active: NavSection;
   onNavigate: (section: NavSection) => void;
+  theme: ThemePreference;
+  onThemeChange: (theme: ThemePreference) => void;
 }
 
 export default function Sidebar(props: Props) {
@@ -28,6 +37,24 @@ export default function Sidebar(props: Props) {
           <span class="nav-label">{item.label}</span>
         </button>
       ))}
+      <div class="nav-theme">
+        <fieldset class="nav-theme-fieldset">
+          <legend class="nav-theme-label">Theme</legend>
+          <div class="nav-theme-options">
+            {THEME_OPTIONS.map((option) => (
+              <button
+                type="button"
+                aria-pressed={props.theme === option.id}
+                class={`nav-theme-option ${props.theme === option.id ? "active" : ""}`}
+                title={option.title}
+                onClick={() => props.onThemeChange(option.id)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </fieldset>
+      </div>
     </nav>
   );
 }

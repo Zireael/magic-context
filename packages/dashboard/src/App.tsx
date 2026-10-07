@@ -11,6 +11,7 @@ import WorkspacesPanel from "./components/WorkspacesPanel/WorkspacesPanel";
 import { getDbHealth, getModelCatalogs, getOpencodeInstallState } from "./lib/api";
 import { loadCachedModelCatalogs, retainLoadedCatalogs } from "./lib/model-catalog-cache";
 import { initServeToken, listen } from "./lib/platform";
+import { createThemeController } from "./lib/theme";
 import type { ModelCatalogs, NavSection, OpencodeInstallState, ProjectCard } from "./lib/types";
 import { checkForUpdate, installAndRelaunch, runUpdater } from "./lib/updater";
 
@@ -18,6 +19,7 @@ const UPDATE_POLL_INTERVAL = 10 * 60 * 1000; // 10 minutes
 
 export default function App() {
   initServeToken();
+  const theme = createThemeController();
 
   const [activeSection, setActiveSection] = createSignal<NavSection>("projects");
   // Projects drill-down: null = card grid, set = that project's detail view.
@@ -111,7 +113,12 @@ export default function App() {
 
   return (
     <div class="app-shell">
-      <Sidebar active={activeSection()} onNavigate={navigate} />
+      <Sidebar
+        active={activeSection()}
+        onNavigate={navigate}
+        theme={theme.preference()}
+        onThemeChange={theme.setPreference}
+      />
 
       <main class="content">
         {/* Update toast */}

@@ -1637,9 +1637,11 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 background:
                                   smartNote.status === "ready"
                                     ? "var(--success)"
-                                    : "var(--text-muted)",
+                                    : "var(--badge-neutral-bg)",
                                 color:
-                                  smartNote.status === "ready" ? "#fff" : "var(--text-primary)",
+                                  smartNote.status === "ready"
+                                    ? "var(--on-accent)"
+                                    : "var(--badge-neutral-text)",
                               }}
                             >
                               {smartNote.status}
@@ -1881,13 +1883,21 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                 const conversationPct = () =>
                   hasData() ? (data().conversation_tokens / total()) * 100 : 0;
 
-                // Colors for each section
+                // Segment fills and the label drawn on each come from theme tokens
+                // so the chart stays legible in both light and dark themes.
                 const colors = {
-                  system: "#c084fc",
-                  compartments: "#4a9eff",
-                  facts: "#f0b429",
-                  memories: "#48bb78",
-                  conversation: "#a0aec0",
+                  system: "var(--chart-system)",
+                  compartments: "var(--chart-compartments)",
+                  facts: "var(--chart-facts)",
+                  memories: "var(--chart-memories)",
+                  conversation: "var(--chart-conversation)",
+                };
+                const labelColors = {
+                  system: "var(--chart-system-text)",
+                  compartments: "var(--chart-compartments-text)",
+                  facts: "var(--chart-facts-text)",
+                  memories: "var(--chart-memories-text)",
+                  conversation: "var(--chart-conversation-text)",
                 };
 
                 return (
@@ -1922,7 +1932,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 "justify-content": "center",
                                 "font-size": "11px",
                                 "font-weight": "600",
-                                color: "#fff",
+                                color: labelColors.system,
                                 "min-width": systemPct() > 8 ? "auto" : "0",
                               }}
                             >
@@ -1939,7 +1949,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 "justify-content": "center",
                                 "font-size": "11px",
                                 "font-weight": "600",
-                                color: "#fff",
+                                color: labelColors.compartments,
                                 "min-width": compartmentPct() > 8 ? "auto" : "0",
                               }}
                             >
@@ -1956,7 +1966,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 "justify-content": "center",
                                 "font-size": "11px",
                                 "font-weight": "600",
-                                color: "#1a1a1a",
+                                color: labelColors.facts,
                                 "min-width": factPct() > 8 ? "auto" : "0",
                               }}
                             >
@@ -1973,7 +1983,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 "justify-content": "center",
                                 "font-size": "11px",
                                 "font-weight": "600",
-                                color: "#fff",
+                                color: labelColors.memories,
                                 "min-width": memoryPct() > 8 ? "auto" : "0",
                               }}
                             >
@@ -1990,7 +2000,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 "justify-content": "center",
                                 "font-size": "11px",
                                 "font-weight": "600",
-                                color: "#1a1a1a",
+                                color: labelColors.conversation,
                                 "min-width": conversationPct() > 8 ? "auto" : "0",
                               }}
                             >
