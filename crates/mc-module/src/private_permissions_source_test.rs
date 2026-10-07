@@ -113,37 +113,76 @@ fn data_store_creators_use_the_private_permission_helper() {
         let Ok(source) = fs::read_to_string(&path) else {
             continue;
         };
-        if ![
-            "context.db",
-            "store.db",
-            "backup_dir",
-            "storage_dir",
-            "project-identities",
-        ]
-        .iter()
-        .any(|marker| source.contains(marker))
-        {
-            continue;
-        }
-        let Ok(parsed) = syn::parse_file(&source) else {
-            continue;
-        };
-        let mut scan = DirectCreatorScan::default();
-        for item in &parsed.items {
-            if let Item::Mod(module) = item {
-                if cfg_test(&module.attrs) {
-                    continue;
-                }
-            }
-            scan.visit_item(item);
-        }
-        if !scan.calls.is_empty() {
-            offenders.push(format!("{}: {}", path.display(), scan.calls.join(", ")));
+        let calls = direct_store_creators(&source);
+        if !calls.is_empty() {
+            offenders.push(format!("{}: {}", path.display(), calls.join(", ")));
         }
     }
 
     assert!(
         offenders.is_empty(),
         "direct store creators bypass helper: {offenders:#?}"
+    );
+}
+
+/// The direct filesystem creators in one storage-related source file, outside
+/// test code. A file that names no store location is not scanned.
+fn direct_store_creators(source: &str) -> Vec<String> {
+    if ![
+        "context.db",
+        "store.db",
+        "backup_dir",
+        "storage_dir",
+        "project-identities",
+    ]
+    .iter()
+    .any(|marker| source.contains(marker))
+    {
+        return Vec::new();
+    }
+    let Ok(parsed) = syn::parse_file(source) else {
+        return Vec::new();
+    };
+    let mut scan = DirectCreatorScan::default();
+    for item in &parsed.items {
+        if let Item::Mod(module) = item {
+            if cfg_test(&module.attrs) {
+                continue;
+            }
+        }
+        scan.visit_item(item);
+    }
+    scan.calls
+}
+
+/// The shipped sources hold no violation, so the scan above would pass even if
+/// it could no longer see one. This planted file proves it still flags every
+/// kind of direct creator, and still ignores the same calls in test code.
+#[test]
+fn the_creator_scan_flags_planted_direct_store_creators() {
+    let planted = r#"
+        const STORE: &str = "context.db";
+        fn open_store(dir: &std::path::Path) {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(STORE), b"").unwrap();
+            let _ = std::fs::File::create(dir.join("store.db"));
+            let _ = std::fs::OpenOptions::new().write(true).create_new(true).open(dir);
+        }
+        #[cfg(test)]
+        mod tests {
+            fn fixture() {
+                std::fs::write("context.db", b"").unwrap();
+            }
+        }
+    "#;
+    assert_eq!(
+        direct_store_creators(planted),
+        vec![
+            "std::fs::create_dir_all".to_string(),
+            "std::fs::write".to_string(),
+            "std::fs::File::create".to_string(),
+            "file-creator::create_new".to_string(),
+        ],
+        "the scan must flag each planted direct creator and nothing in test code"
     );
 }
