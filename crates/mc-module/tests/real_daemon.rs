@@ -842,9 +842,52 @@ fn ensure_daemon_binary(workspace: &Path, cargo_args: &[&str]) -> PathBuf {
     let subconscious = subconscious_root(workspace);
     ensure_binary(
         &subconscious,
-        subconscious.join("target/debug/ck-subc"),
+        daemon_binary_path(&subconscious, cargo_args),
         cargo_args,
     )
+}
+
+// A caller can isolate its daemon build with --target-dir. Resolve the output
+// from that same argument instead of looking in the sibling's default target.
+fn daemon_binary_path(subconscious: &Path, cargo_args: &[&str]) -> PathBuf {
+    let target = cargo_args
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| {
+            if *arg == "--target-dir" {
+                Some(
+                    *cargo_args
+                        .get(index + 1)
+                        .expect("--target-dir needs a path"),
+                )
+            } else {
+                arg.strip_prefix("--target-dir=")
+            }
+        })
+        .map(|target| subconscious.join(target))
+        .unwrap_or_else(|| subconscious.join("target"));
+    target.join("debug/ck-subc")
+}
+
+#[test]
+fn daemon_binary_path_matches_cargo_target_directory() {
+    let source = std::env::temp_dir().join("daemon-source");
+    let isolated_target = std::env::temp_dir().join("store-init-subc");
+    assert_eq!(
+        daemon_binary_path(&source, &["build", "--locked", "--bin", "ck-subc"]),
+        source.join("target/debug/ck-subc")
+    );
+    assert_eq!(
+        daemon_binary_path(
+            &source,
+            &["build", "--target-dir", isolated_target.to_str().unwrap()]
+        ),
+        isolated_target.join("debug/ck-subc")
+    );
+    assert_eq!(
+        daemon_binary_path(&source, &["build", "--target-dir=isolated"]),
+        source.join("isolated/debug/ck-subc")
+    );
 }
 
 /// Run copied Cargo outputs under names that cannot be confused with fleet daemons.
