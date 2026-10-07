@@ -169,7 +169,6 @@ afterEach(() => {
 });
 
 describe("Pi in-process child guard (#247)", () => {
-	// Full extension initialization touches disk and can outlast 15s on a busy CI worker.
 	it("claims process-wide startup maintenance from the full runtime", async () => {
 		isolateXdgEnv();
 		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
@@ -181,7 +180,7 @@ describe("Pi in-process child guard (#247)", () => {
 		const second = createCountingPi();
 		await magicContextPiExtension(second.pi);
 		expect(__test.claimPiStartupMaintenance()).toBe(false);
-	}, 30_000);
+	}, 15_000);
 	it("registers independent sessions in the same process", async () => {
 		isolateXdgEnv();
 		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
@@ -206,7 +205,7 @@ describe("Pi in-process child guard (#247)", () => {
 			"magic-context-turn-refused",
 			"ctx-status",
 		]);
-	}, 30_000);
+	}, 15_000);
 
 	it("headless Pi does not register scheduled dreamer children", async () => {
 		const configHome = isolateXdgEnv();
