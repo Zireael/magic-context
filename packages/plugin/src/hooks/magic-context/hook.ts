@@ -119,6 +119,7 @@ import {
     getLiveNotificationParams,
 } from "./hook-handlers";
 import type { LiveSessionState } from "./live-session-state";
+import { createRequestHookOrder } from "./request-hook-order";
 import {
     type NotificationParams,
     sendCommandResult,
@@ -371,6 +372,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     }
     const lastHeuristicsTurnId = new Map<string, string>();
     const commitSeenLastPass = new Map<string, boolean>();
+    // Whether this request's messages transform already ran when the system hook
+    // sees it; decides if a system-prompt change can still fold into the request.
+    const requestHookOrder = createRequestHookOrder();
     const variantBySession =
         deps.liveSessionState?.variantBySession ?? new Map<string, string | undefined>();
     const liveModelBySession =
@@ -715,6 +719,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     registerLkgPersistence(createDbLkgPersistence(db));
 
     const transform = createTransform({
+        onMessagesPassStarted: requestHookOrder.messagesPrepared,
         cacheTtlConfig: deps.config.cache_ttl,
         cacheTtlConfigured: deps.config.cacheTtlConfigured,
         sampleCacheTtlConfig: () => deps.sampleHistorianConfig?.() ?? deps.config,
@@ -876,6 +881,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 await transform.clearRustSession(sessionId);
             } finally {
                 systemPromptHash.clearSession(sessionId);
+                requestHookOrder.clearSession(sessionId);
                 // Prune every per-session map this hook closure owns. These maps
                 // otherwise accumulate for the lifetime of a long-running plugin process.
                 lastHeuristicsTurnId.delete(sessionId);
@@ -1141,6 +1147,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // Mirror the primary-session caveman opt-in so the agent knows older
         // prose may be rewritten even when ctx_reduce is available.
         experimentalCavemanTextCompression: deps.config.caveman_text_compression?.enabled === true,
+        consumeMessagesPrepared: requestHookOrder.consumeMessagesPrepared,
     });
     const systemPromptHashHandler = systemPromptHash.handler;
 
@@ -1180,6 +1187,34 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             cacheTtlConfig: deps.config.cache_ttl,
         }),
         event: async (input: { event: { type: string; properties?: unknown } }) => {
+            if (input.event.type === "message.updated") {
+                // A finished assistant reply ends the request the last messages
+                // pass prepared. Record it before awaiting the other handlers so a
+                // following system hook already sees it.
+                const info = (
+                    input.event.properties as
+                        | {
+                              info?: {
+                                  id?: unknown;
+                                  role?: unknown;
+                                  sessionID?: unknown;
+                                  time?: { completed?: unknown };
+                              };
+                          }
+                        | undefined
+                )?.info;
+                if (
+                    info?.role === "assistant" &&
+                    typeof info.sessionID === "string" &&
+                    info.time?.completed !== undefined &&
+                    info.time.completed !== null
+                ) {
+                    requestHookOrder.assistantCompleted(
+                        info.sessionID,
+                        typeof info.id === "string" ? info.id : undefined,
+                    );
+                }
+            }
             await eventHook(input);
             if (input.event.type === "message.updated") {
                 runDreamQueueInBackground();

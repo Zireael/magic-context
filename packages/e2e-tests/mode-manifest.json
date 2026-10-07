@@ -60,6 +60,14 @@
             "behavior": true
         },
         {
+            "path": "tests/system-prompt-change-order.test.ts",
+            "tier": "both-modes",
+            "invocation": { "ts": true, "rust": true },
+            "rationale": "OpenCode 1 runs messages.transform before system.transform; an AGENTS.md edit and a configured instruction-file edit with a queued drop must each rewrite the provider prefix once, on the request that first carries the new system text, not again on the next request",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/opencode2/subagent-mode.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
