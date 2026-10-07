@@ -92,9 +92,11 @@ test("Rust OpenCode 1 preserves tagged mock and read image/PDF attachments on fi
             for (const [call, bytes] of frozen) expect(stableSerialize(result(h.mainRequests().at(-1)!.body, call))).toBe(bytes);
         }
         const passes = await h.waitForRustPasses(5);
-        expect(passes.slice(-3).every(pass => pass.decision === "defer")).toBe(true);
+        console.log(`tool attachment Rust passes: ${passes.map(pass => pass.raw).join("\n")}`);
+        // New tail tags can commit a SOFT+ fold while the scheduler defers reduction.
+        // Check the scheduler, not the fold verdict, to prove these are defer passes.
+        expect(passes.slice(-3).every(pass => / scheduler=defer(?: |$)/.test(pass.raw))).toBe(true);
         expect(passes.every(pass => pass.decision !== "error" && pass.decision !== "parked")).toBe(true);
-        console.log(`tool attachment Rust decisions: ${passes.map(pass => pass.decision).join(",")}`);
         containment();
     } finally { await h?.dispose(); }
 }, 600_000);

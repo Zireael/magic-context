@@ -23,12 +23,17 @@ Anthropic's image handling:
   (or reuses a serialized output cache entry). The projected text-only type reaches
   native attach (`lib.rs:14935–14992`, `15074` onwards).
 * Native attach decodes the original input into a **sidecar**, not a replacement
-  CK decision surface. `codec/opencode.rs:892–920` keeps unchanged native parts,
-  which explains the untagged survivors. Modified results are updated from CK:
-  `1047–1108`, `1438–1452`. `output_attachments` at `1377–1390` returns an empty
-  vector for `Text`/`ErrorText`; `apply_tool_output_to_part` then deletes
-  `state.attachments`. Neither tagging nor native attachment caching creates the
-  omission, but tagging makes the already-lossy projection authoritative.
+  CK decision surface. `codec/opencode.rs:432–506` clones the entire raw message
+  for mutation-exempt mids (line 484); certified native reasoning keeps also
+  restore native parts (`lib.rs:14994` onwards). These paths explain why a result
+  can stay untagged and retain its image despite the lossy CK projection.
+  Otherwise `encode_with_meta` compares typed fingerprints (`sidecar.rs:197–218,
+  254–258`) and updates native parts from CK (`opencode.rs:892–920`, `1047–1108`,
+  `1438–1452`). `output_attachments` at `1377–1390` returns an empty vector for
+  `Text`/`ErrorText`; `apply_tool_output_to_part` then deletes `state.attachments`.
+  Tagging is not an attachment-removal operation: it makes the lossy CK text
+  authoritative at an editable native boundary. A non-exempt untagged result
+  could lose attachments there too; the repair preserves those as well.
 * The native codec itself decodes attachments correctly into `Content` or
   `ErrorContent` (`codec/opencode.rs:710–747`). It retains each raw attachment in
   `provider_extras.opencode.rawAttachment`, including opaque/unknown children.
@@ -68,12 +73,15 @@ The parent approved a **one-time next-normal-pass repair**, not a new persisted
 renderer transition. Placement will coincide with the fleet's OpenCode restart
 window (persona/tool rewrite), when ck-mc's process-local CK/native caches are
 empty anyway. An already-served tagged result containing attachments is restored
-on the next normal module pass, including a defer; its provider prefix changes
-from the first such message onward. A local persisted last-served/LKG snapshot
-can continue replaying old bytes while the module is unavailable; repair happens
-when normal module serving resumes. Sessions without attachment-bearing tool
-results must be byte-identical across the upgrade. No database migration or
-live-store edits are involved.
+on the next normal module pass that installs the module output, including a defer;
+its provider prefix changes from the first such message onward. More generally,
+any non-exempt result previously re-encoded without its attachments is repaired,
+not just results carrying visible tags. An existing persisted last-served/LKG
+snapshot can continue replaying old bytes under its existing admission/hold rules;
+this change does not force-release that snapshot. Repair happens when normal
+module serving resumes. Sessions without attachment-bearing tool results must be
+byte-identical across the upgrade. No database migration or live-store edits are
+involved.
 
 ## Verification
 
@@ -141,5 +149,85 @@ PDF blocks arrived on first sight, then tripped on OpenCode's moving Anthropic
 result with only that provider bookkeeping excluded. A later launch encountered
 an empty daemon artifact. Neither is a passing real-host claim.
 
-The delivery's fresh local rebuild and host/shard results will be recorded here
+The accepted fresh local rebuild and host/shard results are recorded below
 with compile-time module/daemon identities and digests, not clock-skewed mtimes.
+
+Both local build commands used an environment assignment before Cargo:
+`MC_BUILD_SHA=... cargo build --locked -p mc-module --bin ck-mc` and
+`CARGO_TARGET_DIR=... cargo build --locked --manifest-path ... -p subc-core --bin
+ck-subc`. This matters even after the AFT placement: plain Cargo build invocations
+can still route remotely without transferring artifacts. None of the accepted
+fresh-host results below relies on such a plain build. The module was built with
+`MC_BUILD_SHA=d9116b4031201c3efa051ba18eee425746d59130` (the implementation
+commit), and the daemon was rebuilt from the clean lock-pinned subconscious
+revision `1a14993c120725fa1dce7267b6e7d0823835930c`. Version probes report:
+
+* `ckdev-mc --version`: `ck-mc 0.1.0 (d9116b4031201c3efa051ba18eee425746d59130)`
+* `ckdev-subc --version`: `ck-subc 0.20.55`
+
+SHA-256 digests of the sealed host executables:
+
+* normal module: `407fd7beaeda1a1f53b6e90479a15650746929d54abd332e967e6612bd73f48a`
+* drive-fault module: `0c945167573977a039e840d732bbf67dc9adff909af9836941fbf1dbaf301187`
+* daemon: `ae0190cc809c98d9f9f3c9170b8a61b7b32fa2beb7b4fcbbb663102ac712ac80`
+
+The normal module digest differs from the rejected pre-update artifact
+`ec50a60b28274e87d3c700cd7e32589faf88e1a1ba9e66f8292f83d605597204`.
+The old integration tests were retried after rebuilding and still failed their
+process-name assertions (`(bash)` / `<defunct>`; the store-ahead test also saw
+`(bash)`). After an integration-test hardlink staging run, the earlier copied daemon was
+observed empty; fresh host copies were therefore sealed in a separate `host-bin`
+directory
+and no Cargo integration run was allowed to overlap the host gates. The copies'
+version and digest were rechecked before serving.
+
+The codec negative-control restoration was verified separately: all 27 native
+codec tests passed, including the loss-notice test, and fmt remained clean.
+
+### Accepted fresh-host results
+
+These results use the identified normal/drive-fault module and lock-pinned daemon
+above, rebuilt using **environment-prefixed** Cargo commands. The module and
+normal daemon digests were checked again after the shard and were unchanged.
+
+* New real OpenCode 1.18.30 regression: **1 passed, 0 failed, 29 assertions**, both
+  with the current source entry and again with the freshly built plugin bundle.
+  It drives a custom screenshot tool and the host's real `read` tool on a PNG
+  and PDF. All three results carry tagged text plus the actual image/document
+  block on their first provider request, and their complete logical result
+  bytes replay identically across three later scheduler-defer passes.
+* The fold verdict on those appended-tail passes is `SOFT+`, because new tail
+  tags are committed; the scheduler is **`defer`**, and diagnostics show
+  `prefix_bust_permitted=false`. The new test checks the scheduler's actual
+  verdict, rather than incorrectly treating the fold verdict as the scheduler.
+  No existing test contract was weakened or renamed.
+* `MC_E2E_SHARD=0/4 scripts/run-rust-hermetic-e2e.sh` exercised all **15 selected
+  files**, including the new attachment regression. Fourteen files passed:
+  **32 passed / 48 host-lane skips**. The marker-byte-identity file initially had
+  a timeout plus three failures requiring `PLUGIN_ENTRY` to be the built dist
+  entry (the source had changed since the prepared bundle). After `bun run --cwd
+  packages/plugin build` passed (including 4 v2 loader tests), only that failed
+  file and the bundle-loaded attachment regression were rerun. Marker file:
+  **7 passed / 0 failed / 320 assertions**. Final selected-file coverage is thus
+  **39 passed / 48 skipped / 0 remaining failures**; the initial full shard
+  invocation itself exited 1, not 0.
+* PID-scoped lsof checks covered the direct host and **63 host PIDs** in the
+  full shard, then **25 host PIDs** in the corrected marker-file run. Every
+  observed database path was under the task's throwaway root. Logs and
+  inventories remain beneath `$TMPDIR/magic-context/bg_db9030ba41707226/`,
+  including `fresh-host-shard-{stdout,stderr}.txt` and `host-containment/`.
+
+Deployment must update the plugin adapter as well as ck-mc: native attachment
+encoding treats the CK result as authoritative, so a module-only placement with
+an old attachment-blind adapter is not the projection repair. The native codec
+continues respecting explicit reduced outputs, while the new adapter provides
+all unreduced media/opaque children. The final follow-up commit only corrects the
+new test's scheduler assertion and records verification; the product source is
+exactly the implementation commit stamped into the fresh binaries.
+
+The live evidence alone cannot identify which particular tag-admission guard
+held each untagged CEREB result; that would require ingress/module state not
+present in request-body captures. The source-level exemption/pending-tag paths
+explain the distinction without reading a forbidden live store. The confirmed
+repair point is the attachment-blind adapter projection and its editable native
+round trip, not a special case for computer_use or for one provider.
