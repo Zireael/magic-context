@@ -2670,6 +2670,143 @@ describe("m[0]/m[1] materialization", () => {
         expect(attempts).toBe(3);
     });
 
+    for (const change of ["memory", "compartment"] as const) {
+        it(`two connections ${change === "memory" ? "include an additive memory in the locked delta" : "retry a fold for a new compartment"} before admission`, () => {
+            const projectDirectory = makeProjectDir();
+            const path = join(projectDirectory, "context.db");
+            db = new Database(path);
+            initializeDatabase(db);
+            db.exec("PRAGMA journal_mode=WAL");
+            getOrCreateSessionMeta(db, SESSION_ID);
+            const sibling = new Database(path);
+            try {
+                let attempts = 0;
+                let commits = 0;
+                const result = materializeWithRetry({
+                    db,
+                    sessionId: SESSION_ID,
+                    state: readStateFromMeta(),
+                    projectPath: PROJECT_PATH,
+                    projectDirectory,
+                    beforeCacheCommitForTest: () => {
+                        attempts++;
+                        if (attempts !== 1) return;
+                        if (change === "memory") {
+                            insertMemory(sibling, {
+                                projectPath: PROJECT_PATH,
+                                category: "ARCHITECTURE",
+                                content: "Concurrent published memory",
+                            });
+                        } else {
+                            appendCompartments(sibling, SESSION_ID, [
+                                {
+                                    sequence: 0,
+                                    startMessage: 0,
+                                    endMessage: 1,
+                                    startMessageId: "concurrent-start",
+                                    endMessageId: "concurrent-end",
+                                    title: "Concurrent compartment",
+                                    content: "Concurrent published history",
+                                    p1: "Concurrent published history",
+                                    p2: "summary",
+                                    p3: "outcome",
+                                    p4: "anchor",
+                                    importance: 70,
+                                    legacy: 0,
+                                },
+                            ]);
+                        }
+                    },
+                    onFoldPrepare: () => () => {
+                        commits++;
+                    },
+                });
+                expect(attempts).toBe(change === "memory" ? 1 : 2);
+                expect(commits).toBe(1);
+                expect(change === "memory" ? result.m1Text : result.m0Text).toContain(
+                    change === "memory"
+                        ? "Concurrent published memory"
+                        : "Concurrent published history",
+                );
+                const meta = getOrCreateSessionMeta(db, SESSION_ID);
+                expect(meta.cachedM0Bytes).toEqual(result.m0Bytes);
+                expect(meta.cachedM1Bytes).toEqual(result.m1Bytes);
+            } finally {
+                sibling.close();
+            }
+        });
+
+        it(`two connections include a ${change} published before soft-refresh admission`, () => {
+            const projectDirectory = makeProjectDir();
+            const path = join(projectDirectory, "context.db");
+            db = new Database(path);
+            initializeDatabase(db);
+            db.exec("PRAGMA journal_mode=WAL");
+            getOrCreateSessionMeta(db, SESSION_ID);
+            const state = readStateFromMeta();
+            injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+            });
+            const before = db
+                .prepare("SELECT * FROM session_meta WHERE session_id = ?")
+                .get(SESSION_ID);
+            const sibling = new Database(path);
+            try {
+                const m0Before = state.cachedM0Bytes;
+                const refreshed = injectM0M1({
+                    db,
+                    sessionId: SESSION_ID,
+                    state,
+                    projectPath: PROJECT_PATH,
+                    projectDirectory,
+                    isCacheBustingPass: true,
+                    beforeCacheCommitForTest: () => {
+                        if (change === "memory")
+                            insertMemory(sibling, {
+                                projectPath: PROJECT_PATH,
+                                category: "ARCHITECTURE",
+                                content: "Concurrent refresh memory",
+                            });
+                        else
+                            appendCompartments(sibling, SESSION_ID, [
+                                {
+                                    sequence: 0,
+                                    startMessage: 0,
+                                    endMessage: 1,
+                                    endMessageId: "refresh-end",
+                                    title: "Refresh compartment",
+                                    content: "Concurrent refresh history",
+                                    p1: "Concurrent refresh history",
+                                    p2: "summary",
+                                    p3: "outcome",
+                                    p4: "anchor",
+                                    importance: 70,
+                                    legacy: 0,
+                                },
+                            ]);
+                    },
+                });
+                const after = getOrCreateSessionMeta(db, SESSION_ID);
+                expect(after.cachedM0Bytes).toEqual(m0Before);
+                expect(after.cachedM1Bytes?.toString("utf8")).toContain(
+                    change === "memory"
+                        ? "Concurrent refresh memory"
+                        : "Concurrent refresh history",
+                );
+                expect(after.cachedM1Bytes?.toString("utf8")).toBe(refreshed.m1Text);
+                expect(
+                    db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(SESSION_ID),
+                ).not.toEqual(before);
+            } finally {
+                sibling.close();
+            }
+        });
+    }
+
     it("injectM0M1 updates root cached state after successful materialization", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
