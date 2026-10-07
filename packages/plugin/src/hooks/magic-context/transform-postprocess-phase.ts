@@ -2023,30 +2023,30 @@ export async function runPostTransformPhase(
                 hardSignals: args.m0M1.hardSignals,
                 muralEnabled: args.m0M1.muralEnabled,
                 compactionOff,
-                onFoldPrepare: (rendered) => {
-                    const bustsPrefix = foldBustsServedPrefix(
-                        foldDueDecision.reason,
-                        servedPrefixBeforeFold,
-                        rendered,
+                onFoldPrepare: () => {
+                    const conversions = prepareLegacyToolSkeletonConversions(
+                        args.db,
+                        args.sessionId,
+                        args.targets,
                     );
-                    const conversions = bustsPrefix
-                        ? prepareLegacyToolSkeletonConversions(
-                              args.db,
-                              args.sessionId,
-                              args.targets,
-                          )
-                        : null;
-                    return (db) => {
-                        if (conversions && !conversions.isCurrent(db)) {
-                            throw new MaterializeContentionError({
-                                reason: "fold conversion snapshot changed",
-                            });
+                    return (db, rendered) => {
+                        const bustsPrefix = foldBustsServedPrefix(
+                            foldDueDecision.reason,
+                            servedPrefixBeforeFold,
+                            rendered,
+                        );
+                        if (bustsPrefix) {
+                            if (!conversions.isCurrent(db)) {
+                                throw new MaterializeContentionError({
+                                    reason: "fold conversion snapshot changed",
+                                });
+                            }
+                            conversions.persist(db);
+                            for (const [tagNumber, mode] of conversions.converted) {
+                                convertedToolSkeletons.set(tagNumber, mode);
+                            }
                         }
-                        conversions?.persist(db);
                         committedFoldBustsServedPrefix = bustsPrefix;
-                        for (const [tagNumber, mode] of conversions?.converted ?? []) {
-                            convertedToolSkeletons.set(tagNumber, mode);
-                        }
                     };
                 },
             });

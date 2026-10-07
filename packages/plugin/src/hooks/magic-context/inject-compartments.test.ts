@@ -2671,7 +2671,7 @@ describe("m[0]/m[1] materialization", () => {
     });
 
     for (const change of ["memory", "compartment"] as const) {
-        it(`two connections retry a fold when a ${change} arrives after m[1] rendering`, () => {
+        it(`two connections ${change === "memory" ? "include an additive memory in the locked delta" : "retry a fold for a new compartment"} before admission`, () => {
             const projectDirectory = makeProjectDir();
             const path = join(projectDirectory, "context.db");
             db = new Database(path);
@@ -2703,6 +2703,7 @@ describe("m[0]/m[1] materialization", () => {
                                     sequence: 0,
                                     startMessage: 0,
                                     endMessage: 1,
+                                    startMessageId: "concurrent-start",
                                     endMessageId: "concurrent-end",
                                     title: "Concurrent compartment",
                                     content: "Concurrent published history",
@@ -2720,9 +2721,9 @@ describe("m[0]/m[1] materialization", () => {
                         commits++;
                     },
                 });
-                expect(attempts).toBe(2);
+                expect(attempts).toBe(change === "memory" ? 1 : 2);
                 expect(commits).toBe(1);
-                expect(result.m0Text).toContain(
+                expect(change === "memory" ? result.m1Text : result.m0Text).toContain(
                     change === "memory"
                         ? "Concurrent published memory"
                         : "Concurrent published history",
@@ -2735,7 +2736,7 @@ describe("m[0]/m[1] materialization", () => {
             }
         });
 
-        it(`two connections reject stale soft-refresh bytes after a ${change} write`, () => {
+        it(`two connections include a ${change} published before soft-refresh admission`, () => {
             const projectDirectory = makeProjectDir();
             const path = join(projectDirectory, "context.db");
             db = new Database(path);
@@ -2755,44 +2756,51 @@ describe("m[0]/m[1] materialization", () => {
                 .get(SESSION_ID);
             const sibling = new Database(path);
             try {
-                expect(() =>
-                    injectM0M1({
-                        db,
-                        sessionId: SESSION_ID,
-                        state,
-                        projectPath: PROJECT_PATH,
-                        projectDirectory,
-                        isCacheBustingPass: true,
-                        beforeCacheCommitForTest: () => {
-                            if (change === "memory")
-                                insertMemory(sibling, {
-                                    projectPath: PROJECT_PATH,
-                                    category: "ARCHITECTURE",
-                                    content: "Concurrent refresh memory",
-                                });
-                            else
-                                appendCompartments(sibling, SESSION_ID, [
-                                    {
-                                        sequence: 0,
-                                        startMessage: 0,
-                                        endMessage: 1,
-                                        endMessageId: "refresh-end",
-                                        title: "Refresh compartment",
-                                        content: "Concurrent refresh history",
-                                        p1: "Concurrent refresh history",
-                                        p2: "summary",
-                                        p3: "outcome",
-                                        p4: "anchor",
-                                        importance: 70,
-                                        legacy: 0,
-                                    },
-                                ]);
-                        },
-                    }),
-                ).toThrow(MaterializeContentionError);
+                const m0Before = state.cachedM0Bytes;
+                const refreshed = injectM0M1({
+                    db,
+                    sessionId: SESSION_ID,
+                    state,
+                    projectPath: PROJECT_PATH,
+                    projectDirectory,
+                    isCacheBustingPass: true,
+                    beforeCacheCommitForTest: () => {
+                        if (change === "memory")
+                            insertMemory(sibling, {
+                                projectPath: PROJECT_PATH,
+                                category: "ARCHITECTURE",
+                                content: "Concurrent refresh memory",
+                            });
+                        else
+                            appendCompartments(sibling, SESSION_ID, [
+                                {
+                                    sequence: 0,
+                                    startMessage: 0,
+                                    endMessage: 1,
+                                    endMessageId: "refresh-end",
+                                    title: "Refresh compartment",
+                                    content: "Concurrent refresh history",
+                                    p1: "Concurrent refresh history",
+                                    p2: "summary",
+                                    p3: "outcome",
+                                    p4: "anchor",
+                                    importance: 70,
+                                    legacy: 0,
+                                },
+                            ]);
+                    },
+                });
+                const after = getOrCreateSessionMeta(db, SESSION_ID);
+                expect(after.cachedM0Bytes).toEqual(m0Before);
+                expect(after.cachedM1Bytes?.toString("utf8")).toContain(
+                    change === "memory"
+                        ? "Concurrent refresh memory"
+                        : "Concurrent refresh history",
+                );
+                expect(after.cachedM1Bytes?.toString("utf8")).toBe(refreshed.m1Text);
                 expect(
                     db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(SESSION_ID),
-                ).toEqual(before);
+                ).not.toEqual(before);
             } finally {
                 sibling.close();
             }

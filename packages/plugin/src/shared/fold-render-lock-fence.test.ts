@@ -17,7 +17,7 @@ for (const [host, path, functions] of [
         ["materializeM0Pi", "softRefreshCachedM1Pi"],
     ],
 ] as const) {
-    test(`${host} fold and refresh render before writer admission`, () => {
+    test(`${host} fold and refresh render m[1] inside their writer section`, () => {
         const source = ts.createSourceFile(
             path,
             readFileSync(resolve(root, path), "utf8"),
@@ -45,17 +45,34 @@ for (const [host, path, functions] of [
                         call.arguments[0]?.getText(source) === '"BEGIN IMMEDIATE"',
                 );
                 expect(admission).toBeDefined();
-                for (const call of calls) {
-                    const name = call.expression.getText(source);
+                const commit = calls.find(
+                    (call) =>
+                        admission &&
+                        call.pos > admission.pos &&
+                        call.expression.getText(source).endsWith(".exec") &&
+                        call.arguments[0]?.getText(source) === '"COMMIT"',
+                );
+                expect(commit).toBeDefined();
+                const renders = calls.filter((call) =>
+                    /^renderM1(?:Pi)?WithMetadata$/.test(call.expression.getText(source)),
+                );
+                expect(renders).toHaveLength(1);
+                for (const render of renders) {
                     if (
-                        /^(renderM[01](?:Pi)?(?:WithMetadata)?|readM1Snapshot|readRenderSnapshot(?:Pi)?)$/.test(
-                            name,
-                        ) ||
-                        name.endsWith("onFoldPrepare")
-                    ) {
-                        if (admission && call.pos > admission.pos)
-                            violations.push(`${node.name.text}: ${name}`);
-                    }
+                        !admission ||
+                        !commit ||
+                        render.pos < admission.pos ||
+                        render.pos > commit.pos
+                    )
+                        violations.push(`${node.name.text}: m[1] render outside writer`);
+                }
+                for (const call of calls) {
+                    if (
+                        call.expression.getText(source).endsWith("onFoldPrepare") &&
+                        admission &&
+                        call.pos > admission.pos
+                    )
+                        violations.push(`${node.name.text}: wire preparation inside writer`);
                 }
             }
             ts.forEachChild(node, visit);

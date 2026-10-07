@@ -399,6 +399,7 @@ function safeGetActiveUserMemoriesPi(db: ContextDatabase): UserMemory[] {
 }
 
 export interface PiM0M1State {
+	/** Test hook before writer admission, before any m[1] render reads. */
 	beforeCacheCommitForTest?: () => void;
 	/** These delivery fields are scoped to one context pass, never persisted. */
 	freezePrefixForPass?: boolean;
@@ -962,7 +963,7 @@ function getCachedMarkers(
 }
 
 function lastBaselineEndMessageId(
-	compartments: readonly Pick<PiCompartment, "endMessageId">[],
+	compartments: readonly PiCompartment[],
 ): string | null {
 	const last = compartments.at(-1);
 	return last?.endMessageId && last.endMessageId.length > 0
@@ -978,16 +979,7 @@ function readCurrentMarkers(
 	return readCurrentMarkersFromCompartments(
 		db,
 		state,
-		state.compactionOff
-			? []
-			: (db
-					.prepare(
-						"SELECT sequence, end_message_id AS endMessageId, legacy FROM compartments WHERE session_id = ? ORDER BY sequence",
-					)
-					.all(state.sessionId) as Pick<
-					PiCompartment,
-					"sequence" | "endMessageId" | "legacy"
-				>[]),
+		getRenderableCompartmentsPi(db, state),
 		projectDocsHash,
 	);
 }
@@ -995,10 +987,7 @@ function readCurrentMarkers(
 function readCurrentMarkersFromCompartments(
 	db: ContextDatabase,
 	state: PiM0M1State,
-	compartments: readonly Pick<
-		PiCompartment,
-		"sequence" | "endMessageId" | "legacy"
-	>[],
+	compartments: readonly PiCompartment[],
 	projectDocsHash?: string,
 ): PiM0SnapshotMarkers {
 	const memPath = memoryProjectPath(state);
@@ -1674,8 +1663,8 @@ export function materializeM0Pi(
 	snapshotMarkers: PiM0SnapshotMarkers;
 	renderedMemoryIds: number[];
 } {
-	// Phase 1 (no lock): read markers + render. Rendering can be slow, so we do
-	// it OUTSIDE the write lock to keep the BEGIN IMMEDIATE critical section tiny.
+	// Phase 1 (no lock): freeze and render m[0]. The m[1] delta is read and
+	// rendered under the writer so its selection and history match the commit.
 	const docs = passSnapshot?.projectDocs ?? readProjectDocsForPiM0(state);
 	if (passSnapshot && passSnapshot.projectDocs === undefined) {
 		passSnapshot.projectDocs = docs;
@@ -1758,11 +1747,6 @@ export function materializeM0Pi(
 
 	const steps = new WriteTransactionSteps();
 	snapshotMarkers.materializedAt = foldMaterializedAt;
-	const prepared = readRenderSnapshotPi(state, db, docs.canonicalHash, () =>
-		renderM1PiWithMetadata(state, db, snapshotMarkers, renderedMemoryIds),
-	);
-	const m1Render = prepared.value;
-	const m1Bytes = Buffer.from(m1Render.text, "utf8");
 	const renderedIdsJson = JSON.stringify(renderedMemoryIds);
 	const upgradeIdentity = encodeCachedM0UpgradeIdentity(
 		snapshotMarkers.upgradeState,
@@ -1772,10 +1756,9 @@ export function materializeM0Pi(
 		snapshotMarkers.memoryRenderEpoch,
 		snapshotMarkers.renderedBudgets ?? null,
 	);
-	steps.mark("pre_m1Render");
+	steps.mark("pre_metadata");
 	state.beforeCacheCommitForTest?.();
-	// Both renders are precomputed. The writer validates both snapshots before
-	// persisting the pair, marker watermarks and boundary atomically.
+	// Validate the m[0] snapshot, render m[1], and persist the pair atomically.
 	try {
 		db.exec("BEGIN IMMEDIATE");
 	} catch (error) {
@@ -1815,11 +1798,19 @@ export function materializeM0Pi(
 			// harness ever revives the field.
 			current.sessionFactsVersion !== snapshotMarkers.sessionFactsVersion ||
 			current.upgradeState !== snapshotMarkers.upgradeState;
-		if (stale || !renderSnapshotIsCurrentPi(current, prepared.markers)) {
+		if (stale) {
 			db.exec("ROLLBACK");
 			throw new PiMaterializeContentionError("snapshot changed before persist");
 		}
 		steps.mark("staleCheck");
+		const m1Render = renderM1PiWithMetadata(
+			state,
+			db,
+			snapshotMarkers,
+			renderedMemoryIds,
+		);
+		const m1Bytes = Buffer.from(m1Render.text, "utf8");
+		steps.mark("m1Render");
 		persistCachedM0(db, state.sessionId, {
 			m0Bytes,
 			muralDataUrl: frozenMuralDataUrl,
@@ -1848,20 +1839,19 @@ export function materializeM0Pi(
 		// "Injected" count AND a stale ctx_search hide-already-visible filter after
 		// any memory change (e.g. migration delete+reinserts with new ids).
 		db.prepare(
-			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
-		).run(renderedMemoryIds.length, renderedIdsJson, state.sessionId);
+			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
+		).run(
+			renderedMemoryIds.length,
+			renderedIdsJson,
+			snapshotMarkers.lastBaselineEndMessageId,
+			state.sessionId,
+		);
 
 		// Persist the frozen trim boundary INSIDE the materialize transaction,
 		// BEFORE COMMIT. If written after COMMIT, a crash in the window leaves a
 		// fresh m[0]/maxCompartmentSeq paired with a stale (or null) boundary, so
 		// the next pass trims against the wrong point (under/over-trim). Atomic
 		// with the m[0] bytes + markers + m[1] bytes is the only correct placement.
-		setCachedBoundary(
-			db,
-			state.sessionId,
-			snapshotMarkers.lastBaselineEndMessageId,
-		);
-
 		steps.mark("sessionMeta");
 		db.exec("COMMIT");
 		steps.mark("commit");
@@ -2022,44 +2012,6 @@ function renderMemoryUpdatesBlockPi(args: {
 interface RenderM1PiResult {
 	text: string;
 	memoryUpdateCount: number;
-}
-
-function readRenderSnapshotPi<T>(
-	state: PiM0M1State,
-	db: ContextDatabase,
-	docsHash: string,
-	read: () => T,
-) {
-	db.exec("BEGIN");
-	try {
-		const markers = readCurrentMarkers(db, state, docsHash);
-		const value = read();
-		db.exec("COMMIT");
-		return { value, markers };
-	} catch (error) {
-		db.exec("ROLLBACK");
-		throw error;
-	}
-}
-
-function renderSnapshotIsCurrentPi(
-	current: PiM0SnapshotMarkers,
-	rendered: PiM0SnapshotMarkers,
-): boolean {
-	// The delta probe includes additive memories, unlike the m[0] CAS. Without
-	// it a memory arriving after rendering could be hidden by a stale commit.
-	return (
-		current.maxMemoryId === rendered.maxMemoryId &&
-		current.maxCompartmentSeq === rendered.maxCompartmentSeq &&
-		current.maxMutationId === rendered.maxMutationId &&
-		current.maxMemoryMutationId === rendered.maxMemoryMutationId &&
-		current.projectMemoryEpoch === rendered.projectMemoryEpoch &&
-		current.workspaceFingerprint === rendered.workspaceFingerprint &&
-		current.projectUserProfileVersion === rendered.projectUserProfileVersion &&
-		current.projectIdentity === rendered.projectIdentity &&
-		current.upgradeState === rendered.upgradeState &&
-		current.lastBaselineEndMessageId === rendered.lastBaselineEndMessageId
-	);
 }
 
 function renderM1PiWithMetadata(
@@ -2494,49 +2446,6 @@ function softRefreshCachedM1Pi(args: {
 	recomputed: boolean;
 } {
 	const steps = new WriteTransactionSteps();
-	const snapshot = readRenderSnapshotPi(
-		args.state,
-		args.db,
-		args.markers.projectDocsHash,
-		() => {
-			const row = readCachedPiM0M1Row(args.db, args.state.sessionId);
-			if (
-				!row ||
-				!cachedPiRowMatchesSnapshot({
-					row,
-					m0Bytes: args.m0Bytes,
-					markers: args.markers,
-					compartmentsForNormalization: args.compartmentsForNormalization,
-				})
-			)
-				return null;
-			const markers = markersFromCachedPiRow(
-				row,
-				args.compartmentsForNormalization,
-			);
-			if (!markers)
-				throw new PiMaterializeContentionError(
-					`invalid cached m[0] markers for ${args.state.sessionId}`,
-				);
-			const compartments = getRenderableCompartmentsPi(args.db, args.state);
-			const rendered = renderM1PiWithMetadata(
-				args.state,
-				args.db,
-				markers,
-				parseMemoryBlockIds(row.memory_block_ids),
-				compartments,
-			);
-			const latest = compartments.at(-1);
-			const advancedBoundary =
-				latest?.endMessageId && latest.endMessageId.length > 0
-					? latest.endMessageId
-					: markers.lastBaselineEndMessageId;
-			return { row, markers, rendered, advancedBoundary };
-		},
-	);
-	const prepared = snapshot.value;
-	const m1Bytes = prepared ? Buffer.from(prepared.rendered.text, "utf8") : null;
-	steps.mark("pre_m1Render");
 	args.state.beforeCacheCommitForTest?.();
 	args.db.exec("BEGIN IMMEDIATE");
 	const transactionStartedAt = performance.now();
@@ -2544,7 +2453,6 @@ function softRefreshCachedM1Pi(args: {
 	try {
 		const row = readCachedPiM0M1Row(args.db, args.state.sessionId);
 		if (
-			!prepared ||
 			!row ||
 			!cachedPiRowMatchesSnapshot({
 				row,
@@ -2575,18 +2483,32 @@ function softRefreshCachedM1Pi(args: {
 			};
 		}
 
-		if (
-			!renderSnapshotIsCurrentPi(
-				readCurrentMarkers(args.db, args.state, args.markers.projectDocsHash),
-				snapshot.markers,
-			)
-		) {
-			throw new PiMaterializeContentionError(
-				"snapshot changed before soft refresh",
-			);
-		}
 		steps.mark("staleCheck");
-		const { markers, rendered, advancedBoundary } = prepared;
+		const markers = markersFromCachedPiRow(
+			row,
+			args.compartmentsForNormalization,
+		);
+		if (!markers)
+			throw new PiMaterializeContentionError(
+				`invalid cached m[0] markers for ${args.state.sessionId}`,
+			);
+		// Read the delta and its trim boundary together under the writer. A pass
+		// snapshot taken before admission may have stale in-place history ranges.
+		const compartments = getRenderableCompartmentsPi(args.db, args.state);
+		const rendered = renderM1PiWithMetadata(
+			args.state,
+			args.db,
+			markers,
+			parseMemoryBlockIds(row.memory_block_ids),
+			compartments,
+		);
+		const m1Bytes = Buffer.from(rendered.text, "utf8");
+		const latest = compartments.at(-1);
+		const advancedBoundary =
+			latest?.endMessageId && latest.endMessageId.length > 0
+				? latest.endMessageId
+				: markers.lastBaselineEndMessageId;
+		steps.mark("m1Render");
 
 		args.db
 			.prepare(

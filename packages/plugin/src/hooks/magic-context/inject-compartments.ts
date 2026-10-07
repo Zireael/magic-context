@@ -1002,17 +1002,23 @@ export interface M0M1RenderOptions {
     hardSignals?: M0HardSignals;
     workspaceIdentitySet?: WorkspaceIdentitySet;
     beforePhase3ForTest?: () => void;
+    /** Runs before writer admission, not between m[1] rendering and its writes. */
     beforeCacheCommitForTest?: () => void;
     /**
-     * Prepare read-only fold side effects before writer admission, on every
-     * retry. The returned callback validates its snapshot and persists writes
-     * atomically with the cached pair; it must not render or traverse the wire.
+     * Prepare wire-dependent fold side effects before writer admission, on every
+     * retry. The returned callback receives the locked render, validates its tag
+     * snapshot and persists writes atomically; it must not traverse the wire.
      */
-    onFoldPrepare?: (rendered: {
-        m0Bytes: Buffer;
-        m1Bytes: Buffer;
-        muralDataUrl: string | null;
-    }) => ((db: Database) => void) | undefined;
+    onFoldPrepare?: () =>
+        | ((
+              db: Database,
+              rendered: {
+                  m0Bytes: Buffer;
+                  m1Bytes: Buffer;
+                  muralDataUrl: string | null;
+              },
+          ) => void)
+        | undefined;
 }
 
 export interface MaterializeDecision {
@@ -1503,7 +1509,6 @@ function getMarkerReadCache(db: Database): BoundedSessionMap<MarkerReadCacheEntr
 function readMarkerChangeProbe(
     args: M0SnapshotMarkerReadArgs,
     workspace: WorkspaceRenderContext,
-    at = Date.now(),
 ): MarkerChangeProbe {
     const statement = cachedStatement(
         markerChangeProbeStatements,
@@ -1519,7 +1524,7 @@ function readMarkerChangeProbe(
         GLOBAL_USER_PROFILE_PROJECT_PATH,
         args.sessionId,
         args.sessionId,
-        at,
+        Date.now(),
         args.sessionId,
         args.projectPath ?? "",
     ) as MarkerChangeProbeRow;
@@ -2605,15 +2610,6 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     options.beforePhase3ForTest?.();
 
     const steps = new WriteTransactionSteps();
-    // The delta has its own read snapshot. Additions before this render may
-    // appear in m[1]; additions after it must invalidate the precomputed bytes.
-    const prepared = readM1Snapshot(options, snapshotMarkers, renderedMemoryIds);
-    const m1Text = prepared.rendered.text;
-    const m1Bytes = Buffer.from(m1Text, "utf8");
-    const visibleMemoryIds = [
-        ...new Set([...renderedMemoryIds, ...prepared.rendered.renderedMemoryIds]),
-    ];
-    const visibleIdsJson = JSON.stringify(visibleMemoryIds);
     const upgradeIdentity = encodeCachedM0UpgradeIdentity(
         snapshotMarkers.upgradeState,
         snapshotMarkers.compartmentRenderEpoch,
@@ -2623,13 +2619,11 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         snapshotMarkers.renderedBudgets ?? null,
     );
     const baselineEndMessageId = lastCompartmentBoundaryId(compartments);
-    steps.mark("pre_m1Render");
-    const commitFold = options.onFoldPrepare?.({
-        m0Bytes,
-        m1Bytes,
-        muralDataUrl: frozenMuralDataUrl,
-    });
+    steps.mark("pre_metadata");
+    const commitFold = options.onFoldPrepare?.();
     steps.mark("pre_onFoldPrepare");
+    let m1Text = M1_EMPTY_PLACEHOLDER;
+    let m1Bytes = Buffer.from(m1Text, "utf8");
     options.beforeCacheCommitForTest?.();
     options.db.exec("BEGIN IMMEDIATE");
     const transactionStartedAt = performance.now();
@@ -2700,12 +2694,32 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
             current.sessionFactsVersion !== snapshotMarkers.sessionFactsVersion ||
             current.upgradeState !== snapshotMarkers.upgradeState ||
             (current.projectIdentity ?? null) !== (snapshotMarkers.projectIdentity ?? null);
-        if (stale || !m1SnapshotIsCurrent(options, prepared)) {
+        if (stale) {
             options.db.exec("ROLLBACK");
             throw new MaterializeContentionError({ reason: "snapshot changed before Phase 3" });
         }
 
         steps.mark("staleCheck");
+        // Keep all delta reads under the writer: selection timestamps, in-place
+        // compartment rewrites and indexed dates are not covered by m[0]'s CAS.
+        const rendered = renderM1WithMetadata(
+            {
+                ...options,
+                workspaceIdentitySet: {
+                    identities: workspace.identities,
+                    namesByIdentity: workspace.namesByIdentity,
+                },
+            },
+            snapshotMarkers,
+            renderedMemoryIds,
+        );
+        m1Text = rendered.text;
+        m1Bytes = Buffer.from(m1Text, "utf8");
+        const visibleMemoryIds = [
+            ...new Set([...renderedMemoryIds, ...rendered.renderedMemoryIds]),
+        ];
+        const visibleIdsJson = JSON.stringify(visibleMemoryIds);
+        steps.mark("m1Render");
         persistCachedM0(options.db, options.sessionId, {
             m0Bytes,
             muralDataUrl: frozenMuralDataUrl,
@@ -2740,9 +2754,9 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // bytes and their id manifest never diverge.
         options.db
             .prepare(
-                "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
+                "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
             )
-            .run(visibleMemoryIds.length, visibleIdsJson, options.sessionId);
+            .run(visibleMemoryIds.length, visibleIdsJson, baselineEndMessageId, options.sessionId);
 
         // Persist the boundary the freshly-rendered m[0]+m[1] cover (the latest
         // compartment's end message id). A cold post-restart pass reads this to
@@ -2750,14 +2764,8 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // so a compartment published after this materialize keeps its raw
         // messages in the tail until an exec pass folds it into m[1]. Same
         // transaction as the m[0] snapshot so bytes and boundary never diverge.
-        options.db
-            .prepare(
-                "UPDATE session_meta SET cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
-            )
-            .run(baselineEndMessageId, options.sessionId);
-
         steps.mark("sessionMeta");
-        commitFold?.(options.db);
+        commitFold?.(options.db, { m0Bytes, m1Bytes, muralDataUrl: frozenMuralDataUrl });
 
         steps.mark("onFoldCommit");
         options.db.exec("COMMIT");
@@ -2890,41 +2898,6 @@ interface RenderM1Result {
     text: string;
     memoryUpdateCount: number;
     renderedMemoryIds: number[];
-}
-
-function readRenderSnapshot<T>(options: M0M1RenderOptions, at: number, read: () => T) {
-    options.db.exec("BEGIN");
-    try {
-        const workspace = resolveWorkspaceRenderContext(options);
-        const probe = readMarkerChangeProbe(options, workspace, at);
-        const upgradeState = getUpgradeState(options.db, options.sessionId);
-        const value = read();
-        options.db.exec("COMMIT");
-        return { value, probe, upgradeState, at };
-    } catch (error) {
-        options.db.exec("ROLLBACK");
-        throw error;
-    }
-}
-
-function readM1Snapshot(options: M0M1RenderOptions, markers: M0SnapshotMarkers, ids: number[]) {
-    const snapshot = readRenderSnapshot(options, markers.materializedAt, () =>
-        renderM1WithMetadata(options, markers, ids),
-    );
-    return { ...snapshot, rendered: snapshot.value };
-}
-
-function m1SnapshotIsCurrent(
-    options: M0M1RenderOptions,
-    snapshot: { probe: MarkerChangeProbe; upgradeState: string | null; at: number },
-): boolean {
-    const workspace = resolveWorkspaceRenderContext(options);
-    return (
-        markerChangeProbeEquals(
-            snapshot.probe,
-            readMarkerChangeProbe(options, workspace, snapshot.at),
-        ) && snapshot.upgradeState === getUpgradeState(options.db, options.sessionId)
-    );
 }
 
 function renderM1WithMetadata(
@@ -3272,40 +3245,13 @@ function replayCachedM1(state: M0M1State): string {
 
 function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
     const steps = new WriteTransactionSteps();
-    const snapshot = readRenderSnapshot(
-        options,
-        options.state.snapshotMarkers?.materializedAt ?? Date.now(),
-        () => {
-            const row = readCachedM0M1Row(options.db, options.sessionId);
-            if (!row || !cachedRowMatchesState(row, options.state)) return null;
-            const markers = markersFromCachedRow(row);
-            if (!markers) throw new RenderM1InvalidMarkersError(options.sessionId);
-            const renderedM0Ids = parseMemoryBlockIds(row.memory_block_ids).filter(
-                (id) => id <= markers.maxMemoryId,
-            );
-            const rendered = renderM1WithMetadata(options, markers, renderedM0Ids);
-            const visibleMemoryIds = [
-                ...new Set([...renderedM0Ids, ...rendered.renderedMemoryIds]),
-            ];
-            return {
-                markers,
-                rendered,
-                visibleMemoryIds,
-                baselineEndMessageId: getLastCompartmentEndMessageId(options.db, options.sessionId),
-            };
-        },
-    );
-    const prepared = snapshot.value;
-    const m1Bytes = prepared ? Buffer.from(prepared.rendered.text, "utf8") : null;
-    const visibleIdsJson = JSON.stringify(prepared?.visibleMemoryIds ?? []);
-    steps.mark("pre_m1Render");
     options.beforeCacheCommitForTest?.();
     options.db.exec("BEGIN IMMEDIATE");
     const transactionStartedAt = performance.now();
     steps.reset();
     try {
         const row = readCachedM0M1Row(options.db, options.sessionId);
-        if (!prepared || !row || !cachedRowMatchesState(row, options.state)) {
+        if (!row || !cachedRowMatchesState(row, options.state)) {
             options.db.exec("ROLLBACK");
             // Post-ROLLBACK fallback read is intentionally NOT wrapped in a
             // transaction: readCachedM0M1Row is a SINGLE atomic SELECT, so
@@ -3325,13 +3271,18 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             };
         }
 
-        if (!m1SnapshotIsCurrent(options, snapshot)) {
-            throw new MaterializeContentionError({
-                reason: "snapshot changed before soft refresh",
-            });
-        }
         steps.mark("staleCheck");
-        const { markers, rendered, visibleMemoryIds, baselineEndMessageId } = prepared;
+        const markers = markersFromCachedRow(row);
+        if (!markers) throw new RenderM1InvalidMarkersError(options.sessionId);
+        const renderedM0Ids = parseMemoryBlockIds(row.memory_block_ids).filter(
+            (id) => id <= markers.maxMemoryId,
+        );
+        const rendered = renderM1WithMetadata(options, markers, renderedM0Ids);
+        const visibleMemoryIds = [...new Set([...renderedM0Ids, ...rendered.renderedMemoryIds])];
+        const m1Bytes = Buffer.from(rendered.text, "utf8");
+        const visibleIdsJson = JSON.stringify(visibleMemoryIds);
+        const baselineEndMessageId = getLastCompartmentEndMessageId(options.db, options.sessionId);
+        steps.mark("m1Render");
 
         options.db
             .prepare(

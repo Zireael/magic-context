@@ -149,10 +149,12 @@ for (const host of ["opencode", "pi"] as const) {
 		}
 		return result;
 	};
+	let refreshedPrefix: string | undefined;
 	for (const phase of ["fold", "refresh", "defer"] as const) {
 		if (phase === "refresh") delta(db, session);
 		const holdsBefore = holds.length;
 		const before = lines.length;
+		const piMessages: Parameters<typeof injectM0M1Pi>[2] = [];
 		const output =
 			host === "opencode"
 				? injectM0M1({
@@ -177,10 +179,57 @@ for (const host of ["opencode", "pi"] as const) {
 							};
 						},
 					})
-				: injectM0M1Pi(piState, db, [], undefined, phase !== "defer");
+				: injectM0M1Pi(piState, db, piMessages, undefined, phase !== "defer");
 		const row = db
 			.prepare("SELECT * FROM session_meta WHERE session_id = ?")
 			.get(session);
+		const served =
+			("preparedMessages" in output ? output.preparedMessages : piMessages) ??
+			[];
+		const cached = row as {
+			cached_m0_bytes: Uint8Array;
+			cached_m1_bytes: Uint8Array;
+			cached_m0_mural_data_url: string;
+		};
+		const prefix = served.slice(0, 2);
+		for (let i = 0; i < 2; i++) {
+			const message = prefix[i] as unknown as {
+				parts?: Array<{ type: string; text?: string }>;
+				content?: Array<{ type: string; text?: string }>;
+			};
+			const parts = message.parts ?? message.content ?? [];
+			const expectedBytes =
+				i === 0 ? cached.cached_m0_bytes : cached.cached_m1_bytes;
+			if (
+				parts.find((part) => part.type === "text")?.text !==
+				Buffer.from(expectedBytes).toString("utf8")
+			)
+				throw new Error(
+					`${host} ${phase}: served text differs from independently baseline-checked persisted bytes`,
+				);
+		}
+		const head = prefix[0] as unknown as {
+			parts?: Array<{ type: string; url?: string }>;
+			content?: Array<{ type: string; data?: string; mimeType?: string }>;
+		};
+		const imageUrl =
+			head.parts?.find((part) => part.type === "file")?.url ??
+			(() => {
+				const image = head.content?.find((part) => part.type === "image");
+				return image
+					? `data:${image.mimeType};base64,${image.data}`
+					: undefined;
+			})();
+		if (imageUrl !== cached.cached_m0_mural_data_url)
+			throw new Error(
+				`${host} ${phase}: served mural differs from baseline-checked payload`,
+			);
+		if (phase === "refresh") refreshedPrefix = JSON.stringify(prefix);
+		if (phase === "defer" && JSON.stringify(prefix) !== refreshedPrefix)
+			throw new Error(`${host}: defer changed the actual image-bearing prefix`);
+		console.log(
+			`${host} ${phase}: actual m[0]/m[1]/mural wire matches persisted baseline payload`,
+		);
 		const tags = db
 			.prepare("SELECT * FROM tags WHERE session_id = ? ORDER BY tag_number")
 			.all(session);

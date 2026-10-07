@@ -1,27 +1,83 @@
 # Fold/refresh writer critical sections
 
+## Final decision after adversarial review
+
+The render split from `9cbb1dff3076665ea43660400e0ed0bf08192fb4` is reverted.
+Both OpenCode and Pi now read and render m[1] **inside the same `BEGIN IMMEDIATE`
+transaction that persists it**, in both HARD folds and soft refreshes. m[0]
+retains its original off-lock render and original marker stale check. The added
+m[1] snapshot helpers and incomplete delta CASes are removed; no broader CAS,
+new revision, schema migration or classification-triggered HARD bust is added.
+
+The independent review was read from
+`alfonso/task/bg_21ecce0dbbd1ef0e-adversarial-review-fold-and-soft-refresh-render-`,
+path `docs/reports/fold-render-lock-review.md`. It demonstrated real sibling
+writes that the split failed to validate: memory importance/reinforcement,
+in-place recovered history ranges, indexed OpenCode heading dates, and Pi
+expiry eligibility at the baseline cutoff. Extending the CAS to every renderer
+input would be a substantial new consistency contract. The measurements did
+not justify that risk: rendering accounted for only 6.5 ms of the original
+46.8 ms OpenCode fold hold and 52.1 ms of the 314.7 ms refresh hold. The fixture
+never reproduced the live 9.3-second hold. Scheduling/host pauses and SQLite
+commit latency cannot be fixed by moving a small render across writer admission.
+
+The retained changes are:
+
+* Per-step, best-effort slow-write attribution, including the in-lock
+  `m1Render`, `staleCheck`, `persistCachedM0`, `sessionMeta`, `onFoldCommit` and
+  `commit`. Fold-only `pre_metadata` and `pre_onFoldPrepare` durations are
+  explicitly outside the reported hold. The hold clock starts after writer
+  admission, not before any contention wait; the production threshold is still
+  one second.
+* Legacy-tool wire traversal happens in `onFoldPrepare` before admission. Its
+  returned callback receives the **locked** m[1] bytes, does the cheap prefix
+  comparison, validates the exact prepared tag projection and writes modes only
+  when the fold busts the prefix. Changed tag rows throw
+  `MaterializeContentionError` and the existing bounded fold retry applies. The
+  callback does not capture LKG or populate wire caches.
+* `reason=unknown` is corrected without changing fold policy: a later pressure
+  refold after a null SOFT preflight is logged as `drift`; Pi logs the actual
+  injection's `m0Reason`; a genuine soft refresh is named `soft_refresh`.
+* Each host's fold combines its adjacent memory-count/id and baseline-boundary
+  updates into **one** `UPDATE session_meta`, preserving all resulting values.
+  The large cached-pair update is still a separate step so its cost is attributed
+  separately. Inspection confirmed that OpenCode's soft refresh already writes
+  its bytes, boundary and manifest in **one statement**; Pi refresh similarly
+  uses one statement. There were no redundant refresh statements to consolidate.
+  The earlier 80.7 ms refresh-update sample is not evidence of several writes.
+
+Review findings 5 and 6 (inherited visible-manifest omissions) remain untouched.
+Neither host's rendered-id selection or manifest contents are changed. The
+original off-lock m[0] limitations and any separate host-DB timestamp changes
+are not claimed to be solved by serializing context-store m[1] reads.
+
 ## Reproduction and differential
 
-`scripts/fold-lock-fixture.ts` creates two fresh, disk-backed WAL databases. Each
-has 1,352 project memories (~700 characters each), 300 tiered history compartments
+`scripts/fold-lock-fixture.ts` creates two fresh disk-backed WAL stores, each
+with 1,352 project memories (~700 characters each), 300 tiered compartments
 (~4 KB P1 each), a 2 MiB mural data URL, and 1,200 dropped tool tags. Refresh adds
 30 memories and three compartments; defer replays the persisted prefix. The
-OpenCode fold also executes the real legacy-tool conversion preparation/persist
-path with 1,200 wire targets. No host database or configuration is opened. The
-script runs `lsof -p <its own pid>` while each database is open, requires every
-open SQLite store to be beneath its throwaway root, and prints the evidence.
+OpenCode fold executes the real legacy conversion preparation/persist path.
+No live host store or configuration is opened. While each store is open, the
+script runs `lsof -p <its own pid>`, requires every listed SQLite store to be
+under its throwaway root, and prints the evidence.
 
-The baseline hashes were captured from revision
-`77a73237bf2cd6c42fce93d27b98f6ca4af0e19e` with timing instrumentation only. They
-are **not** generated from the new renderer. The differential compares the entire
-served injection results (including m[0], m[1], and image payloads), complete
-`session_meta` rows, and complete ordered tag manifests. All six host/phase pairs
-matched before/after; each persisted row includes the frozen mural, both byte
-buffers, all watermarks, the memory manifest, and the trim boundary. The golden
-hashes live in `scripts/fold-lock-fixture-baseline.json`. Hashing serialization of
-Buffers covers their actual bytes, not a regenerated proxy for those bytes.
+The checked-in hashes were independently captured from
+`77a73237bf2cd6c42fce93d27b98f6ca4af0e19e` with timing instrumentation only.
+They were **not regenerated** for either refactor. The restored implementation
+matches all six host/phase result hashes, all six complete `session_meta` hashes,
+and all six ordered tag-manifest hashes in
+`scripts/fold-lock-fixture-baseline.json`. Buffer serialization covers their
+actual bytes, including both cached buffers and the frozen mural payload.
 
-Run from the repository root, with a new root on every invocation:
+The driver additionally examines the actual image-bearing two-message prefix
+for each host/phase. Its served m[0] and m[1] text and mural must equal the
+persisted payload that is checked against the independent baseline. This closes
+the old Pi driver limitation where its result-summary hash alone did not cover
+the outgoing array. The actual complete refresh/defer prefix arrays must also
+match. These additional checks leave the original golden hashes unchanged.
+
+Run from the repository root, with a fresh root on each invocation:
 
 ```sh
 mkdir -p "${TMPDIR:-/tmp/}magic-context"
@@ -35,71 +91,95 @@ env HOME="$root/home" XDG_DATA_HOME="$root/data" \
   bun --tsconfig-override packages/pi-plugin/tsconfig.json scripts/fold-lock-fixture.ts
 ```
 
-Typecheck the diagnostic driver with
+Typecheck the driver with
 `packages/plugin/node_modules/.bin/tsc -p scripts/tsconfig.fold-lock-fixture.json --noEmit`.
-The driver always prints writer hold time, including sub-threshold transactions.
-Production step logs retain the existing one-second threshold. For the measurements
-below the diagnostic threshold was temporarily zero in the worktree, **both**
-before and after; the shipped threshold remains one second.
+It always prints writer hold times, including sub-threshold transactions.
 
 ## Measured timings (milliseconds)
 
-These are single disk-backed runs on a shared machine, not a throughput benchmark.
-Commit/fsync latency and CPU scheduling are visibly noisy. `pre_*` measurements
-are outside the writer hold; other columns are inside it.
+The table compares the original implementation to the final restored-lock
+implementation, **not** the abandoned off-lock split. These are single runs on
+a shared machine, with variable scheduling and fsync latency, not a throughput
+or absolute-latency guarantee. For sub-threshold per-step measurement only, the
+log threshold was temporarily zero in the worktree and then restored; the final
+production constant remains one second.
 
-| Site | Version | Held | m[1] render | Fold preparation | Stale check | Persist m[0]+mural | session_meta writes | Fold commit | SQLite commit |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| OpenCode fold | before | 46.8 | 6.5 | — | 0.4 | 1.7 | 2.0 | 2.8 | 33.4 |
-| OpenCode fold | after | 118.3 | pre: 189.3 | pre: 1.3 | 1.6 | 1.9 | 1.8 | 2.2 | 110.8 |
-| OpenCode refresh | before | 314.7 | 52.1 | — | 4.2 | — | 80.7 | — | 177.8 |
-| OpenCode refresh | after | 31.6 | pre: 42.5 | — | 16.7 | — | 2.3 | — | 12.6 |
-| Pi fold | before | 69.1 | 12.2 | — | 2.8 | 1.9 | 2.1 | — | 50.2 |
-| Pi fold | after | 51.6 | pre: 62.5 | — | 0.6 | 2.5 | 1.6 | — | 46.8 |
-| Pi refresh | before | 26.1 | 5.5 | — | 1.2 | — | 2.1 | — | 17.3 |
-| Pi refresh | after | 23.6 | pre: 10.9 | — | 2.2 | — | 5.6 | — | 15.8 |
+| Site | Version | Held | m[1] render | Stale check | Persist m[0]+mural | session_meta | Fold commit | SQLite commit |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OpenCode fold | original | 46.8 | 6.5 | 0.4 | 1.7 | 2.0 | 2.8 | 33.4 |
+| OpenCode fold | final | 55.2 | 5.0 | 0.6 | 1.7 | 12.7 | 2.9 | 32.2 |
+| OpenCode refresh | original | 314.7 | 52.1 | 4.2 | — | 80.7 | — | 177.8 |
+| OpenCode refresh | final | 22.7 | 5.0 | 0.9 | — | 1.6 | — | 15.1 |
+| Pi fold | original | 69.1 | 12.2 | 2.8 | 1.9 | 2.1 | — | 50.2 |
+| Pi fold | final | 51.1 | 9.1 | 5.4 | 1.2 | 0.8 | — | 34.5 |
+| Pi refresh | original | 26.1 | 5.5 | 1.2 | — | 2.1 | — | 17.3 |
+| Pi refresh | final | 25.1 | 8.0 | 1.2 | — | 2.1 | — | 13.8 |
 
-The final unmodified-threshold run held the writer for 155.7/79.8 ms in
-OpenCode fold/refresh and 183.9/192.8 ms in Pi fold/refresh; neither defer acquired
-a writer. These additional samples reinforce that absolute fsync/scheduling
-latency is not a stable performance assertion. The structural tests enforce the
-important invariant instead of using a flaky wall-clock limit.
+Final OpenCode fold preparation was 0.1 ms for metadata and 2.0 ms for tag/wire
+preparation, both outside the hold. Pi metadata preparation was below 0.1 ms.
+Neither defer acquired a writer. All final m[1] render times are inside the
+reported hold. The large variation in refresh write/commit times reinforces
+that these samples cannot establish a causal performance improvement, nor
+attribute the live incident to rendering. The next live slow line will identify
+which held step actually consumed time.
 
-The pre-render column includes its read-snapshot probe and serialization. Neither
-defer acquires a writer. The synthetic fixture **does not reproduce the live
-9,263 ms hold**. In this run, SQLite commit was the largest in-lock cost, not the
-large-blob update itself or the fold callback. It would be unjustified to
-attribute the live incident to rendering from these measurements alone. The next
-slow occurrence now identifies `staleCheck`, `persistCachedM0`, `sessionMeta`,
-`onFoldCommit`, and `commit`, separately from `pre_m1Render` and
-`pre_onFoldPrepare`. No contention-wait time is counted as hold time.
+## Concurrency regressions and test-contract correction
 
-## Code findings and concurrency contract
+The previous AST fences asserted rendering occurred *before* admission. They
+now assert exactly one m[1] render between admission and commit in each host's
+fold and refresh, while keeping wire preparation before admission. Their
+contract is deliberately reversed as requested by the review follow-up, not
+silently weakened.
 
-* The actual OpenCode `onFoldCommit` caller compared the old/new served prefix
-  and converted legacy dropped-tool skeletons. It did **not** capture LKG or
-  populate wire caches. Buffer/image comparisons and wire target traversal now
-  happen in `onFoldPrepare`; a returned commit callback validates the exact tag
-  row snapshot and writes only the prepared modes under the fold transaction.
-* Both hosts rendered m[1] under `BEGIN IMMEDIATE` in **both** fold and soft
-  refresh. They now render in a deferred read transaction, release that snapshot,
-  and acquire the writer only for validation and writes. Pi's lock-time marker
-  read fetches sequence/boundary/legacy fields, not the history bodies.
-* The original m[0] stale check remains. The m[1] read snapshot has an additional
-  probe including the additive-memory watermark. Omitting `maxMemoryId` is valid
-  for m[0], but no longer valid for a precomputed m[1]. An addition before m[1]
-  rendering can still appear in that delta; an addition after rendering cannot
-  be silently lost. Memory expiry uses the same cutoff for both delta probes.
-* Real two-connection WAL tests insert either a memory or a compartment after
-  rendering and before writer admission. The first fold attempt is rejected,
-  the next attempt includes the publication, and only the valid attempt commits.
-  Soft-refresh tests assert rejection and exact preservation of the previous
-  persisted row; the existing host degradation path handles that error.
-* AST fences cover both hosts' fold and refresh entry points and reject renderer
-  calls or read-render helpers after writer admission. Mutation proofs also
-  neutralize each host's new fold delta CAS and show that the additive-memory
-  test, but not the compartment test, goes red.
-* The misleading `reason=unknown` came from logging the earlier HARD preflight's
-  null reason even when a later m[1] pressure-backstop refold executed. OpenCode
-  names that logging-only case `drift`; Pi uses the actual injection's `m0Reason`.
-  A genuine soft refresh is named `soft_refresh`. No fold policy changed.
+The two-connection tests are also deliberately corrected to the original
+writer-snapshot policy: an additive memory published before fold admission is
+included in locked m[1] without an unnecessary retry, while a compartment
+publication invalidates the off-lock m[0] snapshot and still retries. A memory
+or compartment published before soft-refresh admission is included in the
+locked refresh rather than causing a synthetic post-render rejection.
+
+New real two-connection WAL regressions independently exercise:
+
+* Importance, `last_seen_at` reinforcement and `verified_at` verification in both
+  hosts. A budget admits one candidate. Before admission a sibling changes B's
+  selection input; stored m[1] must contain B, not the old A selection, and must
+  equal an independent render using the same frozen baseline.
+* Both hosts' in-place recovery through the real `recoverUnresolvedCompartments`
+  helper. The existing history revision advances without changing max sequence
+  or end id; persisted headings must show recovered ordinals 3–4, not 1–2.
+  Pi reads both its render compartments and advanced boundary under the writer,
+  rather than using the pre-admission pass snapshot as render input.
+* OpenCode null-to-indexed timestamp backfill through `recordIndexedMessageTime`.
+  Persisted m[1] must contain the newly available `2025-01-01` date heading.
+* The expiry boundary in both hosts, including the review's Pi counterexample:
+  baseline cutoff 1000, publication at 2000 with expiry 2500, admission at 3000.
+  The locked renderer still uses the baseline cutoff and includes the memory.
+
+These tests assert the corrected persisted bytes, not the counterexample's stale
+behavior, and instrument exactly one writer admission. The legacy-tag callback
+retry and pressure-reason logging tests remain. No test for either inherited
+manifest defect is inverted or repaired in this revision.
+
+## Verification of the revised tree
+
+Both suites used throwaway HOME, XDG/storage roots and TMPDIR, with `OPENCODE_DB`
+unset. The final Pi package run passed 1,602 tests (3 skips). The final OpenCode
+package run passed 7,279 tests (6 skips), but did **not** pass its full gate:
+`readGitCommits (smoke) > returns empty array for a non-git directory without
+throwing` timed out at 30 seconds, and the unchanged startup-map timing test
+measured 237 ms against its 200 ms foreground bound. Both files passed all 12
+checks when rerun together in isolation. An earlier broad run also timed out the
+unchanged AFT warm-inventory fixture; its file and the classification guard
+subsequently passed all 26 checks in isolation. No timeout or performance-bound
+assertion was relaxed.
+
+The first broad run correctly rejected the new test registrar being named as a
+production `.test-support.ts` file. It was moved to the existing repository
+convention of a `.test.ts` fixture module, without widening the production-source
+guard. Both new regression adapters and that shared fixture are explicitly
+included in the diagnostic driver's typecheck configuration. All new regression,
+writer-fence, pressure-reason and tag-validation tests passed in the final broad
+run. Mutation controls moved rendering outside the writer and demonstrated red
+fences and stale candidate-A persistence; neutralizing tag validation also
+reddened its production-callback retry test. Every mutation was restored before
+verification and commit.

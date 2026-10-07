@@ -37,7 +37,6 @@ import {
 	materializeM0Pi,
 	materializeM0PiWithRetry,
 	mustMaterializePi,
-	PiMaterializeContentionError,
 	renderM0Pi,
 	renderM1Pi,
 } from "./inject-compartments-pi";
@@ -76,7 +75,7 @@ function result(toolCallId: string) {
 
 describe("Pi render-to-commit concurrency", () => {
 	for (const change of ["memory", "compartment"] as const) {
-		it(`two connections retry a Pi fold when a ${change} arrives after m[1] rendering`, () => {
+		it(`two connections ${change === "memory" ? "include an additive memory in Pi's locked delta" : "retry a Pi fold for a new compartment"} before admission`, () => {
 			const dir = createTestTempDirFromPath(join(tmpdir(), "mc-pi-fold-cas-"));
 			const path = join(dir, "context.db");
 			const db = createTestDb(path);
@@ -125,8 +124,8 @@ describe("Pi render-to-commit concurrency", () => {
 					},
 					db,
 				);
-				expect(attempts).toBe(2);
-				expect(rendered.m0).toContain(
+				expect(attempts).toBe(change === "memory" ? 1 : 2);
+				expect(change === "memory" ? rendered.m1 : rendered.m0).toContain(
 					change === "memory"
 						? "Concurrent Pi memory"
 						: "Concurrent Pi history",
@@ -141,7 +140,7 @@ describe("Pi render-to-commit concurrency", () => {
 			}
 		});
 
-		it(`two connections reject stale Pi soft-refresh bytes after a ${change} write`, () => {
+		it(`two connections include a ${change} published before Pi soft-refresh admission`, () => {
 			const dir = createTestTempDirFromPath(
 				join(tmpdir(), "mc-pi-refresh-cas-"),
 			);
@@ -160,48 +159,57 @@ describe("Pi render-to-commit concurrency", () => {
 				const before = db
 					.prepare("SELECT * FROM session_meta WHERE session_id = ?")
 					.get(state.sessionId);
-				expect(() =>
-					injectM0M1Pi(
-						{
-							...state,
-							beforeCacheCommitForTest: () => {
-								if (change === "memory")
-									insertMemory(sibling, {
-										projectPath: state.projectIdentity,
-										category: "ARCHITECTURE",
-										content: "Concurrent Pi refresh memory",
-									});
-								else
-									appendCompartments(sibling, state.sessionId, [
-										{
-											sequence: 0,
-											startMessage: 0,
-											endMessage: 1,
-											startMessageId: "pi-concurrent-start",
-											endMessageId: "pi-refresh-end",
-											title: "Pi refresh compartment",
-											content: "Concurrent Pi refresh history",
-											p1: "Concurrent Pi refresh history",
-											p2: "summary",
-											p3: "outcome",
-											p4: "anchor",
-											importance: 70,
-											legacy: 0,
-										},
-									]);
-							},
+				const m0Before = getOrCreateSessionMeta(
+					db,
+					state.sessionId,
+				).cachedM0Bytes;
+				injectM0M1Pi(
+					{
+						...state,
+						beforeCacheCommitForTest: () => {
+							if (change === "memory")
+								insertMemory(sibling, {
+									projectPath: state.projectIdentity,
+									category: "ARCHITECTURE",
+									content: "Concurrent Pi refresh memory",
+								});
+							else
+								appendCompartments(sibling, state.sessionId, [
+									{
+										sequence: 0,
+										startMessage: 0,
+										endMessage: 1,
+										startMessageId: "pi-concurrent-start",
+										endMessageId: "pi-refresh-end",
+										title: "Pi refresh compartment",
+										content: "Concurrent Pi refresh history",
+										p1: "Concurrent Pi refresh history",
+										p2: "summary",
+										p3: "outcome",
+										p4: "anchor",
+										importance: 70,
+										legacy: 0,
+									},
+								]);
 						},
-						db,
-						[],
-						undefined,
-						true,
-					),
-				).toThrow(PiMaterializeContentionError);
+					},
+					db,
+					[],
+					undefined,
+					true,
+				);
+				const after = getOrCreateSessionMeta(db, state.sessionId);
+				expect(after.cachedM0Bytes).toEqual(m0Before);
+				expect(after.cachedM1Bytes?.toString("utf8")).toContain(
+					change === "memory"
+						? "Concurrent Pi refresh memory"
+						: "Concurrent Pi refresh history",
+				);
 				expect(
 					db
 						.prepare("SELECT * FROM session_meta WHERE session_id = ?")
 						.get(state.sessionId),
-				).toEqual(before);
+				).not.toEqual(before);
 			} finally {
 				closeQuietly(sibling);
 				closeQuietly(db);
