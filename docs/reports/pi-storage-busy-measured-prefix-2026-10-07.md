@@ -92,3 +92,54 @@ schemas. No lock changes are included.
 
 The parent approved bounded incident attribution and explicitly required both
 append-only reuse and earlier-byte divergence tests.
+
+## Implementation and verification
+
+`pi-lkg.ts` now separates the capture awaiting a provider reply from the last
+measured request. A new capture keeps the older measurement only if its compact
+JSON output extends the exact measured message array and the route/envelope
+remain unchanged. Divergence invalidates the measurement permanently; restoring
+old bytes does not resurrect it. Reply signature, raw input identity, real JSONL
+parent and output-entry ownership are checked before reuse. Fit prices the
+original measured input plus **all** appended messages, including messages
+already absorbed by newer unmeasured captures. Healthy-output estimation follows
+the same rule. The replay assembly and fit guard's fail-closed behavior are
+unchanged; no served messages, migrations, or write transactions were modified.
+
+The previous test assertion that *any* recapture supersedes a measurement was
+replaced deliberately: identical and append-only recaptures now preserve it;
+rewrites, drops and changed host envelopes still invalidate it.
+
+- Failing first: the original implementation failed the identical-recapture
+  and append-only/set-aside regressions (12 passed, 2 failed).
+- Final Pi suite: Bun 1.4.2, `bun run test`, 1601 passed, 3 skipped, 0 failed
+  across 151 files. Its measurement file contains 17 passing tests. The first
+  full run had an unrelated home-directory assertion failure because the
+  verification environment spelled HOME with a doubled slash; normalizing the
+  throwaway HOME fixed that run without a source change.
+- OpenCode suite: Bun 1.4.2, `bun run test`, 7273 passed, 6 skipped, 2 failed
+  across 704 files. Both failures were `spawnSync git ETIMEDOUT` during throwaway
+  fixture commits in `dreamer/verify.test.ts:63`, not test assertions about the
+  implementation. Retrying only those two tests passed (2 passed, 31 filtered
+  out): `runVerify disposition > still archives changed-file code facts,
+  including the PROJECT_RULES boundary` and `non-budget verification rejects a
+  2/22 manifest`. The full invocation is reported as failed, not retroactively
+  green.
+- Both package typechecks passed (TypeScript 5.9.3). Both package lints passed
+  (Biome 2.5.1): Pi checked 241 files with six existing warnings; OpenCode checked
+  1261 files with six warnings and two informational diagnostics.
+- Package scripts ran frozen installs (996 installs / 1251 packages, no
+  changes). Tests used a throwaway HOME, fixture TMPDIR below
+  `$TMPDIR/magic-context/bg_7b2b6d496295afeb/`, and unset OPENCODE_DB. No manifests
+  or lockfiles changed.
+- Non-vacuity control: temporarily replacing the exact served-prefix predicate
+  with `true` (`NON-VACUITY BREAK`) made the rewrite test fail with an illicit
+  130-token measured prefix. The isolated witness run had exactly that one
+  failure and 16 filtered tests. An earlier whole-file control also failed the
+  drop test's no-resurrection assertion; the other 15 tests passed. Both
+  mutations were staged safely, evidenced by a nonempty diff, and restored to
+  an empty working diff before final gates.
+
+Remaining incident-attribution limits are unchanged: these regressions prove
+and close a local lifetime defect, but do not retroactively identify the live
+reply-correlation miss or the lock owner.

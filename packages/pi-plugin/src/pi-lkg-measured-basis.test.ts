@@ -1,10 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
+import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
 import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
 import { outgoingContextRefusal } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { persistPiPressureFromMessageEnd } from "./index";
 import {
 	clearPiLkgSessionState,
 	createPiLkgCoordinator,
@@ -114,6 +116,29 @@ function harness(modelKey = key, prefixOverride?: unknown[]) {
 		sessionId,
 		coordinator,
 		prefix,
+		captureMessages(
+			messages: unknown[],
+			entryIds: string[],
+			outputMessages = messages,
+			outputEntryIds = entryIds,
+		) {
+			coordinator.captureAppliedPass({
+				snapshot: coordinator.beginPass({
+					sessionId,
+					messages,
+					entryIds,
+					modelKey,
+					providerKey: provider,
+				}),
+				outputMessages,
+				outputEntryIds,
+				cacheBusting: false,
+				hostEnvelopeSignature: envelope.envelopeSignature,
+			});
+			if (!capture) throw new Error("scheduled capture required");
+			capture();
+			capture = undefined;
+		},
 		outgoing(messages: readonly unknown[], parent = "input") {
 			const snapshot = coordinator.beginPass({
 				sessionId,
@@ -253,9 +278,201 @@ test("provider usage requires the real JSONL parent and the exact captured pass"
 	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
 	const wrongParent = h.replay("different-parent");
 	expect(wrongParent.ok && wrongParent.measuredPrefix).toBeUndefined();
-	h.recapture();
-	const superseded = h.replay();
-	expect(superseded.ok && superseded.measuredPrefix).toBeUndefined();
+});
+
+for (const flush of [true, false]) {
+	test(`identical unmeasured recapture retains the correlated provider prefix (deferred commit ${flush ? "flushed" : "pending"})`, () => {
+		const h = harness();
+		expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(
+			true,
+		);
+		h.recapture(flush);
+		const replay = h.replay();
+		if (!replay.ok) throw new Error(replay.reason);
+		expect(replay.measuredPrefix?.inputTokens).toBe(130);
+		expect(replay.measuredPrefix?.appendedMessages).toEqual(h.tail);
+	});
+}
+
+test("append-only unmeasured capture and set-aside estimate retain provider-priced fit without changing replay bytes", async () => {
+	const h = harness("anthropic/claude-fable-5-1", [
+		{ role: "user", content: "word ".repeat(310000) },
+	]);
+	h.assistant.usage.input = 262325;
+	h.assistant.usage.totalTokens = 262365;
+	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
+	await persistPiPressureFromMessageEnd({
+		db: h.db,
+		sessionId: h.sessionId,
+		message: h.assistant,
+		piContextWindow: 500000,
+	});
+	const appended = [...h.prefix, ...h.tail];
+	h.captureMessages(appended, ["input", "answer", "new-input"]);
+	const failedReply = {
+		...h.assistant,
+		stopReason: "error",
+		usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, totalTokens: 0 },
+	};
+	expect(notePiLkgProviderUsage(h.sessionId, "new-input", failedReply)).toBe(
+		false,
+	);
+	const newTail = [
+		failedReply,
+		{ role: "user", content: "retry", timestamp: Date.now() + 2 },
+	];
+	await persistPiPressureFromMessageEnd({
+		db: h.db,
+		sessionId: h.sessionId,
+		message: newTail[1],
+		piContextWindow: 500000,
+		piTokens: 418211,
+		piTokensIsRawBranchEstimate: true,
+	});
+	expect(getOrCreateSessionMeta(h.db, h.sessionId).lastInputTokens).toBe(
+		262355,
+	);
+	const replay = h.coordinator.replay(
+		h.coordinator.beginPass({
+			sessionId: h.sessionId,
+			messages: [...appended, ...newTail],
+			entryIds: ["input", "answer", "new-input", "failed", "retry"],
+			modelKey: "anthropic/claude-fable-5-1",
+			providerKey: "anthropic",
+		}),
+		(id) => (id === "answer" ? "input" : "new-input"),
+	);
+	if (!replay.ok) throw new Error(replay.reason);
+	expect(JSON.stringify(replay.messages)).toBe(
+		JSON.stringify([...appended, ...newTail]),
+	);
+	expect(replay.measuredPrefix?.inputTokens).toBe(262355);
+	expect(replay.measuredPrefix?.appendedMessages).toEqual([
+		...h.tail,
+		...newTail,
+	]);
+	const logs: string[] = [];
+	expect(() =>
+		assertPiRawFallbackFits(
+			replay.messages,
+			375000,
+			(line) => logs.push(line),
+			null,
+			h.envelope,
+			replay.measuredPrefix,
+		),
+	).not.toThrow();
+	expect(logs.join("\n")).toContain(
+		"lkg_fit_basis=provider_input measured_input=262355",
+	);
+	// The same bytes must still fail closed without a correlated measurement.
+	expect(() =>
+		assertPiRawFallbackFits(
+			replay.messages,
+			375000,
+			() => {},
+			null,
+			h.envelope,
+		),
+	).toThrow();
+	const healthy = h.outgoing(appended);
+	expect(healthy?.inputTokens).toBe(262355);
+	expect(healthy?.appendedMessages).toEqual(h.tail);
+	expect(h.outgoing(appended, "wrong-parent")).toBeUndefined();
+});
+
+for (const change of ["rewrite", "drop", "envelope"] as const) {
+	test(`unmeasured ${change} capture cannot borrow an earlier provider measurement`, () => {
+		const h = harness();
+		expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(
+			true,
+		);
+		const messages = [...h.prefix, ...h.tail];
+		const ids = ["input", "answer", "new-input"];
+		const output = [...messages];
+		const outputIds = [...ids];
+		if (change === "rewrite")
+			output[0] = { role: "user", content: "changed earlier served bytes" };
+		if (change === "drop") {
+			output.shift();
+			outputIds.shift();
+		}
+		if (change === "envelope") h.envelope.envelopeSignature = "changed-host";
+		h.captureMessages(messages, ids, output, outputIds);
+		const replay = h.coordinator.replay(
+			h.coordinator.beginPass({
+				sessionId: h.sessionId,
+				messages: [...messages, { role: "user", content: "retry" }],
+				entryIds: [...ids, "retry"],
+				modelKey: key,
+				providerKey: "openai-codex",
+			}),
+			(id) => (id === "answer" ? "input" : "new-input"),
+		);
+		if (!replay.ok) throw new Error(replay.reason);
+		expect(replay.measuredPrefix).toBeUndefined();
+		// Restoring the old bytes cannot resurrect invalidated provider evidence.
+		h.captureMessages(messages, ids);
+		const restored = h.outgoing(messages);
+		expect(restored).toBeUndefined();
+	});
+}
+
+test("a new correlated provider reply replaces the retained older measurement", () => {
+	const h = harness();
+	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
+	const appended = [...h.prefix, ...h.tail];
+	h.captureMessages(appended, ["input", "answer", "new-input"]);
+	const newReply = {
+		...h.assistant,
+		timestamp: Date.now() + 1,
+		usage: {
+			input: 200,
+			cacheRead: 20,
+			cacheWrite: 10,
+			output: 10,
+			totalTokens: 240,
+		},
+	};
+	expect(notePiLkgProviderUsage(h.sessionId, "new-input", newReply)).toBe(true);
+	const tail = [newReply, { role: "user", content: "next input" }];
+	const replay = h.coordinator.replay(
+		h.coordinator.beginPass({
+			sessionId: h.sessionId,
+			messages: [...appended, ...tail],
+			entryIds: ["input", "answer", "new-input", "new-answer", "next-input"],
+			modelKey: key,
+			providerKey: "openai-codex",
+		}),
+		(id) => (id === "new-answer" ? "new-input" : "input"),
+	);
+	if (!replay.ok) throw new Error(replay.reason);
+	expect(replay.measuredPrefix?.inputTokens).toBe(230);
+	expect(replay.measuredPrefix?.appendedMessages).toEqual(tail);
+});
+
+test("an over-limit replay without any provider measurement remains fail closed", () => {
+	const h = harness("anthropic/claude-fable-5-1", [
+		{ role: "user", content: "word ".repeat(310000) },
+	]);
+	const replay = h.replay();
+	if (!replay.ok) throw new Error(replay.reason);
+	expect(replay.measuredPrefix).toBeUndefined();
+	const logs: string[] = [];
+	expect(() =>
+		assertPiRawFallbackFits(
+			replay.messages,
+			375000,
+			(line) => logs.push(line),
+			null,
+			h.envelope,
+			replay.measuredPrefix,
+		),
+	).toThrow();
+	expect(logs.join("\n")).toContain(
+		"lkg_fit_basis=host_metadata measured_input=0",
+	);
+	expect(logs.join("\n")).toContain("raw_fallback_over_context_limit");
 });
 
 test("changed host metadata cannot borrow the old measured prefix", () => {
