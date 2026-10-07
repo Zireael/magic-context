@@ -1173,6 +1173,28 @@ pub fn strip_jsonc(input: &str) -> String {
 #[cfg(test)]
 mod protected_tokens_tests {
     #[test]
+    fn review_reasoning_budget_aliases_follow_the_shared_canonical_first_lookup() {
+        let (cfg, _) = super::merge_tiers_with_warnings(
+            Some(&serde_json::json!({"keep_reasoning_tokens": {
+                "openai/*": 250,
+                "openai-codex/*": 500,
+                "google/*": 750
+            }})),
+            None,
+        );
+        // The shared TS/Pi resolver checks canonical spellings first. Both a
+        // collision and a canonical-only wildcard must behave the same in Rust.
+        assert_eq!(
+            cfg.resolve_keep_reasoning_tokens(Some("openai-codex/gpt-6.1-sol")),
+            250
+        );
+        assert_eq!(
+            cfg.resolve_keep_reasoning_tokens(Some("google-antigravity/gemini-3.8-flash")),
+            750
+        );
+    }
+
+    #[test]
     fn reasoning_budget_resolution_fixed_default_and_deprecated_age() {
         use super::*;
         let (cfg, warnings) = merge_tiers_with_warnings(

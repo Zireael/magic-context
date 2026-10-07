@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import prefixBoundGolden from "../../../../../crates/mc-module/testdata/prefix-bound-reasoning-trim.json";
 import budgetGolden from "../../../../../crates/mc-module/testdata/reasoning-budget-trim.json";
+import { sessionDecisionCalibration } from "../../features/magic-context/session-decision-calibration";
 import {
     getActiveTagsBySession,
     getOrCreateSessionMeta,
@@ -12,6 +13,7 @@ import {
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
+    addMergedReasoningStrippedIds,
     addTrailingBlankDecisions,
     getEmergencyInputSample,
     setEmergencyDropSample,
@@ -25,6 +27,7 @@ import { readReplayDocument } from "../../features/magic-context/storage-replay-
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { estimateTokens } from "./read-session-formatting";
 import { reasoningBudgetCutoff, reasoningStepCost } from "./reasoning-budget";
 import {
     removeReasoningParts,
@@ -37,7 +40,7 @@ import {
     makeSentinel,
     neutralizeDroppedReasoningPart,
 } from "./sentinel";
-import { replayClearedReasoning } from "./strip-content";
+import { findMergedReasoningStripDecisions, replayClearedReasoning } from "./strip-content";
 import type { MessageLike } from "./tag-messages";
 import { type TagTarget, tagMessages } from "./tag-messages";
 import { runPostTransformPhase } from "./transform-postprocess-phase";
@@ -419,6 +422,65 @@ describe("reasoning removal through postprocess", () => {
         };
         return runPostTransformPhase(args);
     }
+
+    it("review: bust selection applies frozen prose calibration to unstored thinking estimates", async () => {
+        const database = openDb();
+        const sessionId = "review-calibrated-fallback";
+        getOrCreateSessionMeta(database, sessionId);
+        const ratio = sessionDecisionCalibration(database, sessionId, {
+            bustPermitted: true,
+            modelKey: "anthropic/claude-opus-5-5",
+        }).proseRatio;
+        expect(ratio).toBeGreaterThan(1);
+        const session = toolLoop(3);
+        for (const message of session.messages.slice(1)) {
+            (message.info as unknown as Record<string, unknown>).tokens = { reasoning: 0 };
+            (message.parts[1] as { text: string }).text = "a substantial thought ".repeat(100);
+        }
+        const rawCost = estimateTokens("a substantial thought ".repeat(100));
+        // Three raw estimates fit, but only the newest calibrated estimate fits.
+        await pass(database, sessionId, session, {
+            busting: true,
+            providerID: "google-vertex-anthropic",
+            prefixBound: true,
+            overrides: { keepReasoningTokens: 3 * rawCost },
+        });
+        expect(getRemovedReasoningIds(database, sessionId)).toEqual(
+            new Set(["assistant-0", "assistant-1"]),
+        );
+    });
+
+    it("review: merged-assistant frozen strips cost zero on the next budget rebuild", async () => {
+        const database = openDb();
+        const sessionId = "review-merged-cost";
+        getOrCreateSessionMeta(database, sessionId);
+        const session = toolLoop(3);
+        (session.messages[2].info as unknown as Record<string, unknown>).tokens = {
+            reasoning: 20_000,
+        };
+        const frozen = findMergedReasoningStripDecisions(session.messages, "anthropic", new Set(), {
+            mutationExemptMessage: session.messages[3],
+        });
+        expect(frozen).toContain("assistant-1");
+        expect(addMergedReasoningStrippedIds(database, sessionId, frozen)).toBe(true);
+        await pass(database, sessionId, session, {
+            busting: true,
+            providerID: "anthropic",
+            overrides: {
+                keepReasoningTokens: 200,
+                reasoningByMessage: new Map(
+                    session.messages
+                        .slice(1)
+                        .map((message) => [
+                            message,
+                            [message.parts[1] as import("./tag-messages").ThinkingLikePart],
+                        ]),
+                ),
+            },
+        });
+        // a1 is already off-wire. a0 + newest a2 cost 100 + 100 and both fit.
+        expect(getOrCreateSessionMeta(database, sessionId).clearedReasoningThroughTag).toBe(0);
+    });
 
     it("removes old reasoning on a rebuilding pass and replays it byte-identically on defer passes", async () => {
         const database = openDb();

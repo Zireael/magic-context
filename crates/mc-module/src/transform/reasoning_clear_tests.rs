@@ -1,3 +1,74 @@
+#[test]
+fn review_reasoning_budget_reported_count_survives_an_empty_summary() {
+    let mut request = opencode_openai_removal_request(3, "openai", "gpt-6.1-sol");
+    for message in &mut request.messages {
+        for block in &mut message.ck.content {
+            if let ck_wire::CkKind::Reasoning { text, signature } = &mut block.kind {
+                text.clear();
+                *signature = None;
+            }
+        }
+    }
+    for native in request.native_messages.iter_mut().flatten() {
+        if let Some(parts) = native.get_mut("parts").and_then(Value::as_array_mut) {
+            for part in parts {
+                if part["type"] == "reasoning" {
+                    part["text"] = json!("");
+                    part.as_object_mut().unwrap().remove("metadata");
+                }
+            }
+        }
+    }
+    request.keep_reasoning_tokens_effective = Some(200);
+    let tags = BTreeMap::from([("a0".into(), 2), ("a1".into(), 3), ("a2".into(), 4)]);
+    // The host reports 100 reasoning tokens for each step. Even without visible
+    // summary text or opaque metadata, the positive reported count is authoritative.
+    assert_eq!(
+        reasoning_budget_cutoff(
+            &request,
+            &tags,
+            &CoreState::default(),
+            ReasoningBudgetScope::default()
+        ),
+        2
+    );
+}
+
+#[test]
+fn review_reasoning_clear_never_restores_a_frozen_block_on_exemption_change() {
+    let request = reasoning_clear_fixture();
+    let mut core = CoreState::default();
+    core.frozen_units
+        .push(strip_unit("reasoning_clear", "old", ""));
+    let original = &request.messages[1].ck;
+    let mut before = original.clone();
+    replay_reasoning_clear(
+        &FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units)),
+        "old",
+        &mut before,
+    );
+    assert!(!before.content.iter().any(|block| matches!(
+        &block.kind,
+        ck_wire::CkKind::Reasoning {
+            signature: Some(_),
+            ..
+        }
+    )));
+    // A transient subset or undo can make a removed message newest again. The
+    // frozen decision remains authoritative even on an otherwise priced rebuild.
+    refresh_reasoning_clear_exemptions(&mut core, &request, true, None);
+    let mut after = original.clone();
+    replay_reasoning_clear(
+        &FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units)),
+        "old",
+        &mut after,
+    );
+    assert_eq!(
+        serde_json::to_value(after).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+}
+
 fn reasoning_clear_fixture() -> TransformRequest {
     fn message(mid: &str, ordinal: u64, role: &str, signed: bool) -> CkIngressMessage {
         let mut content = Vec::new();
