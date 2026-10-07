@@ -11,6 +11,8 @@ import {
     resolveMuralWire,
 } from "../../features/magic-context/mural/render-trigger";
 import type { MuralWireOptions } from "../../features/magic-context/mural/resolve-mural";
+import { muralSourceRevision } from "../../features/magic-context/mural/source-revision";
+import { getMuralIdentity } from "../../features/magic-context/mural/storage-mural";
 import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { parseCacheTtl } from "../../features/magic-context/scheduler";
 import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
@@ -36,10 +38,6 @@ import {
     setPersistedTodoSyntheticAnchor,
 } from "../../features/magic-context/storage-meta-persisted";
 import { hasPendingDropOps } from "../../features/magic-context/storage-ops";
-import {
-    GLOBAL_USER_PROFILE_PROJECT_PATH,
-    getProjectState,
-} from "../../features/magic-context/storage-project-state";
 import {
     isRustMarkerAdmissionFenced,
     setRustMarkerAdmissionFence,
@@ -263,8 +261,8 @@ async function resolveCombinedTodowriteVerdict(
             );
             timings.todoProbe += performance.now() - probeStartedAt;
             const persistStartedAt = performance.now();
-            // Permission is still revalidated with the host each pass. Avoid a redundant
-            // SQLite write only when the durable verdict already matches that fresh read.
+            // Only todo changes and synthesis opportunities revalidate with the host.
+            // Avoid rewriting an unchanged durable verdict after that fresh read.
             if (persistedDenied !== permissionDenied) {
                 setPersistedTodoPermissionDenied(deps.db, sessionId, permissionDenied);
             }
@@ -376,7 +374,11 @@ function rustWireCacheEstimatedBytes(cache: RustWireCache): number {
 interface RustSessionState extends ModuleStateSyncState {
     initialized: boolean;
     todoProbeIdentity?: string;
+    todoBustIdentity?: string;
     todoProbeNextPass?: boolean;
+    /** Todo-only signatures survive transport-cache eviction. A full wire resend
+     * must not make an unchanged origin call look like a new todowrite. */
+    todoCallSignatures?: Map<string, string>;
     /** Last seen compartment `max_sequence:count` for this session; a change re-arms auto-embed. */
     autoEmbedCompartmentMark?: string;
     /** Last transform-response compartment key; the compartment query runs only when it moves. */
@@ -416,7 +418,7 @@ interface RustSessionState extends ModuleStateSyncState {
     resolvedMemoryProjectDirectory: string | null;
     resolvedMemoryProjectPath: string | null;
     stateSyncInputSignature: string | null;
-    muralCache: { key: string; value: MuralWireOptions } | null;
+    muralCache: { key: string; revision: string; value: MuralWireOptions } | null;
 
     lkgCaptureSequence: number;
     /**
@@ -1772,7 +1774,23 @@ export function createRustModeTransform(
             budgetTokens,
             modelKeyAcceptsImages(modelKey),
         ]);
-        if (!refresh && state.muralCache?.key === key) return state.muralCache.value;
+        const cached = state.muralCache;
+        if (!refresh && cached?.key === key) return cached.value;
+        const sourceProject =
+            projectIdentity && (options.muralResolverForTests || modelKeyAcceptsImages(modelKey))
+                ? projectIdentity
+                : undefined;
+        const sourceRevision = sourceProject ? muralSourceRevision(deps.db, sourceProject) : "";
+        const revision = sourceProject
+            ? JSON.stringify([sourceRevision, getMuralIdentity(deps.db, sourceProject)])
+            : "";
+        if (
+            options.disableHotPathIoCachesForTests !== true &&
+            cached?.key === key &&
+            cached.revision === revision
+        ) {
+            return cached.value;
+        }
         const value = (options.muralResolverForTests ?? resolveMuralWire)(
             deps.db,
             projectIdentity,
@@ -1780,7 +1798,14 @@ export function createRustModeTransform(
             true,
             budgetTokens,
         );
-        state.muralCache = { key, value };
+        // Resolution may publish a new manifest. Record its revision after the write.
+        state.muralCache = {
+            key,
+            revision: sourceProject
+                ? JSON.stringify([sourceRevision, getMuralIdentity(deps.db, sourceProject)])
+                : "",
+            value,
+        };
         return value;
     };
 
@@ -2960,6 +2985,7 @@ export function createRustModeTransform(
         const todoAvailability = resolveTodowriteAvailability(sessionId);
         const toolPresent = reduceAvailability.frozen && reduceAvailability.callable;
         let todoProbeIdentity = "";
+        let todoBustIdentity = "";
         let todoProbeRequired = true;
         try {
             if (preflightError) throw preflightError;
@@ -3336,20 +3362,33 @@ export function createRustModeTransform(
                     deps.deferredMaterializationSessions?.has(sessionId) === true,
             });
             const todoVerdictStartedAt = performance.now();
+            const todoStart = wireDelta?.rawStart ?? 0;
+            const todoCandidates = wireDelta ? messages.slice(todoStart) : messages;
+            const todoCalls = wireDelta
+                ? new Map(state.todoCallSignatures)
+                : new Map<string, string>();
+            for (const [offset, message] of todoCandidates.entries()) {
+                const id = messageIdOf(message) ?? `index:${todoStart + offset}`;
+                const parts = message.parts?.filter(
+                    (part) => isRecord(part) && part.type === "tool" && part.tool === "todowrite",
+                );
+                if (parts?.length) {
+                    todoCalls.set(
+                        id,
+                        createHash("sha256").update(JSON.stringify(parts)).digest("hex"),
+                    );
+                } else {
+                    todoCalls.delete(id);
+                }
+            }
+            state.todoCallSignatures = todoCalls;
             todoProbeIdentity = JSON.stringify([
-                modelKey,
-                sessionMeta.systemPromptHash,
                 activeAgentFromMessages(messages),
-                currentStateSyncInputSignature,
-                markerAt,
-                getProjectState(deps.db, memoryProjectPath ?? projectRoot),
-                getProjectState(deps.db, GLOBAL_USER_PROFILE_PROJECT_PATH),
-                passInputs.upgrade_state,
-                promptSurfaceConfigIdentity(deps.promptSurface),
-                mural,
-                effectiveFloor,
-                deps.clearReasoningAge,
-                deps.cavemanTextCompression,
+                todoAvailability.frozen,
+                todoAvailability.callable,
+                deps.compactionOff === true,
+                sessionMeta.lastTodoState,
+                [...todoCalls],
             ]);
             let idleBudgetMs = 300_000;
             try {
@@ -3357,22 +3396,29 @@ export function createRustModeTransform(
             } catch {
                 // Invalid TTLs use the same five-minute fallback as the scheduler.
             }
-            // Synthetic todo bytes are re-decided only on a bust. Observe every
-            // adapter-visible bust signal rather than polling host permissions on
-            // an unchanged defer pass; unexpected module busts remain observable.
+            // Full-wire transport, frozen replay, mural and memory changes do not
+            // change todo permissions. Check only new/edited todowrites and busts
+            // that could replace the origin call with a synthetic pair.
+            const maySynthesizeTodo = !!sessionMeta.lastTodoState;
+            todoBustIdentity = JSON.stringify([
+                modelKey,
+                sessionMeta.systemPromptHash,
+                markerAt,
+                effectiveFloor,
+            ]);
             const todoProbeSignals = {
-                cold: !state.initialized,
+                cold: state.todoProbeIdentity === undefined,
                 missing_verdict: getPersistedTodoPermissionDenied(deps.db, sessionId) === null,
-                full_wire: state.forceFullWire || !wireDelta,
                 identity: state.todoProbeIdentity !== todoProbeIdentity,
-                module_hint: state.todoProbeNextPass === true,
-                pressure: usage.percentage >= threshold,
-                memory_sync: memorySyncRequested,
-                refresh: protectionFloorCacheBustingPass,
-                emergency: overflowState.needsEmergencyRecovery,
-                frozen: state.lkgRepresentationFrozen,
-                agent_drop: hasPendingDropOps(deps.db, sessionId),
+                bust_identity: maySynthesizeTodo && state.todoBustIdentity !== todoBustIdentity,
+                module_hint: maySynthesizeTodo && state.todoProbeNextPass === true,
+                pressure: maySynthesizeTodo && usage.percentage >= threshold,
+                memory_sync: maySynthesizeTodo && memorySyncRequested,
+                refresh: maySynthesizeTodo && protectionFloorCacheBustingPass,
+                emergency: maySynthesizeTodo && overflowState.needsEmergencyRecovery,
+                agent_drop: maySynthesizeTodo && hasPendingDropOps(deps.db, sessionId),
                 ttl:
+                    maySynthesizeTodo &&
                     state.lastAppliedAtMs !== undefined &&
                     requestObservedAtMs - state.lastAppliedAtMs >= idleBudgetMs,
             };
@@ -3753,7 +3799,7 @@ export function createRustModeTransform(
                 // Retry complete arrays after a missing delta base or malformed native response.
                 // Neither result proves that the module lost its durable session state.
                 state.forceFullWire = true;
-                if (!todoProbeRequired) {
+                if (!todoProbeRequired && maySynthesizeTodo) {
                     const todoRetryStartedAt = performance.now();
                     todoProbeRequired = true;
                     timings.todoProbeRequired = 1;
@@ -4530,7 +4576,10 @@ export function createRustModeTransform(
                     // Best-effort: a later pass with current recovery evidence retries the clear.
                 }
             }
-            if (timings.todoProbe > 0) state.todoProbeIdentity = todoProbeIdentity;
+            if (timings.todoProbe > 0) {
+                state.todoProbeIdentity = todoProbeIdentity;
+                state.todoBustIdentity = todoBustIdentity;
+            }
             state.todoProbeNextPass =
                 response.reconcile_pending === true ||
                 (isRecord(response.historian) && response.historian.fired === true);

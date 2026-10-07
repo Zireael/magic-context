@@ -114,6 +114,7 @@ import {
     type RustModeModuleClient,
 } from "./rust-mode-transform";
 import { StorageBusyRefusalError } from "./storage-busy-refusal";
+import { buildSyntheticTodoPart } from "./todo-view";
 import type { TransformDeps } from "./transform";
 import { createTransform } from "./transform";
 import type { MessageLike } from "./transform-operations";
@@ -3761,6 +3762,9 @@ describe("Rust mode authority adapter", () => {
         const db = makeDb();
         installRawProvider(sessionId);
         const bodies: Record<string, unknown>[] = [];
+        updateSessionMeta(db, sessionId, {
+            lastTodoState: '[{"content":"pending work","status":"pending","priority":"medium"}]',
+        });
         let decision = "HARD";
         let materializeReason = "first_render";
         const moduleClient: RustModeModuleClient = {
@@ -3883,6 +3887,83 @@ describe("Rust mode authority adapter", () => {
 
         expect(agents).toHaveBeenCalledTimes(1);
         expect(requestBody?.todo_tool_present).toBe(false);
+    });
+
+    it("probes changed todowrites and agent identity, not full-wire retries or unrelated refreshes", async () => {
+        const sessionId = "rust-todo-related-only";
+        sessions.push(sessionId);
+        installAvailabilityDb(sessionId, {});
+        installRawProvider(sessionId);
+        const db = makeDb();
+        const bodies: Record<string, unknown>[] = [];
+        let needFull = false;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body }) => {
+                if (method !== "transform") return { ok: true };
+                bodies.push(body as Record<string, unknown>);
+                if (needFull) {
+                    needFull = false;
+                    return { need_full_sync: true };
+                }
+                return { decision: "SOFT+", prefix_bust_permitted: false, native_messages: [] };
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        const agents = mock(async () => ({ data: [{ name: "build", permission: {} }] }));
+        const get = mock(async () => ({ data: { agent: "build" } }));
+        deps.client = { app: { agents }, session: { get } } as never;
+        deps.sessionDirectoryBySession!.set(sessionId, "/tmp/project");
+        const transform = createRustModeTransform(deps, { moduleClient });
+        const input = makeMessages(sessionId);
+        (input[0].info as { agent?: string }).agent = "build";
+        const run = async () => {
+            await transform.run(
+                sessionId,
+                input,
+                { messages: [...input] },
+                makeMeta(db, sessionId),
+            );
+        };
+        await run();
+        expect(agents).toHaveBeenCalledTimes(1);
+        agents.mockClear();
+        get.mockClear();
+        for (let pass = 0; pass < 12; pass++) {
+            transform.invalidateWireState(sessionId);
+            deps.historyRefreshSessions.add(sessionId);
+            deps.contextUsageMap.set(sessionId, {
+                usage: { inputTokens: 100_000, percentage: 90 },
+                updatedAt: Date.now(),
+            });
+            input[0].parts = [{ type: "text", text: `unrelated edit ${pass}` }];
+            await run();
+        }
+        needFull = true;
+        await run();
+        expect(agents).toHaveBeenCalledTimes(0);
+        expect(get).toHaveBeenCalledTimes(0);
+        expect(bodies.at(-1)?.todo_verdict_probed).toBe(false);
+        input[0].parts.push({
+            type: "tool",
+            tool: "todowrite",
+            callID: "new-todo",
+            state: {
+                status: "completed",
+                input: { todos: [] },
+                output: "[]",
+            },
+        });
+        await run();
+        expect(agents).toHaveBeenCalledTimes(1);
+        await run();
+        expect(agents).toHaveBeenCalledTimes(1);
+        // A late completion on an older message is a todo change even on a full wire.
+        (input[0].parts.at(-1)!.state as { output: string }).output = "updated";
+        await run();
+        expect(agents).toHaveBeenCalledTimes(2);
+        (input[0].info as { agent?: string }).agent = "plan";
+        await run();
+        expect(agents).toHaveBeenCalledTimes(3);
     });
 
     it("defers a repeated module directive until the terminal boundary", async () => {
@@ -4966,6 +5047,236 @@ describe("Rust mode authority adapter", () => {
             logSpy.mockRestore();
         }
     });
+
+    it("keeps all served bytes identical across 64 todo and mural cache passes", async () => {
+        const baselinePath = process.env.MAGIC_CONTEXT_RUST_STAGE_BASELINE;
+        const baselineFactory: typeof createRustModeTransformImpl = baselinePath
+            ? (await import(baselinePath)).createRustModeTransform
+            : createRustModeTransformImpl;
+        const sessionId = "rust-stage-differential";
+        const projectPath = "/tmp/rust-stage-fixture";
+        const todoJson = '[{"content":"review changes","status":"pending","priority":"high"}]';
+        const rows = Array.from({ length: 2_000 }, (_, index) => ({
+            id: `fixture-${index}`,
+            timeCreated: index + 1,
+            contributesOrdinal: true,
+            hasValidInfo: true,
+            ordinal: index + 1,
+            role: index % 2 ? "assistant" : "user",
+            parts: [],
+        }));
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        const runArm = async (factory: typeof createRustModeTransformImpl, baseline: boolean) => {
+            sessions.push(sessionId);
+            installAvailabilityDb(sessionId, {});
+            const db = makeDb();
+            unregisters.push(
+                setRawMessageProvider(sessionId, {
+                    readMessages: () => rows,
+                    getStoredMessageCount: () => rows.length,
+                }),
+            );
+            const memories = Array.from({ length: 400 }, (_, index) => {
+                const content = `Memory ${index}: ${"architectural constraint ".repeat(30)}`;
+                const memory = insertMemory(db, { projectPath, category: "CONSTRAINTS", content });
+                setMuralCue(
+                    db,
+                    projectPath,
+                    memory.id,
+                    `Stable cue ${index}`,
+                    computeCueContentHash(content),
+                );
+                return memory;
+            });
+            const input = rows.map((row, index) => ({
+                info: {
+                    id: row.id,
+                    sessionID: sessionId,
+                    role: index % 2 ? "assistant" : "user",
+                    ...(index % 2
+                        ? { providerID: "test-provider", modelID: "test-model" }
+                        : { agent: "build" }),
+                },
+                parts: [
+                    { type: "text", text: `message ${index}: ${"fixture ballast ".repeat(12)}` },
+                ],
+            })) as MessageLike[];
+            input[999].parts = [
+                {
+                    type: "tool",
+                    tool: "todowrite",
+                    callID: "origin-todo",
+                    state: {
+                        status: "completed",
+                        input: { todos: JSON.parse(todoJson) },
+                        output: todoJson,
+                    },
+                },
+            ];
+            updateSessionMeta(db, sessionId, { lastTodoState: todoJson });
+            let pass = 0;
+            let denied = false;
+            const seenInputs: unknown[] = [];
+            const moduleClient: RustModeModuleClient = {
+                call: async ({ method, body }) => {
+                    if (method !== "transform") return { ok: true };
+                    const request = body as Record<string, unknown>;
+                    seenInputs.push([request.todo_tool_present, request.mural]);
+                    // A deterministic materializer consumes the adapter's actual candidates,
+                    // rather than echoing a fixed native array regardless of their values.
+                    const native: unknown[] = structuredClone(input);
+                    if (pass >= 16) {
+                        (native[999] as MessageLike).parts = [];
+                        if (request.todo_tool_present)
+                            native.unshift(
+                                {
+                                    info: { id: "__magic_context_todo_head__", role: "user" },
+                                    parts: [{ type: "text", text: "Todo state" }],
+                                },
+                                {
+                                    info: { id: "synthetic-todo", role: "assistant" },
+                                    parts: [buildSyntheticTodoPart(todoJson)],
+                                },
+                            );
+                    }
+                    if (request.mural)
+                        native.unshift({
+                            info: { id: "mural", role: "user" },
+                            parts: [request.mural],
+                        });
+                    return {
+                        decision: "HARD",
+                        prefix_bust_permitted: true,
+                        native_messages: native,
+                    };
+                },
+            };
+            const deps = makeDeps(db, moduleClient);
+            deps.projectPath = projectPath;
+            deps.muralEnabled = true;
+            deps.memoryConfig!.injectionBudgetTokens = 1;
+            let probes = 0;
+            let resolutions = 0;
+            deps.client = {
+                app: {
+                    agents: async () => {
+                        probes++;
+                        return {
+                            data: [
+                                {
+                                    name: "build",
+                                    permission: { todowrite: denied ? "deny" : "allow" },
+                                },
+                            ],
+                        };
+                    },
+                },
+                session: { get: async () => ({ data: { agent: "build" } }) },
+            } as never;
+            deps.sessionDirectoryBySession!.set(sessionId, projectPath);
+            const transform = factory(deps, {
+                moduleClient,
+                scheduleLkgCapture: (capture) => capture(),
+                disableHotPathIoCachesForTests: baseline && !baselinePath,
+                muralResolverForTests: (muralDb, project, _model, _enabled, budget) => {
+                    resolutions++;
+                    const result = ensureMuralRendered(muralDb, project!, budget);
+                    return {
+                        enabled: true,
+                        supportsVision: true,
+                        dataUrl: result.dataUrl,
+                        contentHash: result.contentHash,
+                    };
+                },
+            });
+            const outputs: string[] = [];
+            const start = logSpy.mock.calls.length;
+            for (pass = 0; pass < 64; pass++) {
+                // Full sends and unrelated edits do not imply a permission change.
+                if (pass % 3 === 0) transform.invalidateWireState(sessionId);
+                input[1200].parts = [{ type: "text", text: `late edit ${pass}` }];
+                deps.contextUsageMap.set(sessionId, {
+                    usage: {
+                        inputTokens: pass >= 16 && pass < 24 ? 180_000 : 100,
+                        percentage: pass >= 16 && pass < 24 ? 90 : 1,
+                    },
+                    updatedAt: Date.now(),
+                });
+                if (pass === 20 || pass === 22) denied = !denied;
+                if (pass === 32) {
+                    setMuralCue(
+                        db,
+                        projectPath,
+                        memories[0].id,
+                        "Changed cue",
+                        computeCueContentHash(memories[0].content),
+                    );
+                    deps.pendingMaterializationSessions.add(sessionId);
+                }
+                if (pass === 48) {
+                    (input[999].parts[0].state as { output: string }).output += " completed";
+                }
+                const output = { messages: [...input] as unknown[] };
+                await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+                outputs.push(JSON.stringify(output.messages));
+                deps.pendingMaterializationSessions.delete(sessionId);
+            }
+            const stages = ["todo_probe", "todo_verdict", "mural_resolve"];
+            const samples = Object.fromEntries(
+                stages.map((stage) => [
+                    stage,
+                    logSpy.mock.calls
+                        .slice(start)
+                        .filter(([, message]) => message.startsWith("rust pass:"))
+                        .map(([, message]) =>
+                            Number(
+                                message.match(new RegExp(`(?:stages=| )${stage}:([\\d.]+)`))?.[1] ??
+                                    0,
+                            ),
+                        ),
+                ]),
+            );
+            transform.dispose();
+            return { outputs, seenInputs, probes, resolutions, samples };
+        };
+        try {
+            const before = await runArm(baselineFactory, true);
+            const after = await runArm(createRustModeTransformImpl, false);
+            expect(after.outputs).toEqual(before.outputs);
+            expect(after.seenInputs).toEqual(before.seenInputs);
+            expect(after.outputs[16]).not.toContain('"callID":"origin-todo"');
+            expect(after.outputs[16]).toContain('"syntheticTodoMarker":true');
+            expect(after.outputs[20]).not.toContain('"syntheticTodoMarker":true');
+            expect(after.outputs[22]).toContain('"syntheticTodoMarker":true');
+            expect(after.resolutions).toBe(2);
+            if (baselinePath) expect(after.probes).toBeLessThan(before.probes);
+            if (process.env.MAGIC_CONTEXT_HOTPATH_MEASURE === "1") {
+                const summary = (arm: typeof after) => ({
+                    probes: arm.probes,
+                    resolutions: arm.resolutions,
+                    stages: Object.fromEntries(
+                        Object.entries(arm.samples).map(([stage, values]) => {
+                            const sorted = values.sort((a, b) => a - b);
+                            return [
+                                stage,
+                                {
+                                    passes: sorted.length,
+                                    median: sorted[Math.floor(sorted.length / 2)],
+                                    p90: sorted[Math.floor(sorted.length * 0.9)],
+                                    max: sorted.at(-1),
+                                },
+                            ];
+                        }),
+                    ),
+                });
+                console.log(
+                    `RUST_STAGE_DIFFERENTIAL ${JSON.stringify({ baseline: baselinePath ?? "uncached", passes: 64, before: summary(before), after: summary(after) })}`,
+                );
+            }
+        } finally {
+            logSpy.mockRestore();
+        }
+    }, 120_000);
 
     it("keeps a 1,000-message steady-state pass under the adapter budget", async () => {
         const sessionId = `rust-wire-delta-${Date.now()}`;
@@ -9573,6 +9884,10 @@ it("rechecks mural candidates on bootstrap, pressure and flush but not ordinary 
         usage: { inputTokens: 100_000, percentage: 90 },
         updatedAt: Date.now(),
     });
+    // A refresh opportunity is not itself a new mural revision.
+    await run();
+    expect(resolutions).toBe(1);
+    insertMemory(db, { projectPath: deps.projectPath!, category: "CONSTRAINTS", content: "b" });
     await run();
     expect(resolutions).toBe(2);
     expect(muralHashes.at(-1)).toBe("b");
@@ -9581,6 +9896,7 @@ it("rechecks mural candidates on bootstrap, pressure and flush but not ordinary 
         updatedAt: Date.now(),
     });
     cue = "c";
+    insertMemory(db, { projectPath: deps.projectPath!, category: "CONSTRAINTS", content: "c" });
     await run();
     expect(resolutions).toBe(2);
     deps.pendingMaterializationSessions.add(sessionId);
