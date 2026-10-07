@@ -20,7 +20,7 @@ export interface ContrastPair {
 }
 
 const SURFACES = ["bg-base", "bg-panel", "bg-card", "bg-hover", "bg-active"];
-const TEXT = ["text-primary", "text-secondary", "text-muted"];
+const TEXT = ["text-primary", "text-secondary", "text-muted", "text-quiet"];
 const PILL_COLORS = ["green", "accent", "text-secondary", "purple", "indigo", "amber", "red"];
 
 export const CONTRAST_PAIRS: ContrastPair[] = [
@@ -91,6 +91,37 @@ export const CONTRAST_PAIRS: ContrastPair[] = [
     min: 3,
   })),
   { label: "switch knob (on-accent) vs switch-on", fg: "on-accent", bg: "switch-on", min: 3 },
+  // Pills also sit on the sidebar/status strip (bg-panel) and on hovered list
+  // rows (bg-hover), not only on cards.
+  ...PILL_COLORS.flatMap((color) =>
+    ["bg-panel", "bg-hover"].map((surface) => ({
+      label: `${color} pill text on its 15% tint over ${surface}`,
+      fg: color,
+      bg: { tint: color, percent: 15, over: surface },
+      min: 4.5,
+    })),
+  ),
+  // Status words (Live, bust counts, causes) are written straight on the page,
+  // panel and hovered rows as well as on cards.
+  ...["green", "amber", "red", "accent"].flatMap((color) =>
+    ["bg-base", "bg-panel", "bg-hover"].map((bg) => ({
+      label: `${color} text on ${bg}`,
+      fg: color,
+      bg,
+      min: 4.5,
+    })),
+  ),
+  // Cache timeline marks are drawn inside a segment box that washes the card
+  // with 30% of bg-active; the window line is drawn over the same box.
+  ...["chart-good", "chart-warn", "chart-bad", "chart-info", "chart-neutral", "chart-window"].map(
+    (fg) => ({
+      label: `${fg} mark vs the timeline box (30% bg-active over bg-card)`,
+      fg,
+      bg: { tint: "bg-active", percent: 30, over: "bg-card" },
+      min: 3,
+    }),
+  ),
+  { label: "chart-window line vs bg-card", fg: "chart-window", bg: "bg-card", min: 3 },
   { label: "switch knob (on-accent) vs switch-off", fg: "on-accent", bg: "switch-off", min: 3 },
 ];
 

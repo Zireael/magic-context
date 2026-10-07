@@ -410,7 +410,7 @@ try {
       await load(stored, os, 1280);
       const expected = stored === "light" || stored === "dark" ? stored : os;
       await assert(`stored=${stored} os=${os}: data-theme=${expected} before <body>`, `window.__themeAtBody === ${JSON.stringify(expected)}`);
-      const bg = expected === "light" ? "rgb(244, 245, 247)" : "rgb(10, 10, 15)";
+      const bg = expected === "light" ? "rgb(244, 241, 236)" : "rgb(10, 10, 15)";
       await assert(`stored=${stored} os=${os}: page background already ${bg} before <body>`, `window.__bgAtBody === ${JSON.stringify(bg)}`);
     }
   }
@@ -418,7 +418,7 @@ try {
   await load(null, "dark", 1280);
   await assert("default preference is System", "document.querySelector('.nav-theme-option.active').textContent.trim()==='System' && document.querySelector('.nav-theme-option[aria-pressed=\"true\"]').textContent.trim()==='System'");
   await setOsAppearance("light"); await settle();
-  await assert("System: OS switch to light repaints light", "document.documentElement.getAttribute('data-theme')==='light' && getComputedStyle(document.body).backgroundColor==='rgb(244, 245, 247)'");
+  await assert("System: OS switch to light repaints light", "document.documentElement.getAttribute('data-theme')==='light' && getComputedStyle(document.body).backgroundColor==='rgb(244, 241, 236)'");
   await setOsAppearance("dark"); await settle();
   await assert("System: OS switch back to dark repaints dark", "document.documentElement.getAttribute('data-theme')==='dark' && getComputedStyle(document.body).backgroundColor==='rgb(10, 10, 15)'");
   await clickText(".nav-theme-option", "Light");
