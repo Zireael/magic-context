@@ -466,8 +466,10 @@ fn dev_named_binary(path: &Path) -> PathBuf {
         return dev_path;
     }
     let _ = fs::remove_file(&dev_path);
-    fs::hard_link(path, &dev_path)
-        .or_else(|_| fs::copy(path, &dev_path).map(|_| ()))
+    // A copy, never a hard link: on macOS a daemon exec'd through a hard link to
+    // cargo's output was occasionally SIGKILLed at startup, while a copy never was.
+    fs::copy(path, &dev_path)
+        .map(|_| ())
         .unwrap_or_else(|error| {
             panic!(
                 "failed to stage test binary {} as {}: {error}",

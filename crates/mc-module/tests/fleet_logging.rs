@@ -8,9 +8,9 @@ fn module_start_writes_dated_segment_under_resolved_data_dir() {
     let root = tempfile::tempdir_in(scratch_parent).expect("temp data home");
     let module = root.path().join("ckdev-mc");
     let cargo_module = env!("CARGO_BIN_EXE_ck-mc");
-    fs::hard_link(cargo_module, &module)
-        .or_else(|_| fs::copy(cargo_module, &module).map(|_| ()))
-        .expect("stage ck-mc with a dev process name");
+    // A copy, never a hard link: on macOS a binary exec'd through a hard link to
+    // cargo's output was occasionally SIGKILLed at startup, while a copy never was.
+    fs::copy(cargo_module, &module).expect("stage ck-mc with a dev process name");
     let output = Command::new(&module)
         .env("XDG_DATA_HOME", root.path())
         .env("SUBC_MODULE_ID", "magic-context")

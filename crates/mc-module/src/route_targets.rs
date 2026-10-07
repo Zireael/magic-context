@@ -491,8 +491,10 @@ mod tests {
         for (source_name, dev_name) in [("ck-subc", "ckdev-subc"), ("ck-mc", "ckdev-mc")] {
             let source = binaries.join(source_name);
             let destination = dev_binaries.join(dev_name);
-            std::fs::hard_link(&source, &destination)
-                .or_else(|_| fs::copy(&source, &destination).map(|_| ()))
+            // A copy, never a hard link: on macOS a daemon exec'd through a hard link
+            // to cargo's output was occasionally SIGKILLed at startup; a copy never was.
+            fs::copy(&source, &destination)
+                .map(|_| ())
                 .unwrap_or_else(|error| {
                     panic!(
                         "failed to stage {} as {}: {error}",

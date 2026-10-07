@@ -30,7 +30,6 @@ import {
     appendFileSync,
     copyFileSync,
     existsSync,
-    linkSync,
     mkdirSync,
     readdirSync,
     readFileSync,
@@ -184,12 +183,9 @@ function stageDevBinary(
     const destination = join(targetDir, filename);
     if (resolve(source) === resolve(destination)) return destination;
     rmSync(destination, { force: true });
-    try {
-        linkSync(source, destination);
-    } catch {
-        // Cargo targets and CI artifacts can be on different filesystems.
-        copyFileSync(source, destination);
-    }
+    // A copy, never a hard link: on macOS a daemon exec'd through a hard link to
+    // cargo's output was occasionally SIGKILLed at startup, while a copy never was.
+    copyFileSync(source, destination);
     return destination;
 }
 
