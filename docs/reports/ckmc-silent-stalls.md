@@ -1,5 +1,22 @@
 # ck-mc silent stalls: live investigation (2026-10-07)
 
+## Result
+
+**No production fix implemented: the specific 55 s root cause is not proved.**
+The observer ran from 10:29:05 to 11:32:18 (63 min, with short observer-only
+restart gaps), capturing four candidates: a genuine 15.7 s SQL/I/O pass, two
+post-recovery candidates rejected after timestamp reconciliation, and a genuine
+19.6 s transport delay with an already-finished handler. The last candidate
+was sampled jointly with subc while the plugin still awaited completion.
+
+The suspected Rust TRUNCATE checkpoints do not ship. The original 55 s delay
+and the later 19.6 s delay are outside the measured transform handler; the
+latter sample has **all ck-mc threads idle**. The paired subc sample does not
+show a blocking router mutex or daemon-wide exhaustion. It is not defensible
+to name an external SQLite lock owner, or declare subc guilty, from these
+stacks. This report distinguishes the observed waits from unresolved causes
+and proposes bounded follow-up changes rather than changing unrelated tests.
+
 ## Scope and evidence
 
 This is a read-only investigation of the running module, not a store repair.
@@ -8,6 +25,8 @@ PID **31541**, parent `ck-subc` PID **1266**. The request-path files cited below
 are identical between that build commit and the investigation base
 `1b47f42e3178ff8f5aa5f54815f9454d4ff648c3`. All timeline times are UTC;
 macOS `sample` headers use local time, UTC+02:00.
+The live daemon's version probe reports `ck-subc 0.20.58`; do not equate that
+binary version with this workspace's pinned SDK or published daemon crate.
 
 The plugin log path was confirmed, not inferred from a repository filename:
 
@@ -239,13 +258,123 @@ stall-1.lsof.txt   c001992b77ecbbcf973e4427c94499428964720a1de74c967ada237fa8f60
 
 After the cross-module concern was raised, the observer was resumed at
 10:33:22 with capture count one and the **original two-hour deadline**. The
-next capture samples **both ck-mc and ck-subc concurrently** and saves bounded
+subsequent captures sample **both ck-mc and ck-subc concurrently** and save bounded
 tails plus size/mtime snapshots of other modules' daily logs. Only the observer
 was stopped/restarted; no live module was signalled.
 
+## Rejected candidates 2 and 3: do not mistake late log visibility for a live stall
+
+Candidate 2 triggered at **10:35:01.629**, but the plugin ultimately recorded
+completion at **10:35:00.199**, before detection. Its 12,379.9 ms transport
+time comprised **2,687.5 ms response-wait/decode + 9,689.9 ms settle**, with
+handler 2,622.3 ms. Candidate 3 triggered at **10:41:17.279** and was likewise
+reconciled as completed before detection. The observer initially believed the
+pass pending because the completion log records were not yet visible to its
+incremental reader; their timestamps, not the trigger alone, determine this
+classification. The watch was continued instead of counting these as the two
+requested live captures.
+
+Candidate 2's simultaneous samples started at **10:35:02.386** (ck-mc) and
+**10:35:02.382** (subc), after response completion:
+
+```text
+ck-mc: 4419 / 4419 main-thread samples in kevent;
+       all three blocking-pool workers in idle Condvar::wait_timeout
+subc:  3879 samples per thread; most workers in park_condvar / kevent
+       Thread_15797: 1961 samples in pump_stderr_to -> emit_line
+         -> ChildOutputSink::write_line -> cortexkit_log::sink::Destination::write
+         -> std::fs::File::write_all -> write
+       Thread_15809: 1251 samples in the same file-write path
+       total write leaf samples across all threads: 3301
+```
+
+That subc synchronous stderr-file writer is a real executor-blocking hazard,
+**not evidence that the router was blocked for the pending transform**.
+Many other daemon workers were parked, not waiting on that sink's mutex.
+During the sample Broca had log events at 10:35:06.122 and a completed
+`route.account_for` round trip at **10:35:06.298 (18,543 us)**; AFT handled a
+grep at **10:35:07.448 (58 ms total, 2 ms queue, 54 ms execution, 0 ms egress)**;
+subc accepted routes at 10:35:06.243 and 10:35:07.017. Broca's log grew by
+598 bytes, AFT's stderr log by 3,408, subc's log by 259, while ck-mc's log
+stayed at 1,891,427 bytes. Low-traffic modules with old unchanged logs are not
+classified as stalled merely for being quiet.
+
+```text
+stall-2.sample.txt      380447a84fd97d876870b38c42c880dc0764b5ade274c4a8a5ab0cc3b8c98551
+stall-2-subc.sample.txt 1d831a80effe91707f603e0c5887bd7f562782617badcbf675831eb87d643e53
+stall-2.lsof.txt        c91fe39065adf1020550d6c0aa45c0b417177fd848a9f694e2d807e003f807fd
+```
+
+## Live capture 4: transport still pending, handler already finished
+
+The continued observer triggered at **11:32:09.666**, with 16.02 s of observed
+ck-mc silence and ALF pending since **11:31:51.916**. Both samples and `lsof`
+exited 0. It stopped automatically at **11:32:18.892**, after this second live
+pending-pass observation (63:12.94 elapsed from the original start).
+
+```text
+11:31:51.918  ck-mc page accepted (264,831 bytes)
+11:31:52.231  pending drops held
+11:31:53.089  INFO mc-pass-timing: handler_total=1170.1 ms; commit=183.7 ms
+11:32:09.666  observer trigger
+11:32:09.819  plugin: still pending after healthy probe; stall_ms=17902
+11:32:10.518  subc sample starts
+11:32:10.528  ck-mc sample starts
+11:32:11.536  plugin transport completes: 19619.2 ms
+11:32:11.555  plugin final pass: elapsed=20000.4 ms; module=1170.1 ms
+               response-wait/decode=17427.3 ms; settle=2191.4 ms
+```
+
+The sample begins while the plugin still records the pass pending, but runs
+past recovery. ck-mc has **4,442 / 4,442 main-thread samples in
+`current_thread::Context::park -> mio::Poll -> kevent`** and both blocking-pool
+workers have **4,442 / 4,442 samples in idle
+`blocking::pool::Inner::run -> Condvar::wait_timeout -> __psynch_cvwait`**.
+There are no SQL, handler-followup, checkpoint, health-work, projection-eviction,
+or mutex-contention stacks in this capture. The parked condition variables
+are worker-idle waits, **not** a store mutex held by another process. There is
+no source line awaiting a live DB lock to name here: handler completion is
+already logged at **M:15955**, before sampling. Native stack samples do not
+show async tasks suspended on egress credits or a peer's reader.
+
+The paired subc sample has 3,997 samples per thread, 19 total threads:
+
+```text
+main: CachedParkThread::block_on -> __psynch_cvwait
+workers: predominantly multi_thread::Context::park_internal
+         -> park_condvar -> __psynch_cvwait, or mio::Poll -> kevent
+small active branches:
+  connection_loop -> route_for_connection_started -> FrameSink::try_send
+  connection_loop -> ForwardBackend::handle_bound -> FrameSink::send
+  drain_writer -> TcpStream::poll_write -> __sendto
+  pump_stderr_to -> emit_line -> ChildOutputSink::write_line
+    -> cortexkit_log::sink::Destination::write -> File::write_all -> write
+80 write leaf samples total; no __psynch_mutexwait leaf
+```
+
+Subc continued accepting routes at 11:32:09.831 and 11:32:10.288, with a
+prefrontal-host burst at 11:32:10.842-10.853. AFT completed an edit at
+11:32:10.383 (824 ms total, 3 ms queue, 817 ms execution, 2 ms egress), then
+searches at 11:32:13.770 and 11:32:14.102. Broca logged activity at
+11:32:09.237, 09.560, 09.615, 10.242, and 14.277. Thus other routes and
+modules were not universally frozen during this captured delay. This does
+**not** exclude a per-connection forwarding/credit fault in subc or a host
+reader/decode delay; a globally wedged synchronous daemon lock is not shown.
+
+`lsof` again listed only ck-mc on store.db. On context.db it listed OpenCode,
+ck-mc, the two Pi hosts and Dashboard; the long-running sqlite3 reader from
+capture 1 was no longer present. context WAL was 3,007,632 bytes, store WAL
+25,647,032 bytes. An open file descriptor is not an identified busy-lock owner.
+
+```text
+stall-4.sample.txt      7b746a39d303d3eeed31f4486d1f890799c4409ffa093c5fa4a94fd7b37afeeb
+stall-4-subc.sample.txt 57bf6182d8baea0335bad4a01360cb6babaf26e668743e4bbd33c4c668888934
+stall-4.lsof.txt        68f8d6e8182bbad10143cea7a946a39b682785d2ff63bedb3916e50d6b08ac84
+```
+
 ## Fix decision
 
-No production change is justified by the first capture. In particular:
+No production change is justified as a fix for the specific 55 s stall. In particular:
 
 - Changing the two test-only TRUNCATE statements would pass a contrived
   reader test while never reaching the live cause.
@@ -254,13 +383,65 @@ No production change is justified by the first capture. In particular:
 - Ordinary data dispatch is already off the control thread. Background
   historian synchronous database work remains a control-runtime starvation
   risk, but the first sample shows it for a small part of the observation,
-  not for 55 seconds.
+  not for 55 seconds, and the captured transport delay has an idle control
+  runtime.
+- The paired daemon samples show synchronous stderr-file writing on Tokio
+  workers, but not daemon-wide routing blockage. A SUBC root-cause declaration
+  would require per-connection evidence, not the wording of a transport timeout.
 
-The smallest supported follow-up is to measure structural boundary reads and
-background store-lock hold times separately, and correlate handler completion
-with SDK response enqueue/write and subc forwarding. A covering/index or cache
-change for structural boundary reads is a different hypothesis from routing
-starvation and must preserve host-coordinate validation against repaired rows.
+**Smallest next diagnostic change:** correlate one request's attempt/corr with
+(a) handler/encode completion, (b) SDK response enqueue/write completion,
+(c) subc forwarding enqueue/write to that consumer, and (d) host receipt/decode
+and settle completion. It must run even for sub-second handlers, or the
+original missing-INFO ambiguity remains. If the next live watcher sees an idle
+module with a pending host pass, include the **OpenCode host's stack** as well
+as ck-mc/subc; the current captures cannot attribute the suspended async wait
+to a specific owner. No such instrumentation was shipped in this investigation.
+
+Small fix candidates, contingent on that evidence:
+
+1. **If a background historian holds the store mutex on the single-thread
+   control runtime:** move its synchronous store sections to `spawn_blocking`
+   (preserving publication fences and await semantics). Red-first test: hold
+   that background store operation at a barrier and prove a control health
+   response and an unrelated completed handler's response still make progress.
+   Merely moving ordinary transform followup is redundant with the existing
+   adapter.
+2. **If subc's `pump_stderr_to` file sink prevents a specific connection from
+   making progress:** move/bound disk logging off daemon runtime workers.
+   Red-first SUBC test: deliberately block the stderr sink and prove unrelated
+   routing/response writes complete, with bounded queue/drop accounting. This
+   belongs in SUBC, not a ck-mc checkpoint change; the paired samples establish
+   the hazard but not that causal claim.
+3. **If the structural SQL dominates a slow module pass:** use a covering
+   structural-boundary query/index or reuse validated structural coordinates
+   without rereading overflow pages. Preserve repaired-row validation and
+   compare exact results under cold/warm reads and concurrent publications.
+   This targets the first capture, not the proven post-handler delay.
+
 A reader-held-snapshot regression is appropriate only after a runtime
-checkpoint wait is actually demonstrated; the suspected checkpoints here
-cannot provide that red-first control.
+checkpoint wait is demonstrated. Here it would exercise a test-only helper,
+not the live path, so it cannot be a credible red-first proof of a stall fix.
+No external lock holder, exact 55 s blocking line, or daemon-specific fix is
+claimed. The requested report is the delivered change; Rust/TS behavior and
+the live stores remain unchanged.
+
+## Verification and remaining limits
+
+- Git whitespace/diff review checks one changed Markdown report (Git
+  `2.54.0 (Apple Git-157)`). No ARCHITECTURE.md or STRUCTURE.md edits.
+- Four `sample 31541 5` captures, three simultaneous `sample 1266 5`
+  captures, and four two-DB `lsof -nP` captures returned exit 0 with nonempty
+  evidence. Sample tool headers identify macOS 27.0.1 (26A434), report version
+  7, `/usr/bin/sample`; sample counts are recorded above.
+- Python observer version 3.9.6; final watch record reports four candidates,
+  two still-pending observations, 3,792.94 s elapsed, clean observer exit 0.
+- Markdown has no configured LSP producer; scoped inspection reports PARTIAL,
+  not a typecheck pass. Rust/TS typecheck, tests and builds were not rerun for
+  this documentation-only change. The prepared worktree's install/build were
+  reported successful before the investigation; neither was rerun or mutated.
+- The 55 s window predates the watcher. The 19.6 s captured delay has the same
+  small-handler / large-response-wait shape, but is not a reproduction of an
+  exact 55 s timer. No SQLite transaction state or lock owner was observable
+  from `lsof`, and no native sample identifies a suspended async per-route
+  owner. These are limits of the conclusion, not evidence for a guessed fix.
