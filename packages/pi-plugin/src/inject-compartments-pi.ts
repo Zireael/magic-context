@@ -96,7 +96,10 @@ import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-ses
 import { renderUserProfileContent } from "@magic-context/core/hooks/magic-context/user-profile-render";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { sessionLog as logSession } from "@magic-context/core/shared/logger";
-import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
+import {
+	logSlowWriteTransaction,
+	WriteTransactionSteps,
+} from "@magic-context/core/shared/write-transaction-timing";
 import { resolvePiStableId, SYNTH_USER_ID_PREFIX } from "./read-session-pi";
 import {
 	isPiSystemEntry,
@@ -396,6 +399,7 @@ function safeGetActiveUserMemoriesPi(db: ContextDatabase): UserMemory[] {
 }
 
 export interface PiM0M1State {
+	beforeCacheCommitForTest?: () => void;
 	/** These delivery fields are scoped to one context pass, never persisted. */
 	freezePrefixForPass?: boolean;
 	allowFreshContentionFallback?: boolean;
@@ -958,7 +962,7 @@ function getCachedMarkers(
 }
 
 function lastBaselineEndMessageId(
-	compartments: readonly PiCompartment[],
+	compartments: readonly Pick<PiCompartment, "endMessageId">[],
 ): string | null {
 	const last = compartments.at(-1);
 	return last?.endMessageId && last.endMessageId.length > 0
@@ -974,7 +978,16 @@ function readCurrentMarkers(
 	return readCurrentMarkersFromCompartments(
 		db,
 		state,
-		getRenderableCompartmentsPi(db, state),
+		state.compactionOff
+			? []
+			: (db
+					.prepare(
+						"SELECT sequence, end_message_id AS endMessageId, legacy FROM compartments WHERE session_id = ? ORDER BY sequence",
+					)
+					.all(state.sessionId) as Pick<
+					PiCompartment,
+					"sequence" | "endMessageId" | "legacy"
+				>[]),
 		projectDocsHash,
 	);
 }
@@ -982,7 +995,10 @@ function readCurrentMarkers(
 function readCurrentMarkersFromCompartments(
 	db: ContextDatabase,
 	state: PiM0M1State,
-	compartments: readonly PiCompartment[],
+	compartments: readonly Pick<
+		PiCompartment,
+		"sequence" | "endMessageId" | "legacy"
+	>[],
 	projectDocsHash?: string,
 ): PiM0SnapshotMarkers {
 	const memPath = memoryProjectPath(state);
@@ -1740,10 +1756,26 @@ export function materializeM0Pi(
 	}
 	const m0Bytes = Buffer.from(m0, "utf8");
 
-	// Phase 2 + 3 (locked): re-read markers under BEGIN IMMEDIATE; if anything
-	// changed since Phase 1, the rendered bytes are stale — roll back and let the
-	// caller retry. m[1] is rendered and persisted INSIDE the same transaction as
-	// m[0] so cached_m0_bytes/cached_m1_bytes/markers/memory_block_ids stay paired.
+	const steps = new WriteTransactionSteps();
+	snapshotMarkers.materializedAt = foldMaterializedAt;
+	const prepared = readRenderSnapshotPi(state, db, docs.canonicalHash, () =>
+		renderM1PiWithMetadata(state, db, snapshotMarkers, renderedMemoryIds),
+	);
+	const m1Render = prepared.value;
+	const m1Bytes = Buffer.from(m1Render.text, "utf8");
+	const renderedIdsJson = JSON.stringify(renderedMemoryIds);
+	const upgradeIdentity = encodeCachedM0UpgradeIdentity(
+		snapshotMarkers.upgradeState,
+		snapshotMarkers.compartmentRenderEpoch,
+		snapshotMarkers.muralEnabled,
+		snapshotMarkers.renderBudgetIdentity,
+		snapshotMarkers.memoryRenderEpoch,
+		snapshotMarkers.renderedBudgets ?? null,
+	);
+	steps.mark("pre_m1Render");
+	state.beforeCacheCommitForTest?.();
+	// Both renders are precomputed. The writer validates both snapshots before
+	// persisting the pair, marker watermarks and boundary atomically.
 	try {
 		db.exec("BEGIN IMMEDIATE");
 	} catch (error) {
@@ -1753,6 +1785,7 @@ export function materializeM0Pi(
 		throw error;
 	}
 	const transactionStartedAt = performance.now();
+	steps.reset();
 	try {
 		// The lock-time marker check must describe the bytes rendered above. Reusing
 		// that HARD-fold document snapshot avoids a second stat/read pair and prevents
@@ -1782,20 +1815,11 @@ export function materializeM0Pi(
 			// harness ever revives the field.
 			current.sessionFactsVersion !== snapshotMarkers.sessionFactsVersion ||
 			current.upgradeState !== snapshotMarkers.upgradeState;
-		if (stale) {
+		if (stale || !renderSnapshotIsCurrentPi(current, prepared.markers)) {
 			db.exec("ROLLBACK");
 			throw new PiMaterializeContentionError("snapshot changed before persist");
 		}
-		snapshotMarkers.materializedAt = foldMaterializedAt;
-
-		const m1Render = renderM1PiWithMetadata(
-			state,
-			db,
-			snapshotMarkers,
-			renderedMemoryIds,
-		);
-		const m1Bytes = Buffer.from(m1Render.text, "utf8");
-
+		steps.mark("staleCheck");
 		persistCachedM0(db, state.sessionId, {
 			m0Bytes,
 			muralDataUrl: frozenMuralDataUrl,
@@ -1811,18 +1835,12 @@ export function materializeM0Pi(
 			projectDocsHash: snapshotMarkers.projectDocsHash,
 			materializedAt: snapshotMarkers.materializedAt,
 			sessionFactsVersion: snapshotMarkers.sessionFactsVersion,
-			upgradeState: encodeCachedM0UpgradeIdentity(
-				snapshotMarkers.upgradeState,
-				snapshotMarkers.compartmentRenderEpoch,
-				snapshotMarkers.muralEnabled,
-				snapshotMarkers.renderBudgetIdentity,
-				snapshotMarkers.memoryRenderEpoch,
-				snapshotMarkers.renderedBudgets ?? null,
-			),
+			upgradeState: upgradeIdentity,
 			systemHash: snapshotMarkers.systemHash,
 			modelKey: snapshotMarkers.modelKey,
 			projectIdentity: snapshotMarkers.projectIdentity,
 		});
+		steps.mark("persistCachedM0");
 		// Persist the rendered-memory identity in the SAME transaction as the m[0]
 		// snapshot (parity with OpenCode materializeM0). `memory_block_ids` /
 		// `memory_block_count` are otherwise written only by the dead legacy v1
@@ -1831,11 +1849,7 @@ export function materializeM0Pi(
 		// any memory change (e.g. migration delete+reinserts with new ids).
 		db.prepare(
 			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
-		).run(
-			renderedMemoryIds.length,
-			JSON.stringify(renderedMemoryIds),
-			state.sessionId,
-		);
+		).run(renderedMemoryIds.length, renderedIdsJson, state.sessionId);
 
 		// Persist the frozen trim boundary INSIDE the materialize transaction,
 		// BEFORE COMMIT. If written after COMMIT, a crash in the window leaves a
@@ -1848,8 +1862,16 @@ export function materializeM0Pi(
 			snapshotMarkers.lastBaselineEndMessageId,
 		);
 
+		steps.mark("sessionMeta");
 		db.exec("COMMIT");
-		logSlowWriteTransaction("pi_materialize_cache", transactionStartedAt);
+		steps.mark("commit");
+		logSlowWriteTransaction(
+			"pi_materialize_cache",
+			transactionStartedAt,
+			undefined,
+			performance.now(),
+			steps.durations,
+		);
 		rememberPiMuralPayload(
 			state.sessionId,
 			frozenMuralDataUrl,
@@ -2000,6 +2022,44 @@ function renderMemoryUpdatesBlockPi(args: {
 interface RenderM1PiResult {
 	text: string;
 	memoryUpdateCount: number;
+}
+
+function readRenderSnapshotPi<T>(
+	state: PiM0M1State,
+	db: ContextDatabase,
+	docsHash: string,
+	read: () => T,
+) {
+	db.exec("BEGIN");
+	try {
+		const markers = readCurrentMarkers(db, state, docsHash);
+		const value = read();
+		db.exec("COMMIT");
+		return { value, markers };
+	} catch (error) {
+		db.exec("ROLLBACK");
+		throw error;
+	}
+}
+
+function renderSnapshotIsCurrentPi(
+	current: PiM0SnapshotMarkers,
+	rendered: PiM0SnapshotMarkers,
+): boolean {
+	// The delta probe includes additive memories, unlike the m[0] CAS. Without
+	// it a memory arriving after rendering could be hidden by a stale commit.
+	return (
+		current.maxMemoryId === rendered.maxMemoryId &&
+		current.maxCompartmentSeq === rendered.maxCompartmentSeq &&
+		current.maxMutationId === rendered.maxMutationId &&
+		current.maxMemoryMutationId === rendered.maxMemoryMutationId &&
+		current.projectMemoryEpoch === rendered.projectMemoryEpoch &&
+		current.workspaceFingerprint === rendered.workspaceFingerprint &&
+		current.projectUserProfileVersion === rendered.projectUserProfileVersion &&
+		current.projectIdentity === rendered.projectIdentity &&
+		current.upgradeState === rendered.upgradeState &&
+		current.lastBaselineEndMessageId === rendered.lastBaselineEndMessageId
+	);
 }
 
 function renderM1PiWithMetadata(
@@ -2433,11 +2493,58 @@ function softRefreshCachedM1Pi(args: {
 	memoryUpdateCount: number;
 	recomputed: boolean;
 } {
+	const steps = new WriteTransactionSteps();
+	const snapshot = readRenderSnapshotPi(
+		args.state,
+		args.db,
+		args.markers.projectDocsHash,
+		() => {
+			const row = readCachedPiM0M1Row(args.db, args.state.sessionId);
+			if (
+				!row ||
+				!cachedPiRowMatchesSnapshot({
+					row,
+					m0Bytes: args.m0Bytes,
+					markers: args.markers,
+					compartmentsForNormalization: args.compartmentsForNormalization,
+				})
+			)
+				return null;
+			const markers = markersFromCachedPiRow(
+				row,
+				args.compartmentsForNormalization,
+			);
+			if (!markers)
+				throw new PiMaterializeContentionError(
+					`invalid cached m[0] markers for ${args.state.sessionId}`,
+				);
+			const compartments = getRenderableCompartmentsPi(args.db, args.state);
+			const rendered = renderM1PiWithMetadata(
+				args.state,
+				args.db,
+				markers,
+				parseMemoryBlockIds(row.memory_block_ids),
+				compartments,
+			);
+			const latest = compartments.at(-1);
+			const advancedBoundary =
+				latest?.endMessageId && latest.endMessageId.length > 0
+					? latest.endMessageId
+					: markers.lastBaselineEndMessageId;
+			return { row, markers, rendered, advancedBoundary };
+		},
+	);
+	const prepared = snapshot.value;
+	const m1Bytes = prepared ? Buffer.from(prepared.rendered.text, "utf8") : null;
+	steps.mark("pre_m1Render");
+	args.state.beforeCacheCommitForTest?.();
 	args.db.exec("BEGIN IMMEDIATE");
 	const transactionStartedAt = performance.now();
+	steps.reset();
 	try {
 		const row = readCachedPiM0M1Row(args.db, args.state.sessionId);
 		if (
+			!prepared ||
 			!row ||
 			!cachedPiRowMatchesSnapshot({
 				row,
@@ -2468,49 +2575,34 @@ function softRefreshCachedM1Pi(args: {
 			};
 		}
 
-		const markers = markersFromCachedPiRow(
-			row,
-			args.compartmentsForNormalization,
-		);
-		if (!markers) {
+		if (
+			!renderSnapshotIsCurrentPi(
+				readCurrentMarkers(args.db, args.state, args.markers.projectDocsHash),
+				snapshot.markers,
+			)
+		) {
 			throw new PiMaterializeContentionError(
-				`invalid cached m[0] markers for ${args.state.sessionId}`,
+				"snapshot changed before soft refresh",
 			);
 		}
-		const rendered = renderM1PiWithMetadata(
-			args.state,
-			args.db,
-			markers,
-			parseMemoryBlockIds(row.memory_block_ids),
-			// Render new compartments from the SAME snapshot the boundary advances
-			// from below, so a concurrent sibling publish can't put a compartment
-			// in m[1] while its raw messages stay in the tail.
-			args.compartmentsForNormalization,
-		);
-		const m1Bytes = Buffer.from(rendered.text, "utf8");
-		// Advance the persisted trim boundary to the latest compartment now rendered
-		// in m[1]. renderM1 covers compartments seq > cachedM0Seq up to the current
-		// latest, so the visible-message trim must move with it — otherwise the newly
-		// summarized compartment's raw messages stay in the tail (duplication) on
-		// this and every subsequent replay pass. Persisted in the SAME transaction as
-		// cached_m1_bytes so replay passes (which read the boundary from this row)
-		// trim consistently. Mirrors OpenCode caching prepared.compartmentEndMessageId
-		// on each cache-busting pass. Boundary is NOT part of the m[0] CAS identity
-		// (cachedPiRowMatchesSnapshot excludes it), so advancing it cannot spuriously
-		// invalidate a sibling's cached m[0].
-		const latestCompartment = args.compartmentsForNormalization.at(-1);
-		const advancedBoundary =
-			latestCompartment?.endMessageId &&
-			latestCompartment.endMessageId.length > 0
-				? latestCompartment.endMessageId
-				: markers.lastBaselineEndMessageId;
+		steps.mark("staleCheck");
+		const { markers, rendered, advancedBoundary } = prepared;
+
 		args.db
 			.prepare(
 				"UPDATE session_meta SET cached_m1_bytes = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
 			)
 			.run(m1Bytes, advancedBoundary, args.state.sessionId);
+		steps.mark("sessionMeta");
 		args.db.exec("COMMIT");
-		logSlowWriteTransaction("pi_soft_refresh_cache", transactionStartedAt);
+		steps.mark("commit");
+		logSlowWriteTransaction(
+			"pi_soft_refresh_cache",
+			transactionStartedAt,
+			undefined,
+			performance.now(),
+			steps.durations,
+		);
 		return {
 			m0: decodeCachedM0(row.cached_m0_bytes) ?? "",
 			m1: rendered.text,

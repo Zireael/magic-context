@@ -1,0 +1,10 @@
+{
+	"extends": "../packages/pi-plugin/tsconfig.json",
+	"compilerOptions": {
+		"typeRoots": ["../packages/plugin/node_modules/@types"],
+		"types": ["node", "bun"]
+	},
+	"include": ["fold-lock-fixture.ts"],
+	"exclude": [],
+	"references": []
+}

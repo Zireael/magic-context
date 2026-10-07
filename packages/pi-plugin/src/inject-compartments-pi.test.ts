@@ -37,6 +37,7 @@ import {
 	materializeM0Pi,
 	materializeM0PiWithRetry,
 	mustMaterializePi,
+	PiMaterializeContentionError,
 	renderM0Pi,
 	renderM1Pi,
 } from "./inject-compartments-pi";
@@ -72,6 +73,143 @@ function result(toolCallId: string) {
 		timestamp: 1,
 	};
 }
+
+describe("Pi render-to-commit concurrency", () => {
+	for (const change of ["memory", "compartment"] as const) {
+		it(`two connections retry a Pi fold when a ${change} arrives after m[1] rendering`, () => {
+			const dir = createTestTempDirFromPath(join(tmpdir(), "mc-pi-fold-cas-"));
+			const path = join(dir, "context.db");
+			const db = createTestDb(path);
+			db.exec("PRAGMA journal_mode=WAL");
+			const sibling = createTestDb(path);
+			const state = {
+				sessionId: "pi-concurrent",
+				projectIdentity: "git:pi-concurrent",
+				projectDirectory: dir,
+				injectDocs: false,
+			};
+			getOrCreateSessionMeta(db, state.sessionId);
+			let attempts = 0;
+			try {
+				const rendered = materializeM0PiWithRetry(
+					{
+						...state,
+						beforeCacheCommitForTest: () => {
+							attempts++;
+							if (attempts !== 1) return;
+							if (change === "memory")
+								insertMemory(sibling, {
+									projectPath: state.projectIdentity,
+									category: "ARCHITECTURE",
+									content: "Concurrent Pi memory",
+								});
+							else
+								appendCompartments(sibling, state.sessionId, [
+									{
+										sequence: 0,
+										startMessage: 0,
+										endMessage: 1,
+										startMessageId: "pi-concurrent-start",
+										endMessageId: "pi-concurrent-end",
+										title: "Concurrent Pi compartment",
+										content: "Concurrent Pi history",
+										p1: "Concurrent Pi history",
+										p2: "summary",
+										p3: "outcome",
+										p4: "anchor",
+										importance: 70,
+										legacy: 0,
+									},
+								]);
+						},
+					},
+					db,
+				);
+				expect(attempts).toBe(2);
+				expect(rendered.m0).toContain(
+					change === "memory"
+						? "Concurrent Pi memory"
+						: "Concurrent Pi history",
+				);
+				const meta = getOrCreateSessionMeta(db, state.sessionId);
+				expect(meta.cachedM0Bytes?.toString("utf8")).toBe(rendered.m0);
+				expect(meta.cachedM1Bytes?.toString("utf8")).toBe(rendered.m1);
+			} finally {
+				closeQuietly(sibling);
+				closeQuietly(db);
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		it(`two connections reject stale Pi soft-refresh bytes after a ${change} write`, () => {
+			const dir = createTestTempDirFromPath(
+				join(tmpdir(), "mc-pi-refresh-cas-"),
+			);
+			const path = join(dir, "context.db");
+			const db = createTestDb(path);
+			db.exec("PRAGMA journal_mode=WAL");
+			const sibling = createTestDb(path);
+			const state = {
+				sessionId: "pi-refresh-concurrent",
+				projectIdentity: "git:pi-concurrent",
+				projectDirectory: dir,
+				injectDocs: false,
+			};
+			try {
+				injectM0M1Pi(state, db, []);
+				const before = db
+					.prepare("SELECT * FROM session_meta WHERE session_id = ?")
+					.get(state.sessionId);
+				expect(() =>
+					injectM0M1Pi(
+						{
+							...state,
+							beforeCacheCommitForTest: () => {
+								if (change === "memory")
+									insertMemory(sibling, {
+										projectPath: state.projectIdentity,
+										category: "ARCHITECTURE",
+										content: "Concurrent Pi refresh memory",
+									});
+								else
+									appendCompartments(sibling, state.sessionId, [
+										{
+											sequence: 0,
+											startMessage: 0,
+											endMessage: 1,
+											startMessageId: "pi-concurrent-start",
+											endMessageId: "pi-refresh-end",
+											title: "Pi refresh compartment",
+											content: "Concurrent Pi refresh history",
+											p1: "Concurrent Pi refresh history",
+											p2: "summary",
+											p3: "outcome",
+											p4: "anchor",
+											importance: 70,
+											legacy: 0,
+										},
+									]);
+							},
+						},
+						db,
+						[],
+						undefined,
+						true,
+					),
+				).toThrow(PiMaterializeContentionError);
+				expect(
+					db
+						.prepare("SELECT * FROM session_meta WHERE session_id = ?")
+						.get(state.sessionId),
+				).toEqual(before);
+			} finally {
+				closeQuietly(sibling);
+				closeQuietly(db);
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+	}
+});
 
 describe("workspace memory sharing", () => {
 	it("filters foreign categories consistently in Pi m[0] and status counts", () => {

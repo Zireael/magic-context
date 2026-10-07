@@ -2670,6 +2670,135 @@ describe("m[0]/m[1] materialization", () => {
         expect(attempts).toBe(3);
     });
 
+    for (const change of ["memory", "compartment"] as const) {
+        it(`two connections retry a fold when a ${change} arrives after m[1] rendering`, () => {
+            const projectDirectory = makeProjectDir();
+            const path = join(projectDirectory, "context.db");
+            db = new Database(path);
+            initializeDatabase(db);
+            db.exec("PRAGMA journal_mode=WAL");
+            getOrCreateSessionMeta(db, SESSION_ID);
+            const sibling = new Database(path);
+            try {
+                let attempts = 0;
+                let commits = 0;
+                const result = materializeWithRetry({
+                    db,
+                    sessionId: SESSION_ID,
+                    state: readStateFromMeta(),
+                    projectPath: PROJECT_PATH,
+                    projectDirectory,
+                    beforeCacheCommitForTest: () => {
+                        attempts++;
+                        if (attempts !== 1) return;
+                        if (change === "memory") {
+                            insertMemory(sibling, {
+                                projectPath: PROJECT_PATH,
+                                category: "ARCHITECTURE",
+                                content: "Concurrent published memory",
+                            });
+                        } else {
+                            appendCompartments(sibling, SESSION_ID, [
+                                {
+                                    sequence: 0,
+                                    startMessage: 0,
+                                    endMessage: 1,
+                                    endMessageId: "concurrent-end",
+                                    title: "Concurrent compartment",
+                                    content: "Concurrent published history",
+                                    p1: "Concurrent published history",
+                                    p2: "summary",
+                                    p3: "outcome",
+                                    p4: "anchor",
+                                    importance: 70,
+                                    legacy: 0,
+                                },
+                            ]);
+                        }
+                    },
+                    onFoldPrepare: () => () => {
+                        commits++;
+                    },
+                });
+                expect(attempts).toBe(2);
+                expect(commits).toBe(1);
+                expect(result.m0Text).toContain(
+                    change === "memory"
+                        ? "Concurrent published memory"
+                        : "Concurrent published history",
+                );
+                const meta = getOrCreateSessionMeta(db, SESSION_ID);
+                expect(meta.cachedM0Bytes).toEqual(result.m0Bytes);
+                expect(meta.cachedM1Bytes).toEqual(result.m1Bytes);
+            } finally {
+                sibling.close();
+            }
+        });
+
+        it(`two connections reject stale soft-refresh bytes after a ${change} write`, () => {
+            const projectDirectory = makeProjectDir();
+            const path = join(projectDirectory, "context.db");
+            db = new Database(path);
+            initializeDatabase(db);
+            db.exec("PRAGMA journal_mode=WAL");
+            getOrCreateSessionMeta(db, SESSION_ID);
+            const state = readStateFromMeta();
+            injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+            });
+            const before = db
+                .prepare("SELECT * FROM session_meta WHERE session_id = ?")
+                .get(SESSION_ID);
+            const sibling = new Database(path);
+            try {
+                expect(() =>
+                    injectM0M1({
+                        db,
+                        sessionId: SESSION_ID,
+                        state,
+                        projectPath: PROJECT_PATH,
+                        projectDirectory,
+                        isCacheBustingPass: true,
+                        beforeCacheCommitForTest: () => {
+                            if (change === "memory")
+                                insertMemory(sibling, {
+                                    projectPath: PROJECT_PATH,
+                                    category: "ARCHITECTURE",
+                                    content: "Concurrent refresh memory",
+                                });
+                            else
+                                appendCompartments(sibling, SESSION_ID, [
+                                    {
+                                        sequence: 0,
+                                        startMessage: 0,
+                                        endMessage: 1,
+                                        endMessageId: "refresh-end",
+                                        title: "Refresh compartment",
+                                        content: "Concurrent refresh history",
+                                        p1: "Concurrent refresh history",
+                                        p2: "summary",
+                                        p3: "outcome",
+                                        p4: "anchor",
+                                        importance: 70,
+                                        legacy: 0,
+                                    },
+                                ]);
+                        },
+                    }),
+                ).toThrow(MaterializeContentionError);
+                expect(
+                    db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(SESSION_ID),
+                ).toEqual(before);
+            } finally {
+                sibling.close();
+            }
+        });
+    }
+
     it("injectM0M1 updates root cached state after successful materialization", () => {
         db = makeDb();
         const projectDirectory = makeProjectDir();
