@@ -33,6 +33,9 @@
   --text-primary: #e4e4ef;
   --text-secondary: #8888a0;
   --text-muted: #555566;
+  /* Secondary words and copyable ids that must stay quiet but readable (AA):
+     the muted grey where that passes, otherwise the secondary grey. */
+  --text-quiet: var(--text-secondary);
   --accent: #3b82f6;
   --accent-dim: #2563eb;
   /* Text and glyphs drawn on top of solid accent / status fills. */
@@ -72,6 +75,8 @@
   --chart-info: var(--accent);
   --chart-neutral: var(--text-muted);
   --chart-track: var(--border-light);
+  /* Dashed line marking a context window's size on the cache timeline. */
+  --chart-window: var(--text-secondary);
   --toggle-track: var(--bg-hover);
   --range-track: var(--border);
   /* On/off switch (dreamer task cards). */
@@ -91,65 +96,69 @@
   --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238888a0' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
 }
 
-/* Light theme: neutral cool-grey surfaces, white cards, and status colours
-   darkened so text on them (and on their 15% tints) meets WCAG AA. Chart fills
-   use separate, brighter tokens that keep 3:1 against white. The values are
-   asserted by src/lib/theme-contrast.test.ts. */
+/* Light theme: warm stone neutrals (a soft off-white page, slightly lighter
+   warm cards, warm-tinted borders and greys) so the page is not a stark white,
+   with near-neutral dark text. Status colours are darkened so text on them (and
+   on their 15% tints) meets WCAG AA; chart fills use separate, brighter tokens
+   that keep 3:1 against the cards. The values, and that the neutrals stay warm
+   without turning beige, are asserted by src/lib/theme-contrast.test.ts. */
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg-base: #f4f5f7;
-  --bg-panel: #fafbfc;
-  --bg-card: #ffffff;
-  --bg-hover: #eceef2;
-  --bg-active: #e9eefb;
-  --bg-input: #ffffff;
-  --border: #dfe2e8;
-  --border-light: #c4c9d2;
-  --border-control: #7f8896;
-  --border-control-hover: #5f6878;
-  --checkbox-border: #7f8896;
-  --text-primary: #1b2030;
-  --text-secondary: #485063;
-  --text-muted: #5f6878;
-  --accent: #1d4ed8;
+  --bg-base: #f4f1ec;
+  --bg-panel: #f9f7f3;
+  --bg-card: #fdfcfa;
+  --bg-hover: #eeeae3;
+  --bg-active: #e9ecf5;
+  --bg-input: #fffefc;
+  --border: #e4dfd6;
+  --border-light: #cfc8bd;
+  --border-control: #8b847a;
+  --border-control-hover: #6b655d;
+  --checkbox-border: #8b847a;
+  --text-primary: #1f1d1a;
+  --text-secondary: #4d4842;
+  --text-muted: #645e57;
+  --text-quiet: #645e57;
+  --accent: #1c4ad0;
   --accent-dim: #1e40af;
   --on-accent: #ffffff;
   --green: #166534;
   --green-dim: #14532d;
-  --amber: #934406;
+  --amber: #8f4206;
   --amber-dim: #7c3a06;
-  --red: #ab1d1d;
+  --red: #a91d1d;
   --red-dim: #991b1b;
   --purple: #7e22ce;
   --indigo: #4338ca;
   --success: #15803d;
-  --danger: #ab1d1d;
-  --error-bg: #fdeeee;
-  --error-border: #f1c4c4;
-  --error-text: #ab1d1d;
+  --danger: #a91d1d;
+  --error-bg: #fbeeeb;
+  --error-border: #efc6bf;
+  --error-text: #a91d1d;
   --restart-border: #e2c08f;
-  --focus-ring: #1d4ed8;
-  --badge-neutral-bg: #e3e6eb;
-  --badge-neutral-text: #3a4152;
-  --hover-wash: rgba(15, 23, 42, 0.03);
-  --overlay-backdrop: rgba(15, 23, 42, 0.32);
-  --overlay-panel-backdrop: rgba(15, 23, 42, 0.22);
-  --shadow-segment: 0 1px 3px rgba(15, 23, 42, 0.14);
-  --shadow-toast: 0 4px 12px rgba(15, 23, 42, 0.1);
-  --shadow-tooltip: 0 4px 14px rgba(15, 23, 42, 0.14);
-  --shadow-popover: 0 8px 24px rgba(15, 23, 42, 0.12);
-  --shadow-help: 0 8px 30px rgba(15, 23, 42, 0.16);
-  --shadow-modal: 0 12px 40px rgba(15, 23, 42, 0.18);
-  --chart-good: #16a34a;
-  --chart-warn: #d97706;
+  --focus-ring: #1c4ad0;
+  --badge-neutral-bg: #e8e3db;
+  --badge-neutral-text: #3d3933;
+  --hover-wash: rgba(60, 45, 30, 0.035);
+  --overlay-backdrop: rgba(28, 25, 23, 0.32);
+  --overlay-panel-backdrop: rgba(28, 25, 23, 0.22);
+  --shadow-segment: 0 1px 3px rgba(41, 33, 25, 0.14);
+  --shadow-toast: 0 4px 12px rgba(41, 33, 25, 0.1);
+  --shadow-tooltip: 0 4px 14px rgba(41, 33, 25, 0.14);
+  --shadow-popover: 0 8px 24px rgba(41, 33, 25, 0.12);
+  --shadow-help: 0 8px 30px rgba(41, 33, 25, 0.16);
+  --shadow-modal: 0 12px 40px rgba(41, 33, 25, 0.18);
+  --chart-good: #15803d;
+  --chart-warn: #c26a05;
   --chart-bad: #dc2626;
   --chart-info: #2563eb;
-  --chart-neutral: #7f8896;
-  --chart-track: #c4c9d2;
-  --toggle-track: #dfe3ea;
-  --range-track: #d3d8e0;
-  --switch-off: #858e9b;
-  --switch-on: #16a34a;
+  --chart-neutral: #8b847a;
+  --chart-track: #d6cfc4;
+  --chart-window: #8b847a;
+  --toggle-track: #e5e0d7;
+  --range-track: #d9d3c9;
+  --switch-off: #8f887e;
+  --switch-on: #15803d;
   --chart-system: #9333ea;
   --chart-system-text: #ffffff;
   --chart-compartments: #2563eb;
@@ -158,9 +167,9 @@
   --chart-facts-text: #1a1a1a;
   --chart-memories: #15803d;
   --chart-memories-text: #ffffff;
-  --chart-conversation: #b8c0cc;
+  --chart-conversation: #c4bcb1;
   --chart-conversation-text: #1a1a1a;
-  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%235f6878' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b655d' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
 }
 
 /* Keyboard focus is always visible, in both themes. Components that draw their
@@ -234,7 +243,7 @@ body {
 
 .nav-item {
   width: 100%;
-  height: 40px;
+  height: 34px;
   display: flex;
   flex-direction: row;
   align-items: center;
@@ -246,8 +255,9 @@ body {
   background: transparent;
   color: var(--text-secondary);
   gap: 10px;
-  padding: 0 12px;
+  padding: 0 10px;
   position: relative;
+  font-family: var(--sans-font);
 }
 
 .nav-item:hover {
@@ -264,22 +274,24 @@ body {
   content: "";
   position: absolute;
   left: -8px;
-  top: 8px;
-  bottom: 8px;
+  top: 9px;
+  bottom: 9px;
   width: 3px;
   background: var(--accent);
   border-radius: 0 2px 2px 0;
 }
 
 .nav-icon {
-  font-size: 16px;
-  width: 20px;
-  text-align: center;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
 }
 
 .nav-label {
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 500;
   letter-spacing: 0.01em;
   white-space: nowrap;
@@ -366,17 +378,39 @@ body {
   border-top: 1px solid var(--border);
   display: flex;
   align-items: center;
-  padding: 0 12px;
-  gap: 16px;
+  padding: 0 14px;
+  gap: 0;
   font-size: 11px;
   color: var(--text-secondary);
-  font-family: var(--mono-font);
+  font-family: var(--sans-font);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 .status-item {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
+  padding: 0 12px;
+}
+
+.status-item:first-child {
+  padding-left: 0;
+}
+
+/* Thin separators between the strip's items instead of wide gaps. */
+.status-item + .status-item {
+  border-left: 1px solid var(--border);
+}
+
+.status-icon {
+  color: var(--text-quiet);
+}
+
+.status-value {
+  color: var(--text-secondary);
+  font-weight: 600;
 }
 
 .status-dot {
@@ -401,6 +435,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
   flex-shrink: 0;
 }
 
@@ -408,6 +444,145 @@ body {
   font-size: 16px;
   font-weight: 600;
   color: var(--text-primary);
+  letter-spacing: -0.005em;
+}
+
+/* Small label naming a block of a page ("Recent sessions", "Turns"). */
+.section-eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+/* ── Toolbar ─────────────────────────────────────────────
+   Page controls in groups (pickers · filters · live state), every control the
+   same 28px height so pickers, toggles and buttons line up. */
+.toolbar {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.toolbar-group + .toolbar-group {
+  padding-left: 16px;
+  border-left: 1px solid var(--border);
+}
+
+.toolbar-btn,
+.toggle-chip {
+  height: 28px;
+  padding: 0 10px;
+}
+
+.toolbar-btn {
+  gap: 6px;
+}
+
+/* A two-state filter: pressed shows a tick and an accent tint, the label stays. */
+.toggle-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-family: var(--sans-font);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.toggle-chip:hover {
+  border-color: var(--border-control-hover);
+  color: var(--text-primary);
+}
+
+.toggle-chip[aria-pressed="true"] {
+  background: var(--bg-active);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.live-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--green);
+  padding-right: 2px;
+}
+
+.live-status.paused {
+  color: var(--text-quiet);
+}
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--chart-good);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--chart-good) 18%, transparent);
+}
+
+.live-status.paused .live-dot {
+  background: var(--chart-neutral);
+  box-shadow: none;
+}
+
+/* ── Icons, figures, ids ─────────────────────────────── */
+.icon {
+  flex-shrink: 0;
+  display: block;
+}
+
+/* Figures in the UI font with even-width digits, so columns of numbers line up
+   without falling back to monospace. */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* A literal id worth copying: monospace, small and quiet so it never competes
+   with the readable name beside it. */
+.id-text {
+  font-family: var(--mono-font);
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-quiet);
+  letter-spacing: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Outside buttons, one click selects the whole id for copying. */
+.id-text.selectable {
+  user-select: all;
+  cursor: text;
+}
+
+/* A secondary word next to a name (the run's owner, "unmanaged"). */
+.quiet-label {
+  font-size: 11px;
+  color: var(--text-quiet);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .section-actions {
@@ -871,8 +1046,9 @@ body {
 }
 
 .tab-pill.active {
-  background: var(--accent);
-  color: var(--on-accent);
+  background: var(--bg-active);
+  color: var(--accent);
+  font-weight: 600;
 }
 
 /* ── Scrollable list ─────────────────────────────────── */
@@ -889,9 +1065,11 @@ body {
 }
 
 /* ── Mono values ─────────────────────────────────────── */
+/* Literal values that are read character by character (paths, model ids,
+   code). Figures use .num instead, and copyable ids use .id-text. */
 .mono {
   font-family: var(--mono-font);
-  font-size: 12px;
+  font-size: 11.5px;
 }
 
 /* ── Empty state ─────────────────────────────────────── */
@@ -960,41 +1138,311 @@ body {
   background: var(--chart-bad);
 }
 
-/* ── Cache turn rows ─────────────────────────────────── */
-.cache-turn-expanded {
-  margin-top: 8px;
+/* ── Cache page ──────────────────────────────────────── */
+.cache-section {
+  padding: 0 20px 14px;
+  flex-shrink: 0;
+}
+
+.cache-activity-note {
+  font-size: 11px;
+  color: var(--amber);
+  margin-bottom: 8px;
+}
+
+/* Recent-session strip: one non-wrapping row of equal-width cards. */
+.cache-card-row {
+  display: flex;
+  flex-wrap: nowrap;
+}
+
+.cache-card {
+  flex: 1 1 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-}
-
-.cache-step-row {
+  align-items: stretch;
+  gap: 2px;
+  padding: 10px 12px;
+  text-align: left;
+  font-family: var(--sans-font);
+  background: var(--bg-card);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--bg-base);
-  padding: 8px 10px;
-}
-.cache-step-row.selected,
-.card.cache-step-selected {
-  border-color: var(--accent);
-  background: var(--bg-active);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition:
+    border-color var(--transition-fast),
+    box-shadow var(--transition-fast);
 }
 
-.cache-step-header {
+.cache-card:hover {
+  border-color: var(--border-light);
+}
+
+.cache-card.active {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.cache-card > span {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.cache-card-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 18px;
+  text-overflow: ellipsis;
+}
+
+.cache-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 18px;
+}
+
+.cache-card-meta .pill {
+  flex-shrink: 0;
+}
+
+.cache-card-figure {
+  margin-top: 4px;
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 28px;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+}
+
+.cache-card-foot {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 4px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.cache-card-note {
+  color: var(--text-quiet);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cache-card-busts {
+  color: var(--red);
+  font-weight: 500;
+}
+
+/* Timeline header: session name and step count, then model and window fill. */
+.cache-chart {
+  padding: 14px 16px 12px;
+}
+
+.cache-chart-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px 16px;
+  margin-bottom: 10px;
+}
+
+.cache-chart-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
 }
 
-.cache-step-meta {
+.cache-chart-title .pill {
+  flex-shrink: 0;
+}
+
+.cache-chart-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cache-chart-steps {
   font-size: 11px;
   color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  justify-self: end;
+  white-space: nowrap;
+}
+
+.cache-chart-sub {
   display: flex;
-  gap: 8px;
-  align-items: center;
   flex-wrap: wrap;
+  gap: 2px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  min-width: 0;
+}
+
+/* How full the context window is: label, small meter, figures. */
+.context-fill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  justify-self: end;
+  white-space: nowrap;
+}
+
+.context-fill-label {
+  color: var(--text-quiet);
+}
+
+.context-fill-meter {
+  width: 72px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--chart-track);
+  overflow: hidden;
+}
+
+.context-fill-value {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--chart-info);
+}
+
+.context-fill-value.over {
+  background: var(--chart-bad);
+}
+
+.context-fill-pct {
+  color: var(--text-primary);
+  font-weight: 600;
+  min-width: 30px;
+  text-align: right;
+}
+
+/* Turn list: one bordered table, a hairline between rows. */
+.cache-turns {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.cache-turn-grid {
+  display: grid;
+  grid-template-columns:
+    minmax(92px, 1fr) minmax(108px, 1.5fr) minmax(64px, 0.8fr) minmax(76px, 1fr)
+    minmax(76px, 1fr) minmax(64px, 0.8fr) minmax(70px, 0.8fr);
+  align-items: center;
+  column-gap: 12px;
+  padding: 7px 14px;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.cache-turn-grid > .num {
+  text-align: right;
+}
+
+.cache-turn-grid > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cache-turns-head {
+  padding-top: 8px;
+  padding-bottom: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.cache-turn + .cache-turn {
+  border-top: 1px solid var(--border);
+}
+
+.cache-turn-main.expandable {
+  cursor: pointer;
+}
+
+.cache-turn-main.expandable:hover {
+  background: var(--bg-hover);
+}
+
+/* Busts get a red edge so they stand out down the list. */
+.cache-turn.tone-red > .cache-turn-main,
+.cache-step-row.tone-red > .cache-turn-grid {
+  box-shadow: inset 2px 0 0 var(--chart-bad);
+}
+
+.cache-cell-time {
+  color: var(--text-secondary);
+}
+
+.cache-turn-grid > .cache-cell-time {
+  text-align: left;
+}
+
+.cache-cell-hit {
+  font-weight: 600;
+}
+
+.cache-cell-muted {
+  color: var(--text-quiet);
+}
+
+.cache-cell-steps {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--text-secondary);
+}
+
+.cache-status-text {
+  color: var(--text-secondary);
+}
+
+.cache-turn-cause {
+  padding: 0 14px 8px;
+  margin-top: -3px;
+  font-size: 11px;
+}
+
+/* A turn's steps, newest first, set in from the turn row. */
+.cache-steps {
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+  padding: 2px 0;
+}
+
+.cache-step-row > .cache-turn-grid {
+  padding-top: 5px;
+  padding-bottom: 5px;
+  font-size: 11.5px;
+}
+
+.cache-step-row > .cache-turn-grid > :first-child {
+  padding-left: 14px;
+}
+
+.cache-step-row.selected {
+  background: var(--bg-active);
 }
 
 /* ── Centered modal ──────────────────────────────────── */
@@ -1210,7 +1658,7 @@ body {
 }
 
 .kv-table td:last-child {
-  font-family: var(--mono-font);
+  font-variant-numeric: tabular-nums;
   color: var(--text-primary);
 }
 
@@ -1316,7 +1764,7 @@ body {
    A full-height marker line flags steps where MC reclaimed context. */
 .ctx-chart {
   position: relative;
-  height: 120px;
+  height: 148px;
 }
 /* Horizontal row of per-context-window segments. Each segment grows in
    proportion to how many steps it holds (flex-grow set inline = event count). */
@@ -1328,11 +1776,37 @@ body {
 }
 .ctx-segment {
   display: flex;
-  align-items: stretch;
-  gap: 5px;
+  flex-direction: column;
+  gap: 4px;
   flex-shrink: 1;
   flex-basis: 0;
   min-width: 46px;
+}
+/* One line above a segment naming its context window: with a dashed swatch
+   when the window is the axis top, or an arrow when it is above the scale. */
+.ctx-segment-caption {
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.ctx-window-swatch {
+  width: 14px;
+  border-top: 1px dashed var(--chart-window);
+}
+.ctx-segment-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
 }
 /* Vertical divider between two windows, labelled "old → new" (e.g. 1M → 256k). */
 .ctx-model-divider {
@@ -1355,8 +1829,8 @@ body {
 .ctx-model-divider-label {
   writing-mode: vertical-rl;
   transform: rotate(180deg);
-  font-size: 8px;
-  font-family: var(--font-mono, monospace);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
   background: var(--bg-card);
   padding: 3px 1px;
@@ -1388,25 +1862,29 @@ body {
 }
 .ctx-drop-tip-row {
   color: var(--text-secondary);
-  font-family: var(--mono-font);
-  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
 }
 .ctx-drop-tip-hint {
   color: var(--text-muted);
   font-size: 10px;
   margin-top: 2px;
 }
+/* Axis labels sit beside the box; the top padding lines the top label up with
+   the bars' top (the box reserves a strip above the bars for bust ticks). */
 .ctx-axis {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
   align-items: flex-end;
-  width: 30px;
+  width: 32px;
   flex-shrink: 0;
-  font-size: 9px;
-  font-family: var(--font-mono, monospace);
-  color: var(--text-muted);
-  padding: 1px 0;
+  font-size: 10px;
+  line-height: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-quiet);
+  padding: 4px 0 0;
+  margin-bottom: -6px;
 }
 /* The rounded box that holds one context window's bars. Its own border + radius
    make each window read as a distinct panel with its own scale. */
@@ -1418,7 +1896,7 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: color-mix(in srgb, var(--bg-active) 30%, transparent);
-  padding: 0 2px;
+  padding: 10px 3px 0;
 }
 .ctx-gridline {
   position: absolute;
@@ -1426,8 +1904,17 @@ body {
   right: 0;
   height: 1px;
   background: var(--border);
-  opacity: 0.4;
   pointer-events: none;
+}
+/* The context window, when it is the axis top. */
+.ctx-window-line {
+  position: absolute;
+  top: 0;
+  left: -3px;
+  right: -3px;
+  border-top: 1px dashed var(--chart-window);
+  pointer-events: none;
+  z-index: 1;
 }
 .ctx-bars {
   position: relative;
@@ -1439,7 +1926,7 @@ body {
 .ctx-bar-slot {
   flex: 1 1 0;
   min-width: 1px;
-  max-width: 16px;
+  max-width: 18px;
   height: 100%;
   position: relative;
   display: flex;
@@ -1480,10 +1967,27 @@ body {
 .ctx-bar:hover {
   opacity: 0.85;
 }
-/* full_bust has cache_read=0 → no inner segment to color, so tint the whole
-   bar red. Regular bust shows its color via the inner segment below. */
+/* A bust's uncached part is tinted red too, so the whole bar reads as a bust
+   rather than a grey bar with a thin red base. A full bust (nothing read from
+   the cache) is tinted more strongly. */
+.ctx-bar.bust {
+  background: color-mix(in srgb, var(--chart-bad) 35%, var(--chart-track));
+}
 .ctx-bar.full_bust {
-  background: color-mix(in srgb, var(--chart-bad) 55%, var(--chart-track));
+  background: color-mix(in srgb, var(--chart-bad) 60%, var(--chart-track));
+}
+/* Red tick in the strip above the bars, so a bust is visible at any density
+   and whatever its height. */
+.ctx-bust-mark {
+  position: absolute;
+  top: -8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: max(100%, 4px);
+  height: 4px;
+  border-radius: 2px;
+  background: var(--chart-bad);
+  pointer-events: none;
 }
 .ctx-bar.overflow {
   box-shadow: inset 0 2px 0 0 var(--chart-bad);
@@ -1525,6 +2029,42 @@ body {
   background: var(--chart-neutral);
 }
 
+/* Legend under the timeline. */
+.ctx-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px 14px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.ctx-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.ctx-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+.ctx-legend-swatch.cached {
+  background: var(--chart-good);
+}
+.ctx-legend-swatch.uncached {
+  background: var(--chart-track);
+}
+.ctx-legend-swatch.bust {
+  background: var(--chart-bad);
+}
+.ctx-legend-swatch.reclaim {
+  width: 2px;
+  height: 12px;
+  border-radius: 0;
+  background: var(--chart-info);
+}
+
 /* ── Stat banner ─────────────────────────────────────── */
 .stat-banner {
   display: flex;
@@ -1552,7 +2092,7 @@ body {
 .stat-value {
   font-size: 14px;
   font-weight: 600;
-  font-family: var(--mono-font);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ── Dreamer run history ─────────────────────────────── */
@@ -2862,6 +3402,12 @@ select.config-input {
   font-size: 12px;
 }
 
+/* Pickers in a page toolbar match the toolbar's 28px buttons and toggles. */
+.toolbar .fsel-trigger {
+  height: 28px;
+  padding: 0 10px;
+}
+
 /* ── Update toast ────────────────────────────────────── */
 .update-toast {
   display: flex;
@@ -2887,8 +3433,8 @@ select.config-input {
 }
 
 .update-toast-icon {
-  font-size: 18px;
-  line-height: 1;
+  display: flex;
+  color: var(--accent);
 }
 
 .update-toast-text {
@@ -3086,6 +3632,7 @@ select.config-input {
   gap: 14px;
   font-size: 12px;
   color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
 }
 
 .project-card-stat strong {

@@ -6,6 +6,7 @@ import StatusBar from "./components/Layout/StatusBar";
 import LogViewer from "./components/LogViewer/LogViewer";
 import ProjectDetail from "./components/Projects/ProjectDetail";
 import ProjectsGrid from "./components/Projects/ProjectsGrid";
+import Icon from "./components/shared/Icon";
 import UserMemories from "./components/UserMemories/UserMemories";
 import WorkspacesPanel from "./components/WorkspacesPanel/WorkspacesPanel";
 import { getDbHealth, getModelCatalogs, getOpencodeInstallState } from "./lib/api";
@@ -125,7 +126,9 @@ export default function App() {
         <Show when={updateVersion() && !updateDismissed()}>
           <div class="update-toast">
             <div class="update-toast-content">
-              <span class="update-toast-icon">⬆</span>
+              <span class="update-toast-icon">
+                <Icon name="arrow-up-circle" size={18} />
+              </span>
               <div class="update-toast-text">
                 <strong>Update available</strong>
                 <span>v{updateVersion()} is ready to install</span>
