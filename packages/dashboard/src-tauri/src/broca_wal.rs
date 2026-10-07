@@ -43,6 +43,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -617,6 +618,30 @@ impl WalCursor {
     }
 }
 
+/// Bytes this process has read from Broca WAL files and archive containers,
+/// for measuring what a Cache tab refresh costs (`bench_cache_poll`).
+static BYTES_READ: AtomicU64 = AtomicU64::new(0);
+
+pub fn bytes_read_total() -> u64 {
+    BYTES_READ.load(Ordering::Relaxed)
+}
+
+/// The (device, inode) pair naming the file behind `metadata`, so a reader can
+/// tell a file replaced at the same path from the one it already read. `None`
+/// where the platform does not expose it; callers then rely on length alone.
+pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
 fn read_exact_at<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
@@ -625,6 +650,7 @@ fn read_exact_at<R: Read + Seek>(
     reader.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0; len as usize];
     reader.read_exact(&mut buf)?;
+    BYTES_READ.fetch_add(len, Ordering::Relaxed);
     Ok(buf)
 }
 

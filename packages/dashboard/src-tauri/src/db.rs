@@ -4,7 +4,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::broca_wal;
 use crate::external_cache_sessions;
@@ -341,8 +341,32 @@ impl OpenCodeSessions {
 }
 
 fn resolve_opencode_sessions(conn: &Connection) -> Result<OpenCodeSessions, rusqlite::Error> {
-    let mut generations = Vec::new();
+    let generations = opencode_store_generations(conn)?;
     let mut owners = HashMap::new();
+    for &generation in &generations {
+        if !table_exists(conn, opencode_session_table(generation)) {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM {}",
+            opencode_session_table(generation)
+        ))?;
+        for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            owners.insert(id?, generation);
+        }
+    }
+    Ok(OpenCodeSessions {
+        generations,
+        owners,
+    })
+}
+
+/// The session generations an OpenCode store holds, oldest first. A later
+/// generation's row owns an id both tables hold.
+fn opencode_store_generations(
+    conn: &Connection,
+) -> Result<Vec<OpenCodeStoreGeneration>, rusqlite::Error> {
+    let mut generations = Vec::new();
     // OpenCode 1 can create session_message before an upgrade, so its
     // presence alone does not identify V2. Only a populated session_v2
     // alongside session_message adds V2 ownership to a mixed store.
@@ -362,18 +386,6 @@ fn resolve_opencode_sessions(conn: &Connection) -> Result<OpenCodeSessions, rusq
     if generations.is_empty() && table_exists(conn, "project") {
         generations.push(OpenCodeStoreGeneration::V1);
     }
-    for &generation in &generations {
-        if !table_exists(conn, opencode_session_table(generation)) {
-            continue;
-        }
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id FROM {}",
-            opencode_session_table(generation)
-        ))?;
-        for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
-            owners.insert(id?, generation);
-        }
-    }
     if generations.is_empty() {
         return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
             std::io::Error::new(
@@ -382,10 +394,7 @@ fn resolve_opencode_sessions(conn: &Connection) -> Result<OpenCodeSessions, rusq
             ),
         )));
     }
-    Ok(OpenCodeSessions {
-        generations,
-        owners,
-    })
+    Ok(generations)
 }
 
 fn open_opencode_sessions(
@@ -2094,14 +2103,22 @@ fn resolve_session_context_limits_from_conn(
     if keys.is_empty() {
         return out;
     }
+    // Only the wanted sessions, by primary key: session_meta rows are wide
+    // (cached prompt blobs sit before this column), so filtering the whole
+    // table read every row of a busy store (35 MB) on each events fetch.
+    let wanted: Vec<&str> = keys.iter().map(|(_, id)| id.as_str()).collect();
+    let Ok(wanted) = serde_json::to_string(&wanted) else {
+        return out;
+    };
     let Ok(mut stmt) = conn.prepare(
         "SELECT session_id, harness, COALESCE(last_usage_context_limit, 0)
          FROM session_meta
-         WHERE COALESCE(last_usage_context_limit, 0) > 0",
+         WHERE session_id IN (SELECT value FROM json_each(?1))
+           AND COALESCE(last_usage_context_limit, 0) > 0",
     ) else {
         return out;
     };
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([wanted], |row| {
         let sid: String = row.get(0)?;
         let harness_str: String = row.get(1)?;
         let limit: i64 = row.get(2)?;
@@ -2872,7 +2889,7 @@ pub fn get_cache_events_from_db(limit: usize, since_timestamp: Option<i64>) -> V
     build_db_cache_events(rows, true)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CacheSessionListEntry {
     harness: Harness,
     session_id: String,
@@ -3385,47 +3402,67 @@ const FIRST_OPENCODE2_CACHE_EVENT_SQL: &str = "SELECT time_created
      LIMIT 1";
 
 type OpenCodeCachePresenceCache = HashMap<String, (i64, bool)>;
-static OPENCODE_CACHE_PRESENCE: OnceLock<RwLock<OpenCodeCachePresenceCache>> = OnceLock::new();
 
-fn opencode_cache_presence() -> &'static RwLock<OpenCodeCachePresenceCache> {
-    OPENCODE_CACHE_PRESENCE.get_or_init(|| RwLock::new(HashMap::new()))
+mod opencode_list_cache;
+
+static OPENCODE_LIST_CACHE: OnceLock<Mutex<Option<opencode_list_cache::OpenCodeListCache>>> =
+    OnceLock::new();
+
+/// Runs `f` on the process-wide OpenCode list cache for the current store,
+/// (re)opening it when the store path or file changed. `None` when there is
+/// no OpenCode store or it cannot be opened.
+fn with_opencode_list_cache<T>(
+    f: impl FnOnce(&mut opencode_list_cache::OpenCodeListCache) -> T,
+) -> Option<T> {
+    let path = resolve_opencode_db_path()?;
+    let mut guard = OPENCODE_LIST_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()?;
+    if !guard.as_ref().is_some_and(|cache| cache.serves(&path)) {
+        *guard = None;
+        *guard = Some(opencode_list_cache::OpenCodeListCache::open(&path).ok()?);
+    }
+    guard.as_mut().map(f)
 }
 
 /// The recent OpenCode sessions for the Cache tab, plus a note to show when
 /// OpenCode 2 sessions can only be dated by their session row (see
-/// `OPENCODE2_ACTIVITY_FALLBACK_NOTE`).
+/// `OPENCODE2_ACTIVITY_FALLBACK_NOTE`). Served from `OpenCodeListCache`,
+/// which reads only what changed since the previous poll.
 fn load_recent_opencode_cache_sessions(
     limit: usize,
     hidden_subagent_ids: &HashSet<String>,
 ) -> (Vec<CacheSessionListEntry>, Option<&'static str>) {
-    let Some(path) = resolve_opencode_db_path() else {
-        return (Vec::new(), None);
-    };
-    let Ok((conn, resolved)) = open_opencode_sessions(&path) else {
+    with_opencode_list_cache(|cache| {
+        cache.recent_sessions(limit, hidden_subagent_ids, std::time::Instant::now())
+    })
+    .unwrap_or((Vec::new(), None))
+}
+
+/// The same list from one connection with nothing kept between calls: the
+/// reference `OpenCodeListCache` must agree with.
+#[cfg(test)]
+fn load_recent_opencode_cache_sessions_uncached(
+    conn: &Connection,
+    limit: usize,
+    hidden_subagent_ids: &HashSet<String>,
+) -> (Vec<CacheSessionListEntry>, Option<&'static str>) {
+    let Ok(resolved) = resolve_opencode_sessions(conn) else {
         return (Vec::new(), None);
     };
     let note = resolved
         .generations
         .iter()
-        .find_map(|&generation| opencode_cache_activity_note(&conn, generation));
+        .find_map(|&generation| opencode_cache_activity_note(conn, generation));
     let mut sessions = Vec::new();
     for &generation in &resolved.generations {
-        let rows = if let Ok(mut cache) = opencode_cache_presence().write() {
-            load_recent_opencode_cache_sessions_with_cache(
-                &conn,
-                generation,
-                limit,
-                hidden_subagent_ids,
-                &mut cache,
-            )
-        } else {
-            load_recent_opencode_cache_sessions_from_conn(
-                &conn,
-                generation,
-                limit,
-                hidden_subagent_ids,
-            )
-        };
+        let rows = load_recent_opencode_cache_sessions_from_conn(
+            conn,
+            generation,
+            limit,
+            hidden_subagent_ids,
+        );
         sessions.extend(
             rows.into_iter()
                 .filter(|row| resolved.owns(&row.session_id, generation)),
@@ -3445,6 +3482,7 @@ fn opencode_cache_activity_note(
         .then_some(OPENCODE2_ACTIVITY_FALLBACK_NOTE)
 }
 
+#[cfg(test)]
 fn load_recent_opencode_cache_sessions_from_conn(
     conn: &Connection,
     generation: OpenCodeStoreGeneration,
@@ -3467,18 +3505,9 @@ fn load_recent_opencode_cache_sessions_with_cache(
     hidden_subagent_ids: &HashSet<String>,
     presence_cache: &mut OpenCodeCachePresenceCache,
 ) -> Vec<CacheSessionListEntry> {
-    const ABSOLUTE_MAX_SCANNED_SESSIONS: usize = 2_000;
     if limit == 0 {
         return Vec::new();
     }
-
-    // One extra result budget after the first 4x page gets past a dense recent
-    // run of eventless or hidden sessions. The floor gives small requests the
-    // same protection without letting metadata polling grow unbounded.
-    let max_scanned_sessions = limit
-        .saturating_mul(5)
-        .clamp(256, ABSOLUTE_MAX_SCANNED_SESSIONS);
-    let batch_size = limit.saturating_mul(4).clamp(1, max_scanned_sessions);
     let activity = opencode_cache_activity(conn, generation);
     let mut candidate_sql = recent_opencode_cache_sessions_sql(generation, activity);
     if generation == OpenCodeStoreGeneration::V1
@@ -3498,10 +3527,59 @@ fn load_recent_opencode_cache_sessions_with_cache(
     let Ok(mut candidates_stmt) = conn.prepare(&candidate_sql) else {
         return Vec::new();
     };
-    let harness = match generation {
+    let harness = opencode_generation_harness(generation);
+    filter_opencode_cache_candidates(
+        conn,
+        generation,
+        limit,
+        hidden_subagent_ids,
+        presence_cache,
+        |page_limit, offset| {
+            let rows = candidates_stmt
+                .query_map(params![page_limit, offset], |row| {
+                    Ok(CacheSessionListEntry {
+                        harness,
+                        session_id: row.get(0)?,
+                        last_activity_ms: row.get(1)?,
+                        title: row.get(2)?,
+                    })
+                })
+                .ok()?;
+            Some(rows.flatten().collect())
+        },
+    )
+}
+
+fn opencode_generation_harness(generation: OpenCodeStoreGeneration) -> Harness {
+    match generation {
         OpenCodeStoreGeneration::V1 => Harness::Opencode,
         OpenCodeStoreGeneration::V2 => Harness::Opencode2,
-    };
+    }
+}
+
+/// Walks candidate sessions newest first, `page(limit, offset)` at a time,
+/// and keeps those that are not hidden and hold at least one cache event,
+/// until `limit` are found or the scan budget runs out.
+fn filter_opencode_cache_candidates(
+    conn: &Connection,
+    generation: OpenCodeStoreGeneration,
+    limit: usize,
+    hidden_subagent_ids: &HashSet<String>,
+    presence_cache: &mut OpenCodeCachePresenceCache,
+    mut page: impl FnMut(i64, i64) -> Option<Vec<CacheSessionListEntry>>,
+) -> Vec<CacheSessionListEntry> {
+    const ABSOLUTE_MAX_SCANNED_SESSIONS: usize = 2_000;
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    // One extra result budget after the first 4x page gets past a dense recent
+    // run of eventless or hidden sessions. The floor gives small requests the
+    // same protection without letting metadata polling grow unbounded.
+    let max_scanned_sessions = limit
+        .saturating_mul(5)
+        .clamp(256, ABSOLUTE_MAX_SCANNED_SESSIONS);
+    let batch_size = limit.saturating_mul(4).clamp(1, max_scanned_sessions);
     let (recent_messages_sql, first_event_sql) = match generation {
         OpenCodeStoreGeneration::V1 => (
             RECENT_OPENCODE_SESSION_MESSAGES_SQL,
@@ -3529,18 +3607,8 @@ fn load_recent_opencode_cache_sessions_with_cache(
         let Ok(offset) = i64::try_from(scanned) else {
             break;
         };
-        let page = {
-            let Ok(rows) = candidates_stmt.query_map(params![page_limit, offset], |row| {
-                Ok(CacheSessionListEntry {
-                    harness,
-                    session_id: row.get(0)?,
-                    last_activity_ms: row.get(1)?,
-                    title: row.get(2)?,
-                })
-            }) else {
-                break;
-            };
-            rows.flatten().collect::<Vec<_>>()
+        let Some(page) = page(page_limit, offset) else {
+            break;
         };
         let page_len = page.len();
         scanned = scanned.saturating_add(page_len);
@@ -3549,9 +3617,16 @@ fn load_recent_opencode_cache_sessions_with_cache(
             if hidden_subagent_ids.contains(&candidate.session_id) {
                 continue;
             }
+            // A session that once held a cache event is not probed again when
+            // its activity moves; only a session without one is. Re-probing
+            // every active session read up to 200 of its newest message
+            // bodies on every poll. (A revert that deletes every assistant
+            // message would leave the session listed with an empty window.)
             let cached_presence = presence_cache
                 .get(&candidate.session_id)
-                .filter(|(time_updated, _)| *time_updated == candidate.last_activity_ms)
+                .filter(|(time_updated, has_event)| {
+                    *has_event || *time_updated == candidate.last_activity_ms
+                })
                 .map(|(_, has_event)| *has_event);
             let has_event = cached_presence.unwrap_or_else(|| {
                 // Most active sessions have a cache event in their newest rows.
@@ -6642,14 +6717,85 @@ fn session_matches_filter(row: &SessionRow, filter: &SessionFilter) -> bool {
 /// under that label while the host store still lists the session as OpenCode.
 /// Match either label so the dashboard filter still sees those rows.
 fn load_subagent_map_for_harness(harness: Harness) -> std::collections::HashMap<String, bool> {
+    let Some(db_path) = resolve_db_path() else {
+        return HashMap::new();
+    };
+    static CACHE: OnceLock<Mutex<Option<SubagentMapCache>>> = OnceLock::new();
+    let Ok(mut guard) = CACHE.get_or_init(|| Mutex::new(None)).lock() else {
+        return HashMap::new();
+    };
+    let file_key = std::fs::metadata(&db_path)
+        .ok()
+        .as_ref()
+        .and_then(broca_wal::file_identity);
+    if !guard
+        .as_ref()
+        .is_some_and(|cache| cache.path == db_path && cache.file_key == file_key)
+    {
+        *guard = None;
+        let Ok(conn) = open_readonly(&db_path) else {
+            return HashMap::new();
+        };
+        *guard = Some(SubagentMapCache {
+            path: db_path,
+            file_key,
+            conn,
+            data_version: None,
+            computed_at: std::time::Instant::now(),
+            maps: HashMap::new(),
+        });
+    }
+    let cache = guard.as_mut().expect("set above");
+    let Ok(version) = cache
+        .conn
+        .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+    else {
+        *guard = None;
+        return HashMap::new();
+    };
+    // context.db is written on every Magic Context transform, so its data
+    // version moves almost every poll while a session runs. `is_subagent` is
+    // set when a session starts and does not change after, so a map up to
+    // SUBAGENT_MAP_MAX_AGE old is kept rather than scanning `session_meta`
+    // (16 MB on a busy store) once per harness per poll. OpenCode children
+    // are also flagged from the OpenCode store's own parent ids, which follow
+    // every poll.
+    const SUBAGENT_MAP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+    if cache.data_version != Some(version) && cache.computed_at.elapsed() >= SUBAGENT_MAP_MAX_AGE {
+        cache.maps.clear();
+    }
+    if cache.maps.is_empty() {
+        cache.data_version = Some(version);
+        cache.computed_at = std::time::Instant::now();
+    }
+    let group = match harness {
+        Harness::Opencode | Harness::Opencode2 => Harness::Opencode,
+        other => other,
+    };
+    if !cache.maps.contains_key(&group) {
+        let map = load_subagent_map_from_conn(&cache.conn, harness);
+        cache.maps.insert(group, map);
+    }
+    cache.maps.get(&group).cloned().unwrap_or_default()
+}
+
+/// `load_subagent_map_for_harness`'s connection to context.db, kept between
+/// polls with the maps it last read.
+struct SubagentMapCache {
+    path: PathBuf,
+    file_key: Option<(u64, u64)>,
+    conn: Connection,
+    data_version: Option<i64>,
+    computed_at: std::time::Instant,
+    maps: HashMap<Harness, HashMap<String, bool>>,
+}
+
+fn load_subagent_map_from_conn(
+    conn: &Connection,
+    harness: Harness,
+) -> std::collections::HashMap<String, bool> {
     use std::collections::HashMap;
     let mut map: HashMap<String, bool> = HashMap::new();
-    let Some(db_path) = resolve_db_path() else {
-        return map;
-    };
-    let Ok(conn) = open_readonly(&db_path) else {
-        return map;
-    };
     if matches!(harness, Harness::Opencode | Harness::Opencode2) {
         let Ok(mut stmt) = conn.prepare(
             "SELECT session_id, is_subagent
@@ -6692,31 +6838,11 @@ fn load_subagent_map_for_harness(harness: Harness) -> std::collections::HashMap<
 /// child. That column is the host's structural subagent signal and is present
 /// even when Magic Context has no `session_meta` row yet (or the row was
 /// mislabelled). Empty-string parent_id is treated as primary, matching the
-/// plugin fallback.
+/// plugin fallback. Served from `OpenCodeListCache`, which tracks parents as
+/// it follows the session table, instead of a full scan per poll.
 fn load_opencode_store_child_session_ids() -> HashSet<String> {
-    let mut out = HashSet::new();
-    let Some(path) = resolve_opencode_db_path() else {
-        return out;
-    };
-    let Ok((conn, resolved)) = open_opencode_sessions(&path) else {
-        return out;
-    };
-    for &generation in &resolved.generations {
-        let Ok(mut stmt) = conn.prepare(&format!(
-            "SELECT id FROM {} WHERE parent_id IS NOT NULL AND TRIM(parent_id) != ''",
-            opencode_session_table(generation)
-        )) else {
-            continue;
-        };
-        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-            for id in rows.flatten() {
-                if resolved.owns(&id, generation) {
-                    out.insert(id);
-                }
-            }
-        };
-    }
-    out
+    with_opencode_list_cache(|cache| cache.child_session_ids(std::time::Instant::now()))
+        .unwrap_or_default()
 }
 
 fn mark_opencode_store_children_as_subagents(flags: &mut HashMap<(Harness, String), bool>) {
