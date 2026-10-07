@@ -433,8 +433,8 @@ interface RustSessionState extends ModuleStateSyncState {
         captureSequence: number;
         rowVersion: number;
     };
-    /** A fallback replay is provider-visible output. Keep that exact representation through
-     * deferred recovery; healthy-pass and raw-tail limits prevent indefinite stale replay. */
+    /** A fallback replay is provider-visible output. Keep that exact representation
+     * through ordinary defers until a producer rebuild or safety escape adopts native bytes. */
     lkgRepresentationFrozen: boolean;
     lkgFrozenHealthyPasses: number;
     lkgFrozenAtInputCount: number | null;
@@ -4370,10 +4370,11 @@ export function createRustModeTransform(
             state.parked = false;
             state.passesSincePark = 0;
             state.warningSent = false;
-            // A frozen LKG representation is not the module's acknowledged native prefix, so
-            // output deltas cannot safely splice against it. Full transport resumes deltas only
-            // after a producer rebuild or safety escape adopts the module representation.
-            state.forceFullWire = state.lkgRepresentationFrozen;
+            // Input and output acknowledgements describe the module's native arrays,
+            // not the provider-visible LKG replay. The separately retained nativeOutput
+            // is the splice basis even while frozen, so a successful pass can resume
+            // deltas without granting permission to adopt or edit the frozen bytes.
+            state.forceFullWire = false;
 
             const directiveText = directiveTextOf(response);
             if (syntheticTurn) {

@@ -7831,8 +7831,10 @@ describe("LKG durability across restarts", () => {
         await transform.run(sessionId, input, busted, makeMeta(db, sessionId));
         expect(busted.messages).toEqual(representationB);
         expect(transform.getState(sessionId).lkgRepresentationFrozen).toBe(false);
+        // The first recovery re-primes the native basis; later frozen passes may
+        // use it for transport without changing the provider-visible representation.
         expect(transformBodies[2]?.tail_delta).toBeUndefined();
-        expect(transformBodies[3]?.tail_delta).toBeUndefined();
+        expect(transformBodies[3]?.tail_delta).toBeDefined();
 
         const resumedInput = [
             ...input,
