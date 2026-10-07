@@ -802,7 +802,7 @@ export function applyFrozenTrailingBlankDecisions(
 export function findMergedReasoningStripCandidateIds(
     messages: MessageLike[],
     providerID?: string,
-    options?: { mutationExemptMessage?: MessageLike },
+    options?: { mutationExemptMessage?: MessageLike; protectedMessages?: ReadonlySet<MessageLike> },
 ): string[] {
     if (providerID !== "anthropic") return [];
 
@@ -900,7 +900,7 @@ export function findMergedReasoningStripDecisions(
     messages: MessageLike[],
     providerID: string | undefined,
     frozenIds: ReadonlySet<string>,
-    options?: { mutationExemptMessage?: MessageLike },
+    options?: { mutationExemptMessage?: MessageLike; protectedMessages?: ReadonlySet<MessageLike> },
 ): string[] {
     if (providerID !== "anthropic") return [];
     const frozenParts = readFrozenMergedReasoningParts(frozenIds);
@@ -909,6 +909,7 @@ export function findMergedReasoningStripDecisions(
         messages,
         options?.mutationExemptMessage,
         new Set(frozenParts.keys()),
+        options?.protectedMessages,
     )) {
         const id = entry.message.info.id;
         if (typeof id !== "string" || id.length === 0 || frozenParts.has(id)) continue;

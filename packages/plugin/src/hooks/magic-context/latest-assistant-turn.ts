@@ -1,5 +1,8 @@
 import { isRecord } from "../../shared/record-type-guard";
 import { isAnthropicFamilyRoute } from "./sentinel";
+import type { MessageLike, TagTarget } from "./tag-messages";
+import { stripClearedReasoning, stripReasoningFromAssistantIds, stripReasoningFromMergedAssistants } from "./strip-content";
+import { removeReasoningParts } from "./reasoning-removal";
 
 const THINKING_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 const METADATA_TYPES = new Set(["step-start", "step-finish", "snapshot", "patch"]);
@@ -68,3 +71,66 @@ export function hasActiveAnthropicThinkingTurn(
 
 export const ANTHROPIC_LATEST_TURN_FULL =
     "ANTHROPIC_LATEST_TURN_FULL: Context reached 95% within a thinking-bearing assistant turn. Its signed thinking cannot be reduced safely; end the tool loop and send a new user message, or /clear to continue.";
+
+/** First-application safety view. Never use this map for already-frozen replay. */
+export function protectNewTagMutations(
+    messages: MessageLike[],
+    targets: Map<number, TagTarget>,
+    protectedParts: ReadonlySet<unknown>,
+    prefixBound: boolean,
+): Map<number, TagTarget> {
+    if (protectedParts.size === 0) return targets;
+    const positions = new Map<unknown, number>();
+    let ordinal = 0;
+    for (const message of messages) for (const part of message.parts) positions.set(part, ordinal++);
+    let lastProtected = -1;
+    for (const part of protectedParts) lastProtected = Math.max(lastProtected, positions.get(part) ?? -1);
+    const result = new Map<number, TagTarget>();
+    for (const [tag, target] of targets) {
+        const coordinates = target.mutationParts ?? (target.message ? target.message.parts.map(part => ({ message: target.message!, part })) : []);
+        const prefixEdit = prefixBound && coordinates.some(({ part }) => (positions.get(part) ?? Infinity) < lastProtected);
+        const dropsThinking = target.dropReasoningParts?.some(part => protectedParts.has(part)) === true;
+        if (!prefixEdit && !dropsThinking) { result.set(tag, target); continue; }
+        result.set(tag, {
+            ...target,
+            thinkingDropProtected: true,
+            thinkingRewriteProtected: prefixEdit,
+            canDrop: () => false,
+            drop: () => "incomplete",
+            truncate: () => "incomplete",
+            skeletonReal: () => "incomplete",
+            skeletonStripped: () => "incomplete",
+            editMarker: () => "incomplete",
+            editMarkerStripped: () => "incomplete",
+            setContent: (content, options) => prefixEdit || options?.keepReasoning !== true ? false : target.setContent(content, options),
+        });
+    }
+    return result;
+}
+
+/** Discover retained active thinking after reproducing only persisted decisions. */
+export function retainedActiveThinkingParts(args: {
+    messages: MessageLike[];
+    providerID?: string;
+    modelID?: string;
+    mergedIds: ReadonlySet<string>;
+    bindingIds: ReadonlySet<string>;
+    removedIds?: ReadonlySet<string>;
+}): Set<unknown> {
+    if (!hasActiveAnthropicThinkingTurn(args.messages, args.providerID, args.modelID)) return new Set();
+    const copies = args.messages.map(message => ({ info: message.info, parts: message.parts.map(part => {
+        if (!isRecord(part) || THINKING_TYPES.has(String(part.type)) || !isRecord(part.metadata)) return part;
+        return { ...part, metadata: { ...part.metadata, ...(isRecord(part.metadata.openrouter) ? { openrouter: { ...part.metadata.openrouter } } : {}) } };
+    }) }));
+    stripClearedReasoning(copies);
+    stripReasoningFromAssistantIds(copies, args.providerID, args.bindingIds);
+    stripReasoningFromMergedAssistants(copies, args.providerID, { frozenMessageIds: args.mergedIds });
+    if (args.removedIds?.size) removeReasoningParts(copies, args.removedIds, args.providerID);
+    const retained = new Set<unknown>();
+    for (let i = latestAssistantTurnStart(args.messages); i < copies.length; i++) {
+        for (const part of copies[i].parts) {
+            if (isRecord(part) && THINKING_TYPES.has(String(part.type))) retained.add(part);
+        }
+    }
+    return retained;
+}

@@ -1157,6 +1157,7 @@ function buildAggregateTarget(
     };
 
     return {
+        mutationParts: occurrences.map(occ => ({ message: { info: occ.message.info, parts: [] }, part: occ.part })),
         measureReclaim(skeleton) {
             let beforeTools = 0;
             let afterTools = 0;
@@ -1319,6 +1320,7 @@ function buildTextTarget(
     textPrefix: string,
 ): TagTarget {
     return {
+        mutationParts: [{ message: { info: message.info, parts: [] }, part }],
         textPrefix,
         setContent(content: string): boolean {
             return part.setText(content);
@@ -1351,6 +1353,7 @@ function buildToolTarget(
     tagId: number,
 ): TagTarget {
     return {
+        mutationParts: [{ message: { info: message.info, parts: [] }, part }],
         setContent(content: string): boolean {
             return setToolContentOrText(part, content);
         },

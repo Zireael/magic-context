@@ -125,7 +125,6 @@ import {
     selectHiddenMessagesAtCompactionSeam,
 } from "./inject-compartments";
 import {
-    ANTHROPIC_LATEST_TURN_FULL,
     hasActiveAnthropicThinkingTurn,
     latestAssistantTurnMessages,
 } from "./latest-assistant-turn";
@@ -1145,7 +1144,7 @@ export function createTransform(deps: TransformDeps) {
             activeThinkingModel?.modelID,
         );
         let freezeM0M1 =
-            activeThinkingTurn ||
+            (activeThinkingTurn && isPrefixBoundThinkingModel(activeThinkingModel?.providerID, activeThinkingModel?.modelID)) ||
             (sessionDirectoryFellBack &&
                 sessionMeta.cachedM0Bytes != null &&
                 sessionMeta.cachedM1Bytes != null &&
@@ -1506,7 +1505,7 @@ export function createTransform(deps: TransformDeps) {
             resolvedProviderID,
             modelForBudget?.modelID,
         );
-        freezeM0M1 ||= activeThinkingTurn;
+        freezeM0M1 ||= activeThinkingTurn && isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID);
         const canUseEmptySentinels = modelAcceptsEmptyContent(resolvedProviderID);
         const protectedThinkingMessages =
             activeThinkingTurn ||
@@ -2399,9 +2398,6 @@ export function createTransform(deps: TransformDeps) {
         const watermark = getMaxDroppedTagNumber(db, sessionId);
 
         let contextUsage = contextUsageEarly;
-        if (activeThinkingTurn && contextUsage.percentage >= 95) {
-            throw contextRefusalError(ANTHROPIC_LATEST_TURN_FULL);
-        }
         const rawGetNotifParams = runNotificationParams;
         const tCompartmentPhase = performance.now();
         const compartmentPhase = await runCompartmentPhase({

@@ -260,6 +260,14 @@ export interface TagNormalizationTarget {
 }
 
 export type TagTarget = {
+    /** Parts a drop neutralizes, distinct from a meaning-preserving text rewrite. */
+    dropReasoningParts?: readonly unknown[];
+    /** Original coordinates of the content this target edits. */
+    mutationParts?: readonly { message: MessageLike; part: unknown }[];
+    /** New drops are withheld; persisted replay uses the original target map. */
+    thinkingDropProtected?: boolean;
+    /** A rewrite here would invalidate a later protected signed block. */
+    thinkingRewriteProtected?: boolean;
     /** Non-mutating count of current and replacement token-bearing fields for a planned drop. */
     measureReclaim?: (skeleton: boolean) => {
         beforeTools: number;
@@ -921,6 +929,8 @@ export function tagMessages(
                 }
                 targets.set(tagId, {
                     message,
+                    dropReasoningParts: thinkingParts,
+                    mutationParts: [{ message, part: textPart }],
                     textPrefix: skipPrefixInjection ? "" : prependTag(tagId, ""),
                     setContent: (content, options) => {
                         if (textPart.text === content) return false;
@@ -1059,7 +1069,10 @@ export function tagMessages(
                 );
                 targets.set(tagId, {
                     message,
+                    mutationParts: [{ message, part: filePart }],
                     setContent: (content) => {
+                        // File edits do not clear reasoning; their position can
+                        // still invalidate a later prefix-bound signature.
                         const prev = messageParts[partIndex];
                         const prevText =
                             typeof prev === "object" && prev !== null && "text" in prev

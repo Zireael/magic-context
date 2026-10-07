@@ -4956,7 +4956,7 @@ for (const generation of ["v1", "v2"] as const) {
             tagger: createTagger(),
             scheduler: createScheduler({ executeThresholdPercentage: 65 }),
             liveModelBySession: new Map([
-                [sessionId, { providerID: "anthropic", modelID: "claude-sonnet-5" }],
+            [sessionId, { providerID: "anthropic", modelID: "claude-opus-5-5" }],
             ]),
             contextUsageMap: usage,
             clearReasoningAge: 1,
@@ -4978,7 +4978,7 @@ for (const generation of ["v1", "v2"] as const) {
                     role: "assistant",
                     sessionID: sessionId,
                     providerID: "anthropic",
-                    modelID: "claude-sonnet-5",
+                    modelID: "claude-opus-5-5",
                 },
                 parts: [
                     { type: "reasoning", text: `signed thinking ${n}` },

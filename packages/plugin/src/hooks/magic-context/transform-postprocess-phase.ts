@@ -1,4 +1,5 @@
 import { compareOpenCodeMessagesByCanonicalOrder } from "../../features/magic-context/compaction-marker";
+import { ANTHROPIC_LATEST_TURN_FULL, protectNewTagMutations, retainedActiveThinkingParts } from "./latest-assistant-turn";
 import {
     mergeProtectedTools,
     normalizeProtectedToolName,
@@ -114,7 +115,7 @@ import {
     type DroppedTokenReduction,
     estimateDroppedTokensFromTagReductions,
 } from "./dropped-token-estimate";
-import { EmergencyFailClosedError, outgoingContextRefusal } from "./emergency-fail-closed";
+import { contextRefusalError, EmergencyFailClosedError, outgoingContextRefusal } from "./emergency-fail-closed";
 import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
@@ -1967,8 +1968,21 @@ export async function runPostTransformPhase(
         args.m0M1 !== undefined &&
         (!!args.m0M1.projectPath || !!args.m0M1.projectDirectory) &&
         (args.fullFeatureMode || compactionOff);
-    const activeThinkingTurn = args.activeThinkingTurn === true;
-    const freezeM0M1 = args.freezeM0M1 === true || activeThinkingTurn;
+    const frozenThinking = new Set(args.activeThinkingTurn ? getMergedReasoningStrippedIds(args.db, args.sessionId) : []);
+    const bindingThinking = new Set([...frozenThinking].filter(id => id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)).map(id => id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length)));
+    const retainedThinking = args.activeThinkingTurn ? retainedActiveThinkingParts({ messages: args.messages, providerID: args.resolvedProviderID, modelID: args.resolvedModelID, mergedIds: frozenThinking, bindingIds: bindingThinking, removedIds: getReasoningRemovalState(args.db, args.sessionId).messageIds }) : new Set<unknown>();
+    const activeThinkingTurn = retainedThinking.size > 0;
+    const protectedThinkingMessages = new Set(args.messages.filter(message => message.parts.some(part => retainedThinking.has(part))));
+    const newTargets = protectNewTagMutations(args.messages, args.targets, retainedThinking, args.thinkingBindingRecoveryEnabledForModel === true);
+    let maxReasoningTag = 0;
+    for (const tag of args.messageTagNumbers.values()) maxReasoningTag = Math.max(maxReasoningTag, tag);
+    let safeReasoningCutoff = maxReasoningTag;
+    for (const message of protectedThinkingMessages) {
+        const tag = args.messageTagNumbers.get(message);
+        if (tag && tag > 0) safeReasoningCutoff = Math.min(safeReasoningCutoff, tag - 1);
+    }
+    const safeReasoningAge = Math.max(args.clearReasoningAge, maxReasoningTag - safeReasoningCutoff);
+    const freezeM0M1 = args.freezeM0M1 === true || (activeThinkingTurn && args.thinkingBindingRecoveryEnabledForModel === true);
     const foldDueDecision =
         m0M1EnabledForFold && args.m0M1 && !freezeM0M1
             ? mustMaterialize({
@@ -2196,12 +2210,10 @@ export async function runPostTransformPhase(
     };
     // A cache-bust opportunity is not permission to edit an unfinished signed
     // turn. Retain pending drops until a real user message ends the tool loop.
-    const publishedWorkDrainAllowed =
-        !compactionOff && !activeThinkingTurn && hasReclaimRide(rideSignals);
+    const publishedWorkDrainAllowed = !compactionOff && hasReclaimRide(rideSignals);
     const shouldApplyPendingOps = publishedWorkDrainAllowed;
     const shouldRunHeuristics =
         !compactionOff &&
-        !activeThinkingTurn &&
         hasReclaimRide(rideSignals) &&
         (rideSignals.publishedHistory ||
             materializationRequested ||
@@ -2439,7 +2451,7 @@ export async function runPostTransformPhase(
             pendingOpsDidMutate = applyPendingOperations(
                 args.sessionId,
                 args.db,
-                args.targets,
+                newTargets,
                 new Set([
                     ...(args.contextUsage.percentage >= 95 ? [] : args.protectedTagIds),
                     ...protectedToolTags,
@@ -2515,7 +2527,7 @@ export async function runPostTransformPhase(
             let cleanup = applyHeuristicCleanup(
                 args.sessionId,
                 args.db,
-                args.targets,
+                newTargets,
                 args.messageTagNumbers,
                 {
                     protectedTagNumbers: args.protectedTagNumbers,
@@ -2549,7 +2561,7 @@ export async function runPostTransformPhase(
                 const ridingCleanup = applyHeuristicCleanup(
                     args.sessionId,
                     args.db,
-                    args.targets,
+                    newTargets,
                     args.messageTagNumbers,
                     {
                         protectedTagNumbers: args.protectedTagNumbers,
@@ -2623,7 +2635,7 @@ export async function runPostTransformPhase(
                           args.messages,
                           args.reasoningByMessage,
                           args.messageTagNumbers,
-                          args.clearReasoningAge,
+                          safeReasoningAge,
                       )
                     : 0;
             if (routineCleanupApplied && canUseEmptySentinels) {
@@ -2637,7 +2649,7 @@ export async function runPostTransformPhase(
                     ? stripInlineThinking(
                           args.messages,
                           args.messageTagNumbers,
-                          args.clearReasoningAge,
+                          safeReasoningAge,
                       )
                     : 0;
             // Fresh caveman compression above rebuilds text from its original source,
@@ -2679,6 +2691,7 @@ export async function runPostTransformPhase(
                     alreadyRemoved: removedReasoningIds,
                     prefixBound: prefixBoundModel,
                     alsoGone: bindingStrippedIds,
+                    protectedMessages: protectedThinkingMessages,
                 });
                 if (newIds.length > 0) {
                     let persisted = false;
@@ -2724,7 +2737,7 @@ export async function runPostTransformPhase(
                 for (const tag of args.messageTagNumbers.values()) {
                     if (tag > maxTag) maxTag = tag;
                 }
-                const newWatermark = maxTag - args.clearReasoningAge;
+                const newWatermark = maxTag - safeReasoningAge;
                 const currentWatermark = args.sessionMeta?.clearedReasoningThroughTag ?? 0;
                 if (newWatermark > currentWatermark) {
                     updateSessionMeta(args.db, args.sessionId, {
@@ -2762,7 +2775,7 @@ export async function runPostTransformPhase(
             // safe pass picks up the work.
             // A frozen m[0]/m[1] pass did not materialize, so the request
             // stays pending for the next pass that can.
-            if (pendingMaterializationAtPassStart && !freezeM0M1) {
+            if (pendingMaterializationAtPassStart && !freezeM0M1 && !pendingOps.some(op => newTargets.get(op.tagId)?.thinkingDropProtected)) {
                 args.pendingMaterializationSessions.delete(args.sessionId);
             }
             if (args.currentTurnId) {
@@ -2786,7 +2799,7 @@ export async function runPostTransformPhase(
             const syntheticPendingOps = buildSyntheticToolReclaimOps({
                 db: args.db,
                 sessionId: args.sessionId,
-                targets: args.targets,
+                targets: newTargets,
                 watermark: args.sessionMeta.toolReclaimWatermark ?? 0,
                 protectedToolTags,
                 pendingOps,
@@ -2805,7 +2818,7 @@ export async function runPostTransformPhase(
                 const supersessionOps = buildSupersessionReclaimOps({
                     db: args.db,
                     sessionId: args.sessionId,
-                    targets: args.targets,
+                    targets: newTargets,
                     pendingOps,
                     recentMessageIds,
                     protectedTagNumbers: args.protectedTagNumbers,
@@ -2820,7 +2833,7 @@ export async function runPostTransformPhase(
                 const editReclaim = buildEditSupersessionReclaim({
                     db: args.db,
                     sessionId: args.sessionId,
-                    targets: args.targets,
+                    targets: newTargets,
                     pendingOps,
                     recentMessageIds,
                     protectedTagNumbers: args.protectedTagNumbers,
@@ -3734,7 +3747,7 @@ export async function runPostTransformPhase(
                     args.messages,
                     args.resolvedProviderID,
                     mergedReasoningStrippedIds,
-                    { mutationExemptMessage: reasoningMutationExemptMessage },
+                    { mutationExemptMessage: reasoningMutationExemptMessage, protectedMessages: protectedThinkingMessages },
                 );
                 const newlyDetectedIds = candidates.filter(
                     (id) => !mergedReasoningStrippedIds.has(id),
@@ -4043,7 +4056,7 @@ export async function runPostTransformPhase(
             db: args.db,
             sessionId: args.sessionId,
             messages: args.messages,
-            protectedMessages: args.protectedThinkingMessages,
+            protectedMessages: protectedThinkingMessages,
             alreadyFrozen: thinkingBindingRecoveryMessageIds,
         });
         if (outcome.strip) {
@@ -4111,6 +4124,9 @@ export async function runPostTransformPhase(
         : 0;
 
     args.restoreLatestTurnOriginals?.();
+    if (activeThinkingTurn && args.contextUsage.percentage >= 95 && !pendingOpsDidMutate && !heuristicOrReasoningDidMutate && !foldBustsServedPrefixThisPass) {
+        throw contextRefusalError(ANTHROPIC_LATEST_TURN_FULL);
+    }
     sessionLog(
         args.sessionId,
         `final representation: clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts} removedReasoningParts=${removedReasoningParts} settledDroppedReasoning=${settledDroppedReasoning}`,

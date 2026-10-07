@@ -156,7 +156,7 @@ export function applyCavemanCleanup(
     // tag's depth unchanged (it will be reconsidered on the next pass).
     const tagsNeedingCompression = eligible.filter((tag, index) => {
         const target = targets.get(tag.tagNumber);
-        if (!target?.getContent || !target.setContent) return false;
+        if (!target?.getContent || !target.setContent || target.thinkingRewriteProtected) return false;
         const targetDepth = computeTargetDepth(index, eligible.length);
         return targetDepth > tag.cavemanDepth;
     });
@@ -172,7 +172,7 @@ export function applyCavemanCleanup(
         const compressedBefore = tags.filter(
             (tag) => tag.type === "message" && tag.status === "active" && tag.cavemanDepth > 0,
         );
-        const switched = recordCavemanCurrentRules(
+        const switched = compressedBefore.some(tag => targets.get(tag.tagNumber)?.thinkingRewriteProtected) ? null : recordCavemanCurrentRules(
             db,
             sessionId,
             englishWordRules,

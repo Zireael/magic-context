@@ -145,6 +145,7 @@ export function selectReasoningRemovals(args: {
      * good (the binding-mismatch strip set). Only the prefix walk reads it.
      */
     alsoGone?: ReadonlySet<string>;
+    protectedMessages?: ReadonlySet<MessageLike>;
 }): string[] {
     let maxTag = 0;
     for (const tag of args.messageTagNumbers.values()) if (tag > maxTag) maxTag = tag;
@@ -168,6 +169,7 @@ export function selectReasoningRemovals(args: {
             continue;
         const tag = args.messageTagNumbers.get(message) ?? 0;
         const removable =
+            !args.protectedMessages?.has(message) &&
             id !== undefined &&
             message !== newest &&
             message !== exempt &&
