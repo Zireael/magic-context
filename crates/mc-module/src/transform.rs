@@ -2246,6 +2246,479 @@ pub fn transform_with_projection(
     result
 }
 
+/// The append-only runner seam. Transport handlers supply a complete, durably ingested
+/// lineage as `TransformRequest.messages`, not the byte-capped suffix of a status page.
+/// They persist this state together with their answer before sending it. In particular,
+/// the version high-water must survive an allocated-but-unsent answer.
+/// The caller resolves `template.session_id` from (project_root, session, harness);
+/// this engine seam neither resolves handles nor calls a gateway.
+pub mod compaction {
+    use super::*;
+
+    pub(super) const PASS_KIND: &str = "compaction.step";
+    pub use crate::memory_render::{
+        M0_EMPTY_BODY as M0_EMPTY_PLACEHOLDER, M1_PLACEHOLDER as M1_EMPTY_PLACEHOLDER,
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Preset {
+        Head,
+        Worker,
+        Reader,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PreviousUsage {
+        pub input_tokens: Option<u64>,
+        pub cached_input_tokens: Option<u64>,
+        pub cache_write_tokens: Option<u64>,
+    }
+
+    /// Normalized status fields, independent of the runner's wire envelope. The caller
+    /// maps structural rejection to `structural`; all other reasons stay retryable.
+    #[derive(Debug, Clone)]
+    pub struct Status {
+        pub lineage_id: String,
+        pub newest_ordinal: Option<u64>,
+        pub previous_usage: Option<PreviousUsage>,
+        pub request_tokens: u64,
+        pub context_window: u64,
+        pub prefix_rebuilding: bool,
+        pub last_applied_version: Option<u64>,
+        pub last_not_applied: Option<NotApplied>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct NotApplied {
+        pub version: u64,
+        pub structural: bool,
+    }
+
+    impl Status {
+        pub fn usage(&self) -> ModuleUsage {
+            ModuleUsage {
+                // Fresh input and cache reads are disjoint. Writes add to them only
+                // when reported separately (Codex includes writes in fresh input).
+                // Prefer a complete provider measurement to the estimate: static
+                // calibration can overestimate code-heavy Claude prompts by 1.44x
+                // and has caused false context refusals. Do not take their maximum.
+                current_total_input_tokens: self
+                    .previous_usage
+                    .and_then(|u| {
+                        Some(
+                            u.input_tokens?
+                                .saturating_add(u.cached_input_tokens?)
+                                .saturating_add(u.cache_write_tokens.unwrap_or(0)),
+                        )
+                    })
+                    .unwrap_or(self.request_tokens),
+                context_limit_tokens: self.context_window,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Range {
+        pub lineage_id: String,
+        pub from: u64,
+        pub to: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct View {
+        pub compaction_id: String,
+        pub version: u64,
+        pub range: Range,
+        pub replacement: Vec<CkWireMessage>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct State {
+        pub compaction_id: String,
+        pub preset: Preset,
+        pub version_high_water: u64,
+        pub rebuild_epoch: u64,
+        pub last_produced: Option<View>,
+        pub last_applied: Option<View>,
+    }
+
+    impl State {
+        pub fn new(compaction_id: String, preset: Preset) -> Self {
+            Self {
+                compaction_id,
+                preset,
+                version_high_water: 0,
+                rebuild_epoch: 0,
+                last_produced: None,
+                last_applied: None,
+            }
+        }
+
+        fn allocate(&mut self, mut view: View) -> Result<View, TransformError> {
+            self.version_high_water = self.version_high_water.checked_add(1).ok_or_else(|| {
+                TransformError::LineageProtocol("compaction version exhausted".to_string())
+            })?;
+            view.version = self.version_high_water;
+            self.last_produced = Some(view.clone());
+            Ok(view)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Answer {
+        Noop,
+        Replacement(View),
+    }
+
+    /// Keep the final engine response available to the handler for historian dispatch
+    /// and diagnostics. Permission is deliberately not inferred from its action string.
+    pub struct Output {
+        pub answer: Answer,
+        pub engine: TransformWithProjection,
+        pub prefix_bust_permitted: bool,
+    }
+
+    /// Produce Setup's full initial view. Setup is the only call that can initialize
+    /// the served head without a previous view; ordinary steps require that view.
+    pub fn setup(
+        store: &McStore,
+        template: &TransformRequest,
+        ctx: &ProducerContext<'_>,
+        status: &Status,
+        state: &mut State,
+    ) -> Result<Output, TransformError> {
+        run(store, template, ctx, status, state, true)
+    }
+
+    pub fn step(
+        store: &McStore,
+        template: &TransformRequest,
+        ctx: &ProducerContext<'_>,
+        status: &Status,
+        state: &mut State,
+    ) -> Result<Output, TransformError> {
+        run(store, template, ctx, status, state, false)
+    }
+
+    fn run(
+        store: &McStore,
+        template: &TransformRequest,
+        ctx: &ProducerContext<'_>,
+        status: &Status,
+        state: &mut State,
+        initial: bool,
+    ) -> Result<Output, TransformError> {
+        if !ctx.compaction_enabled || status.context_window == 0 {
+            return Err(TransformError::LineageProtocol(
+                "compaction requires a context window and an enabled engine".to_string(),
+            ));
+        }
+        if !initial && state.last_applied.is_none() {
+            return Err(TransformError::LineageProtocol(
+                "compaction setup missing".to_string(),
+            ));
+        }
+        let range = working_range(status, &template.messages)?;
+        if state
+            .last_applied
+            .as_ref()
+            .is_some_and(|v| v.range.lineage_id != status.lineage_id)
+        {
+            return Err(TransformError::LineageProtocol(
+                "compaction lineage changed without setup".to_string(),
+            ));
+        }
+        if let Some(version) = status.last_applied_version {
+            state.version_high_water = state.version_high_water.max(version);
+            if let Some(view) = state
+                .last_produced
+                .as_ref()
+                .filter(|v| v.version == version)
+            {
+                state.last_applied = Some(view.clone());
+            }
+        }
+        if let Some(rejected) = status.last_not_applied {
+            state.version_high_water = state.version_high_water.max(rejected.version);
+        }
+        let rejected = status.last_not_applied.filter(|rejected| {
+            state
+                .last_produced
+                .as_ref()
+                .is_some_and(|v| v.version == rejected.version)
+                && state
+                    .last_applied
+                    .as_ref()
+                    .is_none_or(|v| v.version < rejected.version)
+        });
+        let usage = status.usage();
+        let execute_due = usage.current_total_input_tokens as f64 * 100.0
+            >= status.context_window as f64 * ctx.execute_threshold_percentage;
+        // A cold prefix, or an unapplied view on an execute opportunity, is concrete
+        // rebuild work. Retain the epoch on later calls so it causes only one HARD.
+        if status.prefix_rebuilding || (rejected.is_some() && execute_due) {
+            state.rebuild_epoch = state.rebuild_epoch.checked_add(1).ok_or_else(|| {
+                TransformError::LineageProtocol("compaction rebuild epoch exhausted".to_string())
+            })?;
+        }
+        let mut req = template.clone();
+        req.kind = PASS_KIND.to_string();
+        req.serializer_profile = "owned-broca".to_string();
+        req.is_subagent = state.preset != Preset::Head;
+        req.usage = Some(usage);
+        req.geometry = None;
+        req.serve_native = false;
+        req.native_messages = None;
+        req.tail_delta = None;
+        // Step hooks own appends and tags. Compaction must not first tag raw content
+        // that the runner already served while compaction calls were gated off.
+        req.tool_present = false;
+        req.auto_search_enabled = false;
+        req.todo_tool_present = Some(false);
+        req.render_config = format!(
+            "{}|broca-compaction:{}",
+            req.render_config, state.rebuild_epoch
+        );
+        let engine = transform_with_projection(store, &req, ctx)?;
+        let permitted = engine.response.prefix_bust_permitted || status.prefix_rebuilding;
+        let mut answer = Answer::Noop;
+        if initial || permitted {
+            let replacement = replacement(&engine.response, &req, state.preset)?;
+            let candidate = View {
+                compaction_id: state.compaction_id.clone(),
+                version: 0,
+                range,
+                replacement,
+            };
+            let structural_repeat = rejected.is_some_and(|r| r.structural)
+                && state
+                    .last_produced
+                    .as_ref()
+                    .is_some_and(|v| same_view(v, &candidate));
+            if !structural_repeat {
+                if rejected.is_some_and(|r| !r.structural) {
+                    // The engine has already frozen these bytes. A lost/late answer
+                    // must not disappear just because the subsequent pass is a replay.
+                    let view = state.last_produced.clone().expect("rejected view present");
+                    answer = Answer::Replacement(state.allocate(view)?);
+                } else if initial
+                    || !matches_served(&candidate, state.last_applied.as_ref(), &req.messages)
+                {
+                    answer = Answer::Replacement(state.allocate(candidate)?);
+                }
+            }
+        }
+        if initial {
+            if let Answer::Replacement(view) = &answer {
+                state.last_applied = Some(view.clone());
+            }
+        }
+        Ok(Output {
+            answer,
+            engine,
+            prefix_bust_permitted: permitted,
+        })
+    }
+
+    fn working_range(
+        status: &Status,
+        messages: &[CkIngressMessage],
+    ) -> Result<Range, TransformError> {
+        let to = match status.newest_ordinal {
+            Some(newest) => newest
+                .checked_add(1)
+                .ok_or(TransformError::OrdinalViolation)?,
+            None => 0,
+        };
+        // A full lineage prevents a range endpoint from cutting a tool arc. Refuse
+        // incomplete status pages instead of silently treating them as the transcript.
+        if messages.last().map(|m| m.ordinal) != status.newest_ordinal
+            || messages
+                .windows(2)
+                .any(|w| w[0].ordinal.checked_add(1) != Some(w[1].ordinal))
+        {
+            return Err(TransformError::OrdinalViolation);
+        }
+        let mut open_calls = HashSet::new();
+        for block in messages.iter().flat_map(|m| &m.ck.content) {
+            match &block.kind {
+                ck_wire::CkKind::ToolCall {
+                    id,
+                    provider_executed: false,
+                    ..
+                } => {
+                    open_calls.insert(id.as_str());
+                }
+                ck_wire::CkKind::ToolResult {
+                    id,
+                    provider_executed: false,
+                    ..
+                } => {
+                    if !open_calls.remove(id.as_str()) {
+                        return Err(TransformError::LineageProtocol(
+                            "compaction range starts inside a tool arc".to_string(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !open_calls.is_empty() {
+            return Err(TransformError::LineageProtocol(
+                "compaction range ends inside a tool arc".to_string(),
+            ));
+        }
+        Ok(Range {
+            lineage_id: status.lineage_id.clone(),
+            from: messages.first().map_or(0, |m| m.ordinal),
+            to,
+        })
+    }
+
+    fn same_view(left: &View, right: &View) -> bool {
+        left.range == right.range && bytes(&left.replacement) == bytes(&right.replacement)
+    }
+
+    fn bytes(messages: &[CkWireMessage]) -> Vec<Vec<u8>> {
+        messages.iter().map(canonical_message_bytes).collect()
+    }
+
+    fn matches_served(candidate: &View, applied: Option<&View>, raw: &[CkIngressMessage]) -> bool {
+        let Some(applied) = applied else {
+            return false;
+        };
+        if applied.range.lineage_id != candidate.range.lineage_id
+            || applied.range.from != candidate.range.from
+        {
+            return false;
+        }
+        let mut served = applied.replacement.clone();
+        served.extend(
+            raw.iter()
+                .filter(|m| m.ordinal >= applied.range.to)
+                .map(|m| m.ck.clone()),
+        );
+        bytes(&served) == bytes(&candidate.replacement)
+    }
+
+    fn replacement(
+        response: &TransformResponse,
+        req: &TransformRequest,
+        preset: Preset,
+    ) -> Result<Vec<CkWireMessage>, TransformError> {
+        let messages = response
+            .ck_messages
+            .as_ref()
+            .ok_or(TransformError::UnknownShape(
+                "compaction engine returned no messages",
+            ))?;
+        let mut out = Vec::with_capacity(messages.len());
+        let frame_start = messages.iter().take_while(|m| m.role == "system").count();
+        let frame_end = if preset == Preset::Head {
+            frame_start + 2
+        } else {
+            frame_start
+        };
+        if preset == Preset::Head {
+            // Owned Broca's legacy whole-prompt path puts leading systems before the
+            // two frames. Replacement indices are instead Setup's stable slots.
+            let frames =
+                messages
+                    .get(frame_start..frame_end)
+                    .ok_or(TransformError::UnknownShape(
+                        "compaction head frames missing",
+                    ))?;
+            for (frame, placeholder) in frames
+                .iter()
+                .zip([M0_EMPTY_PLACEHOLDER, M1_EMPTY_PLACEHOLDER])
+            {
+                if !frame.meta.synthetic || frame.role != "user" {
+                    return Err(TransformError::UnknownShape(
+                        "compaction head frame is not synthetic user content",
+                    ));
+                }
+                let mut frame = (**frame).clone();
+                nonempty_text(&mut frame);
+                if frame.content.is_empty() {
+                    frame = CkWireMessage::synthetic_user_text(placeholder);
+                }
+                out.push(frame);
+            }
+        }
+        out.extend(
+            messages
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i < frame_start || *i >= frame_end)
+                .map(|(_, m)| (**m).clone()),
+        );
+        for message in &mut out {
+            nonempty_text(message);
+        }
+        out.retain(|m| !m.content.is_empty());
+        // Compare CK bytes, not metadata or message IDs. An insertion/deletion is an
+        // edit too, so a head insertion strips every later signed block. Never alter
+        // a signature's text: discard the entire reasoning block instead.
+        let first_edit = req
+            .messages
+            .iter()
+            .map(|m| &m.ck)
+            .zip(out.iter())
+            .position(|(raw, served)| {
+                canonical_message_bytes(raw) != canonical_message_bytes(served)
+            })
+            .or_else(|| {
+                (req.messages.len() != out.len()).then_some(req.messages.len().min(out.len()))
+            });
+        if let Some(first_edit) = first_edit {
+            for message in out.iter_mut().skip(first_edit) {
+                let before = message.content.len();
+                message.content.retain(|b| {
+                    !matches!(
+                        b.kind,
+                        ck_wire::CkKind::Reasoning {
+                            signature: Some(_),
+                            ..
+                        } | ck_wire::CkKind::RedactedReasoning { .. }
+                    )
+                });
+                if message.content.len() != before {
+                    message.mark_modified();
+                }
+            }
+            out.retain(|m| !m.content.is_empty());
+        }
+        Ok(out)
+    }
+
+    fn nonempty_text(message: &mut CkWireMessage) {
+        let before = message.content.len();
+        message
+            .content
+            .retain(|b| !matches!(&b.kind, ck_wire::CkKind::Text { text } if text.is_empty()));
+        let mut changed = message.content.len() != before;
+        for block in &mut message.content {
+            if let ck_wire::CkKind::ToolResult { output, .. } = &mut block.kind {
+                if let ck_wire::CkOutputKind::Content { blocks }
+                | ck_wire::CkOutputKind::ErrorContent { blocks } = &mut output.kind
+                {
+                    let before = blocks.len();
+                    blocks.retain(|b| !matches!(&b.kind, ck_wire::ResultBlockKind::Text { text } if text.is_empty()));
+                    if blocks.len() != before {
+                        block.mark_modified();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            message.mark_modified();
+        }
+    }
+}
+
 pub(crate) fn transform_with_projection_cached(
     store: &McStore,
     req: &TransformRequest,
@@ -4329,8 +4802,11 @@ fn apply_once(
         Some(&mut m1_revision_read_timings),
     )?;
     let effective_usage = effective_usage(req.usage.as_ref(), loaded.meta.last_usage.as_ref());
-    let context_limit_tokens =
-        effective_context_limit_tokens(&effective_usage, req.geometry.as_ref());
+    let context_limit_tokens = if req.kind == compaction::PASS_KIND {
+        effective_usage.context_limit_tokens as f64
+    } else {
+        effective_context_limit_tokens(&effective_usage, req.geometry.as_ref())
+    };
     let hard_context_limit_tokens =
         effective_hard_context_limit_tokens(req.geometry.as_ref(), context_limit_tokens);
     let usage_input_tokens = effective_usage.current_total_input_tokens as f64;
@@ -4544,7 +5020,14 @@ fn apply_once(
     // correctly ride m1 as a SOFT delta once the boundary is present. The store query runs
     // only in this rare never-minted window (short-circuited by is_empty), never in steady
     // state where the boundary is present.
-    let first_fold_due = if loaded.core.boundary_id.is_empty() {
+    // Append-only compaction has already served Setup's placeholders. Its first
+    // publication waits for an execute opportunity rather than busting that warm
+    // prefix merely because a historian finished. Legacy whole-prompt transforms
+    // retain their eager first-fold behavior.
+    let first_fold_due = if loaded.core.boundary_id.is_empty()
+        && (req.kind != compaction::PASS_KIND
+            || scheduler_outcome.pass != scheduler::PassDecision::Defer)
+    {
         match has_compartments_cache {
             Some(value) => value,
             None => store.has_compartments(&req.session_id)?,
@@ -16218,6 +16701,538 @@ fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod compaction_adapter_tests {
+        use super::*;
+        use crate::transform::compaction::{
+            self as adapter, Answer, NotApplied, Preset, PreviousUsage, State, Status, View,
+        };
+
+        fn status(messages: &[CkIngressMessage]) -> Status {
+            Status {
+                lineage_id: "lineage".to_string(),
+                newest_ordinal: messages.last().map(|m| m.ordinal),
+                previous_usage: Some(PreviousUsage {
+                    input_tokens: Some(10),
+                    cached_input_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                }),
+                request_tokens: 90_000,
+                context_window: 100_000,
+                prefix_rebuilding: false,
+                last_applied_version: None,
+                last_not_applied: None,
+            }
+        }
+
+        fn context() -> ProducerContext<'static> {
+            let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+            ctx.memory_enabled = false;
+            ctx.inject_docs = false;
+            ctx.temporal_awareness = false;
+            ctx.protected_tokens_floor = 0;
+            ctx
+        }
+
+        fn view(answer: Answer) -> View {
+            match answer {
+                Answer::Replacement(view) => view,
+                Answer::Noop => panic!("expected a full replacement"),
+            }
+        }
+
+        fn wire_bytes(messages: &[CkWireMessage]) -> Vec<u8> {
+            serde_json::to_vec(messages).unwrap()
+        }
+
+        #[test]
+        fn usage_preserves_disjoint_measurements_and_unmeasured_fields() {
+            let mut st = status(&[]);
+            for (usage, expected) in [
+                (
+                    Some(PreviousUsage {
+                        input_tokens: Some(40),
+                        cached_input_tokens: Some(20),
+                        cache_write_tokens: Some(10),
+                    }),
+                    70,
+                ),
+                (
+                    Some(PreviousUsage {
+                        input_tokens: Some(40),
+                        cached_input_tokens: Some(20),
+                        cache_write_tokens: None,
+                    }),
+                    60,
+                ),
+                (
+                    Some(PreviousUsage {
+                        input_tokens: Some(40),
+                        cached_input_tokens: None,
+                        cache_write_tokens: Some(10),
+                    }),
+                    90_000,
+                ),
+                (
+                    Some(PreviousUsage {
+                        input_tokens: None,
+                        cached_input_tokens: Some(20),
+                        cache_write_tokens: Some(10),
+                    }),
+                    90_000,
+                ),
+                (None, 90_000),
+                (
+                    Some(PreviousUsage {
+                        input_tokens: Some(0),
+                        cached_input_tokens: Some(0),
+                        cache_write_tokens: None,
+                    }),
+                    0,
+                ),
+                (
+                    Some(PreviousUsage {
+                        input_tokens: Some(u64::MAX),
+                        cached_input_tokens: Some(1),
+                        cache_write_tokens: Some(1),
+                    }),
+                    u64::MAX,
+                ),
+            ] {
+                st.previous_usage = usage;
+                assert_eq!(st.usage().current_total_input_tokens, expected);
+                assert_eq!(st.usage().context_limit_tokens, 100_000);
+            }
+        }
+
+        #[test]
+        fn fresh_head_slots_are_fixed_nonempty_and_growing_defers_are_noop() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let mut state = State::new("compact".to_string(), Preset::Head);
+            let mut request = req("ses", "cfg0", vec![]);
+            let initial = view(
+                adapter::setup(&store, &request, &context(), &status(&[]), &mut state)
+                    .unwrap()
+                    .answer,
+            );
+            assert_eq!(initial.replacement.len(), 2);
+            assert_eq!(
+                initial.replacement[0],
+                CkWireMessage::synthetic_user_text(adapter::M0_EMPTY_PLACEHOLDER)
+            );
+            assert_eq!(
+                initial.replacement[1],
+                CkWireMessage::synthetic_user_text(adapter::M1_EMPTY_PLACEHOLDER)
+            );
+            for ordinal in 0..3 {
+                request.messages.push(item(
+                    &format!("raw-{ordinal}"),
+                    ordinal,
+                    "new raw user text",
+                ));
+                let pass = adapter::step(
+                    &store,
+                    &request,
+                    &context(),
+                    &status(&request.messages),
+                    &mut state,
+                )
+                .unwrap();
+                assert_eq!(pass.answer, Answer::Noop);
+                assert!(!pass.prefix_bust_permitted);
+                assert_eq!(
+                    wire_bytes(&state.last_applied.as_ref().unwrap().replacement),
+                    wire_bytes(&initial.replacement)
+                );
+            }
+        }
+
+        #[test]
+        fn status_window_is_used_even_below_the_legacy_plausible_floor() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let request = req("small-window", "cfg0", vec![item("raw", 0, "raw")]);
+            let mut st = status(&request.messages);
+            st.context_window = 100;
+            st.previous_usage = Some(PreviousUsage {
+                input_tokens: Some(66),
+                cached_input_tokens: Some(0),
+                cache_write_tokens: None,
+            });
+            let mut state = State::new("compact".to_string(), Preset::Head);
+            let out = adapter::setup(&store, &request, &context(), &st, &mut state).unwrap();
+            assert_eq!(
+                out.engine.response.scheduler_decision.as_deref(),
+                Some("execute")
+            );
+        }
+
+        #[test]
+        fn first_publish_and_pending_drop_wait_then_summed_fill_executes_once() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let request = req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("a", 0, "covered history"),
+                    item("tail", 1, "pending payload"),
+                ],
+            );
+            let mut st = status(&request.messages);
+            let mut state = State::new("compact".to_string(), Preset::Head);
+            let initial = view(
+                adapter::setup(&store, &request, &context(), &st, &mut state)
+                    .unwrap()
+                    .answer,
+            );
+            store
+                .append_pending_agent_drops("ses", &["tail#0".to_string()], 1)
+                .unwrap();
+            store
+                .replace_compartments("ses", &[comp(1, 0, 0, "a", "PUBLISHED")])
+                .unwrap();
+            let low = adapter::step(&store, &request, &context(), &st, &mut state).unwrap();
+            assert_eq!(low.answer, Answer::Noop);
+            assert!(!low.prefix_bust_permitted);
+            assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
+            assert_eq!(
+                wire_bytes(&initial.replacement),
+                wire_bytes(&state.last_applied.as_ref().unwrap().replacement)
+            );
+            st.previous_usage = Some(PreviousUsage {
+                input_tokens: Some(40_000),
+                cached_input_tokens: Some(20_000),
+                cache_write_tokens: Some(6_000),
+            });
+            let high = adapter::step(&store, &request, &context(), &st, &mut state).unwrap();
+            assert_eq!(
+                high.engine.response.scheduler_decision.as_deref(),
+                Some("execute")
+            );
+            assert!(high.prefix_bust_permitted);
+            let changed = view(high.answer);
+            assert_eq!(changed.range.from, 0);
+            assert_eq!(changed.range.to, 2);
+            assert!(wire_bytes(&changed.replacement)
+                .windows(9)
+                .any(|w| w == b"PUBLISHED"));
+            assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+            st.last_applied_version = Some(changed.version);
+            assert_eq!(
+                adapter::step(&store, &request, &context(), &st, &mut state)
+                    .unwrap()
+                    .answer,
+                Answer::Noop
+            );
+        }
+
+        #[test]
+        fn prefix_rebuilding_publishes_below_threshold_and_replays_afterwards() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let request = req(
+                "ses",
+                "cfg0",
+                vec![item("a", 0, "raw history"), item("tail", 1, "tail")],
+            );
+            let mut st = status(&request.messages);
+            let mut state = State::new("compact".to_string(), Preset::Head);
+            adapter::setup(&store, &request, &context(), &st, &mut state).unwrap();
+            store
+                .replace_compartments("ses", &[comp(1, 0, 0, "a", "COLD PUBLISH")])
+                .unwrap();
+            st.prefix_rebuilding = true;
+            let pass = adapter::step(&store, &request, &context(), &st, &mut state).unwrap();
+            assert!(pass.prefix_bust_permitted);
+            let changed = view(pass.answer);
+            st.prefix_rebuilding = false;
+            st.last_applied_version = Some(changed.version);
+            assert_eq!(
+                adapter::step(&store, &request, &context(), &st, &mut state)
+                    .unwrap()
+                    .answer,
+                Answer::Noop
+            );
+        }
+
+        #[test]
+        fn later_soft_replacement_keeps_m0_bytes_and_contains_the_entire_working_range() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let request = req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("a", 0, "first"),
+                    item("b", 1, "second"),
+                    item("tail", 2, "tail"),
+                ],
+            );
+            store
+                .replace_compartments("ses", &[comp(1, 0, 0, "a", "BASELINE")])
+                .unwrap();
+            let mut st = status(&request.messages);
+            let mut state = State::new("compact".to_string(), Preset::Head);
+            let initial = view(
+                adapter::setup(&store, &request, &context(), &st, &mut state)
+                    .unwrap()
+                    .answer,
+            );
+            store
+                .replace_compartments(
+                    "ses",
+                    &[comp(1, 0, 0, "a", "BASELINE"), comp(2, 1, 1, "b", "DELTA")],
+                )
+                .unwrap();
+            assert_eq!(
+                adapter::step(&store, &request, &context(), &st, &mut state)
+                    .unwrap()
+                    .answer,
+                Answer::Noop
+            );
+            st.previous_usage = Some(PreviousUsage {
+                input_tokens: Some(66_000),
+                cached_input_tokens: Some(0),
+                cache_write_tokens: None,
+            });
+            let pass = adapter::step(&store, &request, &context(), &st, &mut state).unwrap();
+            assert_eq!(pass.engine.response.action, "SOFT");
+            let changed = view(pass.answer);
+            assert_eq!(
+                canonical_message_bytes(&changed.replacement[0]),
+                canonical_message_bytes(&initial.replacement[0])
+            );
+            assert_eq!(changed.range.from, 0);
+            assert_eq!(changed.range.to, 3);
+            assert!(wire_bytes(&changed.replacement)
+                .windows(5)
+                .any(|w| w == b"DELTA"));
+            assert!(wire_bytes(&changed.replacement)
+                .windows(4)
+                .any(|w| w == b"tail"));
+        }
+
+        #[test]
+        fn marker_only_hard_commits_markers_but_serves_frozen_noop() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let request = req("ses", "cfg0", vec![item("a", 0, "raw")]);
+            let st = status(&request.messages);
+            let mut state = State::new("compact".to_string(), Preset::Head);
+            let initial = view(
+                adapter::setup(&store, &request, &context(), &st, &mut state)
+                    .unwrap()
+                    .answer,
+            );
+            let mut loaded = store.load("ses").unwrap();
+            loaded.meta.project_memory_epoch_pending = true;
+            store
+                .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+            let pass = adapter::step(&store, &request, &context(), &st, &mut state).unwrap();
+            assert_eq!(pass.engine.response.action, "HARD");
+            assert!(pass.engine.response.committed);
+            assert!(!pass.engine.response.prefix_bust_permitted);
+            assert!(!pass.prefix_bust_permitted);
+            assert_eq!(pass.answer, Answer::Noop);
+            assert!(!store.load("ses").unwrap().meta.project_memory_epoch_pending);
+            assert_eq!(
+                wire_bytes(&initial.replacement),
+                wire_bytes(&state.last_applied.as_ref().unwrap().replacement)
+            );
+        }
+
+        #[test]
+        fn head_indices_precede_system_and_edited_prefix_strips_whole_signed_blocks() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let mut signed = reasoning_item("signed", 1, "private reasoning", "visible answer");
+            if let ck_wire::CkKind::Reasoning { signature, .. } = &mut signed.ck.content[0].kind {
+                *signature = Some("signature".to_string());
+            }
+            signed
+                .ck
+                .content
+                .push(CkWireBlock::bare(ck_wire::CkKind::Text {
+                    text: String::new(),
+                }));
+            let request = req(
+                "ses",
+                "cfg0",
+                vec![system_item("system", 0, "system"), signed],
+            );
+            let mut state = State::new("compact".to_string(), Preset::Head);
+            let initial = view(
+                adapter::setup(
+                    &store,
+                    &request,
+                    &context(),
+                    &status(&request.messages),
+                    &mut state,
+                )
+                .unwrap()
+                .answer,
+            );
+            assert!(initial.replacement[0].meta.synthetic);
+            assert!(initial.replacement[1].meta.synthetic);
+            assert_eq!(initial.replacement[2].role, "system");
+            assert!(initial
+                .replacement
+                .iter()
+                .flat_map(|m| &m.content)
+                .all(|b| !matches!(&b.kind, ck_wire::CkKind::Text { text } if text.is_empty())));
+            assert!(initial
+                .replacement
+                .iter()
+                .flat_map(|m| &m.content)
+                .all(|b| !matches!(
+                    &b.kind,
+                    ck_wire::CkKind::Reasoning {
+                        signature: Some(_),
+                        ..
+                    }
+                )));
+            assert!(wire_bytes(&initial.replacement)
+                .windows(14)
+                .any(|w| w == b"visible answer"));
+        }
+
+        #[test]
+        fn worker_and_reader_emit_no_head_and_keep_unedited_signed_thinking() {
+            for preset in [Preset::Worker, Preset::Reader] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = store(dir.path());
+                let mut signed = reasoning_item("signed", 0, "reasoning", "answer");
+                if let ck_wire::CkKind::Reasoning { signature, .. } = &mut signed.ck.content[0].kind
+                {
+                    *signature = Some("signature".to_string());
+                }
+                let request = req("ses", "cfg0", vec![signed]);
+                let mut state = State::new("compact".to_string(), preset);
+                let initial = view(
+                    adapter::setup(
+                        &store,
+                        &request,
+                        &context(),
+                        &status(&request.messages),
+                        &mut state,
+                    )
+                    .unwrap()
+                    .answer,
+                );
+                assert_eq!(
+                    wire_bytes(&initial.replacement),
+                    wire_bytes(&[request.messages[0].ck.clone()])
+                );
+            }
+        }
+
+        #[test]
+        fn full_working_range_contains_both_tool_sides_and_rejects_partial_pages() {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let mut result = tool_result("result", 1, "tool", "output");
+            result.ck.content[0] = serde_json::from_value(json!({
+                "kind": {"type": "tool_result", "id": "tool", "tool_name": "read", "output": {
+                    "kind": {"type": "content", "blocks": [
+                        {"kind": {"type": "text", "text": ""}},
+                        {"kind": {"type": "text", "text": "output"}}
+                    ]}
+                }}
+            }))
+            .unwrap();
+            let request = req(
+                "ses",
+                "cfg0",
+                vec![assistant_tool_call("call", 0, "tool"), result],
+            );
+            let st = status(&request.messages);
+            let mut state = State::new("compact".to_string(), Preset::Head);
+            let initial = view(
+                adapter::setup(&store, &request, &context(), &st, &mut state)
+                    .unwrap()
+                    .answer,
+            );
+            assert_eq!(initial.range.from, 0);
+            assert_eq!(initial.range.to, 2);
+            assert!(!String::from_utf8(wire_bytes(&initial.replacement))
+                .unwrap()
+                .contains("\"text\":\"\""));
+            assert_eq!(
+                initial
+                    .replacement
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .filter(|b| matches!(
+                        b.kind,
+                        ck_wire::CkKind::ToolCall { .. } | ck_wire::CkKind::ToolResult { .. }
+                    ))
+                    .count(),
+                2
+            );
+            let mut partial = request.clone();
+            partial.messages.pop();
+            assert!(adapter::step(&store, &partial, &context(), &st, &mut state).is_err());
+            assert!(adapter::step(
+                &store,
+                &partial,
+                &context(),
+                &status(&partial.messages),
+                &mut state
+            )
+            .is_err());
+            let mut past = st.clone();
+            past.newest_ordinal = Some(0);
+            assert!(adapter::step(&store, &request, &context(), &past, &mut state).is_err());
+        }
+
+        #[test]
+        fn unapplied_reason_controls_retry_and_versions_resume_above_runner() {
+            for structural in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = store(dir.path());
+                let request = req("ses", "cfg0", vec![item("a", 0, "raw")]);
+                let mut st = status(&request.messages);
+                st.last_applied_version = Some(40);
+                let mut state = State::new("compact".to_string(), Preset::Head);
+                let initial = view(
+                    adapter::setup(&store, &request, &context(), &st, &mut state)
+                        .unwrap()
+                        .answer,
+                );
+                assert_eq!(initial.version, 41);
+                store
+                    .replace_compartments("ses", &[comp(1, 0, 0, "a", "CHANGED VIEW")])
+                    .unwrap();
+                st.prefix_rebuilding = true;
+                let changed = view(
+                    adapter::step(&store, &request, &context(), &st, &mut state)
+                        .unwrap()
+                        .answer,
+                );
+                st.prefix_rebuilding = false;
+                st.last_applied_version = Some(initial.version);
+                st.last_not_applied = Some(NotApplied {
+                    version: changed.version,
+                    structural,
+                });
+                st.previous_usage = None;
+                let retried = adapter::step(&store, &request, &context(), &st, &mut state).unwrap();
+                if structural {
+                    assert_eq!(retried.answer, Answer::Noop);
+                } else {
+                    let retry = view(retried.answer);
+                    assert!(retry.version > changed.version);
+                    assert_eq!(
+                        wire_bytes(&retry.replacement),
+                        wire_bytes(&changed.replacement)
+                    );
+                    assert_eq!(retry.range, changed.range);
+                }
+            }
+        }
+    }
     use super::*;
     use crate::m1_compose::{m1_revision_signal, m1_revision_signal_parts_for_pass};
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
