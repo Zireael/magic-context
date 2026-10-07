@@ -68,6 +68,14 @@
             "behavior": true
         },
         {
+            "path": "tests/rust-plugin-stage-cache.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "opt-in measurement (MC_RUST_STAGE_BASELINE): compares the pre-change Rust adapter bundle with the current one for byte-identical output and todo/mural stage cost through a hermetic module and isolated OpenCode 1.18; needs a preserved baseline bundle, so it runs by hand, outside the mode lanes",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/system-prompt-change-order.test.ts",
             "tier": "both-modes",
             "invocation": { "ts": true, "rust": true },

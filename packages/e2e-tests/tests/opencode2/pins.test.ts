@@ -51,6 +51,10 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			// opener to openCurrentDatabase, so host paths cannot synchronously run
 			// migrations after async boot. This deliberate v1 safety change is not
 			// v2 loader leakage; the worker applies pending migrations off-thread.
+			// Re-minted when the v1 entry began checking the agent's checkout claim
+			// before Magic Context's first write for a session (62c040ad76, "gate every
+			// pre-turn Magic Context write on the checkout claim"); OpenCode 2 wires the
+			// same check through its own adapter, so this is a v1 change, not v2 leakage.
 			bytes = bytes
 				.replace('import { setup } from "./v2/server";\n', "")
 				.replace("PluginModule & { setup: typeof setup }", "PluginModule")
