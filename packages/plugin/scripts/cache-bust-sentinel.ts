@@ -1150,6 +1150,19 @@ export async function runSentinelOnce(
             const windows = groupBustWindows(requests, sessionState.openWindow);
             counters.bustWindows += windows.length;
             for (const window of windows) {
+                for (const row of window.rows) {
+                    if (row.divergenceClass !== "tail_shrink_no_rewrite") continue;
+                    stderr(
+                        JSON.stringify({
+                            kind: "cache_bust_sentinel_observation",
+                            session_id: row.session,
+                            at: row.at,
+                            divergence_class: row.divergenceClass,
+                            rewritten_tokens: Math.max(0, row.rewrittenTokens ?? 0),
+                            first_divergence: row.firstDivergence,
+                        }),
+                    );
+                }
                 const hasUnaccounted = window.rows.some((row) =>
                     isUnaccountedCacheBustClass(row.divergenceClass as string),
                 );
