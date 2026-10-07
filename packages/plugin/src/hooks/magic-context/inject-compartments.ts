@@ -67,9 +67,11 @@ import {
     decodeCachedM0UpgradeIdentity,
     encodeCachedM0UpgradeIdentity,
     MEMORY_RENDER_FORMAT_EPOCH,
+    readCachedM0MemoryIds,
     renderBudgetIdentityChanged,
     renderedBudgetShrinkReason,
     renderedBudgetSnapshot,
+    withCachedM0MemoryIds,
 } from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
 import { historyLocalBudget } from "./decision-calibration";
@@ -212,8 +214,8 @@ function findVisibleReanchorIndex(
 }
 
 /**
- * Return the set of memory ids currently rendered in the cached
- * <session-history> block for this session, if any. Used by ctx_search
+ * Return the set of project-memory ids currently rendered in the cached
+ * m[0]+m[1] prompt pair for this session, if any. Used by ctx_search
  * to hard-filter memories the agent already sees in context — retrieving
  * them from search wastes tokens and pushes high-signal raw-history hits
  * further down the ranking.
@@ -2371,7 +2373,8 @@ function applyMarkersToState(
     state: M0M1State,
     m0Bytes: Buffer,
     markers: M0SnapshotMarkers,
-    m1Bytes?: Buffer,
+    m1Bytes: Buffer,
+    renderedM0Ids: readonly number[],
 ): void {
     state.cachedM0Bytes = m0Bytes;
     if (m1Bytes) state.cachedM1Bytes = m1Bytes;
@@ -2385,13 +2388,16 @@ function applyMarkersToState(
     state.cachedM0ProjectDocsHash = markers.projectDocsHash;
     state.cachedM0MaterializedAt = markers.materializedAt;
     state.cachedM0SessionFactsVersion = markers.sessionFactsVersion;
-    state.cachedM0UpgradeState = encodeCachedM0UpgradeIdentity(
-        markers.upgradeState,
-        markers.compartmentRenderEpoch,
-        markers.muralEnabled,
-        markers.renderBudgetIdentity,
-        markers.memoryRenderEpoch,
-        markers.renderedBudgets ?? null,
+    state.cachedM0UpgradeState = withCachedM0MemoryIds(
+        encodeCachedM0UpgradeIdentity(
+            markers.upgradeState,
+            markers.compartmentRenderEpoch,
+            markers.muralEnabled,
+            markers.renderBudgetIdentity,
+            markers.memoryRenderEpoch,
+            markers.renderedBudgets ?? null,
+        ),
+        renderedM0Ids,
     );
     // Runtime markers must be mirrored into flat state because the next
     // mustMaterialize pass reads cachedM0SystemHash/ToolSetHash/ModelKey directly
@@ -2610,13 +2616,16 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
     options.beforePhase3ForTest?.();
 
     const steps = new WriteTransactionSteps();
-    const upgradeIdentity = encodeCachedM0UpgradeIdentity(
-        snapshotMarkers.upgradeState,
-        snapshotMarkers.compartmentRenderEpoch,
-        snapshotMarkers.muralEnabled,
-        snapshotMarkers.renderBudgetIdentity,
-        snapshotMarkers.memoryRenderEpoch,
-        snapshotMarkers.renderedBudgets ?? null,
+    const upgradeIdentity = withCachedM0MemoryIds(
+        encodeCachedM0UpgradeIdentity(
+            snapshotMarkers.upgradeState,
+            snapshotMarkers.compartmentRenderEpoch,
+            snapshotMarkers.muralEnabled,
+            snapshotMarkers.renderBudgetIdentity,
+            snapshotMarkers.memoryRenderEpoch,
+            snapshotMarkers.renderedBudgets ?? null,
+        ),
+        renderedMemoryIds,
     );
     const baselineEndMessageId = lastCompartmentBoundaryId(compartments);
     steps.mark("pre_metadata");
@@ -3018,9 +3027,7 @@ function renderM1WithMetadata(
     // facts reach the agent as promoted memories via the new-memories block
     // above (maxMemoryId watermark), not via a <session_facts> delta here.
 
-    const renderedNewMemoryIds = newMemoriesBlock
-        ? trimmedNewMemories.map((memory) => memory.id)
-        : [];
+    const renderedNewMemoryIds = newMemoriesBlock ? deltaMemories.map((memory) => memory.id) : [];
     if (blocks.length === 0) {
         return {
             text: M1_EMPTY_PLACEHOLDER,
@@ -3274,8 +3281,10 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
         steps.mark("staleCheck");
         const markers = markersFromCachedRow(row);
         if (!markers) throw new RenderM1InvalidMarkersError(options.sessionId);
-        const renderedM0Ids = parseMemoryBlockIds(row.memory_block_ids).filter(
-            (id) => id <= markers.maxMemoryId,
+        const renderedM0Ids = readCachedM0MemoryIds(
+            row.cached_m0_upgrade_state,
+            parseMemoryBlockIds(row.memory_block_ids),
+            markers.maxMemoryId,
         );
         const rendered = renderM1WithMetadata(options, markers, renderedM0Ids);
         const visibleMemoryIds = [...new Set([...renderedM0Ids, ...rendered.renderedMemoryIds])];
@@ -3290,7 +3299,8 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
                     SET cached_m1_bytes = ?,
                         cached_m0_last_baseline_end_message_id = ?,
                         memory_block_count = ?,
-                        memory_block_ids = ?
+                        memory_block_ids = ?,
+                        cached_m0_upgrade_state = ?
                   WHERE session_id = ?`,
             )
             .run(
@@ -3298,6 +3308,7 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
                 baselineEndMessageId,
                 visibleMemoryIds.length,
                 visibleIdsJson,
+                withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
                 options.sessionId,
             );
         steps.mark("sessionMeta");
@@ -3311,6 +3322,10 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             steps.durations,
         );
         options.state.cachedM1Bytes = m1Bytes;
+        options.state.cachedM0UpgradeState = withCachedM0MemoryIds(
+            row.cached_m0_upgrade_state,
+            renderedM0Ids,
+        );
         options.state.snapshotMarkers = markers;
         return rendered;
     } catch (error) {
@@ -3991,6 +4006,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
                 materialized.m0Bytes,
                 materialized.snapshotMarkers,
                 materialized.m1Bytes,
+                materialized.renderedMemoryIds,
             );
             m1Render = {
                 text: materialized.m1Text,
@@ -4161,6 +4177,7 @@ export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
                 refolded.m0Bytes,
                 refolded.snapshotMarkers,
                 refolded.m1Bytes,
+                refolded.renderedMemoryIds,
             );
             rematerialized = true;
             m0Text = decodeM0Bytes(options.state.cachedM0Bytes) ?? M0_EMPTY_BODY;

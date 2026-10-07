@@ -39,6 +39,7 @@ import {
     COMPARTMENT_RENDER_EPOCH,
     encodeCachedM0UpgradeIdentity,
     MEMORY_RENDER_FORMAT_EPOCH,
+    withCachedM0MemoryIds,
 } from "./compartment-render-epoch";
 import {
     capturePrefixTrimSourceOrder,
@@ -2464,13 +2465,16 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof row.cached_m0_materialized_at).toBe("number");
         expect(row.cached_m0_session_facts_version).toBe(0);
         expect(row.cached_m0_upgrade_state).toBe(
-            encodeCachedM0UpgradeIdentity(
-                "ready",
-                COMPARTMENT_RENDER_EPOCH,
-                false,
-                "m8000-h60000",
-                MEMORY_RENDER_FORMAT_EPOCH,
-                "m8000-h60000",
+            withCachedM0MemoryIds(
+                encodeCachedM0UpgradeIdentity(
+                    "ready",
+                    COMPARTMENT_RENDER_EPOCH,
+                    false,
+                    "m8000-h60000",
+                    MEMORY_RENDER_FORMAT_EPOCH,
+                    "m8000-h60000",
+                ),
+                [],
             ),
         );
     });
@@ -2835,13 +2839,16 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof state.cachedM0MaterializedAt).toBe("number");
         expect(state.cachedM0SessionFactsVersion).toBe(0);
         expect(state.cachedM0UpgradeState).toBe(
-            encodeCachedM0UpgradeIdentity(
-                "ready",
-                COMPARTMENT_RENDER_EPOCH,
-                false,
-                "m8000-h60000",
-                MEMORY_RENDER_FORMAT_EPOCH,
-                "m8000-h60000",
+            withCachedM0MemoryIds(
+                encodeCachedM0UpgradeIdentity(
+                    "ready",
+                    COMPARTMENT_RENDER_EPOCH,
+                    false,
+                    "m8000-h60000",
+                    MEMORY_RENDER_FORMAT_EPOCH,
+                    "m8000-h60000",
+                ),
+                [],
             ),
         );
         expect(state.snapshotMarkers?.maxMemoryId).toBe(0);
