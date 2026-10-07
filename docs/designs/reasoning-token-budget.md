@@ -204,9 +204,9 @@ by starting one.
 - **No `[cleared]` inside a signed block (#22050).** No new rewriting lane is added. Whole-part
   removal deletes the part along with its signature or encrypted metadata. The canonical
   Anthropic watermark lane writes `[cleared]` only into a part that `stripClearedReasoning`
-  replaces with an empty sentinel on the same pass, and the replay path does the same on every
-  later pass (`transform.ts:2324-2350`), which OpenCode's Anthropic adapter drops
-  before the wire, and prefix-bound models never take that lane. Pi empties the thinking text
+  replaces with an empty sentinel on the same pass; the replay path does the same on every
+  later pass (`transform.ts:2324-2350`). OpenCode's Anthropic adapter drops that empty
+  sentinel before the wire, and prefix-bound models never take that lane. Pi empties the thinking text
   and drops the signature, and its serializers omit empty thinking.
 - **Absorbing trailing-blank decisions (#16284).** Removal stays where it is today: last, after
   `finalizeMessageRepresentation` and after frozen trailing-blank decisions, which are captured
