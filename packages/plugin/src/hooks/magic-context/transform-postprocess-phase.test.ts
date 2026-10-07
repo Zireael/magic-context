@@ -11544,6 +11544,69 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
         }
     });
 
+    it("review: a served hint still strips signed thinking and its defer replay is byte-identical", async () => {
+        openDb();
+        const embedding = await import("../../features/magic-context/memory/embedding");
+        const worker = await import("./auto-search-worker-client");
+        const { autoSearchTestSnapshot } = await import("./auto-search-snapshot.fixture");
+        const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(
+            autoSearchTestSnapshot("git:review-healthy"),
+        );
+        const search = spyOn(worker, "searchAutoHint").mockResolvedValue([
+            {
+                source: "memory",
+                content: "historian cache wiring details",
+                score: 1,
+                memoryId: 1,
+                category: "ARCHITECTURE_DECISIONS",
+                matchType: "fts",
+            },
+        ]);
+        const sessionId = "review-healthy-thinking";
+        const fresh = () =>
+            ({
+                info: { id: "fresh-user", role: "user" },
+                parts: [{ type: "text", text: "historian cache wiring details" }],
+            }) as MessageLike;
+        try {
+            const warm = boundLoop(sessionId, 8);
+            warm.messages.push(fresh());
+            await serve(sessionId, warm, { clearReasoningAge: 999 });
+            const pass = boundLoop(sessionId, 8);
+            pass.messages.push(fresh());
+            const result = await serve(sessionId, pass, {
+                force: true,
+                clearReasoningAge: 999,
+                overrides: {
+                    projectPath: "git:review-healthy",
+                    autoSearch: { enabled: true, scoreThreshold: 0, minPromptChars: 1 },
+                },
+            });
+            expect(search).toHaveBeenCalledTimes(1);
+            expect(JSON.stringify(pass.messages)).toContain("<ctx-search-hint>");
+            expect(result.proactiveThinkingStrip?.messageIds).toHaveLength(8);
+            expect(JSON.stringify(pass.messages)).not.toContain("signed 7");
+            const defer = boundLoop(sessionId, 8);
+            defer.messages.push(fresh());
+            const replay = await serve(sessionId, defer, {
+                clearReasoningAge: 999,
+                overrides: {
+                    projectPath: "git:review-healthy",
+                    autoSearch: { enabled: true, scoreThreshold: 0, minPromptChars: 1 },
+                },
+            });
+            expect(replay.proactiveThinkingStrip).toBeNull();
+            const bytes = (messages: MessageLike[]) =>
+                JSON.stringify(
+                    messages.map((message) => ({ role: message.info.role, parts: message.parts })),
+                );
+            expect(bytes(defer.messages)).toBe(bytes(pass.messages));
+        } finally {
+            search.mockRestore();
+            snapshot.mockRestore();
+        }
+    });
+
     it("Rust-mode host keeps newer blocks on a module bust whose only edit is the oldest-prefix trim, and strips them otherwise", () => {
         openDb();
         const postprocess = (
