@@ -245,3 +245,32 @@ After this refinement: all 27 native codec tests, the 2 attachment/cache tests,
 and the attachment-free upgrade test passed; package-scoped clippy -D warnings
 and fmt also passed. Final identified binaries and real-host rerun are recorded
 below; the earlier full native-attach shard remains separately identified above.
+
+### Final-source fresh-build gate (supersedes earlier host runs)
+
+Product commit `8091d49bdae1e37a21f89c8c43e30ce60ff12d9c` was rebuilt with
+`MC_BUILD_SHA=$(git rev-parse HEAD) cargo build ...`; both normal and drive-fault
+outputs were copied into a new isolated `host-bin-final` directory. The daemon
+was rebuilt with the environment-prefixed lock-pinned command again.
+
+* Module version: `ck-mc 0.1.0 (8091d49bdae1e37a21f89c8c43e30ce60ff12d9c)`
+* Module SHA-256: `1de7ca62b9967f26a75141b2c488517cb17e9092a1a59a427253d0fc5f8426ba`
+* Drive-fault SHA-256: `bcc5aaf4664dcec8159361b3f3e8a3384c167f02530069492c29cfca268c2cfb`
+* Daemon: `ck-subc 0.20.55`, SHA-256 unchanged at
+  `ae0190cc809c98d9f9f3c9170b8a61b7b32fa2beb7b4fcbbb663102ac712ac80`
+* rustfmt version: `1.10.0-stable (b940084d7e 2026-09-28)`.
+
+With those exact final-source binaries and the current plugin bundle:
+
+1. The new real-host attachment test passed: **1 pass / 0 fail / 29 assertions**.
+2. The entire `MC_E2E_SHARD=0/4 scripts/run-rust-hermetic-e2e.sh` invocation passed
+   **without retries**: **15 files, 39 pass / 48 host-lane skips / 0 fail**.
+3. lsof containment passed for **55 host PIDs** in that full shard, plus the
+   direct attachment-test host; all database inventories were inside the
+   throwaway root. Final logs are `final-host-shard-{stdout,stderr}.txt` there.
+4. Version and digest probes after the gates still match the identities above.
+
+Only this final-source run is the final native-attach acceptance claim. The
+remaining full package-suite/Cargo integration failures described above are
+unrelated baseline failures, not hidden or relabeled as passes. No product source
+changes follow this build; the delivery's last commit only records these results.
