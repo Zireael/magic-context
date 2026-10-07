@@ -557,6 +557,16 @@ fn the_command_line_needs_a_backup_dir_to_apply() {
     assert!(options.apply);
 }
 
+/// The session_meta columns the repair clears: upgrade state, m[0] and m[1] bytes,
+/// and the visible-memory manifest (ids and count).
+type ClearedCachedPair = (
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    String,
+    i64,
+);
+
 #[test]
 fn repair_discards_typescript_memory_ids_with_the_cached_pair() {
     let fixture = Fixture::new();
@@ -569,7 +579,7 @@ fn repair_discards_typescript_memory_ids_with_the_cached_pair() {
 
     fixture.apply();
     let live = fixture.live();
-    let cleared: (Option<String>, Option<Vec<u8>>, Option<Vec<u8>>, String, i64) = live.query_row(
+    let cleared: ClearedCachedPair = live.query_row(
         "SELECT cached_m0_upgrade_state, cached_m0_bytes, cached_m1_bytes, memory_block_ids, memory_block_count FROM session_meta WHERE session_id = ?1",
         params![SESSION],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
