@@ -615,6 +615,11 @@ export interface TransformDeps {
     };
     /** Fire-and-forget active-session embed backfill after transform returns. */
     maybeAutoEmbedSession?: (sessionId: string) => void;
+    /**
+     * Called once per pass, before either renderer runs, with the session and the
+     * host's input messages: the request these messages belong to is being built.
+     */
+    onMessagesPassStarted?: (sessionId: string, messages: readonly MessageLike[]) => void;
     /** Resolved project mode. Rust mode bypasses every TS mutation below. */
     transformMode?: "ts" | "rust";
     /** Prompt-surface routing and USER description overrides forwarded to Rust mode. */
@@ -723,6 +728,7 @@ export function createTransform(deps: TransformDeps) {
         if (!sessionId) {
             return;
         }
+        deps.onMessagesPassStarted?.(sessionId, messages);
         const temporalCandidates = deps.experimentalTemporalAwareness
             ? collectTemporalCandidates(messages)
             : undefined;
@@ -2446,8 +2452,10 @@ export function createTransform(deps: TransformDeps) {
         // change, plus the TTL idle window. The tool-set fingerprint is observed
         // alongside them but never folds m[0] because its process-global scope
         // would create false-positive folds across sessions. When system.transform
-        // follows messages.transform, systemHash is the persisted last-turn hash;
-        // a warm system change is then detected on the next pass.
+        // follows messages.transform (OpenCode 1), systemHash is the persisted
+        // last-turn hash. The system hook then adopts a change on the request that
+        // first carries it (see system-prompt-hash.ts), so the next pass does not
+        // fold on it and the provider rewrites its cache once, not twice.
         const hardModel = deps.liveModelBySession?.get(sessionId);
         const hardModelKey = hardModel ? `${hardModel.providerID}/${hardModel.modelID}` : "";
         const hardToolSetHash = deps.getToolSetHash?.(sessionId) ?? "";
