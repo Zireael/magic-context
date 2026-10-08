@@ -22859,6 +22859,81 @@ pub(crate) mod tests {
             .is_empty());
     }
 
+    fn check_review_issue630_rust_95_without_unsafe_work(is_subagent: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut assistant = assistant_tool_call("a", 2, "t");
+        assistant.ck.content.insert(
+            0,
+            CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "original".into(),
+                signature: Some("sig-original".into()),
+            }),
+        );
+        let mut request = with_usage(
+            req(
+                "review-no-unsafe-work",
+                "cfg",
+                vec![
+                    item("u", 1, "task"),
+                    assistant,
+                    tool_result("r", 3, "t", "spent"),
+                ],
+            ),
+            20_000,
+            100_000,
+        );
+        request.is_subagent = is_subagent;
+        request.provider_id = Some("anthropic".into());
+        request.model_key = Some("claude-opus-5-5".into());
+        request.serializer_profile = "opencode-aisdk".into();
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        transform(&s, &request, &ctx).unwrap();
+        // Only one signed response, no queued drop, and no provider overflow.
+        // The existing 95%-usage reading still leaves room in the window.
+        request = with_usage(request, 95_000, 100_000);
+        let result = transform(&s, &request, &ctx);
+        assert!(result.is_ok(), "primary/subagent={is_subagent}: {result:?}");
+    }
+
+    #[test]
+    fn review_issue630_rust_primary_95_without_unsafe_work_still_serves() {
+        check_review_issue630_rust_95_without_unsafe_work(false);
+    }
+
+    #[test]
+    fn review_issue630_rust_subagent_95_without_unsafe_work_still_serves() {
+        check_review_issue630_rust_95_without_unsafe_work(true);
+    }
+
+    #[test]
+    fn review_issue630_rust_metadata_route_keeps_all_active_thinking() {
+        let native = vec![
+            serde_json::json!({"info":{"id":"u","role":"user"},"parts":[{"type":"text","text":"task"}]}),
+            serde_json::json!({"info":{"id":"a1","role":"assistant"},"parts":[
+                {"type":"reasoning","text":"first","metadata":{"anthropic":{"signature":"sig-first"}}},
+                {"type":"text","text":"answer one"}
+            ]}),
+            serde_json::json!({"info":{"id":"a2","role":"assistant"},"parts":[
+                {"type":"reasoning","text":"last","metadata":{"anthropic":{"signature":"sig-last"}}},
+                {"type":"text","text":"answer two"}
+            ]}),
+        ];
+        let decoded = crate::codec::decode_opencode(&native);
+        let mut request = opencode_req("review-custom-route", "cfg", decoded.messages);
+        // Custom route names are not provider evidence. The native blocks still
+        // explicitly identify their Anthropic signatures, just as in the TS fixture.
+        request.provider_id = Some("custom".into());
+        request.model_key = Some("renamed".into());
+        request.native_messages = Some(native);
+        let tags = BTreeMap::from([("a1".into(), 2), ("a2".into(), 4)]);
+        let selected = opencode_reasoning_removal_mids(&request, &tags, Some(3), &HashSet::new());
+        assert!(
+            selected.is_empty(),
+            "removed active signed thinking: {selected:?}"
+        );
+    }
+
     #[test]
     fn issue_619_primary_execute_holds_queued_drops() {
         check_issue_619_subagent_ride(false, true, true);

@@ -26926,6 +26926,9 @@ mod tests {
                 bytes.len(),
                 Sha256::digest(&bytes)
             );
+            if pass == 3 {
+                eprintln!("issue630-byte-audit {}", String::from_utf8_lossy(&bytes));
+            }
             // Captured on the pre-compaction implementation with the identical fixture.
             // Pass 3 is the one exception: the whole fixture is a single Anthropic
             // turn with signed thinking on a prefix-bound model, and its priced pass
