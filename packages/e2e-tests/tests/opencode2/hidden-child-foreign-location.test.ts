@@ -14,6 +14,7 @@ import { execFileSync } from "node:child_process";
 import { OpenCode } from "@opencode/client";
 import { CANONICAL_DREAM_TASKS } from "../../../plugin/src/features/magic-context/dreamer/task-registry";
 import { insertMemory } from "../../../plugin/src/features/magic-context/memory";
+import { resolveProjectIdentityForSession } from "../../../plugin/src/features/magic-context/memory/project-identity";
 import { Database } from "../../../plugin/src/shared/sqlite";
 import {
 	assertOpenPaths,
@@ -69,11 +70,11 @@ function hashTree(root: string): Record<string, string> {
 	return out;
 }
 
-function dreamerConfig(): Record<string, unknown> {
+function dreamerConfig(disable = false): Record<string, unknown> {
 	const tasks: Record<string, unknown> = {};
 	for (const task of CANONICAL_DREAM_TASKS)
 		tasks[task] = { schedule: task === "map-memories" ? "0 3 * * *" : "" };
-	return { disable: false, tasks };
+	return { disable, tasks };
 }
 
 async function eventually(check: () => boolean, what: string, timeoutMs = 60_000) {
@@ -85,7 +86,7 @@ async function eventually(check: () => boolean, what: string, timeoutMs = 60_000
 }
 
 /** Two directories (A: the project with memories to map, B: another repository), both running Magic Context. */
-async function twoDirectoryHost() {
+async function twoDirectoryHost(options: { dreamerDisabledAtBoot?: boolean } = {}) {
 	const fixture = isolation();
 	const projectB = join(fixture.root, "infra-repo");
 	mkdirSync(join(projectB, "infra"), { recursive: true });
@@ -107,7 +108,7 @@ async function twoDirectoryHost() {
 	);
 	const host = await spawnOpencode2({
 		existingIsolation: fixture,
-		magicContextConfig: { dreamer: dreamerConfig() },
+		magicContextConfig: { dreamer: dreamerConfig(options.dreamerDisabledAtBoot === true) },
 	});
 	copyFileSync(join(fixture.cwd, "opencode.json"), join(projectB, "opencode.json"));
 	const client = OpenCode.make({
@@ -126,38 +127,41 @@ async function twoDirectoryHost() {
 	console.log(
 		`issue-639 host ${execFileSync(CLI, ["--version"], { encoding: "utf8" }).trim()} pid=${host.pid} lsof db=${JSON.stringify(dbPaths)}`,
 	);
-	await eventually(
-		() => (readPluginLog(host.env).match(/\[dreamer\] registered project /g) ?? []).length >= 2,
-		"both directories to register with the dream timer",
-	);
-	const identities = [
-		...readPluginLog(host.env).matchAll(/\[dreamer\] registered project (\S+) \(/g),
-	].map((match) => match[1]!);
-	// A registers first: its location booted first.
-	const identityA = identities[0]!;
-	const db = new Database(join(host.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db"), {
-		readwrite: true,
-		fileMustExist: true,
-	});
+	// The identity the plugin derives for A, as each of its passes does.
+	const identityA = resolveProjectIdentityForSession(fixture.cwd);
+	if (!identityA) throw new Error("project A has no identity");
+	if (options.dreamerDisabledAtBoot !== true)
+		await eventually(
+			() => readPluginLog(host.env).includes(`[dreamer] registered project ${identityA} (`),
+			"directory A to register with the dream timer",
+		);
 	const memoryIds: number[] = [];
-	try {
-		for (let index = 0; index < 3; index++)
-			memoryIds.push(
-				insertMemory(db as never, {
-					projectPath: identityA,
-					category: "ARCHITECTURE",
-					content: `Fixture claim ${index} is recorded in fact.txt.`,
-				}).id,
-			);
-		db.prepare(
-			`INSERT INTO task_schedule_state (project_path, task, last_run_at, next_due_at, schedule, last_status, last_error, retry_count)
-			 VALUES (?, 'map-memories', NULL, ?, NULL, NULL, NULL, 0)
-			 ON CONFLICT(project_path, task) DO UPDATE SET last_run_at = NULL, next_due_at = excluded.next_due_at,
-			   schedule = NULL, last_status = NULL, last_error = NULL, retry_count = 0`,
-		).run(identityA, Date.now() - 60_000);
-	} finally {
-		db.close();
-	}
+	/** Adds unmapped memories to A and makes its map-memories task due now. */
+	const seedDueMapping = (count: number) => {
+		const db = new Database(join(host.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db"), {
+			readwrite: true,
+			fileMustExist: true,
+		});
+		try {
+			for (let index = 0; index < count; index++)
+				memoryIds.push(
+					insertMemory(db as never, {
+						projectPath: identityA,
+						category: "ARCHITECTURE",
+						content: `Fixture claim ${memoryIds.length} is recorded in fact.txt.`,
+					}).id,
+				);
+			db.prepare(
+				`INSERT INTO task_schedule_state (project_path, task, last_run_at, next_due_at, schedule, last_status, last_error, retry_count)
+				 VALUES (?, 'map-memories', NULL, ?, NULL, NULL, NULL, 0)
+				 ON CONFLICT(project_path, task) DO UPDATE SET last_run_at = NULL, next_due_at = excluded.next_due_at,
+				   schedule = NULL, last_status = NULL, last_error = NULL, retry_count = 0`,
+			).run(identityA, Date.now() - 60_000);
+		} finally {
+			db.close();
+		}
+	};
+	seedDueMapping(3);
 	const mappedCount = () => {
 		const read = new Database(join(host.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db"), {
 			readonly: true,
@@ -175,7 +179,16 @@ async function twoDirectoryHost() {
 			read.close();
 		}
 	};
-	return { host, client, projectA: fixture.cwd, projectB, identityA, memoryIds, mappedCount };
+	return {
+		host,
+		client,
+		projectA: fixture.cwd,
+		projectB,
+		identityA,
+		memoryIds,
+		mappedCount,
+		seedDueMapping,
+	};
 }
 
 /**
@@ -357,30 +370,38 @@ test(
 test(
 	"dreamer.disable takes effect without a restart, in both directions",
 	async () => {
-		const state = await twoDirectoryHost();
+		const state = await twoDirectoryHost({ dreamerDisabledAtBoot: true });
 		const { host, client, projectA } = state;
 		const userConfig = join(host.env.XDG_CONFIG_HOME!, "cortexkit", "magic-context.jsonc");
-		const setDisable = (disable: boolean) => {
+		const setDisable = async (disable: boolean) => {
 			const config = JSON.parse(readFileSync(userConfig, "utf8"));
 			config.dreamer = { ...config.dreamer, disable };
 			writeFileSync(userConfig, JSON.stringify(config, null, 2));
+			// The config reader keys on mtime and size; let the edit be observable.
+			await Bun.sleep(1_100);
 		};
 		try {
 			const seen = scriptMock(host, state.memoryIds);
-			setDisable(true);
-			// The config reader keys on mtime; make sure the edit is observable.
-			await Bun.sleep(1_100);
+			// Off at boot: a finished turn starts nothing.
 			await endTurn(client, projectA, "work while the dreamer is off");
 			await Bun.sleep(5_000);
 			expect(seen.shaped).toBe(0);
 			expect(state.mappedCount()).toBe(0);
-			expect(readPluginLog(host.env)).not.toContain("map-memories: committed");
 
-			setDisable(false);
-			await Bun.sleep(1_100);
-			await endTurn(client, projectA, "work after turning it back on");
+			// Turned on in the config: the next turn starts the dreamer and runs the due task.
+			await setDisable(false);
+			await endTurn(client, projectA, "work after turning it on");
 			await eventually(() => state.mappedCount() === state.memoryIds.length, "the mapping run");
-			expect(seen.shaped).toBeGreaterThanOrEqual(1);
+			const shapedWhileOn = seen.shaped;
+			expect(shapedWhileOn).toBeGreaterThanOrEqual(1);
+
+			// Turned off again, with new work due: nothing more runs.
+			await setDisable(true);
+			state.seedDueMapping(2);
+			await endTurn(client, projectA, "work after turning it off again");
+			await Bun.sleep(5_000);
+			expect(seen.shaped).toBe(shapedWhileOn);
+			expect(state.mappedCount()).toBe(state.memoryIds.length - 2);
 		} catch (error) {
 			console.error(host.stderr(), readPluginLog(host.env));
 			throw error;
