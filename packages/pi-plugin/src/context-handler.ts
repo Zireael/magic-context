@@ -388,7 +388,6 @@ import {
 	stripPiLeadingTemporalMarker,
 	withoutPiLeadingTemporalMarker,
 } from "./temporal-awareness-pi";
-import { withTimeout } from "./timeout";
 import {
 	type PiMessageTokenCacheEntry,
 	tokenizePiMessages,
@@ -443,6 +442,7 @@ let mutationGateObserverForTests:
 let lkgRecoveryLogObserverForTests: ((message: string) => void) | undefined;
 
 let variantChangeLogObserverForTests: ((message: string) => void) | undefined;
+let beforePipelineForTests: (() => Promise<void>) | undefined;
 
 function logPiLkgRecovery(sessionId: string, message: string): void {
 	lkgRecoveryLogObserverForTests?.(message);
@@ -450,6 +450,13 @@ function logPiLkgRecovery(sessionId: string, message: string): void {
 }
 
 export const __test = {
+	setBeforePipelineForTests(fn: (() => Promise<void>) | undefined) {
+		const previous = beforePipelineForTests;
+		beforePipelineForTests = fn;
+		return () => {
+			beforePipelineForTests = previous;
+		};
+	},
 	updateSessionProjectTracking,
 	isPiHardCacheExpired,
 	adoptPiFallbackTags,
@@ -3418,10 +3425,9 @@ export function registerPiContextHandler(
 				clearEmergencyDropSample(options.db, sessionId);
 			}
 
-			// At 95%, wait up to 30s for an in-flight historian, then evaluate
-			// tiered reclaim with only open arcs and ctx_reduce exemplars protected.
-			// The wait does not abort the child: its own runner timeout still bounds
-			// execution, and a late publication can materialize on the next pass.
+			// Emergency reclaim uses already-published history and available tags.
+			// Never join the historian here: it can outlive the host's context deadline.
+			// Its independent publication remains available to the next admitted pass.
 			const hardUsagePercentage = needsEmergencyBump
 				? Math.max(EMERGENCY_BLOCK_PERCENTAGE, usagePercentage)
 				: windowGeometry?.usableHard && usageInputTokens > 0
@@ -3447,25 +3453,8 @@ export function registerPiContextHandler(
 					);
 					sessionLog(
 						sessionId,
-						`EMERGENCY: usage=${usagePercentage.toFixed(1)}% — notified user, awaiting in-flight historian + evaluating tiered emergency reclaim`,
+						`EMERGENCY: usage=${usagePercentage.toFixed(1)}% — notified user, evaluating available tiered emergency reclaim without joining historian`,
 					);
-				}
-
-				// Wait for in-flight historian (if any) so its drops can
-				// be applied on this pass. Bounded so a hung historian
-				// doesn't stall the user's turn.
-				const histPromise = inFlightHistorian.get(sessionId);
-				if (histPromise) {
-					try {
-						await guardAwait(withTimeout(histPromise, 30_000));
-						sessionLog(
-							sessionId,
-							"EMERGENCY: historian wait completed (or timed out)",
-						);
-					} catch {
-						// Historian already logged its own failure; just continue.
-						assertCurrentPass();
-					}
 				}
 
 				// Disarm a stuck emergency-recovery flag only after real pressure has
@@ -3567,6 +3556,7 @@ export function registerPiContextHandler(
 			logTransformTiming(sessionId, "prePipelineTotal", transformStartTime);
 			const tRunPipeline = performance.now();
 			budget.stage = "pipeline";
+			if (beforePipelineForTests) await guardAwait(beforePipelineForTests());
 			assertCurrentPass();
 			const result = await guardAwait(
 				runPipeline({
@@ -3715,11 +3705,7 @@ export function registerPiContextHandler(
 			// fire-and-forget so we never block the LLM call on it.
 			const tHistorianScheduling = performance.now();
 			const historian = options.historian;
-			if (
-				historian &&
-				!options.compactionOff &&
-				budget.remainingWork() > 0
-			) {
+			if (historian && !options.compactionOff && budget.remainingWork() > 0) {
 				withoutSqliteTransformPass(() =>
 					maybeFireHistorian({
 						pi,

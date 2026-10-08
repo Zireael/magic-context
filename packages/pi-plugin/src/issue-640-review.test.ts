@@ -52,9 +52,8 @@ for (const cancellation of ["successor", "signal"] as const) {
 		const db = createTestDb();
 		const sessionId = `review-late-${cancellation}`;
 		const historian = deferred();
-		const restoreHistorian = __test.setInFlightHistorianForTests(
-			sessionId,
-			historian.promise,
+		const restorePause = __test.setBeforePipelineForTests(
+			() => historian.promise,
 		);
 		const controller = new AbortController();
 		let older: Promise<unknown> | undefined;
@@ -77,14 +76,14 @@ for (const cancellation of ["successor", "signal"] as const) {
 				(error: Error) => ({ error: error.message }),
 			);
 			await new Promise((done) => setImmediate(done));
-			// The metadata transaction has finished. Waiting for in-flight history
-			// summarization pauses this request before it assigns or migrates tags,
-			// allowing cancellation or a replacement request to arrive first.
+			// Pause after admission and before tagging so cancellation or a
+			// replacement request can arrive without depending on a historian join.
 			expect(db.inTransaction).toBe(false);
 			expect(
 				db.prepare("SELECT * FROM tags WHERE session_id=?").all(sessionId),
 			).toHaveLength(0);
 			if (cancellation === "successor") {
+				restorePause();
 				const newer = [userMessage("replacement input", 2)];
 				const result = await handler(
 					{ messages: newer },
@@ -113,7 +112,7 @@ for (const cancellation of ["successor", "signal"] as const) {
 		} finally {
 			historian.resolve();
 			await older;
-			restoreHistorian();
+			restorePause();
 			clearContextHandlerSession(sessionId);
 			resetLkgSlotsForTest();
 			db.close();
