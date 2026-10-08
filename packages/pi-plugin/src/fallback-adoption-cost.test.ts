@@ -8,6 +8,43 @@ import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir
 import { __test } from "./context-handler";
 import { createTestDb } from "./test-utils.test";
 
+it("changed negative-preflight revision rebuilds served fingerprints before the authoritative scan", () => {
+	const db = createTestDb();
+	const preflightRevision = {
+		external: db.prepare("PRAGMA data_version").get() as { data_version: number },
+		local: db.prepare("SELECT total_changes() AS changes").get() as { changes: number },
+	};
+	let rebuilt = 0;
+	const exec = db.exec.bind(db);
+	const spy = spyOn(db, "exec").mockImplementation((sql) => {
+		exec(sql);
+		if (sql === "BEGIN IMMEDIATE") db.prepare("INSERT INTO tags(message_id,type,status,session_id,tag_number,byte_size,entry_fingerprint) VALUES ('pi-msg-served:p0','message','dropped','session',7,0,'served-fp')").run();
+	});
+	try {
+		__test.adoptPiFallbackTags(db, "session", createTagger(), new Map([["tail", "tail-fp"]]), {
+			preflightRevision,
+			rebuildFingerprints: () => { rebuilt++; expect(db.inTransaction).toBe(true); return new Map([["served", "served-fp"], ["tail", "tail-fp"]]); },
+		});
+		expect(rebuilt).toBe(1);
+		expect(db.prepare("SELECT message_id,status FROM tags").get()).toEqual({ message_id: "served:p0", status: "dropped" });
+	} finally { spy.mockRestore(); db.close(); }
+});
+
+it("unchanged negative-preflight revision keeps the tail-only fingerprint fast path", () => {
+	const db = createTestDb();
+	const preflightRevision = {
+		external: db.prepare("PRAGMA data_version").get() as { data_version: number },
+		local: db.prepare("SELECT total_changes() AS changes").get() as { changes: number },
+	};
+	let rebuilt = 0;
+	try {
+		__test.adoptPiFallbackTags(db, "session", createTagger(), new Map(), {
+			preflightRevision, rebuildFingerprints: () => { rebuilt++; return new Map(); },
+		});
+		expect(rebuilt).toBe(0);
+	} finally { db.close(); }
+});
+
 it("fallback discovery revalidates a sibling commit after its revision snapshot", () => {
 	const dir = createTestTempDirFromPath(
 		join(tmpdir(), "pi-adoption-revision-"),

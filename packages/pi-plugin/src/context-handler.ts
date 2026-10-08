@@ -2160,6 +2160,32 @@ interface AdoptPiFallbackTagsOptions {
 	resolveStableId?: (msg: unknown, index: number) => string | undefined;
 	hasFallbackMessageTags?: boolean;
 	hasFallbackToolOwnerTags?: boolean;
+	preflightRevision?: ReturnType<typeof readPiAdoptionRevision>;
+	rebuildFingerprints?: () => ReadonlyMap<string, string>;
+}
+
+function readPiAdoptionRevision(db: ContextDatabase) {
+	return {
+		external: db.prepare("PRAGMA data_version").get() as { data_version: number },
+		local: db.prepare("SELECT total_changes() AS changes").get() as { changes: number },
+	};
+}
+
+function preparePiAdoptionFingerprints(fingerprintById: ReadonlyMap<string, string>) {
+	const realIdsByFingerprint = new Map<string, string[]>();
+	for (const [id, fingerprint] of fingerprintById) {
+		if (id.startsWith("pi-msg-")) continue;
+		const ids = realIdsByFingerprint.get(fingerprint) ?? [];
+		ids.push(id);
+		realIdsByFingerprint.set(fingerprint, ids);
+	}
+	const fingerprints = [...realIdsByFingerprint.keys()];
+	const batches: { values: string[]; placeholders: string }[] = [];
+	for (let i = 0; i < fingerprints.length; i += 900) {
+		const values = fingerprints.slice(i, i + 900);
+		batches.push({ values, placeholders: values.map(() => "?").join(",") });
+	}
+	return { realIdsByFingerprint, batches };
 }
 
 function readAdoptablePiFallbackFingerprints(
@@ -2198,32 +2224,13 @@ function adoptPiFallbackTags(
 	// Prepare message identities and SQL bind lists before taking the writer.
 	// Another connection can add a synthetic tag while this work runs, so validate
 	// the discovery revision after BEGIN; never trust an earlier negative read.
-	const realIdsByFingerprint = new Map<string, string[]>();
-	for (const [id, fingerprint] of fingerprintById) {
-		if (id.startsWith("pi-msg-")) continue;
-		const ids = realIdsByFingerprint.get(fingerprint) ?? [];
-		ids.push(id);
-		realIdsByFingerprint.set(fingerprint, ids);
-	}
-	const fingerprints = [...realIdsByFingerprint.keys()];
-	const batches: { values: string[]; placeholders: string }[] = [];
-	for (let i = 0; i < fingerprints.length; i += 900) {
-		const values = fingerprints.slice(i, i + 900);
-		batches.push({ values, placeholders: values.map(() => "?").join(",") });
-	}
+	let { realIdsByFingerprint, batches } = preparePiAdoptionFingerprints(fingerprintById);
 	const ownerMap =
 		options.messages && options.resolveStableId
 			? buildPiToolOwnerMap(options.messages, options.resolveStableId)
 			: null;
-	if (!batches.length && !ownerMap?.size) return;
-	const revision = () => ({
-		external: db.prepare("PRAGMA data_version").get() as {
-			data_version: number;
-		},
-		local: db.prepare("SELECT total_changes() AS changes").get() as {
-			changes: number;
-		},
-	});
+	if (!batches.length && !ownerMap?.size && !options.rebuildFingerprints) return;
+	const revision = () => readPiAdoptionRevision(db);
 	const beforeDiscovery = revision();
 	// Discover candidates without blocking writers and prepare their target ids.
 	// The revision check below is authoritative: discovery may miss a sibling's
@@ -2240,6 +2247,18 @@ function adoptPiFallbackTags(
 	const discoveredTargets = targetsFor(discovered);
 
 	runImmediateTransaction(db, () => {
+		const admitted = revision();
+		const preflight = options.preflightRevision;
+		const rebuild = options.rebuildFingerprints;
+		const expanded = Boolean(preflight && rebuild && (
+			preflight.external.data_version !== admitted.external.data_version ||
+			preflight.local.changes !== admitted.local.changes
+		));
+		if (expanded && rebuild) {
+			// A new commit may target history omitted by the negative gate. Recover
+			// those pristine fingerprints, not just more rows for the old tail set.
+			({ realIdsByFingerprint, batches } = preparePiAdoptionFingerprints(rebuild()));
+		}
 		if (batches.length && hasPersistedPiFallbackMessageTags(db, sessionId)) {
 			// After writer admission the candidate set cannot gain rows from a
 			// sibling connection. Missing fingerprints need no per-message read;
@@ -2247,18 +2266,16 @@ function adoptPiFallbackTags(
 			// data_version detects other connections' commits; total_changes catches
 			// this connection's own writes. With BEGIN held, an unchanged revision
 			// makes discovery authoritative without repeating the large IN queries.
-			const admitted = revision();
 			const unchanged =
+				!expanded &&
 				beforeDiscovery.external.data_version ===
 					admitted.external.data_version &&
 				beforeDiscovery.local.changes === admitted.local.changes;
 			const adoptable = unchanged
 				? discovered
 				: readAdoptablePiFallbackFingerprints(db, sessionId, batches);
-			const targets = discoveredTargets.filter(([, fp]) => adoptable.has(fp));
-			targets.push(
-				...targetsFor([...adoptable].filter((fp) => !discovered.has(fp))),
-			);
+			const targets = expanded ? targetsFor(adoptable) : discoveredTargets.filter(([, fp]) => adoptable.has(fp));
+			if (!expanded) targets.push(...targetsFor([...adoptable].filter((fp) => !discovered.has(fp))));
 			for (const [realMessageId, fingerprint] of targets) {
 				// Only real ids can be adoption targets; a pi-msg-* id has no fallback
 				// predecessor to migrate from.
@@ -6105,6 +6122,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// This indexed preflight avoids rebuilding fingerprints for every old message.
 	// A negative result is rechecked by adoption after this map is complete, while
 	// tool-owner adoption performs its only existence probe at that later point.
+	const preflightRevision = readPiAdoptionRevision(args.db);
 	const hasFallbackMessageTags = hasPiFallbackMessageTags(
 		args.db,
 		args.sessionId,
@@ -6127,6 +6145,15 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			messages: args.messages as PiAgentMessage[],
 			resolveStableId: stableIdResolver,
 			hasFallbackMessageTags,
+			preflightRevision,
+			rebuildFingerprints: !hasFallbackMessageTags && args.reusableMessageIds?.size
+				? () => {
+					args.assertCurrentPass?.();
+					const full = buildEntryFingerprintMap(args.messages as PiAgentMessage[], stableIdResolver);
+					for (const [id, fingerprint] of full) entryFingerprintByMessageId.set(id, fingerprint);
+					return entryFingerprintByMessageId;
+				}
+				: undefined,
 		},
 	);
 	logTransformTiming(
