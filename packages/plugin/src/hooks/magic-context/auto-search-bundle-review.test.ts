@@ -87,6 +87,7 @@ for (const [runtime, directory, harness, packed] of [
     ["node", "packages/pi-plugin/dist", "pi", true],
     ["node", "packages/pi-plugin/dist", "omp", true],
     ["pi", "packages/pi-plugin/dist", "pi", false],
+    ["omp", "packages/pi-plugin/dist", "omp", false],
 ] as const) {
     test.skipIf(!Bun.which(runtime))(
         `review bundle: ${packed ? "packed " : ""}${harness} worker under ${runtime} loads, restarts, retires and shuts down`,
@@ -146,29 +147,53 @@ for (const [runtime, directory, harness, packed] of [
             db.close();
             const driverPath = join(fixtureRoot, "driver.mjs");
             writeFileSync(driverPath, driver);
-            const host = runtime === "pi";
+            const host = runtime === "pi" || runtime === "omp";
             const argumentsForDriver = [workerEntry, path, harness, fixtureRoot];
-            const command = host
-                ? [
-                      runtime,
-                      "--mode",
-                      "rpc",
-                      "--no-session",
-                      "--no-extensions",
-                      "--no-skills",
-                      "--no-tools",
-                      "--provider",
-                      "openai",
-                      "--model",
-                      "gpt-4o",
-                      "--api-key",
-                      "review-fixture-not-a-secret",
-                      "--extension",
-                      fileURLToPath(
-                          new URL("./auto-search-host-review.fixture.ts", import.meta.url),
-                      ),
-                  ]
-                : [runtime, driverPath, ...argumentsForDriver];
+            const command =
+                runtime === "omp"
+                    ? [
+                          runtime,
+                          "--mode",
+                          "rpc",
+                          "--no-session",
+                          "--no-skills",
+                          "--no-tools",
+                          "--no-lsp",
+                          "--no-pty",
+                          "--no-rules",
+                          "--no-title",
+                          "--provider",
+                          "openai",
+                          "--model",
+                          "gpt-4o",
+                          "--api-key",
+                          "review-fixture-not-a-secret",
+                          "--extension",
+                          fileURLToPath(
+                              new URL("./auto-search-omp-host-review.fixture.ts", import.meta.url),
+                          ),
+                      ]
+                    : host
+                      ? [
+                            runtime,
+                            "--mode",
+                            "rpc",
+                            "--no-session",
+                            "--no-extensions",
+                            "--no-skills",
+                            "--no-tools",
+                            "--provider",
+                            "openai",
+                            "--model",
+                            "gpt-4o",
+                            "--api-key",
+                            "review-fixture-not-a-secret",
+                            "--extension",
+                            fileURLToPath(
+                                new URL("./auto-search-host-review.fixture.ts", import.meta.url),
+                            ),
+                        ]
+                      : [runtime, driverPath, ...argumentsForDriver];
             const child = Bun.spawn(command, {
                 windowsHide: true,
                 cwd: host ? fixtureRoot : repo,
