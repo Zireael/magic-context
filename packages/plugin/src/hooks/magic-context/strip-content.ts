@@ -923,8 +923,7 @@ export function stripReasoningFromMergedAssistants(
     // look eligible to keep on the next request. Only legacy bare ids still
     // use that layout-dependent rule, preserving their pre-deployment bytes.
     for (const message of messages) {
-        if (message === options?.mutationExemptMessage || message.info.role !== "assistant")
-            continue;
+        if (message.info.role !== "assistant") continue;
         const parts = frozenParts.get(message.info.id ?? "");
         if (!parts) continue;
         for (let index = 0; index < message.parts.length; index += 1) {
@@ -935,6 +934,28 @@ export function stripReasoningFromMergedAssistants(
             message.parts[index] = makeSentinel(part);
             stripped++;
         }
+    }
+    // Legacy bare ids carry no exact part selection. Never rediscover a layout
+    // that could bring a previously removed signed block back on a host subset.
+    if (options?.frozenMessageIds) {
+        const legacyIds = new Set(
+            [...options.frozenMessageIds].filter(
+                (id) =>
+                    !frozenParts.has(id) &&
+                    !id.startsWith(MERGED_REASONING_PARTS_PREFIX) &&
+                    !id.startsWith("binding_mismatch:"),
+            ),
+        );
+        for (const message of messages) {
+            if (!legacyIds.has(message.info.id ?? "")) continue;
+            for (let index = 0; index < message.parts.length; index++) {
+                const part = message.parts[index];
+                if (!isRecord(part) || !REASONING_PART_TYPES.has(String(part.type))) continue;
+                message.parts[index] = makeSentinel(part);
+                stripped++;
+            }
+        }
+        return stripped;
     }
     for (const entry of planMergedAssistantReasoningStrip(
         messages,

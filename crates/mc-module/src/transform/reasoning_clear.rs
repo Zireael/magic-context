@@ -19,40 +19,27 @@ pub(crate) fn reasoning_native_source_hash(req: &TransformRequest) -> String {
 }
 
 fn reasoning_clear_exemption_changed(
-    core: &CoreState,
-    req: &TransformRequest,
-    anchor: Option<&str>,
+    _core: &CoreState,
+    _req: &TransformRequest,
+    _anchor: Option<&str>,
 ) -> bool {
-    let newest = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
-    core.frozen_units.iter().any(|unit| {
-        unit.reset_rule != REASONING_CLEAR_SUSPENDED
-            && unit
-                .key
-                .strip_prefix("strip:reasoning_clear:")
-                .is_some_and(|mid| Some(mid) == newest || Some(mid) == anchor)
-    })
+    false
 }
 
-/// Exemption changes are structural repairs. Suspend a prior clear only on the
-/// pass that prices restoration of the signed response, and retain that keep on
-/// subsequent defers even when another assistant arrives.
+/// A frozen removal is absorbing. Retire obsolete suspension flags on priced
+/// passes, but never restore a signed block because its visibility changed.
 fn refresh_reasoning_clear_exemptions(
     core: &mut CoreState,
-    req: &TransformRequest,
+    _req: &TransformRequest,
     can_bust: bool,
-    anchor: Option<&str>,
+    _anchor: Option<&str>,
 ) {
     if !can_bust {
         return;
     }
-    let newest = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
     for unit in &mut core.frozen_units {
-        if let Some(mid) = unit.key.strip_prefix("strip:reasoning_clear:") {
-            unit.reset_rule = if Some(mid) == newest || Some(mid) == anchor {
-                REASONING_CLEAR_SUSPENDED.to_string()
-            } else {
-                String::new()
-            };
+        if unit.key.starts_with("strip:reasoning_clear:") {
+            unit.reset_rule.clear();
         }
     }
 }
@@ -166,6 +153,7 @@ fn new_reasoning_clear_units(
             || message.ck.role != "assistant"
             || message.mid.is_empty()
             || newest == Some(message.mid.as_str())
+            || in_active_anthropic_turn(req, &message.mid)
             || lineage_anchor_mid == Some(message.mid.as_str())
             || tag == 0
             || tag > cutoff
@@ -211,7 +199,6 @@ fn active_reasoning_clear<'a>(
 ) -> Option<&'a FrozenUnit> {
     output_message_strip_unit(frozen_units, "reasoning_clear", mid)
         .or_else(|| output_message_strip_unit(frozen_units, "reasoning_clear_legacy", mid))
-        .filter(|unit| unit.reset_rule != REASONING_CLEAR_SUSPENDED)
 }
 
 fn replay_reasoning_clear(
@@ -237,7 +224,6 @@ fn replay_reasoning_clear(
 pub(crate) fn reasoning_clear_mids(units: &[FrozenUnit]) -> HashSet<&str> {
     units
         .iter()
-        .filter(|unit| unit.reset_rule != REASONING_CLEAR_SUSPENDED)
         .filter_map(|unit| unit.key.strip_prefix("strip:reasoning_clear:"))
         .collect()
 }
@@ -245,7 +231,6 @@ pub(crate) fn reasoning_clear_mids(units: &[FrozenUnit]) -> HashSet<&str> {
 pub(crate) fn reasoning_native_clear_mids(units: &[FrozenUnit]) -> HashSet<&str> {
     units
         .iter()
-        .filter(|unit| unit.reset_rule != REASONING_CLEAR_SUSPENDED)
         .filter_map(|unit| {
             unit.key
                 .strip_prefix("strip:reasoning_clear:")

@@ -6984,6 +6984,11 @@ fn apply_once(
     }
     let cleared_mids = reasoning_clear_mids(&core.frozen_units)
         .into_iter()
+        .chain(core.frozen_units.iter().filter_map(|unit| {
+            unit.key
+                .strip_prefix("strip:reasoning_age:")
+                .or_else(|| unit.key.strip_prefix("strip:merged_reasoning:"))
+        }))
         .map(str::to_owned)
         .collect::<HashSet<_>>();
     core.frozen_units.retain(|unit| {
@@ -13661,6 +13666,7 @@ fn tag_number_by_message(tags: &[McTagRow]) -> BTreeMap<String, u64> {
 }
 
 include!("transform/reasoning_budget.rs");
+include!("transform/active_anthropic_turn.rs");
 
 include!("transform/reasoning_clear.rs");
 
@@ -13800,6 +13806,7 @@ fn new_frozen_strip_units(
             // this already-busting pass and replays unchanged on defers; selection.rs continues to
             // exclude every reasoning block from ReductionDecision targets.
             let cc_aged = message.ck.role == "assistant"
+                && !in_active_anthropic_turn(req, &message.mid)
                 && scope.visible(message)
                 && reasoning_mutation_exempt_mid != Some(message.mid.as_str())
                 && cc_reasoning_cutoff.is_some_and(|cutoff| {
@@ -13973,6 +13980,7 @@ fn opencode_reasoning_removal_mids<'a>(
             && Some(mid) != newest
             && Some(mid) != exempt
             && Some(mid) != scope.anchor
+            && !in_active_anthropic_turn(req, mid)
             && tag > 0
             && tag <= cutoff
             && message.ck.content.iter().any(has_meaningful_content);
@@ -13995,12 +14003,12 @@ struct ReasoningMutationPolicy {
 fn remove_frozen_historical_reasoning(
     frozen_units: &FrozenUnitLookup<'_>,
     message: &CkIngressMessage,
-    reasoning_mutation_exempt: bool,
+    _reasoning_mutation_exempt: bool,
     rebuilt: &mut CkWireMessage,
 ) -> usize {
-    if reasoning_mutation_exempt
-        || message.ck.role != "assistant"
-        || output_message_strip_unit(frozen_units, "reasoning_age", &message.mid).is_none()
+    if message.ck.role != "assistant"
+        || (output_message_strip_unit(frozen_units, "reasoning_age", &message.mid).is_none()
+            && output_message_strip_unit(frozen_units, "merged_reasoning", &message.mid).is_none())
     {
         return 0;
     }

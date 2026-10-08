@@ -78,6 +78,7 @@ import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import { stableStringify } from "../../shared/stable-json";
+import { hasAnthropicReasoning } from "./active-anthropic-turn";
 import {
     type ConvertedToolDropMode,
     foldBustsServedPrefix,
@@ -2597,6 +2598,12 @@ export async function runPostTransformPhase(
                       alreadyRemoved: removedReasoningIds,
                       alsoGone: bindingStrippedIds,
                       countNeutralized: reasoningRemovalSelectable,
+                      proseRatio: sessionDecisionCalibration(args.db, args.sessionId).proseRatio,
+                      frozenMergedIds: getMergedReasoningStrippedIds(args.db, args.sessionId),
+                      anthropic:
+                          canUseEmptySentinels ||
+                          prefixBoundModel ||
+                          hasAnthropicReasoning(args.messages),
                       textEstimateByMessageId: getReasoningTokenEstimatesByMessage(
                           args.db,
                           args.sessionId,

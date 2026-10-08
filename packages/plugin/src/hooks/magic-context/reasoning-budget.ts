@@ -1,4 +1,8 @@
 import type { ContextDatabase } from "../../features/magic-context/storage";
+import {
+    getMergedReasoningStrippedIds,
+    THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
+} from "../../features/magic-context/storage-meta-persisted";
 import { getReasoningRemovalState } from "../../features/magic-context/storage-reasoning-removal";
 import {
     getReasoningTokenEstimatesByMessage,
@@ -7,9 +11,13 @@ import {
 import { resolveModelConfigValue } from "../../shared/prompt-surface";
 import { isRecord } from "../../shared/record-type-guard";
 import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
+import { hasAnthropicReasoning, isInActiveAnthropicTurn } from "./active-anthropic-turn";
 import { estimateTokens } from "./read-session-formatting";
 import { neutralizedReasoningSource } from "./sentinel";
-import { findLatestAssistantReasoningMutationExemptMessage } from "./strip-content";
+import {
+    findLatestAssistantReasoningMutationExemptMessage,
+    stripReasoningFromMergedAssistants,
+} from "./strip-content";
 import type { MessageLike } from "./tag-messages";
 
 /** Read-only historian projection. DB-only/cold-start callers may use tag estimates instead. */
@@ -42,6 +50,12 @@ export function projectOpencodeReasoningBudgetCutoff(
         alreadyRemoved: gone,
         textEstimateByMessageId: getReasoningTokenEstimatesByMessage(db, sessionId, proseRatio),
         proseRatio,
+        frozenMergedIds: getMergedReasoningStrippedIds(db, sessionId),
+        alsoGone: new Set(
+            [...getMergedReasoningStrippedIds(db, sessionId)]
+                .filter((id) => id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX))
+                .map((id) => id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length)),
+        ),
     });
 }
 
@@ -186,6 +200,8 @@ export function opencodeReasoningBudgetCutoff(args: {
     textEstimateByMessageId?: ReadonlyMap<string, number>;
     proseRatio?: number;
     countNeutralized?: boolean;
+    anthropic?: boolean;
+    frozenMergedIds?: ReadonlySet<string>;
 }): number {
     const assistants = args.messages.filter((message) => message.info.role === "assistant");
     const newest = assistants.at(-1);
@@ -193,33 +209,37 @@ export function opencodeReasoningBudgetCutoff(args: {
     return reasoningBudgetCutoff(
         assistants.map((message) => ({
             tag: args.messageTagNumbers.get(message) ?? 0,
-            exempt: message === newest || message === exempt,
+            exempt:
+                message === newest ||
+                message === exempt ||
+                isInActiveAnthropicTurn(
+                    args.messages,
+                    args.messages.indexOf(message),
+                    args.anthropic ?? hasAnthropicReasoning(args.messages),
+                ),
             cost: () => {
+                const costMessage = { ...message, parts: [...message.parts] };
+                if (args.frozenMergedIds)
+                    stripReasoningFromMergedAssistants([costMessage], "anthropic", {
+                        frozenMessageIds: args.frozenMergedIds,
+                    });
                 const visible = reasoningTextAndOpaque(
                     args.countNeutralized
-                        ? message.parts.map(neutralizedReasoningSource)
-                        : message.parts,
+                        ? costMessage.parts.map(neutralizedReasoningSource)
+                        : costMessage.parts,
                 );
                 if (!visible.hasReasoning && !visible.inlineText) return 0;
                 const info = message.info as unknown as Record<string, unknown>;
                 const tokens = isRecord(info.tokens) ? info.tokens.reasoning : undefined;
-                const persisted =
-                    typeof message.info.id === "string"
-                        ? args.textEstimateByMessageId?.get(message.info.id)
-                        : undefined;
                 const typedGone =
                     typeof message.info.id === "string" &&
-                    ((args.alreadyRemoved?.has(message.info.id) === true &&
-                        message !== newest &&
-                        message !== exempt) ||
+                    (args.alreadyRemoved?.has(message.info.id) === true ||
                         args.alsoGone?.has(message.info.id) === true);
                 return (
                     (visible.hasReasoning && !typedGone
                         ? reasoningStepCost(
                               typeof tokens === "number" ? tokens : undefined,
-                              persisted !== undefined && persisted > 0
-                                  ? persisted
-                                  : estimateTokens(visible.text) * (args.proseRatio ?? 1),
+                              estimateTokens(visible.text) * (args.proseRatio ?? 1),
                               visible.opaque,
                           )
                         : 0) +

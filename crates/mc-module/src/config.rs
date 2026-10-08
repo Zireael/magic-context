@@ -275,20 +275,11 @@ impl McModuleConfig {
         let Some(values) = value.as_object() else {
             return 10_000;
         };
-        let mut lookup = self.clone();
-        lookup.cache_ttl_by_model = values
-            .iter()
-            .filter_map(|(key, value)| value.as_u64().map(|value| (key.clone(), value.to_string())))
-            .collect();
-        lookup.cache_ttl = values
-            .get("default")
-            .and_then(Value::as_u64)
-            .unwrap_or(10_000)
-            .to_string();
-        lookup
-            .resolve_cache_ttl_with_provenance(model_key)
-            .value
-            .parse()
+        model_key
+            .into_iter()
+            .flat_map(crate::tool_catalog::model_key_candidates)
+            .find_map(|candidate| values.get(&candidate).and_then(Value::as_u64))
+            .or_else(|| values.get("default").and_then(Value::as_u64))
             .unwrap_or(10_000)
     }
     pub fn resolve_protected_tokens(&self, usable_soft: u64) -> ResolvedProtectedTokens {

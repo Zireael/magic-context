@@ -6695,6 +6695,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					.proseRatio,
 				piMessageStableId: stableIdResolver,
 				prefixBound,
+				anthropic: args.canUseEmptySentinels || prefixBound,
 				alreadyGone: (id) => bindingStripped.has(id) || nativeGone.has(id),
 			});
 			reasoningBudgetCutoffThisPass = maxCutoff;

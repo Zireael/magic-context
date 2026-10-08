@@ -702,8 +702,9 @@ export function getAllStatusTagTokenTotalsFlat(
     return { totals, nullMessageIds };
 }
 
-/** Stored plaintext reasoning estimates, grouped by the assistant owning each tag.
- * A missing estimate stays missing so the caller can tokenize the host's visible text.
+/** Only message tags prove ownership of their own assistant's reasoning group.
+ * Tool tags describe the preceding thought, not their tool owner, and parallel
+ * tools repeat that estimate. Repeated text tags likewise charge the group once.
  */
 export function getReasoningTokenEstimatesByMessage(
     db: Database,
@@ -722,9 +723,9 @@ export function getReasoningTokenEstimatesByMessage(
     }>;
     const totals = new Map<string, number>();
     for (const row of rows) {
-        if (row.type === "tool" && row.tool_owner_message_id === null) continue;
+        if (row.type !== "message") continue;
         const id = ownerMessageIdForTagRow(row);
-        totals.set(id, (totals.get(id) ?? 0) + row.reasoning_token_count * proseRatio);
+        totals.set(id, Math.max(totals.get(id) ?? 0, row.reasoning_token_count * proseRatio));
     }
     return totals;
 }

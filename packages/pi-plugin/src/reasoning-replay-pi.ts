@@ -36,6 +36,10 @@
 
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
+import {
+	hasAnthropicReasoning,
+	isInActiveAnthropicTurn,
+} from "@magic-context/core/hooks/magic-context/active-anthropic-turn";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import {
 	reasoningBudgetCutoff,
@@ -167,6 +171,7 @@ export function piReasoningClearCutoff(args: {
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 	prefixBound: boolean;
 	proseRatio?: number;
+	anthropic?: boolean;
 	/** Entries whose thinking another strip already removed for good. */
 	alreadyGone?: (id: string) => boolean;
 }): number {
@@ -181,6 +186,8 @@ export function piBudgetCutoff(args: {
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 	alreadyGone?: (id: string) => boolean;
 	proseRatio?: number;
+	prefixBound?: boolean;
+	anthropic?: boolean;
 }): number {
 	const assistants = args.messages
 		.map((message, index) => ({ message, index }))
@@ -200,7 +207,16 @@ export function piBudgetCutoff(args: {
 			const id = args.piMessageStableId(entry.message, entry.index);
 			return {
 				tag: id ? (args.messageIdToMaxTag.get(id) ?? 0) : 0,
-				exempt: entry === newest || entry === exempt,
+				exempt:
+					entry === newest ||
+					entry === exempt ||
+					isInActiveAnthropicTurn(
+						args.messages,
+						entry.index,
+						args.anthropic === true ||
+							args.prefixBound === true ||
+							hasAnthropicReasoning(args.messages),
+					),
 				alreadyRemoved:
 					id !== undefined &&
 					args.alreadyGone?.(id) === true &&
@@ -319,7 +335,7 @@ export function piPrefixBoundReasoningCutoff(args: {
 	alreadyGone?: (id: string) => boolean;
 	proseRatio?: number;
 }): number {
-	const ageCutoff = piBudgetCutoff(args);
+	const ageCutoff = piBudgetCutoff({ ...args, prefixBound: true });
 	if (ageCutoff <= 0) return 0;
 
 	let newestIndex = -1;

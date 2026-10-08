@@ -1353,7 +1353,7 @@ describe("strip-content", () => {
 });
 
 describe("frozen merged reasoning parts", () => {
-    it("preserves the pre-deploy bare-id partial-strip bytes", () => {
+    it("keeps legacy bare-id removals absorbing when no exact part selection exists", () => {
         const build = () => [
             message("legacy", "assistant", [
                 { type: "reasoning", text: "kept first" },
@@ -1365,11 +1365,7 @@ describe("frozen merged reasoning parts", () => {
         stripReasoningFromMergedAssistants(legacy, "anthropic", {
             frozenMessageIds: new Set(["legacy"]),
         });
-        expect(legacy[0].parts).toEqual([
-            { type: "reasoning", text: "kept first" },
-            { type: "text", text: "between" },
-            SENTINEL,
-        ]);
+        expect(legacy[0].parts).toEqual([SENTINEL, { type: "text", text: "between" }, SENTINEL]);
         const fresh = build();
         stripReasoningFromMergedAssistants(fresh, "anthropic", {
             frozenMessageIds: new Set(["legacy"]),
@@ -1423,8 +1419,8 @@ describe("frozen merged reasoning parts", () => {
                 frozenMessageIds: frozen,
                 mutationExemptMessage: exempt,
             }),
-        ).toBe(0);
-        expect(exempt.parts[0]).toMatchObject({ type: "reasoning" });
+        ).toBe(1);
+        expect(exempt.parts[0]).toEqual(SENTINEL);
         expect(
             stripReasoningFromMergedAssistants([exempt], "openai", { frozenMessageIds: frozen }),
         ).toBe(0);

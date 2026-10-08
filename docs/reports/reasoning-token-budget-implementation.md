@@ -76,3 +76,55 @@ change to the user-selected default.
 - No live OpenCode/CortexKit stores or configs were opened or migrated. Host runs use
   throwaway XDG roots, `OPENCODE_DB` and `MAGIC_CONTEXT_STORAGE_DIR`; package suites use
   throwaway `HOME` and do not export `OPENCODE_DB`.
+
+## Adversarial follow-up
+
+The accepted review commit `e8571ede97` and its witnesses were imported unchanged before
+production edits. The first TS/Pi run reproduced all seven named failures (46 passed,
+7 failed). Fixes retain every witness expectation:
+
+- Budget-only first selection protects all assistant steps after the last real Anthropic
+  user request, including subagents. Tool-result and synthetic user carriers do not reset
+  the boundary. The isolated predicates are `active-anthropic-turn.ts` and Rust's
+  `transform/active_anthropic_turn.rs`; neither is a compatibility shim for the parallel
+  branch's absent helper. The parent explicitly narrowed coordination scope: fresh merged
+  and proactive stripping remain unchanged here and are owned by the parallel turn fix.
+- Whole-part and exact merged-part frozen replay no longer restores a block when a host
+  subset changes the latest assistant. Bare legacy merged ids have no exact part evidence,
+  so replay conservatively keeps those removals absorbing. Rust clear refresh retires the
+  old suspension flags rather than restoring signed content; frozen age/merged removals
+  take precedence over render exemptions and native keep decisions.
+- Legacy tool tags price preceding thinking, not their owner's thought, and repeat it for
+  parallel tools. Live selection now estimates the step's own kept plaintext. DB-only
+  estimates use deduplicated message-tag evidence, never tool ownership. Exact frozen
+  merged-part selections are replayed on a private cost-only parts array before charging;
+  a retained sibling still counts. Frozen prose calibration is supplied to fallback and
+  inline estimates as well as stored projections.
+- Rust uses the existing shared `tool_catalog::model_key_candidates` alias walk instead
+  of the literal-provider TTL resolver. Declared reasoning-part presence gives positive
+  reported usage precedence even when the body is empty and has no opaque metadata.
+
+Fixture changes are explicit: `toolLoop` itself remains unchanged. The calibration
+witness alone uses a new historical context helper so it does not simultaneously demand
+active-turn preservation and historical removal. Existing budget prefix fixtures identify
+historical context; the pruning/index regression closes its turn with a real follow-up
+request. No review expectation was weakened. Existing tests that claimed exemption-based
+restoration were changed to the newly required absorbing contract, not silently inverted.
+
+The three requested Rust witness filters were each tried once, sequentially, in background
+with five-minute timeouts. The first two never reached tests while all six compile slots
+were occupied (exit 124); their runtime results are **not run**. Compilation then completed
+for the third filter, which passed the positive-empty-summary witness (one test, exit 0).
+There was no local Rust host launch, live-store access or migration.
+
+Final follow-up gates: plugin `bun run test` passed 7,326 tests (six skips) and Pi
+`bun run test` passed 1,625 tests (three skips). The seven TS/Pi review witnesses
+and all controls are green with unchanged assertions. The isolated LKG child-writer
+failure observed in an earlier parallel run was not reproducible in isolation or the
+final full Pi run. Final bundles were rebuilt and the OpenCode 1.18.30 thinking-mock
+host proof passed again (PID 97768, 22 assertions, throwaway databases proven by lsof).
+Fresh merged/proactive selection functions and provider-error recovery are unchanged;
+only budget first selection uses the new active-turn predicate. The two existing replay
+tests that asserted resurrection now assert absorbing frozen removals, as explicitly
+required. Budget prefix fixtures are historical context carriers rather than live
+requests, and preserve their cutoff/byte-identity assertions.

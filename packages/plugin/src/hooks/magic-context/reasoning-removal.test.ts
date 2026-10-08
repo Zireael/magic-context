@@ -116,6 +116,14 @@ function toolLoop(steps: number, options: { reasoningOnlyStep?: number } = {}) {
     return { messages, tags };
 }
 
+// The calibration witness prices historical steps rather than the active user
+// turn. Its context carrier is synthetic; toolLoop retains its original shape.
+function historicalToolLoop(steps: number) {
+    const session = toolLoop(steps);
+    (session.messages[0].parts[0] as Record<string, unknown>).synthetic = true;
+    return session;
+}
+
 describe("selectReasoningRemovals", () => {
     it("random prefix sessions never leave a thinking gap across the stop rule", () => {
         let seed = 620;
@@ -432,7 +440,7 @@ describe("reasoning removal through postprocess", () => {
             modelKey: "anthropic/claude-opus-5-5",
         }).proseRatio;
         expect(ratio).toBeGreaterThan(1);
-        const session = toolLoop(3);
+        const session = historicalToolLoop(3);
         for (const message of session.messages.slice(1)) {
             (message.info as unknown as Record<string, unknown>).tokens = { reasoning: 0 };
             (message.parts[1] as { text: string }).text = "a substantial thought ".repeat(100);
@@ -1150,12 +1158,12 @@ describe("the removal lane never changes bytes without taking reasoning off the 
 });
 
 describe("replay and route guards", () => {
-    it("replay skips the newest assistant with replayable content, as Rust does", () => {
+    it("frozen replay remains absorbing when removed assistants become newest", () => {
         const { messages } = toolLoop(3);
         const newest = messages[messages.length - 1];
         removeReasoningParts(messages, new Set(["assistant-1", "assistant-2"]), "openai");
         expect(reasoningCount(messages[2])).toBe(0);
-        expect(reasoningCount(newest)).toBe(1);
+        expect(reasoningCount(newest)).toBe(0);
     });
 
     it("recognizes the OpenRouter adapter by its metadata under any provider id", () => {

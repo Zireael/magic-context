@@ -726,7 +726,13 @@ describe("piReasoningClearCutoff", () => {
 	it("prefix-bound: matches the shared TypeScript, Pi and Rust golden", () => {
 		for (const scenario of prefixBoundGolden.cases) {
 			const messages: Array<Record<string, unknown>> = [
-				{ role: "user", timestamp: 1, content: [{ type: "text", text: "go" }] },
+				// Historical context carrier: the real active-turn witness is separate.
+				{
+					role: "user",
+					synthetic: true,
+					timestamp: 1,
+					content: [{ type: "text", text: "go" }],
+				},
 			];
 			for (let step = 0; step < scenario.steps; step++) {
 				messages.push({

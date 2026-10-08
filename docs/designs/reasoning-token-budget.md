@@ -17,8 +17,7 @@ measurement), [`docs/reports/reasoning-removal-all-providers-design.md`](../repo
    the model may think).
 2. **Unit:** one assistant step's reasoning, costed in input tokens. Use the provider's
    **reported reasoning count** for that step when it is positive (OpenCode `tokens.reasoning`,
-   Pi `usage.reasoning`). Otherwise use the **stored text estimate** that tags already persist
-   (`tags.reasoning_token_count`). When a step has opaque reasoning and neither number, count a
+   Pi `usage.reasoning`). Otherwise estimate the **kept plaintext of that assistant step**, using the frozen prose calibration. Legacy tool-tag estimates describe preceding thinking and cannot price their tool owner's step. When a step has opaque reasoning and neither number, count a
    **fixed 1,000 tokens**. The multiplier is 1.0 on every route: the measurement found about
    1.0 input token per reported reasoning token on every well-sampled route.
 3. **Select newest to oldest, keeping whole steps while the running cost fits.** The first step
@@ -104,9 +103,7 @@ watermark, so it is cut by the same cutoff.
    Pi `usage.reasoning`; Rust OpenCode leg: `info.tokens.reasoning` in `native_messages`). If
    `reported > 0`, use it.
 2. Otherwise, if the step has reasoning text, use a text estimate multiplied by the model's
-   calibration `proseRatio`, as `storage-tags.ts:699` already does. On OpenCode, the estimate is
-   the sum of `tags.reasoning_token_count` over the message's tags, which is computed once per
-   tag at insert (`tag-messages.ts:376`). Pi tag rows store `null` there
+   calibration `proseRatio`, as `storage-tags.ts:699` already does. On OpenCode, the served step's own plaintext is estimated directly, after exact frozen merged-part removals are accounted for. Message-tag estimates can support DB-only projections once deduplicated; tool-tag estimates are excluded because they belong to preceding thinking. Pi tag rows store `null` there
    (`shared/tag-transcript.ts:528/942/1048`), and Rust tag rows (`mc-store` `McTagRow`) have no
    such column. Those two tokenize the thinking text on the busting pass: Pi with core
    `estimateTokens`, Rust with `mc_tokenizer::estimate_tokens`. That work is bounded, because
@@ -140,9 +137,9 @@ Gemini at 1.22, and there the removable share is unknown (see open question 3).
 
 | Harness | Reported count | Text estimate | Notes |
 |---|---|---|---|
-| OpenCode 1 (TS and Rust OpenCode leg) | `info.tokens.reasoning` on the assistant message; separate from `output` | `tags.reasoning_token_count` | Ollama routes store R=0 next to text, so they use the text estimate |
+| OpenCode 1 (TS and Rust OpenCode leg) | `info.tokens.reasoning` on the assistant message; separate from `output` | Kept thinking plaintext on that step | Legacy tool-tag estimates cannot prove the owning step's reasoning cost |
 | Pi / OMP | `usage.reasoning` (present on 3,989 of 4,020 Codex steps) | Thinking text tokenized on the busting pass (Pi tag rows store `null`) | Pi Anthropic coverage is unmeasured; the same rules apply |
-| OpenCode 2 | No measured steps (the named store has no assistant rows) | Same tag column | Read the same field if the v2 message exposes it; otherwise text estimate |
+| OpenCode 2 | No measured steps (the named store has no assistant rows) | Kept thinking plaintext on that step | Read the same field if the v2 message exposes it; otherwise text estimate |
 | Claude Code (Rust CC profile) | Claude Code usage has no reasoning split | Thinking text where the transcript keeps it, tokenized on the pass | Undercounts summarised Claude thinking by about 2×; see open question 6 |
 
 The counts are read **live from the host messages on the busting pass**. No new column is
@@ -172,7 +169,9 @@ The cutoff then goes into each lane where `maxTag − clear_reasoning_age` goes 
 lanes keep all of their existing eligibility rules:
 
 - the newest assistant and `findLatestAssistantReasoningMutationExemptMessage` (the newest one
-  with replayable content) are never touched;
+  with replayable content) are never newly selected;
+- on Anthropic routes, every assistant step after the last real user request is charged but exempt from the budget cutoff, in primary and subagent sessions; synthetic context and tool-result user carriers do not start a new turn;
+- frozen removals take precedence over every current exemption or lineage change: once removed, signed reasoning never returns;
 - tag 0, no wire content left after removal, and OpenRouter Gemini-signature details all still
   make a message ineligible;
 - **prefix-bound models** (Fable 5.1, Opus 5.5, Sonnet 5.5) still walk oldest first and stop at
@@ -366,7 +365,7 @@ without a separate diagnostic command.
   also contradict the report's warning that a zero result is about one adapter route, not a
   model brand: the same model on OpenRouter measured k=0.994. The cost is one log line and one
   frozen id per removed step.
-- **No count, but text.** Use the persisted text estimate. Where the true resend is about 1×
+- **No count, but text.** Estimate the step's own kept plaintext with frozen calibration. Where the true resend is about 1×
   (local Qwen measured 0.73–1.04), the estimate is about right. Where it is unknown (GLM), the
   estimate is the best available, and it errs toward removing reasoning that is actually resent.
 - **No count and no text (opaque).** A fixed 1,000 tokens per step, so these steps still use up
@@ -383,7 +382,7 @@ without a separate diagnostic command.
 | Concern | TS (OpenCode 1 and 2) | Pi / OMP | Rust module |
 |---|---|---|---|
 | Cutoff function | New pure `reasoningBudgetCutoff` in core `hooks/magic-context/reasoning-budget.ts` | Imports the same core function | `reasoning_budget_cutoff` next to `tag_age_cutoff`, which it replaces (`transform.rs:13149`) |
-| Step cost | `info.tokens.reasoning`, then the tag-row estimate, then 1,000 | `usage.reasoning`, then thinking text tokenized on the pass, then 1,000 | OpenCode leg: `native_messages[].info.tokens.reasoning`, then thinking text via `mc_tokenizer::estimate_tokens`, then 1,000; CC leg: thinking-text estimate |
+| Step cost | `info.tokens.reasoning`, then the step's kept-plaintext estimate, then 1,000 | `usage.reasoning`, then thinking text tokenized on the pass, then 1,000 | OpenCode leg: `native_messages[].info.tokens.reasoning`, then thinking text via `mc_tokenizer::estimate_tokens`, then 1,000; CC leg: thinking-text estimate |
 | Where the cutoff replaces age | `selectReasoningRemovals` (arg), `clearOldReasoning`, `stripInlineThinking`, the watermark write at `transform-postprocess-phase.ts:2670`, `compartment-trigger.ts:250` | `piReasoningClearCutoff`, `piPrefixBoundReasoningCutoff`, `clearOldReasoningPi`, `stripInlineThinkingPi`, `applyNativeReasoningReplayPi` (`:124`), historian trigger inputs (`context-handler.ts:5005`) | `opencode_reasoning_removal_mids`, `reasoning_clear_cutoff_with_tags`, CC `cc_reasoning_cutoff` |
 | Config plumbing | `hook.ts:733`, `transform.ts:451`, `rust-mode-transform.ts:1632/3107/3326`, `v2/hooks/context.ts:1485` | `index.ts:1120/1550`, `context-handler.ts:537` constant removed | `TransformRequest.keep_reasoning_tokens_effective`, module config |
 | Bust gate | `routineCleanupApplied` | execute pass | `is_bust_pass` |
@@ -491,9 +490,7 @@ request carrying only `clear_reasoning_age` and derives the budget itself.
    *Recommendation:* use the text estimate unscaled, label the status `(estimated)`, and leave
    prefix-bound removal on Claude Code out of scope. It is a new lane with its own binding
    risks.
-7. **Protect the whole current user turn?** *Recommendation:* no. A subagent run is one long
-   turn, and protecting it would bring back the 609-item encrypted reasoning pile-up. The
-   existing newest and exempt protections already cover the open tool round.
+7. **Protect the whole current Anthropic turn.** Settled: the budget never selects reasoning after the last real user request, in any session. This can exceed the budget during a long active turn. Only budget first-selection uses this boundary here; fresh merged/proactive stripping policy remains owned by the parallel active-turn change. Absorbing replay of already-frozen removals is never withheld.
 8. **Let the force band remove below the budget?** *Recommendation:* not in v1. The emergency
    planner reclaims tool outputs by need, and reasoning reaches its budget on that same bust
    anyway.

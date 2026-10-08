@@ -32,7 +32,6 @@ fn reasoning_budget_cutoff(
     let removed: HashSet<&str> = core
         .frozen_units
         .iter()
-        .filter(|unit| unit.reset_rule != REASONING_CLEAR_SUSPENDED)
         .filter_map(|unit| {
             unit.key
                 .strip_prefix("strip:reasoning_age:")
@@ -51,26 +50,31 @@ fn reasoning_budget_cutoff(
         Some(message.mid.as_str()) == newest
             || Some(message.mid.as_str()) == exempt
             || Some(message.mid.as_str()) == scope.anchor
+            || in_active_anthropic_turn(req, message.mid.as_str())
     };
-    let off_wire =
-        |message: &CkIngressMessage| removed.contains(message.mid.as_str()) && !is_exempt(&message);
+    let off_wire = |message: &CkIngressMessage| removed.contains(message.mid.as_str());
     let cost = |message: &CkIngressMessage| {
         let typed_gone = off_wire(message);
         let mut text = String::new();
         let mut inline_text = String::new();
         let mut opaque = false;
+        let mut has_reasoning = false;
         for block in &message.ck.content {
             match &block.kind {
                 ck_wire::CkKind::Reasoning {
                     text: visible,
                     signature,
                 } if !typed_gone => {
+                    has_reasoning = true;
                     if visible != "[cleared]" {
                         text.push_str(visible);
                     }
                     opaque |= visible.is_empty() && signature.is_some();
                 }
-                ck_wire::CkKind::RedactedReasoning { .. } if !typed_gone => opaque = true,
+                ck_wire::CkKind::RedactedReasoning { .. } if !typed_gone => {
+                    opaque = true;
+                    has_reasoning = true;
+                }
                 ck_wire::CkKind::Text { text: visible } => {
                     for captures in reasoning_inline_pattern().captures_iter(visible) {
                         inline_text.push_str(&captures[1]);
@@ -96,7 +100,7 @@ fn reasoning_budget_cutoff(
                         .is_none_or(str::is_empty)
             });
         }
-        if text.is_empty() && !opaque && inline_text.is_empty() {
+        if !has_reasoning && !opaque && inline_text.is_empty() {
             return 0;
         }
         let reported = native
@@ -106,7 +110,7 @@ fn reasoning_budget_cutoff(
         let ratio =
             crate::decision_calibration::DecisionCalibration::for_model(req.model_key.as_deref())
                 .prose_ratio;
-        let typed = if typed_gone || (text.is_empty() && !opaque) {
+        let typed = if typed_gone || (!has_reasoning && !opaque) {
             0
         } else if reported > 0 {
             reported

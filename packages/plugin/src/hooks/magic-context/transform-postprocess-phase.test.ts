@@ -11309,7 +11309,8 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
     const boundLoop = (sessionId: string, steps: number, options: { untagged?: number } = {}) => {
         const messages: MessageLike[] = [
             {
-                info: { id: "user-0", role: "user", sessionID: sessionId },
+                // A historical context carrier, not the active real-user request.
+                info: { id: "user-0", role: "user", sessionID: sessionId, synthetic: true },
                 parts: [{ type: "text", text: "do the work" }],
             } as unknown as MessageLike,
         ];
