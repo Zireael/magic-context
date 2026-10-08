@@ -7,6 +7,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { isCheckoutClaimRefusalError } from "@magic-context/core/features/magic-context/checkout-claim";
 import { log } from "@magic-context/core/shared/logger";
 import { withSqliteTransformPass } from "@magic-context/core/shared/sqlite";
+import { PiContextBudget } from "./pi-context-budget";
 
 const ENTRY_TYPE = "magic-context-turn-refused";
 const RETRY_MESSAGE =
@@ -24,6 +25,7 @@ export function registerPiGuardedContext(
 	handler: (
 		event: ContextEvent,
 		ctx: ExtensionContext,
+		budget: PiContextBudget,
 	) =>
 		| Promise<{ messages: ContextEvent["messages"] } | undefined>
 		| Promise<void>,
@@ -33,12 +35,13 @@ export function registerPiGuardedContext(
 		(entry) => new Text(entry.data?.message ?? RETRY_MESSAGE, 0, 0),
 	);
 	pi.on("context", async (event, ctx) => {
+		const budget = new PiContextBudget();
 		try {
 			// Share at most 250 ms of synchronous waiting for later turn writes,
 			// including autocommit statements. Initial session-meta admission uses
 			// the separate yielding writer budget shared with OpenCode.
 			// Do not rerun the handler: it may already have committed earlier writes.
-			return await withSqliteTransformPass(() => handler(event, ctx));
+			return await withSqliteTransformPass(() => handler(event, ctx, budget));
 		} catch (error) {
 			// A newer pass owns this session now. Calling its session-wide abort
 			// API from the abandoned hook would cancel the replacement turn.

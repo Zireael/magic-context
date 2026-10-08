@@ -229,7 +229,11 @@ import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provid
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
-import { withAsyncPrivilegedWriter } from "@magic-context/core/shared/sqlite";
+import {
+	guardSqliteTransformPass,
+	withAsyncPrivilegedWriter,
+	withoutSqliteTransformPass,
+} from "@magic-context/core/shared/sqlite";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
 	TEXT_TAG_IDENTITY_MARKER,
@@ -293,6 +297,7 @@ import {
 	preparePiToolRemovalMeasurements,
 } from "./native-replay-state-pi";
 import { hasVisibleNoteReadCallPi } from "./note-visibility-pi";
+import { PI_CONTEXT_BUDGET } from "./pi-context-budget";
 import {
 	resolvePiUsableContextLimit,
 	resolvePiWindowGeometry,
@@ -2514,7 +2519,7 @@ export function registerPiContextHandler(
 		sessionLog(sessionId, message);
 	});
 
-	registerPiGuardedContext(pi, async (event, ctx) => {
+	registerPiGuardedContext(pi, async (event, ctx, budget) => {
 		const passSessionId = ctx.sessionManager
 			? resolveSessionId(ctx)
 			: undefined;
@@ -2523,7 +2528,7 @@ export function registerPiContextHandler(
 		const signal =
 			(event as { signal?: AbortSignal }).signal ??
 			(ctx as { signal?: AbortSignal }).signal;
-		const assertCurrentPass = () => {
+		budget.assertOwner = () => {
 			// Supersession takes precedence over cancellation: the old context's
 			// abort API belongs to the session and could cancel its replacement.
 			if (
@@ -2535,14 +2540,14 @@ export function registerPiContextHandler(
 				);
 			signal?.throwIfAborted();
 		};
-		const guardAwait = async <T>(pending: Promise<T>): Promise<T> => {
-			try {
-				return await pending;
-			} finally {
-				assertCurrentPass();
-			}
-		};
+		const assertCurrentPass = budget.assert;
+		const guardAwait = budget.wait;
 		const passGuard = { assert: assertCurrentPass, wait: guardAwait };
+		guardSqliteTransformPass({
+			assert: assertCurrentPass,
+			remainingMs: () => budget.remainingWork(),
+		});
+		budget.stage = "schema/claim";
 		const toolWireSchema = await guardAwait(loadPiToolWireSchema());
 		if (processOptions.checkoutClaim) {
 			const claimSessionId = resolveSessionId(ctx);
@@ -2553,7 +2558,7 @@ export function registerPiContextHandler(
 				if (refusal) throw refusal;
 			}
 		}
-		const transformStartTime = performance.now();
+		const transformStartTime = budget.startedAt;
 		let rawMessageCount = 0;
 		let rawFallbackLimit: number | undefined;
 		let sessionIdForError: string | undefined;
@@ -2708,67 +2713,72 @@ export function registerPiContextHandler(
 			});
 			lkgPassSnapshot = snapshot;
 			let checkedReplay = false;
-			const sessionMetaForUsage = await withAsyncPrivilegedWriter(
-				options.db,
-				() => {
-					assertCurrentPass();
-					// Keep BEGIN held through the session-meta read/create. Acquiring and
-					// releasing an empty transaction would let another writer win before
-					// this write. Subsequent tagging/materialization failures refuse the
-					// turn rather than rerunning already committed work.
-					return getOrCreateSessionMeta(options.db, sessionId);
-				},
-				{
-					signal,
-					jitter: true,
-					beforeRetry: (error) => {
+			budget.stage = "writer admission";
+			const sessionMetaForUsage = await guardAwait(
+				withAsyncPrivilegedWriter(
+					options.db,
+					() => {
 						assertCurrentPass();
-						if (checkedReplay) return;
-						checkedReplay = true;
-						const state = loadPiHistorianStateSnapshot(options.db, sessionId);
-						lkgEmergencyRecoveryArmed = state.needsEmergencyRecovery;
-						if (state.detectedContextLimit > 0)
-							rawFallbackLimit = resolvePiWindowGeometry({
-								model: ctx.model,
-								rawContextWindow: piUsage?.contextWindow,
-								detectedContextLimit: state.detectedContextLimit,
-							})?.usableHard;
-						if (
-							lkgCompactionOff ||
-							lkgEmergencyRecoveryArmed ||
-							isProviderOverflowFailClosedProven(sessionId)
-						)
-							return;
-						const replay = lkgCoordinator.replay(
-							snapshot,
-							(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
-						);
-						if (!replay.ok) return;
-						try {
-							assertPiRawFallbackFits(
-								replay.messages,
-								rawFallbackLimit,
-								(line) => logPiLkgRecovery(sessionId, line),
-								error,
-								readPiLkgFitEnvelope(
-									ctx,
-									pi,
-									lkgModelKey,
-									sessionDecisionCalibration(options.db, sessionId),
-									toolWireSchema,
-								),
-								replay.measuredPrefix,
-							);
-						} catch {
-							return;
-						}
-						logPiLkgRecovery(
-							sessionId,
-							`TRANSIENT STORAGE FAILURE ${piStorageErrorReason(error)}: LKG replay served ${replay.messages.length} messages instead of raw ${rawMessageCount}`,
-						);
-						throw new PiLkgAdmissionReplay(replay.messages);
+						// Keep BEGIN held through the session-meta read/create. Acquiring and
+						// releasing an empty transaction would let another writer win before
+						// this write. Subsequent tagging/materialization failures refuse the
+						// turn rather than rerunning already committed work.
+						return getOrCreateSessionMeta(options.db, sessionId);
 					},
-				},
+					{
+						signal,
+						budgetMs: budget.writerAllowance(),
+						assertCurrentPass,
+						jitter: true,
+						beforeRetry: (error) => {
+							assertCurrentPass();
+							if (checkedReplay) return;
+							checkedReplay = true;
+							const state = loadPiHistorianStateSnapshot(options.db, sessionId);
+							lkgEmergencyRecoveryArmed = state.needsEmergencyRecovery;
+							if (state.detectedContextLimit > 0)
+								rawFallbackLimit = resolvePiWindowGeometry({
+									model: ctx.model,
+									rawContextWindow: piUsage?.contextWindow,
+									detectedContextLimit: state.detectedContextLimit,
+								})?.usableHard;
+							if (
+								lkgCompactionOff ||
+								lkgEmergencyRecoveryArmed ||
+								isProviderOverflowFailClosedProven(sessionId)
+							)
+								return;
+							const replay = lkgCoordinator.replay(
+								snapshot,
+								(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
+							);
+							if (!replay.ok) return;
+							try {
+								assertPiRawFallbackFits(
+									replay.messages,
+									rawFallbackLimit,
+									(line) => logPiLkgRecovery(sessionId, line),
+									error,
+									readPiLkgFitEnvelope(
+										ctx,
+										pi,
+										lkgModelKey,
+										sessionDecisionCalibration(options.db, sessionId),
+										toolWireSchema,
+									),
+									replay.measuredPrefix,
+								);
+							} catch {
+								return;
+							}
+							logPiLkgRecovery(
+								sessionId,
+								`TRANSIENT STORAGE FAILURE ${piStorageErrorReason(error)}: LKG replay served ${replay.messages.length} messages instead of raw ${rawMessageCount}`,
+							);
+							throw new PiLkgAdmissionReplay(replay.messages);
+						},
+					},
+				),
 			);
 			assertCurrentPass();
 			updateSessionProjectTracking(sessionId, projectIdentity, options.db);
@@ -3556,6 +3566,7 @@ export function registerPiContextHandler(
 
 			logTransformTiming(sessionId, "prePipelineTotal", transformStartTime);
 			const tRunPipeline = performance.now();
+			budget.stage = "pipeline";
 			assertCurrentPass();
 			const result = await guardAwait(
 				runPipeline({
@@ -3703,24 +3714,31 @@ export function registerPiContextHandler(
 			// behavior is the Step 4b.2 contract, and historian is
 			// fire-and-forget so we never block the LLM call on it.
 			const tHistorianScheduling = performance.now();
-			if (options.historian && !options.compactionOff) {
-				maybeFireHistorian({
-					pi,
-					ctx,
-					sessionId,
-					db: options.db,
-					historian: options.historian,
-					isFirstContextPassForSession,
-					activeTags: result.activeTags,
-					rawMessageProvider,
-					taggerFloor,
-					sessionMeta,
-					piUsage,
-					minimumPercentage: usagePercentage,
-					liveIsRawBranchEstimate: piLiveUsageIsRawBranchEstimate,
-					historianStateSnapshot: historianStateForPass,
-					publishedHistoryRide: isCacheBusting,
-				});
+			const historian = options.historian;
+			if (
+				historian &&
+				!options.compactionOff &&
+				budget.remainingWork() > 0
+			) {
+				withoutSqliteTransformPass(() =>
+					maybeFireHistorian({
+						pi,
+						ctx,
+						sessionId,
+						db: options.db,
+						historian,
+						isFirstContextPassForSession,
+						activeTags: result.activeTags,
+						rawMessageProvider,
+						taggerFloor,
+						sessionMeta,
+						piUsage,
+						minimumPercentage: usagePercentage,
+						liveIsRawBranchEstimate: piLiveUsageIsRawBranchEstimate,
+						historianStateSnapshot: historianStateForPass,
+						publishedHistoryRide: isCacheBusting,
+					}),
+				);
 			}
 			logTransformTiming(
 				sessionId,
@@ -3787,7 +3805,12 @@ export function registerPiContextHandler(
 			logTransformTiming(sessionId, "noteNudges", tNoteNudges);
 
 			const tAutoSearch = performance.now();
-			if (options.autoSearch?.enabled && !options.compactionOff) {
+			budget.stage = "auto-search";
+			if (
+				options.autoSearch?.enabled &&
+				!options.compactionOff &&
+				budget.remainingWork() > PI_CONTEXT_BUDGET.searchMs
+			) {
 				try {
 					outputMessages = await guardAwait(
 						runAutoSearchHintForPi({
@@ -4123,6 +4146,7 @@ export function registerPiContextHandler(
 			// sessions sitting below execute threshold never see populated
 			// values, making Pi's status surface permanently zero.
 			const tWorkMetrics = performance.now();
+			budget.stage = "bookkeeping";
 			try {
 				const metrics = computePiWorkMetrics(outputMessages as unknown[]);
 				setSessionWorkMetrics(
@@ -4173,11 +4197,14 @@ export function registerPiContextHandler(
 				sessionId,
 				sessionMeta.lastTransformError,
 			);
-			options.maybeAutoEmbedSession?.(
-				sessionId,
-				projectDirectory,
-				projectIdentity,
-			);
+			if (budget.remainingWork() > PI_CONTEXT_BUDGET.completionReserveMs)
+				withoutSqliteTransformPass(() =>
+					options.maybeAutoEmbedSession?.(
+						sessionId,
+						projectDirectory,
+						projectIdentity,
+					),
+				);
 			logTransformTiming(sessionId, "postPipelineTotal", postPipelineStart);
 			const transformElapsedMs = performance.now() - transformStartTime;
 			recordPiTransformTiming({
@@ -4228,6 +4255,7 @@ export function registerPiContextHandler(
 				if (refusal) throw contextRefusalError(refusal);
 			}
 			let serializedOutput: PiLkgSerializedOutput | undefined;
+			budget.stage = "LKG/served publication";
 			if (!lkgCompactionOff && lkgPassSnapshot) {
 				let hostEnvelopeSignature: string | undefined;
 				try {
@@ -4280,9 +4308,10 @@ export function registerPiContextHandler(
 				messages: typeof event.messages;
 			};
 		} catch (err) {
-			assertCurrentPass();
+			budget.assertOutcome();
+			budget.stage = "recovery";
 			if (err instanceof PiLkgAdmissionReplay && sessionIdForError) {
-				assertCurrentPass();
+				budget.assertOutcome();
 				capturePiServedArray(sessionIdForError, err.messages);
 				return { messages: err.messages } as {
 					messages: typeof event.messages;
@@ -4352,8 +4381,10 @@ export function registerPiContextHandler(
 							sessionIdForError,
 							`${failureLabel} ${reason}: LKG replay served ${replay.messages.length} messages instead of raw ${rawMessageCount}`,
 						);
-						assertCurrentPass();
+						budget.assertOutcome();
 						capturePiServedArray(sessionIdForError, replay.messages);
+						budget.assertOutcome();
+						budget.recovery = "fitting LKG replay";
 						return { messages: replay.messages } as unknown as {
 							messages: typeof event.messages;
 						};
@@ -4363,7 +4394,7 @@ export function registerPiContextHandler(
 						`${failureLabel} ${piStorageErrorReason(err)}: LKG unavailable (${replay.reason}); refusing unreduced ${rawMessageCount}-message input`,
 					);
 				} catch (replayError) {
-					assertCurrentPass();
+					budget.assertOutcome();
 					if (replayError instanceof PiStorageBusyError) throw replayError;
 					logPiLkgRecovery(
 						sessionIdForError,

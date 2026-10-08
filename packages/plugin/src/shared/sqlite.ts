@@ -245,6 +245,7 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
         configurable: true,
         writable: true,
         value: (sql: string) => {
+            if (/^\s*(?:COMMIT|END)\b/i.test(sql)) assertTransformWrite();
             if (/^\s*BEGIN\s+(?:IMMEDIATE|EXCLUSIVE)(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql)) {
                 // A transaction that ended without passing through exec (for
                 // example an automatic rollback) must not be timed as this one.
@@ -617,7 +618,12 @@ export function prepareCachedStatement(db: Database, sql: string): Statement {
 
 const privilegeDepth = new WeakMap<Database, number>();
 const transformPassScope = new AsyncLocalStorage<
-    { active: boolean; remainingWaitMs: number } | undefined
+    | {
+          active: boolean;
+          remainingWaitMs: number;
+          guard?: { assert(): void; remainingMs(): number };
+      }
+    | undefined
 >();
 const admissionScope = new AsyncLocalStorage<boolean>();
 const backgroundWriterScope = new AsyncLocalStorage<boolean>();
@@ -653,6 +659,16 @@ export function withSqliteTransformPass<T>(operation: () => T): T {
 /** Start detached maintenance work without borrowing a foreground pass's budget. */
 export function withoutSqliteTransformPass<T>(operation: () => T): T {
     return transformPassScope.run(undefined, operation);
+}
+
+/** Attach the adapter's existing generation/cancellation/deadline guard to writes. */
+export function guardSqliteTransformPass(guard: { assert(): void; remainingMs(): number }): void {
+    const lease = transformPassScope.getStore();
+    if (lease) lease.guard = guard;
+}
+
+function assertTransformWrite(): void {
+    if (!backgroundWriterScope.getStore()) transformPassScope.getStore()?.guard?.assert();
 }
 
 /** Bun names SQLite codes; node:sqlite exposes the numeric (possibly extended) errcode. */
@@ -698,6 +714,7 @@ interface WriterAcquisition {
     startedAt: number;
     attempts: number;
     claimed: boolean;
+    remainingMs?: () => number;
 }
 
 /** A write transaction whose BEGIN went through `acquireShort` and has not ended yet. */
@@ -724,6 +741,7 @@ function foregroundWaitLease() {
  * native API cannot separate lock waiting from statement execution. Exhaustion
  * switches to zero-wait acquisition, not a refusal when the writer is free. */
 function withAutocommitTimeout<T>(db: Database, operation: () => T): T {
+    assertTransformWrite();
     const lease = foregroundWaitLease();
     if (isInTransaction(db) || (!lease && !backgroundWriterScope.getStore())) return operation();
     const previous = pragmaNumber(db, "busy_timeout");
@@ -749,6 +767,7 @@ function withAutocommitTimeout<T>(db: Database, operation: () => T): T {
 
 /** The connection is never handed back to another caller with a shortened timeout. */
 function acquireShort(db: Database, acquire: () => unknown, site: string): void {
+    assertTransformWrite();
     const started = performance.now();
     const previous = pragmaNumber(db, "busy_timeout");
     const outer = writerAcquisitionScope.getStore();
@@ -763,7 +782,12 @@ function acquireShort(db: Database, acquire: () => unknown, site: string): void 
         // stays short. An ordinary BEGIN inside a transform pass cannot yield;
         // give that single attempt enough time for a brief writer to finish.
         const lease = foregroundWaitLease();
-        const timeout = lease ? Math.floor(lease.remainingWaitMs) : SHORT_BUSY_TIMEOUT_MS;
+        const timeout = Math.floor(
+            Math.min(
+                lease ? lease.remainingWaitMs : SHORT_BUSY_TIMEOUT_MS,
+                owner?.remainingMs?.() ?? lease?.guard?.remainingMs() ?? Infinity,
+            ),
+        );
         db.exec(`PRAGMA busy_timeout=${timeout}`);
         acquire();
         acquiredAt = performance.now();
@@ -878,12 +902,19 @@ export async function withAsyncPrivilegedWriter<T>(
         signal?: AbortSignal;
         beforeRetry?: (error: SqliteAcquisitionBusyError) => void;
         jitter?: boolean;
+        budgetMs?: number;
+        assertCurrentPass?: () => void;
     } = {},
 ): Promise<T> {
     const started = performance.now();
+    const budgetMs = Math.max(
+        0,
+        Math.min(FOREGROUND_ACQUISITION_BUDGET_MS, options.budgetMs ?? Infinity),
+    );
     let attempts = 0;
     for (;;) {
         options.signal?.throwIfAborted();
+        options.assertCurrentPass?.();
         attempts++;
         let entered = false;
         try {
@@ -893,6 +924,7 @@ export async function withAsyncPrivilegedWriter<T>(
                 startedAt: started,
                 attempts,
                 claimed: false,
+                remainingMs: () => Math.max(0, budgetMs - (performance.now() - started)),
             };
             // The acquisition and hold of this transaction are reported when it
             // commits or rolls back (see endWriterTransaction).
@@ -913,7 +945,7 @@ export async function withAsyncPrivilegedWriter<T>(
             // This runs only after a failed BEGIN, never after callback writes.
             options.beforeRetry?.(error);
             const elapsed = performance.now() - started;
-            if (elapsed >= FOREGROUND_ACQUISITION_BUDGET_MS) {
+            if (elapsed >= budgetMs) {
                 reportSqliteDiagnostic(
                     `sqlite writer site=privileged_writer lane=foreground acquire_ms=${Math.round(elapsed)} attempts=${attempts} outcome=busy`,
                 );
@@ -922,7 +954,7 @@ export async function withAsyncPrivilegedWriter<T>(
             const backoff = attempts === 1 ? 500 : 1000;
             const delay = Math.min(
                 options.jitter ? backoff * (0.8 + Math.random() * 0.4) : backoff,
-                FOREGROUND_ACQUISITION_BUDGET_MS - elapsed,
+                budgetMs - elapsed,
             );
             await new Promise<void>((resolve, reject) => {
                 const abort = () => {
