@@ -161,6 +161,34 @@ fn load_pre_fix_reasoning_fixture(dir: &std::path::Path) -> (McStore, TransformR
     (db, request, fixture)
 }
 
+#[test]
+fn re_review_legacy_reexemption_never_restores_an_already_served_signed_block() {
+    let previous = include_bytes!("../../gen/reasoning-clear-legacy/pre-fix.native.json");
+    assert!(!String::from_utf8_lossy(previous).contains("thinking-already"));
+    let dir = tempfile::tempdir().unwrap();
+    let (db, mut request, _) = load_pre_fix_reasoning_fixture(dir.path());
+    // This unchanged signed response was already cleared before deployment, but
+    // its durable clear unit has not been adopted yet. A host subset makes it
+    // newest. Pricing the subset must not bring its original signed bytes back.
+    request.native_messages.as_mut().unwrap().retain(|message| {
+        !["old", "multipart-user"]
+            .iter()
+            .any(|id| message["info"]["id"] == *id)
+    });
+    request.messages =
+        crate::codec::decode_opencode(request.native_messages.as_ref().unwrap()).messages;
+    let mut ctx = pctx("git:fixture", "/nonexistent-docs", 0);
+    ctx.temporal_awareness = false;
+    let mut result = transform_with_projection(&db, &request, &ctx).unwrap();
+    let mut native = ReasoningNativeHarness::new();
+    native.attach(&db, &mut result, &request);
+    assert!(
+        !String::from_utf8_lossy(&native_mid_bytes(&native, "already"))
+            .contains("thinking-already"),
+        "legacy re-exemption restored the original signed thinking-already block"
+    );
+}
+
 fn append_native_reasoning(request: &mut TransformRequest, id: &str) {
     request.native_messages.as_mut().unwrap().push(json!({"info":{"id":id,"role":"assistant"},"parts":[
         {"id":format!("{id}-r"),"type":"reasoning","text":format!("thinking-{id}"),"metadata":{"signature":format!("signature-{id}")}},

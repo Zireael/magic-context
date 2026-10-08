@@ -69,6 +69,46 @@ fn review_reasoning_clear_never_restores_a_frozen_block_on_exemption_change() {
     );
 }
 
+#[test]
+fn re_review_merged_strip_keeps_the_first_thinking_block_on_its_first_priced_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = store(dir.path());
+    let mut request = reasoning_clear_fixture();
+    request.keep_reasoning_tokens_effective = Some(10_000);
+    request.messages[1]
+        .ck
+        .content
+        .push(CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+            text: "interleaved-second".to_string(),
+            signature: Some("signature-second".to_string()),
+        }));
+    let mut newer = request.messages[1].clone();
+    newer.mid = "new".to_string();
+    newer.ordinal = 17;
+    newer.ck.meta.harness_id = Some("new".to_string());
+    request.messages.push(newer);
+    let ctx = pctx("git:proj", dir.path().to_str().unwrap(), 0);
+    transform_with_projection(&db, &request, &ctx).unwrap();
+    request.render_config = "priced-merged".to_string();
+    let result = transform_with_projection(&db, &request, &ctx).unwrap();
+    assert_eq!(result.response.action, "HARD");
+    assert!(db
+        .load(&request.session_id)
+        .unwrap()
+        .core
+        .frozen_units
+        .iter()
+        .any(|unit| unit.key == "strip:merged_reasoning:old"));
+    let bytes = reasoning_clear_target(&result.response);
+    assert!(!String::from_utf8_lossy(&bytes).contains("interleaved-second"));
+    // The serializer repair selected only the interleaved second block. A
+    // message-level replay flag must not turn that into removal of its sibling.
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("thinking-old"),
+        "merged replay also removed the first thinking block that its planner kept"
+    );
+}
+
 fn reasoning_clear_fixture() -> TransformRequest {
     fn message(mid: &str, ordinal: u64, role: &str, signed: bool) -> CkIngressMessage {
         let mut content = Vec::new();
