@@ -487,3 +487,135 @@ fn attachment_repair_projection_cache_retains_ingress_during_legacy_replay() {
         native[1]["parts"][0]["state"]["attachments"]
     );
 }
+
+#[test]
+fn attachment_rereview_provisional_result_upgrade_waits_for_permission_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let (native, fixed) = attachment_review_fixture();
+    let session = "attachment-rereview-provisional";
+    let mut old = attachment_review_request(
+        &native[..2],
+        attachment_review_old_ingress(fixed.clone())[..2].to_vec(),
+        session,
+    );
+    old.mid_turn = true;
+    let prime = attachment_review_request(&native[..1], old.messages[..1].to_vec(), session);
+    run(&store, &prime, &[]);
+    let before = run(&store, &old, &[]);
+    assert!(!before.prefix_bust_permitted);
+    assert!(!store
+        .load(session)
+        .unwrap()
+        .meta
+        .block_identity_by_mid
+        .contains_key("screenshot"));
+    let screenshot = |response: &TransformResponse, raw: &[serde_json::Value]| {
+        attachment_review_native(response, raw)
+            .into_iter()
+            .find(|message| message["info"]["id"] == "screenshot")
+            .unwrap()
+    };
+    let old_native = screenshot(&before, &native[..2]);
+    assert!(old_native["parts"][0]["state"].get("attachments").is_none());
+    drop(store);
+    let reopened = crate::transform::tests::store(dir.path());
+    // The previously served streaming assistant is now historical, with newer
+    // signed thinking behind it. A restart must not make its old image first-sight.
+    let upgraded = attachment_review_request(&native, fixed, session);
+    let after = run(&reopened, &upgraded, &[]);
+    assert!(!after.prefix_bust_permitted);
+    assert!(after.messages().iter().any(|message| {
+        message.meta.harness_id.as_deref() == Some("later")
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block.kind, ck_wire::CkKind::Reasoning { .. }))
+    }));
+    assert_eq!(
+        screenshot(&after, &native),
+        old_native,
+        "a previously served provisional tool result must not restore media on a defer"
+    );
+}
+
+#[test]
+fn attachment_rereview_compaction_off_restoration_replays_on_the_next_defer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let (native, fixed) = attachment_review_fixture();
+    let session = "attachment-rereview-additive";
+    let old = attachment_review_request(
+        &native,
+        attachment_review_old_ingress(fixed.clone()),
+        session,
+    );
+    let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    ctx.compaction_enabled = false;
+    let before = transform(&store, &old, &ctx).unwrap();
+    let upgraded = attachment_review_request(&native, fixed, session);
+    let deferred = transform(&store, &upgraded, &ctx).unwrap();
+    assert!(!deferred.prefix_bust_permitted);
+    assert_eq!(
+        attachment_review_native(&deferred, &native),
+        attachment_review_native(&before, &native)
+    );
+    let mut loaded = store.load(session).unwrap();
+    loaded.meta.soft_refresh_pending = true;
+    store
+        .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+        .unwrap();
+    let restored = transform(&store, &upgraded, &ctx).unwrap();
+    assert!(restored.prefix_bust_permitted);
+    let screenshot = |response: &TransformResponse| {
+        attachment_review_native(response, &native)
+            .into_iter()
+            .find(|message| message["info"]["id"] == "screenshot")
+            .unwrap()
+    };
+    let restored_native = screenshot(&restored);
+    assert_eq!(
+        restored_native["parts"][0]["state"]["attachments"],
+        native[1]["parts"][0]["state"]["attachments"]
+    );
+    drop(store);
+    let reopened = crate::transform::tests::store(dir.path());
+    let replay = transform(&reopened, &upgraded, &ctx).unwrap();
+    assert!(!replay.prefix_bust_permitted);
+    assert_eq!(
+        screenshot(&replay),
+        restored_native,
+        "compaction-off must not undo an admitted restoration on the next defer"
+    );
+}
+
+#[test]
+fn attachment_rereview_provisional_discovery_does_not_write_on_defer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let (native, fixed) = attachment_review_fixture();
+    let session = "attachment-rereview-provisional-writes";
+    let mut old = attachment_review_request(
+        &native[..2],
+        attachment_review_old_ingress(fixed.clone())[..2].to_vec(),
+        session,
+    );
+    old.mid_turn = true;
+    let prime = attachment_review_request(&native[..1], old.messages[..1].to_vec(), session);
+    run(&store, &prime, &[]);
+    run(&store, &old, &[]);
+    run(&store, &old, &[]);
+    let baseline = store.load(session).unwrap();
+    let control = run(&store, &old, &[]);
+    assert!(!control.prefix_bust_permitted);
+    assert_eq!(
+        store.load(session).unwrap().row_version,
+        baseline.row_version,
+        "identical old-adapter replay must be write-free before measuring discovery"
+    );
+    let mut upgraded = attachment_review_request(&native[..2], fixed[..2].to_vec(), session);
+    upgraded.mid_turn = true;
+    let deferred = run(&store, &upgraded, &[]);
+    assert!(!deferred.prefix_bust_permitted);
+    assert_eq!(store.load(session).unwrap().row_version, baseline.row_version, "discovering media on an already-served provisional result must not introduce a defer write");
+}
