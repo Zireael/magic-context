@@ -712,7 +712,8 @@ fn tool_output_from_part(part: &Value, is_error: bool, output_text: String) -> C
         .get("state")
         .and_then(|state| state.get("attachments"))
         .or_else(|| part.get("attachments"))
-        .and_then(Value::as_array);
+        .and_then(Value::as_array)
+        .filter(|attachments| !attachments.is_empty());
     let Some(attachments) = attachments else {
         return if is_error {
             CkToolOutput::bare(CkOutputKind::ErrorText { text: output_text })
@@ -721,21 +722,53 @@ fn tool_output_from_part(part: &Value, is_error: bool, output_text: String) -> C
         };
     };
 
+    let kinds: Vec<_> = attachments
+        .iter()
+        .map(|attachment| classify_tool_result_child(attachment, ToolResultChildAdapter::OpenCode))
+        .collect();
+    let needs_tag_carrier = kinds
+        .iter()
+        .any(|kind| matches!(kind, ResultBlockKind::Media { .. }))
+        && !kinds
+            .iter()
+            .any(|kind| matches!(kind, ResultBlockKind::Text { .. }));
     let mut blocks = Vec::new();
-    if !output_text.is_empty() {
+    if !output_text.is_empty() || needs_tag_carrier {
         blocks.push(ResultBlock {
             kind: ResultBlockKind::Text { text: output_text },
             provider_extras: ProviderExtras::new(),
         });
     }
-    for attachment in attachments {
+    for (attachment, kind) in attachments.iter().zip(kinds) {
         let mut provider_extras = ProviderExtras::new();
-        provider_extras
-            .entry(HARNESS.to_string())
-            .or_default()
-            .insert("rawAttachment".to_string(), attachment.clone());
+        let mut raw = attachment.clone();
+        let mut source_fields = Vec::new();
+        if let ResultBlockKind::Media { media } = &kind {
+            let rendered = render_media_part(media);
+            for field in ["url", "data"] {
+                let derived = if field == "url" {
+                    rendered.get("url")
+                } else {
+                    media.source.get("data")
+                };
+                if raw.get(field).is_some() && raw.get(field) == derived {
+                    raw.as_object_mut().unwrap().remove(field);
+                    source_fields.push(field);
+                }
+            }
+        }
+        if !matches!(kind, ResultBlockKind::Opaque { .. }) {
+            let ns = provider_extras.entry(HARNESS.to_string()).or_default();
+            ns.insert("rawAttachment".to_string(), raw);
+            if !source_fields.is_empty() {
+                ns.insert(
+                    "rawAttachmentSourceFields".to_string(),
+                    json!(source_fields),
+                );
+            }
+        }
         blocks.push(ResultBlock {
-            kind: classify_tool_result_child(attachment, ToolResultChildAdapter::OpenCode),
+            kind,
             provider_extras,
         });
     }
@@ -1454,24 +1487,40 @@ fn unshown_attachment_notice(block: &ResultBlock, media: &MediaBlock) -> String 
 fn tool_media_is_unshown(block: &ResultBlock, media: &MediaBlock) -> bool {
     // An unchanged native child is losslessly replayable even in a vendor format.
     // A changed media source instead needs a representable fresh carrier.
-    block
-        .provider_extras
-        .get(HARNESS)
-        .and_then(|ns| ns.get("rawAttachment"))
-        .is_none_or(|retained| media_from_part(retained) != *media)
+    retained_tool_attachment(block, media)
+        .is_none_or(|retained| media_from_part(&retained) != *media)
         && render_media_part(media)
             .get("url")
             .and_then(Value::as_str)
-            .is_none()
+            .is_none_or(str::is_empty)
+}
+
+// Payload fields live only in the media source. The carrier records which native
+// fields to reconstruct, keeping vendor metadata and the original native shape.
+fn retained_tool_attachment(block: &ResultBlock, media: &MediaBlock) -> Option<Value> {
+    let ns = block.provider_extras.get(HARNESS)?;
+    let mut raw = ns.get("rawAttachment")?.clone();
+    if let Some(fields) = ns
+        .get("rawAttachmentSourceFields")
+        .and_then(Value::as_array)
+    {
+        let rendered = render_media_part(media);
+        for field in fields.iter().filter_map(Value::as_str) {
+            let value = match field {
+                "url" => rendered.get("url"),
+                "data" => media.source.get("data"),
+                _ => None,
+            };
+            if let (Some(object), Some(value)) = (raw.as_object_mut(), value) {
+                object.insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    Some(raw)
 }
 
 fn render_tool_attachment(block: &ResultBlock, media: &MediaBlock) -> Value {
-    let Some(mut retained) = block
-        .provider_extras
-        .get(HARNESS)
-        .and_then(|namespace| namespace.get("rawAttachment"))
-        .cloned()
-    else {
+    let Some(mut retained) = retained_tool_attachment(block, media) else {
         return render_media_part(media);
     };
     if media_from_part(&retained) == *media {

@@ -879,7 +879,8 @@ function moduleToolOutput(
     if (!Array.isArray(attachments) || attachments.length === 0) {
         return { kind: { type: error ? "error_text" : "text", text } };
     }
-    const blocks: Record<string, unknown>[] = text ? [{ kind: { type: "text", text } }] : [];
+    // Even media-only results need a separate text carrier for their address tag.
+    const blocks: Record<string, unknown>[] = [{ kind: { type: "text", text } }];
     for (const attachment of attachments) {
         const child =
             attachment !== null && typeof attachment === "object"
@@ -931,7 +932,41 @@ function moduleToolOutput(
                 },
             };
         }
-        blocks.push({ kind, provider_extras: { opencode: { rawAttachment: attachment } } });
+        // Store payload bytes once. Native encoding reconstructs only the recorded
+        // fields from the media source; all other carrier fields remain lossless.
+        const rawAttachment = { ...child };
+        const sourceFields: string[] = [];
+        if (kind.type === "media") {
+            const media = kind.media as { source: { type: string; data?: string; url?: string } };
+            const derivedUrl =
+                media.source.type === "data_base64"
+                    ? `data:${mime};base64,${media.source.data}`
+                    : media.source.url;
+            for (const [field, derived] of [
+                ["url", derivedUrl],
+                ["data", media.source.data],
+            ] as const) {
+                if (child[field] !== undefined && child[field] === derived) {
+                    delete rawAttachment[field];
+                    sourceFields.push(field);
+                }
+            }
+        }
+        blocks.push(
+            kind.type === "opaque"
+                ? { kind }
+                : {
+                      kind,
+                      provider_extras: {
+                          opencode: {
+                              rawAttachment,
+                              ...(sourceFields.length
+                                  ? { rawAttachmentSourceFields: sourceFields }
+                                  : {}),
+                          },
+                      },
+                  },
+        );
     }
     return { kind: { type: error ? "error_content" : "content", blocks } };
 }

@@ -69,11 +69,60 @@ describe("encodeOpenCodeMessagesToCk", () => {
             expect(output.blocks[3].kind.opaque.raw).toEqual(attachments[2]);
             expect(output.blocks[4].kind).toEqual({ type: "text", text: "attached text" });
             expect(
-                output.blocks
-                    .slice(1)
-                    .map((block: any) => block.provider_extras.opencode.rawAttachment),
+                output.blocks.slice(1).map((block: any) => {
+                    if (block.kind.type === "opaque") return block.kind.opaque.raw;
+                    const ns = block.provider_extras.opencode;
+                    const raw = { ...ns.rawAttachment };
+                    for (const field of ns.rawAttachmentSourceFields ?? []) {
+                        const media = block.kind.media;
+                        raw[field] =
+                            field === "data"
+                                ? media.source.data
+                                : media.source.type === "data_base64"
+                                  ? `data:${media.media_type};base64,${media.source.data}`
+                                  : media.source.url;
+                    }
+                    return raw;
+                }),
             ).toEqual(attachments);
             expect(JSON.stringify(encodeOpenCodeMessagesToCk([raw]))).toBe(JSON.stringify(encoded));
+        }
+    });
+
+    it("keeps media-only results taggable and carries each screenshot payload once", () => {
+        for (const status of ["completed", "error"]) {
+            const payload = "A".repeat(768 * 1024);
+            const [encoded] = encodeOpenCodeMessagesToCk([
+                {
+                    info: { id: "media-only", role: "assistant" },
+                    parts: [
+                        {
+                            type: "tool",
+                            callID: "screen",
+                            tool: "read",
+                            state: {
+                                status,
+                                input: {},
+                                output: "",
+                                error: "",
+                                attachments: [
+                                    {
+                                        type: "file",
+                                        mime: "image/png",
+                                        url: `data:image/png;base64,${payload}`,
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                },
+            ]);
+            const output = (encoded!.ck.content[1] as any).kind.output.kind;
+            expect(output.blocks[0]).toEqual({ kind: { type: "text", text: "" } });
+            expect(output.blocks[1].provider_extras.opencode.rawAttachmentSourceFields).toEqual([
+                "url",
+            ]);
+            expect(JSON.stringify(encoded).split(payload)).toHaveLength(2);
         }
     });
 
