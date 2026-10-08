@@ -34,6 +34,7 @@ import {
 	insertTag,
 	queueM0Mutation,
 	queuePendingOp,
+	recordProtectedTailPublicationFloor,
 	setChannel1NudgeState,
 	setLastNudgeUndropped,
 	setPendingPiCompactionMarkerState,
@@ -6029,6 +6030,159 @@ describe("registerPiContextHandler", () => {
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
 				expect(consumePendingMaterialization(sessionId)).toBe(false);
 			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("drains the published Pi marker at ordinal 9 with floor 10 on the first bust after low-usage defers", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-9-floor-10";
+			const fake = createFakePi();
+			const logger = await import("@magic-context/core/shared/logger");
+			const logCalls = spyOn(logger, "sessionLog");
+			const pending = {
+				endMessageId: "synth-user-38b47eef",
+				firstKeptEntryId: "5fedebb3",
+				ordinal: 9,
+				publishedAt: 1791428662185,
+				summary:
+					"Magic Context compacted: Corrected noisy Tier 0 detectors, validated historical recall, ran canary orders 0-19",
+				tokensBefore: 1186,
+			};
+			const appendCompaction = mock((..._args: unknown[]) => "compact-9");
+			try {
+				updateSessionMeta(db, sessionId, {
+					piStableIdScheme: 1,
+					lastResponseTime: Date.now(),
+				});
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					injection: { injectionBudgetTokens: 10_000 },
+					scheduler: { executeThresholdPercentage: 80 },
+				});
+				const handler = fake.handlers.get("context") as (
+					event: { messages: never[] },
+					ctx: never,
+				) => Promise<{ messages: never[] }>;
+				const pass = async (percent: number) => {
+					const messages = Array.from({ length: 11 }, (_, index) =>
+						index % 2 === 0
+							? userMessage(`request ${index + 1}`, index + 1)
+							: assistantMessage(`answer ${index + 1}`, index + 1),
+					);
+					const entryIds = messages.map((_, index) =>
+						index === 8
+							? pending.endMessageId
+							: index === 9
+								? pending.firstKeptEntryId
+								: `entry-${index + 1}`,
+					);
+					const ctx = fakeContext(sessionId, process.cwd(), entryIds, messages);
+					const branchEntries: unknown[] = ctx.sessionManager.getBranch();
+					return handler({ messages: messages as never[] }, {
+						...ctx,
+						getContextUsage: () => ({
+							tokens: percent * 1000,
+							percent,
+							contextWindow: 100_000,
+						}),
+						sessionManager: {
+							...ctx.sessionManager,
+							getBranch: () => branchEntries,
+							appendCompaction: (...args: unknown[]) => {
+								const id = appendCompaction(...args);
+								branchEntries.push({
+									type: "compaction",
+									id,
+									firstKeptEntryId: args[1],
+								});
+								return id;
+							},
+						},
+					} as never);
+				};
+				const decision = () =>
+					logCalls.mock.calls
+						.filter(
+							([id, message]) =>
+								id === sessionId && message.startsWith("transform:"),
+						)
+						.at(-1)?.[1];
+
+				// Warm an existing history baseline, as in a session that has already
+				// compacted ordinals 1-4, so first publication is not a HARD-fold trigger.
+				appendCompartments(db, sessionId, [
+					{
+						sequence: 0,
+						startMessage: 1,
+						endMessage: 4,
+						startMessageId: "entry-1",
+						endMessageId: "entry-4",
+						title: "Earlier history",
+						content: "Previously compacted requests and answers.",
+					},
+				]);
+				const baseline = await pass(1);
+				appendCompartments(db, sessionId, [
+					{
+						sequence: 1,
+						startMessage: 5,
+						endMessage: 7,
+						startMessageId: "entry-5",
+						endMessageId: "entry-7",
+						title: "Detector corrections",
+						content: "Corrected noisy Tier 0 detectors.",
+					},
+					{
+						sequence: 2,
+						startMessage: 7,
+						endMessage: 9,
+						startMessageId: "entry-7",
+						endMessageId: pending.endMessageId,
+						title: "Recall validation",
+						content: "Validated historical recall, ran canary orders 0-19.",
+					},
+				]);
+				// Publication advances the protected-tail floor to the FIRST kept
+				// ordinal, while the pending marker names the LAST summarized one.
+				recordProtectedTailPublicationFloor(db, sessionId, 10);
+				setPendingPiCompactionMarkerState(db, sessionId, pending);
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+				expect(hasPendingMaterialization(sessionId)).toBe(false);
+				for (const percent of [1, 9.555953650947497, 15]) {
+					expect((await pass(percent)).messages).toEqual(baseline.messages);
+					expect(decision()).toContain("decision=defer");
+					expect(appendCompaction).not.toHaveBeenCalled();
+					expect(getPendingPiCompactionMarkerState(db, sessionId)).toEqual(
+						pending,
+					);
+					expect(
+						getOrCreateSessionMeta(db, sessionId).priorBoundaryOrdinal,
+					).toBe(10);
+				}
+
+				// Cross the execute threshold without entering the force band or
+				// sending explicit flush signals. No further publication is needed.
+				const busting = await pass(81);
+				expect(decision()).toContain("decision=execute");
+				expect(busting.messages.map(textOf).join("\n")).toContain(
+					"Recall validation",
+				);
+				expect(appendCompaction).toHaveBeenCalledTimes(1);
+				expect(appendCompaction).toHaveBeenCalledWith(
+					pending.summary,
+					"5fedebb3",
+					1186,
+					{ source: "magic-context", lastCompactedOrdinal: 9 },
+					true,
+				);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
+				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
+				expect(consumeDeferredMaterialization(sessionId)).toBe(false);
+			} finally {
+				logCalls.mockRestore();
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);
 			}
