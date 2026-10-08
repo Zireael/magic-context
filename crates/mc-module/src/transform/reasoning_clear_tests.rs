@@ -26,9 +26,19 @@ fn integration_reasoning_budget_metadata_route_protects_active_thinking_until_re
             ReasoningBudgetScope::default(),
         )
     };
-    assert_eq!(cutoff(&native), 0, "metadata identifies an active Anthropic turn");
-    native.push(json!({"info":{"id":"next-u","role":"user"},"parts":[{"type":"text","text":"next task"}]}));
-    assert_eq!(cutoff(&native), 2, "a real user releases historical budget selection");
+    assert_eq!(
+        cutoff(&native),
+        0,
+        "metadata identifies an active Anthropic turn"
+    );
+    native.push(
+        json!({"info":{"id":"next-u","role":"user"},"parts":[{"type":"text","text":"next task"}]}),
+    );
+    assert_eq!(
+        cutoff(&native),
+        2,
+        "a real user releases historical budget selection"
+    );
 }
 
 #[test]
