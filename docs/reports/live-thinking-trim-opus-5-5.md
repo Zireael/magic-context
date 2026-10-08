@@ -1,8 +1,85 @@
-# Opus/Sonnet 5.5 preserved-thinking matrix: not reached (seed blocker)
+# Opus/Sonnet 5.5 preserved-thinking matrix: recorded Opus seed reached
 
-**Updated:** 2026-10-08. Route: Anthropic native Messages (`https://api.anthropic.com/v1/messages`), default vault credential `oauth:anthropic`, through the enrolled `mc-e2e` consumer. No account rotation was used. Two post-quota live attempts were made; both were seed-only and sent no matrix variants.
+**Updated:** 2026-10-08. Route: Anthropic native Messages (`https://api.anthropic.com/v1/messages`), default vault credential `oauth:anthropic`, through the enrolled `mc-e2e` consumer. No account rotation was used. The recorded-seed run below reached eight Opus cells; restoration was not reached and no Sonnet specimen existed. The earlier synthetic-seeding attempts are retained below as historical evidence.
 
-## Seeding reruns
+## Recorded-seed run: 2026-10-08 11:09:53–11:10:02 UTC
+
+**Result:** the unchanged Opus control was accepted. Oldest-prefix, suffix and complete thinking removal were accepted. A middle gap, an earlier tool-result edit and a first-user re-render were rejected with signature-binding errors, consistent with the tested parts of memory **#23609**. Replacing the oldest signed thinking block's displayed text with **`[cleared]` was accepted (HTTP 200)**, contrary to an Anthropic-direct extension of **#22050**. The latter memory explicitly names Vertex, Bedrock and Copilot; those routes were not tested and their recorded claims are not refuted by this result.
+
+### Specimen selection and isolation
+
+- Read-only source: `$(getconf DARWIN_USER_TEMP_DIR)opencode-anthropic-auth-dumps/`. At selection, all **3,603** `.body.json` files parsed successfully and all specified `claude-opus-5-5`. The **3,611** `.request.json` files contained only URL/method/headers, not additional bodies; headers were not used for authentication. No Sonnet 5.5 request body existed in this snapshot.
+- Selected the smallest qualifying body by file size: at least six signed blocks across three assistant messages, at least two tool results, and tool calls between signed assistant messages. Only this file was copied; source dumps were neither modified nor deleted.
+- Private copy: `~/.local/share/cortexkit/magic-context/specimens/thinking-matrix/opus-5-5-2026-10-08-recorded.json`, **682,559 bytes**, mode **0600**, model **`claude-opus-5-5`**. It contains **6 signed thinking blocks across 6 assistant messages**, **521 messages**, and **167 tool calls / 167 tool results**. There are no unsigned or redacted thinking blocks in this specimen.
+- Rough token estimate: **170,640** (`ceil(file bytes / 4)`), not a tokenizer count. The control's provider-reported input was **254,457** tokens including cache reads, demonstrating that the byte estimate understated this request.
+- The seed already uses `thinking: {type: "adaptive", display: "summarized"}` and **`output_config: {effort: "high"}`**. This is a native request-body field, not a repository config path or an invented compatibility shim.
+- All cells retain recorded history/system/tools/effort except their specified mutation. Common transport changes are `stream: false`, `max_tokens: 64`, and `thinking.block_binding.prefix_mismatch_behavior: "error"`, with `thinking-binding-controls-2026-08-01` in the beta headers. “Unchanged control” means unchanged conversation content under those common settings.
+- The installed auth plugin shaped bearer headers against a loopback-only rejection using OpenCode **1.18.30**; this bootstrap made **zero** upstream model calls. `lsof` samples before and after bootstrap showed only the disposable root's OpenCode `live.db` and Magic Context `context.db` handles (including WAL/SHM files). Host PID **92195**; its root was removed after disposal. No recorded or newly generated tool was executed.
+- The parent explicitly authorized one read-only exception to the supplied live-store rule: `~/.config/cortexkit/mc-e2e/enrollment.json`, set as `MC_E2E_ENROLLMENT_PATH`. No other live config/store was opened, read, written or migrated. The vault's default `oauth:anthropic` credential was read once; there were no alternate credentials, retries or quota polling.
+
+Harness revision: `ec166ec712bd7e39088ff010dae312f72bb37611`, incorporating the hardened harness and prior report from `refs/alfonso/accepted/bg_443cc9a55aff7c0a`. Reduced runtime results remain in `$TMPDIR/magic-context/live-providers/thinking-matrix-recorded-2026-10-08-bg480261/results.json`; they contain statuses, usage, diagnostics and hashed request shapes, not raw request bodies, conversation text, signatures or bearer headers. The specimen is outside the repository and `.cortexkit/`.
+
+### Per-cell results
+
+All mutations use independent copies of the same recorded seed. The restore cell would reuse only a newly signed response from the accepted oldest-prefix cell. Every HTTP 200 below had `stop_reason: max_tokens`, 64 output tokens, zero reported thinking tokens, and empty `input_transformations` / `context_management.applied_edits` diagnostics. These are acceptance observations, not completed-response observations.
+
+| Cell / exact mutation | HTTP | Request ID | Exact error text | Comparison with recorded claim |
+| --- | --- | --- | --- | --- |
+| Unchanged control; all 6 signed blocks retained | 200 | `req_011CfpfdQDySNAULzfJr5ihs` | None | Valid seed/control; not itself a memory claim |
+| Oldest-prefix trim; remove oldest 1, retain identical later 5 | 200 | `req_011CfpfdXmevQg3PyA52UNSL` | None | Matches #23609 for the tested one-block prefix |
+| Suffix removal; remove signed blocks 2–6, retain oldest 1 | 200 | `req_011CfpfdfieRvKXDNYKAuPWT` | None | Matches #23609 |
+| Remove all thinking; retain 0 signed blocks | 200 | `req_011Cfpfdn6NmNGtEQ6e8VRnA` | None | Matches #23609 |
+| Middle gap; remove second signed block, retain oldest and later 4 | 400 | `req_011CfpfdtiUnDR7Tqk53ja2Q` | E1 below (verbatim body) | Matches #23609's middle-gap rejection |
+| Restore removed oldest block after generation while absent | Not sent | None | None: not reached | #23609 restoration remains unverified; prefix-trim response produced no new signed block |
+| Edit first tool result; retain all later signed blocks | 400 | `req_011CfpfdvKUSAKeKAurtges1` | E2 below (verbatim body) | Matches #23609's earlier tool-result edit rejection |
+| Re-render first user's first text block by appending a context-marker line; retain all signed blocks | 400 | `req_011CfpfdwipL8643kUpAxpk1` | E3 below (verbatim body) | Matches #23609's earlier user-message edit rejection |
+| Replace oldest signed thinking text with literal `[cleared]`; preserve original signature and other blocks | **200** | `req_011CfpfdyAtCM4MNhh2wN2Ux` | **None** | **Does not match an Anthropic-direct analogue of #22050** |
+
+E1 — middle gap:
+
+```json
+{"type":"error","error":{"type":"invalid_request_error","message":"messages.277.content.8: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". The `thinking` block that preceded this one when it was created is missing from this request."},"request_id":"req_011CfpfdtiUnDR7Tqk53ja2Q"}
+```
+
+E2 — earlier tool-result edit:
+
+```json
+{"type":"error","error":{"type":"invalid_request_error","message":"messages.273.content.5: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\"."},"request_id":"req_011CfpfdvKUSAKeKAurtges1"}
+```
+
+E3 — first-user re-render:
+
+```json
+{"type":"error","error":{"type":"invalid_request_error","message":"messages.273.content.5: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". A message older than `messages.0.content.0` differs from when this block was created."},"request_id":"req_011CfpfdwipL8643kUpAxpk1"}
+```
+
+The returned error bodies contain no signature or conversation text; no redaction or truncation was required for these three errors. Provider message indices above are preserved exactly, not mapped back to the original recorded message indices.
+
+**Sonnet 5.5:** all nine cells are **not sent**, with no HTTP status, error text, request ID or measured usage: no qualifying Sonnet body was present. Neither #23609 nor an Anthropic-direct analogue of #22050 was validated for Sonnet by this run.
+
+### Request budget, tokens and limitations
+
+**8 upstream requests on Opus, 0 on Sonnet**, below the nine-per-model limit. No 429 or quota error occurred. Restoration was explicitly not reached instead of sending the unchanged seed again as a false restoration test, and no extra generation request was spent. The CLI exited **1** solely because restoration lacked the necessary new signed response. Tool-input edits and edit-plus-strip recovery pairs are outside this nine-cell run and remain unverified here. The server rejects a whole request at its first invalid later block; the middle-gap result does not individually test every later signature.
+
+| Accepted cell | Uncached input | Cache read | Cache creation | Total input | Output |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Control | 2 | 254,455 | 0 | 254,457 | 64 |
+| Oldest-prefix trim | 2 | 56,805 | 197,551 | 254,358 | 64 |
+| Suffix removal | 2 | 56,805 | 197,095 | 253,902 | 64 |
+| All thinking removed | 2 | 56,805 | 196,996 | 253,803 | 64 |
+| `[cleared]` | 2 | 254,455 | 0 | 254,457 | 64 |
+| **Reported totals** | **10** | **679,325** | **591,642** | **1,270,977** | **320** |
+
+The run therefore spent **1,270,977 provider-reported input tokens across accepted requests**, counting uncached input, cache reads and cache creation once (not double-counting the nested `iterations` usage). The three HTTP 400 responses supplied no usage: any token consumption or billing on those rejections is **unknown**, not measured zero. The control and `[cleared]` cell had identical reported input/cache usage, but this is not proof about the provider's internal treatment of displayed thinking text. Cache reuse is not evidence of cross-route compatibility.
+
+### Local verification of recorded mode
+
+- Bun **1.4.2**: `bun test --timeout 30000 packages/e2e-tests/src/live-providers` — **38 passed, 1 optional smoke skipped, 0 failed**, 174 assertions across 39 tests in five files.
+- TypeScript **5.9.3**: `bun packages/e2e-tests/node_modules/typescript/bin/tsc --noEmit -p packages/e2e-tests/tsconfig.live-providers.json` — passed, silent on success.
+- Isolated guard mutations each made only the intended test fail: `recorded signed-thinking matrix > stops after a rejected control without sending any mutation` and `recorded signed-thinking matrix > stops immediately on 429 or quota errors without retries`. Each red run had 37 passed / 1 skipped / 1 failed; staged-state restoration returned the working diff to empty. Restored matrix tests passed **17/17**, 121 assertions.
+- No package manifest or lockfile changed. The worktree had already passed frozen installation and build before the task; no production/plugin code or packaging changed.
+
+## Earlier synthetic seeding reruns (historical)
 
 ### Attempt A: manual `enabled` thinking (unsupported mode)
 
@@ -19,7 +96,7 @@ After switching seed requests to `thinking: {type: "adaptive"}` and `output_conf
 
 ### Requested claims, per model
 
-All claims remain **unverified**: the relevant variant calls were not reached, so there are no variant request IDs and the live provider neither confirms nor contradicts any signature rule. The revised harness now defines the same trim/edit cells for both models, but the seed guard prevents sending them without enough signed history.
+All claims remained **unverified in those synthetic attempts**: the relevant variant calls were not reached, so there are no variant request IDs and the live provider neither confirmed nor contradicted any signature rule. The hardened synthetic harness defined the same trim/edit cells for both models, but its seed guard prevented sending them without enough signed history. See the recorded-seed results above for the later Opus evidence.
 
 | Claim | Opus 5.5 | Sonnet 5.5 |
 | --- | --- | --- |
@@ -87,7 +164,7 @@ All listed responses were HTTP 200. The request IDs below identify seed calls on
 | `claude-sonnet-5-5` | `seed-8-tool` | `req_011Cfp3AHGL7rhQ7adwZ4EjS` | `tool_use`, 0 thinking tokens |
 | `claude-sonnet-5-5` | `seed-8-final` | `req_011Cfp3AQSvxQdVRKaN1xpfk` | `end_turn`, 0 thinking tokens |
 
-## Current harness and local verification
+## Synthetic harness and earlier local verification (historical)
 
 The local harness now uses adaptive/high effort, the benign `record_note` tool, reasoning-inviting arithmetic seed prompts, up to eight completed rounds, and one alternate neutral prompt retry on a refusal. The common 13 one-shot mutation/control cells run for both models; a restoration check reuses the oldest-prefix response and issues one additional request only if that response produced a signed block. Any 429 stops both models immediately. The cap is 92 calls. The harness keeps signatures in memory and records statuses, request IDs, per-round signed-block counts, and hashed request shapes without raw thinking text or signatures.
 
