@@ -84,8 +84,8 @@ test("mock rejects edited, missing and reordered latest-turn thinking across too
 	}
 });
 
-for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "drops" }, { band: 76, mode: "primary" }, { band: 76, mode: "legacy-accepted" }, { band: 76, mode: "legacy-rejected" }]) {
-	test(mode === "primary" ? "Anthropic primary long tool loop defers thinking-changing queued drops" : mode === "drops" ? `Anthropic task preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
+for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "drops" }, { band: 76, mode: "primary" }, { band: 85, mode: "primary" }, { band: 76, mode: "legacy-accepted" }, { band: 76, mode: "legacy-rejected" }]) {
+	test(mode === "primary" ? `Anthropic primary long tool loop defers thinking-changing queued drops at ${band}%` : mode === "drops" ? `Anthropic task preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
         let enforceLegacy = mode !== "legacy-accepted";
         const modelID = mode.startsWith("legacy-") ? "mock-sonnet" : "claude-sonnet-5-5";
 		const oldTmp = process.env.TMPDIR;
@@ -132,6 +132,10 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 		);
 		mkdirSync(proof, { recursive: true });
 		let pass = 0;
+		// A primary keeps the newest tool calls in its protected working set, so its
+		// loop runs two more calls before the queued drop can leave that window.
+		const reducePass = mode === "primary" ? 6 : 4;
+		const lastPass = reducePass + 3;
 		let parentSent = false;
 		let childId = "";
 		let tag = 0;
@@ -215,7 +219,12 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 						description: "Read spent output",
 					});
 				if (pass === 3 && (mode === "drops" || mode === "primary")) return tool("bash", { command: "cat c.txt", description: "Displace the protected output floor" });
-                if (pass === 4) {
+				if (mode === "primary" && pass > 3 && pass < reducePass)
+					return tool("bash", {
+						command: `printf step-${pass}`,
+						description: "Grow the active tool loop",
+					});
+                if (pass === reducePass) {
 					const child = h
 						.contextDb()
 						.query("SELECT session_id FROM session_meta WHERE is_subagent = 1")
@@ -252,7 +261,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
                     if (pass < 7) return tool("bash", { command: "printf legacy-continue", description: "Continue accepted legacy replay" });
                     return { text: "Legacy worker done", usage };
                 }
-                if (pass < 7)
+                if (pass < lastPass)
 					return tool("bash", {
 						command: "printf continue",
 						description: "Continue",
@@ -305,9 +314,14 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
                 contain();
                 return;
             }
-			expect(pass).toBe(7);
-			expect(bytes(wire[4])).toContain("SPENT-b");
-			expect(bytes(wire[4]!.slice(0, wire[3]!.length))).toBe(bytes(wire[3]));
+			expect(pass).toBe(lastPass);
+			expect(h.mock.requests().some((r) => r.thinkingViolation)).toBe(false);
+			// The request after ctx_reduce still carries the output and extends the
+			// previous request byte for byte: no thinking was edited or removed.
+			expect(bytes(wire[reducePass])).toContain("SPENT-b");
+			expect(bytes(wire[reducePass]!.slice(0, wire[reducePass - 1]!.length))).toBe(
+				bytes(wire[reducePass - 1]),
+			);
 			expect(
 				h
 					.contextDb()

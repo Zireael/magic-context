@@ -71,6 +71,7 @@ import {
     noteLkgProviderResponse,
 } from "../../hooks/magic-context/lkg-measured-request";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
+import { armLatestThinkingRecoveryFromError } from "../../hooks/magic-context/latest-thinking-recovery";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
 import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
@@ -1140,6 +1141,20 @@ export async function registerContext(context: V2Context) {
                 if (event.type === "session.error" || event.type === "session.execution.failed") {
                     const error = hiddenTerminalError(event);
                     if (error !== undefined) hiddenSessionErrors.set(sessionID, error);
+                    if (error !== undefined && db && !compactionOff) {
+                        const model = liveModels.get(sessionID);
+                        try {
+                            armLatestThinkingRecoveryFromError({
+                                db,
+                                sessionId: sessionID,
+                                error,
+                                providerID: model?.providerID,
+                                modelID: model?.modelID,
+                            });
+                        } catch (armError) {
+                            log("[magic-context] v2 latest-thinking recovery arm failed", armError);
+                        }
+                    }
                     continue;
                 }
                 if (event.type === "session.deleted") {

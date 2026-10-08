@@ -1,4 +1,5 @@
 import { decodeMergedReasoningParts } from "../../features/magic-context/merged-reasoning-decisions";
+import { detectLatestTurnThinkingMismatch } from "../../features/magic-context/overflow-detection";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     armThinkingBindingRecovery,
@@ -9,6 +10,8 @@ import { ensureSessionMetaRow } from "../../features/magic-context/storage-meta-
 import { isRecord } from "../../shared/record-type-guard";
 import { contextRefusalError } from "./emergency-fail-closed";
 import { latestAssistantTurnStart } from "./latest-assistant-turn";
+import { dropSlot } from "./lkg-slot";
+import { isAnthropicFamilyRoute } from "./sentinel";
 import type { MessageLike } from "./tag-messages";
 import { TOOL_SWEEP_SCOPED_MARKER } from "./tool-sweep-policy";
 
@@ -196,4 +199,25 @@ export function armBindingRecoverySafely(db: ContextDatabase, sessionId: string)
     if (getThinkingBindingRecoveryTarget(db, sessionId)?.startsWith(LATEST_THINKING_RESTORE))
         armLatestThinkingRecovery(db, sessionId);
     else armThinkingBindingRecovery(db, sessionId);
+}
+
+/**
+ * Arm restoration from a host failure event when the provider rejected edits to
+ * the active turn's thinking. OpenCode 2 reports provider failures only through
+ * its session event stream, so it arms here; the next pass then replays the
+ * turn's original thinking once. Returns whether the error was this rejection.
+ */
+export function armLatestThinkingRecoveryFromError(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    error: unknown;
+    providerID?: string;
+    modelID?: string;
+}): boolean {
+    if (!detectLatestTurnThinkingMismatch(args.error)) return false;
+    if (!isAnthropicFamilyRoute(args.providerID, args.modelID)) return true;
+    armLatestThinkingRecovery(args.db, args.sessionId);
+    // The last-known-good request still carries the rejected bytes.
+    dropSlot(args.sessionId, "latest-thinking-recovery-arm");
+    return true;
 }

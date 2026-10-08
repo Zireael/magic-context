@@ -7,6 +7,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     armLatestThinkingRecovery,
+    armLatestThinkingRecoveryFromError,
     captureLatestTurnOriginals,
     prepareLatestThinkingRecovery,
 } from "./latest-thinking-recovery";
@@ -92,6 +93,32 @@ test("missing thinking originals refuse locally rather than resend a rejected tu
         parts: [{ type: "text", text: "new turn" }],
     });
     expect(prepare()).toEqual({ restore: false, ended: true });
+});
+
+test("a host failure event arms restoration only for Anthropic-family active-turn rejections", () => {
+    const { db, prepare } = fixture();
+    const error = {
+        statusCode: 400,
+        data: {
+            message:
+                "messages.3.content.0: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified.",
+        },
+    };
+    const arm = (providerID: string, modelID: string, value: unknown = error) =>
+        armLatestThinkingRecoveryFromError({
+            db,
+            sessionId: "session",
+            error: value,
+            providerID,
+            modelID,
+        });
+    expect(arm("anthropic", "claude-sonnet-5", { statusCode: 500, message: "overloaded" })).toBe(
+        false,
+    );
+    expect(arm("openai", "gpt-5")).toBe(true);
+    expect(prepare()).toEqual({ restore: false, ended: false });
+    expect(arm("google-vertex", "claude-sonnet-5")).toBe(true);
+    expect(prepare()).toEqual({ restore: true, ended: false });
 });
 
 test("a rejected restoration is quarantined instead of entering a 400 loop", () => {

@@ -555,12 +555,13 @@ export class TestHarness implements HostHarness {
 
     assertHistorianRequestsUseMock(): void {
         if (this.expectMagicContext && this.hasContextDb()) {
-            // A test that pins the historian to its own mock model routes there.
+            // The historian is pinned to the host's mock provider, on its own mock
+            // model when a test names one and on the host model otherwise.
             const historianModel = this.spawnOptions.historianMockModel;
             assertHistorianMockRouting(
                 this.contextDb(),
                 "opencode",
-                `mock-anthropic/${historianModel?.id ?? "mock-sonnet"}`,
+                `${this.spawnOptions.mockProviderID ?? "mock-anthropic"}/${historianModel?.id ?? this.spawnOptions.mockModelID ?? "mock-sonnet"}`,
             );
         }
     }
