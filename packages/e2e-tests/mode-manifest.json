@@ -6,7 +6,7 @@
             "path": "tests/latest-turn-thinking.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
-            "rationale": "Real OpenCode 1.18.x task child at execute and force against a provider-side thinking oracle; negative controls reject edited, removed and reordered latest-turn blocks, queued drops release only after a real user turn, and host PID lsof proves throwaway containment. OpenCode 2, Pi and Rust have caller and module unit gates.",
+            "rationale": "Real OpenCode 1.18.x task child and primary long tool loop at execute and force against a provider-side thinking oracle; negative controls reject edited, removed and reordered latest-turn blocks, queued drops release only after a real user turn, accepted legacy strips replay unchanged, a provider rejection restores the original thinking once, and host PID lsof proves throwaway containment. OpenCode 2, Pi and Rust have caller and module unit gates.",
             "contract_refs": ["FOLD-UNDER-PRESSURE"],
             "hosts": ["opencode"]
         },
