@@ -30,7 +30,6 @@
  * native compaction.
  */
 
-import { captureOriginalTurn, prepareLatestThinkingRecovery } from "@magic-context/core/hooks/magic-context/latest-thinking-recovery";
 import * as crypto from "node:crypto";
 import type {
 	ContextEvent,
@@ -189,7 +188,13 @@ import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inj
 import {
 	ANTHROPIC_LATEST_TURN_FULL,
 	hasActiveAnthropicThinkingTurn,
+	latestAssistantTurnStart,
+	protectNewTagMutations,
 } from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
+import {
+	captureOriginalTurn,
+	prepareLatestThinkingRecovery,
+} from "@magic-context/core/hooks/magic-context/latest-thinking-recovery";
 import {
 	markNoteNudgeDelivered,
 	observeNoteNudgeServe,
@@ -5466,19 +5471,33 @@ async function runCompactionOffPipeline(
 
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.compactionOff) return runCompactionOffPipeline(args);
-	const thinkingRecovery = prepareLatestThinkingRecovery({ db: args.db, sessionId: args.sessionId, messages: args.messages,
-        id: (message, index) => resolvePiStableId(message, index, args.entryIds, args.entryIdByRef ?? undefined),
-        parts: message => Array.isArray((message as { content?: unknown })?.content) ? (message as { content: unknown[] }).content : [],
-    });
-    if (thinkingRecovery.ended) signalPiPendingMaterialization(args.sessionId);
-    let restoreOriginals: ReturnType<typeof captureOriginalTurn<unknown>> | undefined;
-    const activeThinkingTurn = hasActiveAnthropicThinkingTurn(
+	const thinkingRecovery = prepareLatestThinkingRecovery({
+		db: args.db,
+		sessionId: args.sessionId,
+		messages: args.messages,
+		id: (message, index) =>
+			resolvePiStableId(
+				message,
+				index,
+				args.entryIds,
+				args.entryIdByRef ?? undefined,
+			),
+		parts: (message) =>
+			Array.isArray((message as { content?: unknown })?.content)
+				? (message as { content: unknown[] }).content
+				: [],
+	});
+	if (thinkingRecovery.ended) signalPiPendingMaterialization(args.sessionId);
+	let restoreOriginals:
+		| ReturnType<typeof captureOriginalTurn<unknown>>
+		| undefined;
+	const activeThinkingTurn = hasActiveAnthropicThinkingTurn(
 		args.messages,
 		args.resolvedProviderID,
 		args.resolvedModelID,
 	);
-	if (activeThinkingTurn && args.contextUsage.percentage >= 95)
-		throw contextRefusalError(ANTHROPIC_LATEST_TURN_FULL);
+	const protectedSignedPrefix =
+		activeThinkingTurn && args.reasoningClearing?.prefixBound === true;
 	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
 		resolvePiStableId(
 			msg,
@@ -5821,7 +5840,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		persistedM0BeforeFold.cachedM0Bytes === null
 			? -1
 			: persistedM0BeforeFold.cachedM0MaxCompartmentSeq;
-	if (activeThinkingTurn && piM0State) {
+	if (protectedSignedPrefix && piM0State) {
 		piM0State.preparedPrefix = prepareCachedM0M1PiReplay(
 			piM0State,
 			args.db,
@@ -5829,7 +5848,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 	if (
-		!activeThinkingTurn &&
+		!protectedSignedPrefix &&
 		(foldDueDecision.value || softRefreshOpportunity) &&
 		piM0State
 	) {
@@ -5950,7 +5969,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				publishedM1RefreshedThisPass ||
 				(canConsumeDeferredLate && deferredHistoryWasPendingAtPassStart)),
 	};
-	const isCacheBustingPass = !activeThinkingTurn && hasReclaimRide(rideSignals);
+	const isCacheBustingPass = hasReclaimRide(rideSignals);
 	if (args.temporalAwareness && isCacheBustingPass) {
 		temporalDecisions = freezeTemporalDecisions(
 			args.db,
@@ -6047,6 +6066,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		args.reusableMessageIds,
 	);
 	const tTag = performance.now();
+	// Part getters build fresh proxy objects. Reuse one view for tagging and
+	// safety coordinates; its proxies still read/write the working messages.
+	const mutationView = transcript.messages.map((message) => ({
+		...message,
+		parts: message.parts,
+	}));
 	let tagTextTokenCache = piTagTextTokenCacheBySession.get(args.sessionId);
 	if (!tagTextTokenCache) {
 		tagTextTokenCache = new Map();
@@ -6064,31 +6089,87 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		"tagging-persistence-failure",
 		() => args.tagger.cleanup(args.sessionId),
 		() =>
-			tagTranscript(args.sessionId, transcript, args.tagger, args.db, {
-				skipPrefixInjection: !ctxReduceCallable,
-				entryFingerprintByMessageId,
-				reuseMessageIds: textIdentityPlan.reusableMessageIds,
-				textIdentityDriftMessageIds: textIdentityPlan.driftedMessageIds,
-				textIdentitySourceCache: textIdentityPlan.sourceCache,
-				textTokenCache: tagTextTokenCache,
-				toolTokenCache: tagToolTokenCache,
-				onTiming: hasPiTransformTimingObserver()
-					? (phase, elapsedMs) => {
-							recordPiTransformTiming({
-								sessionId: args.sessionId,
-								stage: `tag:${phase}`,
-								elapsedMs,
-							});
-						}
-					: undefined,
-			}),
+			tagTranscript(
+				args.sessionId,
+				{ ...transcript, messages: mutationView },
+				args.tagger,
+				args.db,
+				{
+					skipPrefixInjection: !ctxReduceCallable,
+					entryFingerprintByMessageId,
+					reuseMessageIds: textIdentityPlan.reusableMessageIds,
+					textIdentityDriftMessageIds: textIdentityPlan.driftedMessageIds,
+					textIdentitySourceCache: textIdentityPlan.sourceCache,
+					textTokenCache: tagTextTokenCache,
+					toolTokenCache: tagToolTokenCache,
+					onTiming: hasPiTransformTimingObserver()
+						? (phase, elapsedMs) => {
+								recordPiTransformTiming({
+									sessionId: args.sessionId,
+									stage: `tag:${phase}`,
+									elapsedMs,
+								});
+							}
+						: undefined,
+				},
+			),
 	);
 	logTransformTiming(args.sessionId, "tagMessages", tTag);
-    if (thinkingRecovery.restore) {
-        transcript.commit();
-        restoreOriginals = captureOriginalTurn(args.messages as unknown[], message => (message as { content: unknown }).content,
-            (message, content) => { (message as { content: unknown }).content = content; });
-    }
+	const reasoningTagsForProtection = buildMessageIdToMaxTag(targets);
+	const frozenThinkingForProtection = activeThinkingTurn
+		? frozenBindingEntryIds(args.db, args.sessionId)
+		: new Set<string>();
+	const protectedThinkingProxies = new Set<unknown>();
+	if (activeThinkingTurn) {
+		for (
+			let i = latestAssistantTurnStart(workingMessages);
+			i < mutationView.length;
+			i++
+		) {
+			const id = stableIdResolver(workingMessages[i], i);
+			if (
+				!thinkingRecovery.restore &&
+				id &&
+				frozenThinkingForProtection.has(id)
+			)
+				continue;
+			for (let p = 0; p < mutationView[i].parts.length; p++) {
+				const part = mutationView[i].parts[p];
+				if (part.kind !== "thinking") continue;
+				const local = (
+					workingMessages[i] as { content?: { redacted?: boolean }[] }
+				).content?.[p];
+				if (
+					!thinkingRecovery.restore &&
+					!local?.redacted &&
+					id &&
+					(reasoningTagsForProtection.get(id) ?? Infinity) <=
+						(args.sessionMeta.clearedReasoningThroughTag ?? 0)
+				)
+					continue;
+				protectedThinkingProxies.add(part);
+			}
+		}
+	}
+	const newTargets = protectNewTagMutations(
+		mutationView.map((message) => ({
+			info: message.info,
+			parts: message.parts,
+		})),
+		targets,
+		protectedThinkingProxies,
+		args.reasoningClearing?.prefixBound === true,
+	);
+	if (thinkingRecovery.restore) {
+		transcript.commit();
+		restoreOriginals = captureOriginalTurn(
+			args.messages as unknown[],
+			(message) => (message as { content: unknown }).content,
+			(message, content) => {
+				(message as { content: unknown }).content = content;
+			},
+		);
+	}
 
 	// Legacy dropped-tool skeletons (argument marker) convert to the
 	// real-or-absent rule only on a pass whose HARD fold executed and loses the
@@ -6259,7 +6340,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			pendingOpsDidMutate = applyPendingOperations(
 				args.sessionId,
 				args.db,
-				targets,
+				newTargets,
 				new Set([
 					...(args.contextUsage.percentage >= 95
 						? []
@@ -6289,7 +6370,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			pendingOpsAppliedThisPass = true;
 			if (hasPendingMaterializeSignal) {
 				if (args.heuristics === undefined) {
-					consumePendingMaterialization(args.sessionId);
+					if (
+						!pendingOps.some(
+							(op) => newTargets.get(op.tagId)?.thinkingDropProtected,
+						)
+					)
+						consumePendingMaterialization(args.sessionId);
 				}
 			}
 			// NOTE: do NOT consume deferredMaterialization here. OpenCode only
@@ -6517,7 +6603,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			heuristicsResult = applyPiHeuristicCleanup(
 				args.sessionId,
 				args.db,
-				targets,
+				newTargets,
 				args.messages,
 				{
 					protectedTags: args.protectedTags,
@@ -6554,7 +6640,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				const ridingCleanup = applyPiHeuristicCleanup(
 					args.sessionId,
 					args.db,
-					targets,
+					newTargets,
 					args.messages,
 					{
 						protectedTags: args.protectedTags,
@@ -6624,7 +6710,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			heuristicsExecuted = true;
 			executedWorkThisPass = true;
 			if (hasPendingMaterializeSignal) {
-				consumePendingMaterialization(args.sessionId);
+				if (
+					!pendingOps.some(
+						(op) => newTargets.get(op.tagId)?.thinkingDropProtected,
+					)
+				)
+					consumePendingMaterialization(args.sessionId);
 			}
 			if (currentTurnId !== null) {
 				lastHeuristicsTurnIdBySession.set(args.sessionId, currentTurnId);
@@ -6694,6 +6785,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				? frozenBindingEntryIds(args.db, args.sessionId)
 				: new Set<string>();
 			const maxCutoff = piReasoningClearCutoff({
+				protectLatestTurn: activeThinkingTurn,
 				messages: workingMessages,
 				messageIdToMaxTag,
 				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
@@ -6702,7 +6794,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				alreadyGone: (id) => bindingStripped.has(id),
 			});
 			const clearOutcome = clearOldReasoningPi({
-				protectLatestTurn: false,
+				protectLatestTurn: activeThinkingTurn,
 				messages: workingMessages,
 				messageIdToMaxTag,
 				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
@@ -6713,7 +6805,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// message, so it never starts on a prefix-bound model; the cutoff
 			// above already stops below any text it could reach on replay.
 			const stripOutcome = stripInlineThinkingPi({
-				protectLatestTurn: false,
+				protectLatestTurn: activeThinkingTurn,
 				messages: workingMessages,
 				messageIdToMaxTag,
 				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
@@ -6799,7 +6891,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		const syntheticPendingOps = buildSyntheticToolReclaimOps({
 			db: args.db,
 			sessionId: args.sessionId,
-			targets,
+			targets: newTargets,
 			watermark: reclaimMeta.toolReclaimWatermark ?? 0,
 			protectedToolTags,
 			pendingOps,
@@ -6819,7 +6911,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			const supersessionOps = buildSupersessionReclaimOps({
 				db: args.db,
 				sessionId: args.sessionId,
-				targets,
+				targets: newTargets,
 				pendingOps,
 				recentMessageIds,
 				protectedToolTags,
@@ -6833,7 +6925,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			const editReclaim = buildEditSupersessionReclaim({
 				db: args.db,
 				sessionId: args.sessionId,
-				targets,
+				targets: newTargets,
 				pendingOps,
 				recentMessageIds,
 				protectedToolTags,
@@ -6853,7 +6945,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			autoReclaimDidMutate = applyPendingOperations(
 				args.sessionId,
 				args.db,
-				targets,
+				newTargets,
 				protectedTagNumbersForPass,
 				undefined,
 				[],
@@ -7376,7 +7468,16 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	}
 
 	restoreOriginals?.(workingMessages);
-    const materialized = injectionResult?.m0Materialized === true;
+	if (
+		protectedThinkingProxies.size > 0 &&
+		args.contextUsage.percentage >= 95 &&
+		pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected) &&
+		!pendingOpsDidMutate &&
+		!heuristicOrReasoningDidMutate &&
+		!foldBustsServedPrefixThisPass
+	)
+		throw contextRefusalError(ANTHROPIC_LATEST_TURN_FULL);
+	const materialized = injectionResult?.m0Materialized === true;
 	if (
 		args.reasoningClearing?.prefixBound &&
 		firstEditSourceOrder &&

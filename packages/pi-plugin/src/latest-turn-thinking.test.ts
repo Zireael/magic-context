@@ -105,7 +105,7 @@ test("Pi Anthropic task retains queued drops at execute and force and refuses at
 		...fakeContext(sessionId),
 		model: {
 			provider: "anthropic",
-			id: "claude-sonnet-5",
+			id: "claude-opus-5-5",
 			api: "anthropic-messages",
 			contextWindow: 100_000,
 		},
@@ -119,7 +119,7 @@ test("Pi Anthropic task retains queued drops at execute and force and refuses at
 		userMessage("task", 1),
 		assistantMessage("spent", 2, {
 			provider: "anthropic",
-			model: "claude-sonnet-5",
+			model: "claude-opus-5-5",
 			content: [
 				{
 					type: "thinking",
@@ -131,7 +131,7 @@ test("Pi Anthropic task retains queued drops at execute and force and refuses at
 		}),
 		assistantMessage("newest", 3, {
 			provider: "anthropic",
-			model: "claude-sonnet-5",
+			model: "claude-opus-5-5",
 			content: [
 				{
 					type: "thinking",

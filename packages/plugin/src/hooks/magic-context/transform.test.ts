@@ -4956,7 +4956,7 @@ for (const generation of ["v1", "v2"] as const) {
             tagger: createTagger(),
             scheduler: createScheduler({ executeThresholdPercentage: 65 }),
             liveModelBySession: new Map([
-            [sessionId, { providerID: "anthropic", modelID: "claude-opus-5-5" }],
+                [sessionId, { providerID: "anthropic", modelID: "claude-opus-5-5" }],
             ]),
             contextUsageMap: usage,
             clearReasoningAge: 1,
@@ -5020,6 +5020,18 @@ for (const generation of ["v1", "v2"] as const) {
                 usage: { percentage: 95, inputTokens: 95_000 },
                 updatedAt: Date.now(),
                 hasUsageTokens: true,
+            });
+            // The trailing output was legally reclaimable at 95%. A later
+            // signed block now freezes that output too, leaving no safe drop.
+            raw.push({
+                info: {
+                    id: "last-thought",
+                    role: "assistant",
+                    sessionID: sessionId,
+                    providerID: "anthropic",
+                    modelID: "claude-opus-5-5",
+                },
+                parts: [{ type: "reasoning", text: "last immutable thought" }],
             });
             await expect(pass()).rejects.toThrow("ANTHROPIC_LATEST_TURN_FULL");
             expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toContain(tag.tagNumber);

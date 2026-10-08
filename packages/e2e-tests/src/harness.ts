@@ -24,6 +24,7 @@ import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { spawnOpencode, type SpawnedOpencode, type SpawnOptions } from "./opencode-runner/spawn";
 
 export interface TestHarnessOptions {
+    mockModelID?: string;
     thinkingScope?: (body: Record<string, unknown>) => string | undefined;
     /** Use a canonical provider id when testing provider-specific replay lanes. */
     mockProviderID?: string;
@@ -150,6 +151,7 @@ export class TestHarness implements HostHarness {
         const spawnOpts: SpawnOptions = {
             mockProviderURL: baseURL,
             mockProviderID: options.mockProviderID,
+            mockModelID: options.mockModelID,
             magicContextConfig: options.magicContextConfig,
             openCodeConfigExtra: options.openCodeConfigExtra,
             openCodeGlobalConfigExtra: options.openCodeGlobalConfigExtra,
@@ -385,7 +387,7 @@ export class TestHarness implements HostHarness {
             body: {
                 model: {
                     providerID: options.providerID ?? this.spawnOptions.mockProviderID ?? "mock-anthropic",
-                    modelID: options.modelID ?? "mock-sonnet",
+                    modelID: options.modelID ?? this.spawnOptions.mockModelID ?? "mock-sonnet",
                 },
                 parts: [{ type: "text", text }],
                 ...(options.agent ? { agent: options.agent } : {}),

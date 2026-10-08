@@ -5124,10 +5124,9 @@ fn apply_once(
     // Subagents execute a reductions-only branch, not the prefix plan. Inherited
     // HARD/reconcile advisories cannot price automatic reductions without a fold.
     let active_thinking_turn = active_anthropic_thinking_turn(req);
-    if active_thinking_turn && usage_percentage >= 95.0 {
-        return Err(TransformError::AnthropicLatestTurnFull);
-    }
-    let prefix_materialization_enabled = !req.is_subagent && !active_thinking_turn;
+    let protected_signed_prefix =
+        active_thinking_turn && is_prefix_bound_thinking_model(req.model_key.as_deref());
+    let prefix_materialization_enabled = !req.is_subagent && !protected_signed_prefix;
     let profile_transition = !loaded.meta.last_serializer_profile.is_empty()
         && loaded.meta.last_serializer_profile != req.serializer_profile;
     // A known previous identity that differs from this request means the provider's
@@ -5213,13 +5212,12 @@ fn apply_once(
                 && current_m1_digest != applied_m1_revision)))
         || loaded.meta.soft_refresh_pending
         || (prefix_materialization_enabled && scheduler_outcome.idle_ttl_fired);
-    let supersession_ride_available = !active_thinking_turn
-        && (independent_rebuild
+    let supersession_ride_available = independent_rebuild
         // Subagents cannot fold history. Execute is their one shared permission
         // for queued drops and automatic cleanup, not a request to change bytes.
         || (req.is_subagent && scheduler_outcome.pass.canonical_decision() == "execute")
         || force_episode_available
-        || scheduler_outcome.pass == scheduler::PassDecision::Emergency95);
+            || scheduler_outcome.pass == scheduler::PassDecision::Emergency95;
     let pass_already_busting = supersession_ride_available;
     let emergency_minimum_waived = independent_rebuild;
     let calibration_candidate = crate::decision_calibration::DecisionCalibration::freeze_for_model(
@@ -5252,8 +5250,7 @@ fn apply_once(
     // profile default now covers every pass directly.
     let tail_reclaim_enabled = serializer_profile.is_none_or(healing::tail_reclaim);
     let cached_m1_missing_due = cached_m1_missing(&loaded.core);
-    let producer_gate = !active_thinking_turn
-        && tail_reclaim_enabled
+    let producer_gate = tail_reclaim_enabled
         && producer_gate(
             scheduler_outcome.pass,
             !loaded.meta.initialized
@@ -5317,7 +5314,7 @@ fn apply_once(
         active_calibration.tools_ratio,
     );
     let tag_window_protected_block_ids = protection_window.row_identities.block_ids.clone();
-    let exempt_message_protected_block_ids = [mutation_exempt_mid, lineage_anchor_mid]
+    let mut exempt_message_protected_block_ids = [mutation_exempt_mid, lineage_anchor_mid]
         .into_iter()
         .flatten()
         .flat_map(|mid| {
@@ -5328,6 +5325,7 @@ fn apply_once(
                 .map(|block| block.id.clone())
         })
         .collect::<HashSet<_>>();
+    exempt_message_protected_block_ids.extend(active_thinking_prefix_edit_ids(&loaded.core, req));
     let mut protected_block_ids = tag_window_protected_block_ids
         .union(&exempt_message_protected_block_ids)
         .cloned()
@@ -5709,8 +5707,7 @@ fn apply_once(
     // The reductions-only child branch preserves inherited history and accepts
     // reduction units only. Image/system/age-reasoning strip units stay primary-only;
     // an execute ride must not silently widen that separate replay contract.
-    let is_bust_pass =
-        !active_thinking_turn && !req.is_subagent && is_provider_prefix_mutation_pass;
+    let is_bust_pass = !req.is_subagent && is_provider_prefix_mutation_pass;
     if replay_legacy_treatment && is_provider_prefix_mutation_pass {
         return Err(TransformError::SyntheticTreatmentBust);
     }
@@ -7382,6 +7379,33 @@ fn apply_once(
     let scheduler_applied_reductions = frozen_red_targets(&core)
         .iter()
         .any(|target| !frozen_reductions_before.contains(target));
+    let old_units = loaded
+        .core
+        .frozen_units
+        .iter()
+        .map(|unit| unit.key.as_str())
+        .collect::<HashSet<_>>();
+    let safe_reasoning_applied = core.frozen_units.iter().any(|unit| {
+        !old_units.contains(unit.key.as_str())
+            && (unit.key.starts_with("strip:reasoning_clear:")
+                || unit.key.starts_with("strip:reasoning_age:"))
+    });
+    let active_mids = protected_thinking_turn_mids(req);
+    let retained_active_thinking = ck_messages.iter().any(|message| {
+        message
+            .meta
+            .harness_id
+            .as_deref()
+            .is_some_and(|mid| active_mids.contains(mid))
+            && message.content.iter().any(is_reasoning_block)
+    });
+    if usage_percentage >= 95.0
+        && retained_active_thinking
+        && !scheduler_applied_reductions
+        && !safe_reasoning_applied
+    {
+        return Err(TransformError::AnthropicLatestTurnFull);
+    }
     let reasoning_clear_units = core
         .frozen_units
         .iter()
@@ -8510,6 +8534,7 @@ fn new_caveman_units(
         .map(|row| (row.block_id.as_str(), row))
         .collect::<HashMap<_, _>>();
     let frozen_red = frozen_red_targets(core);
+    let unsafe_thinking_prefix = active_thinking_prefix_edit_ids(core, req);
     let mut candidates = live
         .iter()
         .filter_map(|block| {
@@ -8540,6 +8565,9 @@ fn new_caveman_units(
     let total = candidates.len();
     let mut units = Vec::new();
     for (position, (_tag_number, block_id, source)) in candidates.into_iter().enumerate() {
+        if unsafe_thinking_prefix.contains(&block_id) {
+            continue;
+        }
         let target_depth = caveman_target_depth(position, total);
         if target_depth == 0 {
             continue;
@@ -13700,6 +13728,8 @@ fn new_frozen_strip_units(
         HashSet::new()
     };
     let mut units = BTreeMap::<String, FrozenUnit>::new();
+    let protected_thinking = protected_thinking_turn_mids(req);
+    let unsafe_content = active_thinking_prefix_edit_ids(core, req);
     let mut has_assistant_response = false;
 
     for index in (0..req.messages.len()).rev() {
@@ -13720,7 +13750,14 @@ fn new_frozen_strip_units(
             has_assistant_response = true;
         }
         if index < protected_start {
-            if message.ck.role != "user" && whole_system_injected(blocks) {
+            if message.ck.role != "user"
+                && whole_system_injected(blocks)
+                && !protected_thinking.contains(message.mid.as_str())
+                && !blocks
+                    .iter()
+                    .enumerate()
+                    .any(|(i, _)| unsafe_content.contains(&ck_wire::block_id(&message.mid, i)))
+            {
                 let unit = strip_unit("system_injected", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
@@ -13740,6 +13777,9 @@ fn new_frozen_strip_units(
                         continue;
                     }
                     let target = format!("{}#{block_index}", message.mid);
+                    if unsafe_content.contains(&target) {
+                        continue;
+                    }
                     let unit = strip_unit("system_injected_block", &target, &cleaned);
                     if !existing_keys.contains(unit.key.as_str()) {
                         units.insert(unit.key.clone(), unit);
@@ -13754,6 +13794,7 @@ fn new_frozen_strip_units(
             // this already-busting pass and replays unchanged on defers; selection.rs continues to
             // exclude every reasoning block from ReductionDecision targets.
             let cc_aged = message.ck.role == "assistant"
+                && !protected_thinking.contains(message.mid.as_str())
                 && reasoning_mutation_exempt_mid != Some(message.mid.as_str())
                 && cc_reasoning_cutoff.is_some_and(|cutoff| {
                     let tag = message_tag_number(message, tag_numbers);
@@ -13770,13 +13811,19 @@ fn new_frozen_strip_units(
                 && index < protected_start
                 && blocks.iter().any(is_reduce_block)
                 && !protected_reduce
+                && !blocks
+                    .iter()
+                    .enumerate()
+                    .any(|(i, _)| unsafe_content.contains(&ck_wire::block_id(&message.mid, i)))
             {
                 let unit = strip_unit("stale_reduce", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
                 }
             }
-            if whole_marker_or_blank_message(blocks) {
+            if whole_marker_or_blank_message(blocks)
+                && !protected_thinking.contains(message.mid.as_str())
+            {
                 let unit = strip_unit("placeholder", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
@@ -13884,6 +13931,7 @@ fn opencode_reasoning_removal_mids<'a>(
     let prefix_bound = is_prefix_bound_thinking_model(req.model_key.as_deref());
     let newest = latest_assistant_mid(&req.messages);
     let exempt = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let protected_thinking = protected_thinking_turn_mids(req);
     // `@openrouter/ai-sdk-provider` keeps copies of the reasoning as
     // `metadata.openrouter.reasoning_details` on other parts of the message. This lane
     // cannot strip those, so such messages are skipped whatever the provider id is.
@@ -13917,6 +13965,7 @@ fn opencode_reasoning_removal_mids<'a>(
         }
         let tag = message_tag_number(message, tag_numbers);
         let eligible = !mid.is_empty()
+            && !protected_thinking.contains(mid)
             && !openrouter_shaped.contains(mid)
             && Some(mid) != newest
             && Some(mid) != exempt
@@ -15020,7 +15069,7 @@ fn new_merged_reasoning_strip_units(
     rendered_messages: &[ServedMessage],
     can_mutate_provider_prefix: bool,
 ) -> Vec<FrozenUnit> {
-    if !can_mutate_provider_prefix || active_anthropic_thinking_turn(req) {
+    if !can_mutate_provider_prefix {
         return Vec::new();
     }
     let Some(profile) = SerializerProfile::parse(&req.serializer_profile) else {
@@ -15032,6 +15081,7 @@ fn new_merged_reasoning_strip_units(
         .map(|unit| unit.key.as_str())
         .collect::<HashSet<_>>();
     let mutation_exempt_mid = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let protected_thinking = protected_thinking_turn_mids(req);
     let clear_lookup = FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units));
     let mut prev_assistant = false;
     let mut units = Vec::new();
@@ -15046,7 +15096,8 @@ fn new_merged_reasoning_strip_units(
                 && active_reasoning_clear(&clear_lookup, mid).is_none()
             {
                 let mut candidate = rendered.clone().into_message();
-                let mutation_exempt = mutation_exempt_mid == Some(mid);
+                let mutation_exempt =
+                    mutation_exempt_mid == Some(mid) || protected_thinking.contains(mid);
                 if apply_serializer_residual_to_message(
                     profile,
                     req.provider_id.as_deref(),
@@ -16299,7 +16350,7 @@ fn protected_thinking_turn_mids(req: &TransformRequest) -> HashSet<&str> {
     }
     req.messages[latest_assistant_turn_start(&req.messages)..]
         .iter()
-        .filter(|m| m.ck.role == "assistant")
+        .filter(|m| m.ck.role == "assistant" && m.ck.content.iter().any(is_reasoning_block))
         .map(|m| m.mid.as_str())
         .collect()
 }
@@ -16309,6 +16360,57 @@ fn active_anthropic_thinking_turn(req: &TransformRequest) -> bool {
     req.messages
         .iter()
         .any(|m| protected.contains(m.mid.as_str()) && m.ck.content.iter().any(is_reasoning_block))
+}
+
+/// Reproduce persisted reasoning decisions before protecting a new prefix edit.
+/// Already-frozen legacy omissions are not new mutations and remain authoritative.
+fn active_thinking_prefix_edit_ids(core: &CoreState, req: &TransformRequest) -> HashSet<String> {
+    if !is_prefix_bound_thinking_model(req.model_key.as_deref()) {
+        return HashSet::new();
+    }
+    let active = protected_thinking_turn_mids(req);
+    let lookup = FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units));
+    let exempt = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let mut ordinal = 0;
+    let mut last = None;
+    let mut coordinates = Vec::new();
+    let mut previous_assistant = false;
+    for message in &req.messages {
+        let mut replay = message.ck.clone();
+        replay_reasoning_clear(&lookup, &message.mid, &mut replay);
+        remove_frozen_historical_reasoning(
+            &lookup,
+            message,
+            exempt == Some(message.mid.as_str()),
+            &mut replay,
+        );
+        if output_message_strip_unit(&lookup, "merged_reasoning", &message.mid).is_some() {
+            if let Some(profile) = SerializerProfile::parse(&req.serializer_profile) {
+                apply_serializer_residual_to_message(
+                    profile,
+                    req.provider_id.as_deref(),
+                    exempt == Some(message.mid.as_str()),
+                    !previous_assistant,
+                    &mut replay,
+                );
+            }
+        }
+        for (index, block) in message.ck.content.iter().enumerate() {
+            coordinates.push((ordinal, ck_wire::block_id(&message.mid, index)));
+            if active.contains(message.mid.as_str())
+                && is_reasoning_block(block)
+                && replay.content.iter().any(|kept| kept == block)
+            {
+                last = Some(ordinal);
+            }
+            ordinal += 1;
+        }
+        previous_assistant = message.ck.role == "assistant";
+    }
+    coordinates
+        .into_iter()
+        .filter_map(|(position, id)| last.is_some_and(|last| position < last).then_some(id))
+        .collect()
 }
 
 fn latest_assistant_mid(messages: &[CkIngressMessage]) -> Option<&str> {
@@ -22697,6 +22799,14 @@ pub(crate) mod tests {
                 signature: Some("signature-two".to_string()),
             }),
         );
+        let mut final_thought = trailing_regression_assistant("a3", 6, None, false);
+        final_thought.ck.content.insert(
+            0,
+            CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "last signed thought".to_string(),
+                signature: Some("signature-three".to_string()),
+            }),
+        );
         let mut request = with_usage(
             req(
                 "latest-turn-drops",
@@ -22707,6 +22817,7 @@ pub(crate) mod tests {
                     tool_result("r1", 3, "t1", "spent output"),
                     second,
                     tool_result("r2", 5, "t2", "newest output"),
+                    final_thought,
                 ],
             ),
             76_000,
@@ -22714,7 +22825,7 @@ pub(crate) mod tests {
         );
         request.is_subagent = true;
         request.provider_id = Some("anthropic".to_string());
-        request.model_key = Some("anthropic/claude-sonnet-5".to_string());
+        request.model_key = Some("anthropic/claude-opus-5-5".to_string());
         request.serializer_profile = "opencode-aisdk".to_string();
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
         transform(&s, &request, &ctx).unwrap();
@@ -22739,7 +22850,7 @@ pub(crate) mod tests {
             transform(&s, &request, &ctx),
             Err(TransformError::AnthropicLatestTurnFull)
         ));
-        request.messages.push(item("next-real-user", 6, "continue"));
+        request.messages.push(item("next-real-user", 7, "continue"));
         request = with_usage(request, 76_000, 100_000);
         transform(&s, &request, &ctx).unwrap();
         assert!(s
@@ -27064,6 +27175,18 @@ pub(crate) mod tests {
                 fixture.name
             );
 
+            // These goldens exercise historical serializer repair. A live
+            // continuation must instead retain every thinking block.
+            if fixture.expect_strip {
+                let ordinal = request
+                    .messages
+                    .last()
+                    .map_or(1, |message| message.ordinal + 1);
+                request
+                    .messages
+                    .push(item("next-real-user", ordinal, "next turn"));
+            }
+
             let response = run(&store, &request, &spine());
             assert_eq!(response.action, "HARD");
             let target = response
@@ -28734,6 +28857,10 @@ pub(crate) mod tests {
         ) -> TransformRequest {
             let mut request = profile_req(SerializerProfile::OpencodeAiSdk, session, cfg, messages);
             request.provider_id = Some("anthropic".to_string());
+            // Serializer repair is priced only for completed history.
+            request
+                .messages
+                .push(item("next-real-user", 100, "next turn"));
             request
         }
 
@@ -28857,6 +28984,10 @@ pub(crate) mod tests {
             let mut request = opencode_req(session, config, messages);
             request.provider_id = Some("anthropic".to_string());
             request.is_subagent = true;
+            // New stripping is tested outside the still-frozen assistant turn.
+            request
+                .messages
+                .push(item("next-real-user", 100, "next turn"));
             request
         }
 

@@ -409,7 +409,10 @@ describe("createTransform index staleness regressions", () => {
         ];
 
         // History cleanup is permitted only after a real user closes this turn.
-        secondPass.push({ info: { id: "next-user", role: "user", sessionID: sessionId }, parts: [{ type: "text", text: "Next turn" }] });
+        secondPass.push({
+            info: { id: "next-user", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "Next turn" }],
+        });
         await transform({}, { messages: secondPass });
 
         // The tool drop removed m-assistant-call and m-tool-drop via pruneEmptyMessages, so array shifts:

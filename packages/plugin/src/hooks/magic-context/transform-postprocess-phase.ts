@@ -1,5 +1,4 @@
 import { compareOpenCodeMessagesByCanonicalOrder } from "../../features/magic-context/compaction-marker";
-import { ANTHROPIC_LATEST_TURN_FULL, protectNewTagMutations, retainedActiveThinkingParts } from "./latest-assistant-turn";
 import {
     mergeProtectedTools,
     normalizeProtectedToolName,
@@ -61,7 +60,6 @@ import {
     getReasoningRemovalState,
     markDropLeavesReasoning,
 } from "../../features/magic-context/storage-reasoning-removal";
-
 import {
     getTagNumberByMessageId,
     markTagsCompactedByMessageIds,
@@ -115,7 +113,11 @@ import {
     type DroppedTokenReduction,
     estimateDroppedTokensFromTagReductions,
 } from "./dropped-token-estimate";
-import { contextRefusalError, EmergencyFailClosedError, outgoingContextRefusal } from "./emergency-fail-closed";
+import {
+    contextRefusalError,
+    EmergencyFailClosedError,
+    outgoingContextRefusal,
+} from "./emergency-fail-closed";
 import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
@@ -136,6 +138,11 @@ import {
     prepareCachedM0M1Replay,
     renderCompartmentInjection,
 } from "./inject-compartments";
+import {
+    ANTHROPIC_LATEST_TURN_FULL,
+    protectNewTagMutations,
+    retainedActiveThinkingParts,
+} from "./latest-assistant-turn";
 import { markNoteNudgeDelivered, observeNoteNudgeServe, peekNoteNudgeText } from "./note-nudger";
 import { hasVisibleNoteReadCall } from "./note-visibility";
 import type { PassDegradationKind, PassDegradationSite, PassOutcome } from "./pass-outcome";
@@ -1968,21 +1975,49 @@ export async function runPostTransformPhase(
         args.m0M1 !== undefined &&
         (!!args.m0M1.projectPath || !!args.m0M1.projectDirectory) &&
         (args.fullFeatureMode || compactionOff);
-    const frozenThinking = new Set(args.activeThinkingTurn ? getMergedReasoningStrippedIds(args.db, args.sessionId) : []);
-    const bindingThinking = new Set([...frozenThinking].filter(id => id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)).map(id => id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length)));
-    const retainedThinking = args.activeThinkingTurn ? retainedActiveThinkingParts({ messages: args.messages, providerID: args.resolvedProviderID, modelID: args.resolvedModelID, mergedIds: frozenThinking, bindingIds: bindingThinking, removedIds: getReasoningRemovalState(args.db, args.sessionId).messageIds }) : new Set<unknown>();
+    const frozenThinking = new Set(
+        args.activeThinkingTurn ? getMergedReasoningStrippedIds(args.db, args.sessionId) : [],
+    );
+    const bindingThinking = new Set(
+        [...frozenThinking]
+            .filter((id) => id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX))
+            .map((id) => id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length)),
+    );
+    const retainedThinking = args.activeThinkingTurn
+        ? retainedActiveThinkingParts({
+              messages: args.messages,
+              providerID: args.resolvedProviderID,
+              modelID: args.resolvedModelID,
+              mergedIds: frozenThinking,
+              bindingIds: bindingThinking,
+              removedIds: getReasoningRemovalState(args.db, args.sessionId).messageIds,
+          })
+        : new Set<unknown>();
     const activeThinkingTurn = retainedThinking.size > 0;
-    const protectedThinkingMessages = new Set(args.messages.filter(message => message.parts.some(part => retainedThinking.has(part))));
-    const newTargets = protectNewTagMutations(args.messages, args.targets, retainedThinking, args.thinkingBindingRecoveryEnabledForModel === true);
+    const protectedThinkingMessages = new Set(
+        args.messages.filter((message) => message.parts.some((part) => retainedThinking.has(part))),
+    );
+    const newTargets = protectNewTagMutations(
+        args.messages,
+        args.targets,
+        retainedThinking,
+        args.thinkingBindingRecoveryEnabledForModel === true,
+    );
     let maxReasoningTag = 0;
-    for (const tag of args.messageTagNumbers.values()) maxReasoningTag = Math.max(maxReasoningTag, tag);
+    for (const tag of args.messageTagNumbers.values())
+        maxReasoningTag = Math.max(maxReasoningTag, tag);
     let safeReasoningCutoff = maxReasoningTag;
     for (const message of protectedThinkingMessages) {
         const tag = args.messageTagNumbers.get(message);
         if (tag && tag > 0) safeReasoningCutoff = Math.min(safeReasoningCutoff, tag - 1);
     }
-    const safeReasoningAge = Math.max(args.clearReasoningAge, maxReasoningTag - safeReasoningCutoff);
-    const freezeM0M1 = args.freezeM0M1 === true || (activeThinkingTurn && args.thinkingBindingRecoveryEnabledForModel === true);
+    const safeReasoningAge = Math.max(
+        args.clearReasoningAge,
+        maxReasoningTag - safeReasoningCutoff,
+    );
+    const freezeM0M1 =
+        args.freezeM0M1 === true ||
+        (activeThinkingTurn && args.thinkingBindingRecoveryEnabledForModel === true);
     const foldDueDecision =
         m0M1EnabledForFold && args.m0M1 && !freezeM0M1
             ? mustMaterialize({
@@ -2183,6 +2218,9 @@ export async function runPostTransformPhase(
             compartmentRunning);
     const pendingOps = shouldReadPendingOps ? getPendingOps(args.db, args.sessionId) : [];
     const hasPendingUserOps = pendingOps.length > 0;
+    // Preserve the requested application opportunity when thinking safety, not
+    // cache policy, prevents this batch. The next real user releases the veto.
+    if (args.schedulerDecision === "execute" && pendingOps.some(op => newTargets.get(op.tagId)?.thinkingDropProtected)) args.pendingMaterializationSessions.add(args.sessionId);
     const formatPendingOpsDepth = (): string => {
         const depth = getPendingOpsCount(args.db, args.sessionId);
         return depth === null ? "not loaded (deferred pass)" : String(depth);
@@ -2646,11 +2684,7 @@ export async function runPostTransformPhase(
             // models it stays off too (Pi caps both lanes with one cutoff).
             const strippedInline =
                 routineCleanupApplied && ageLaneAllowed
-                    ? stripInlineThinking(
-                          args.messages,
-                          args.messageTagNumbers,
-                          safeReasoningAge,
-                      )
+                    ? stripInlineThinking(args.messages, args.messageTagNumbers, safeReasoningAge)
                     : 0;
             // Fresh caveman compression above rebuilds text from its original source,
             // which brings back inline thinking that the replay at the start of this
@@ -2775,7 +2809,11 @@ export async function runPostTransformPhase(
             // safe pass picks up the work.
             // A frozen m[0]/m[1] pass did not materialize, so the request
             // stays pending for the next pass that can.
-            if (pendingMaterializationAtPassStart && !freezeM0M1 && !pendingOps.some(op => newTargets.get(op.tagId)?.thinkingDropProtected)) {
+            if (
+                pendingMaterializationAtPassStart &&
+                !freezeM0M1 &&
+                !pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
+            ) {
                 args.pendingMaterializationSessions.delete(args.sessionId);
             }
             if (args.currentTurnId) {
@@ -3747,7 +3785,10 @@ export async function runPostTransformPhase(
                     args.messages,
                     args.resolvedProviderID,
                     mergedReasoningStrippedIds,
-                    { mutationExemptMessage: reasoningMutationExemptMessage, protectedMessages: protectedThinkingMessages },
+                    {
+                        mutationExemptMessage: reasoningMutationExemptMessage,
+                        protectedMessages: protectedThinkingMessages,
+                    },
                 );
                 const newlyDetectedIds = candidates.filter(
                     (id) => !mergedReasoningStrippedIds.has(id),
@@ -4124,7 +4165,13 @@ export async function runPostTransformPhase(
         : 0;
 
     args.restoreLatestTurnOriginals?.();
-    if (activeThinkingTurn && args.contextUsage.percentage >= 95 && !pendingOpsDidMutate && !heuristicOrReasoningDidMutate && !foldBustsServedPrefixThisPass) {
+    if (
+        activeThinkingTurn &&
+        args.contextUsage.percentage >= 95 &&
+        !pendingOpsDidMutate &&
+        !heuristicOrReasoningDidMutate &&
+        !foldBustsServedPrefixThisPass
+    ) {
         throw contextRefusalError(ANTHROPIC_LATEST_TURN_FULL);
     }
     sessionLog(

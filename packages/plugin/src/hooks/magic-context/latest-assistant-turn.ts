@@ -1,8 +1,12 @@
 import { isRecord } from "../../shared/record-type-guard";
-import { isAnthropicFamilyRoute } from "./sentinel";
-import type { MessageLike, TagTarget } from "./tag-messages";
-import { stripClearedReasoning, stripReasoningFromAssistantIds, stripReasoningFromMergedAssistants } from "./strip-content";
 import { removeReasoningParts } from "./reasoning-removal";
+import { isAnthropicFamilyRoute } from "./sentinel";
+import {
+    stripClearedReasoning,
+    stripReasoningFromAssistantIds,
+    stripReasoningFromMergedAssistants,
+} from "./strip-content";
+import type { MessageLike, TagTarget } from "./tag-messages";
 
 const THINKING_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 const METADATA_TYPES = new Set(["step-start", "step-finish", "snapshot", "patch"]);
@@ -82,15 +86,27 @@ export function protectNewTagMutations(
     if (protectedParts.size === 0) return targets;
     const positions = new Map<unknown, number>();
     let ordinal = 0;
-    for (const message of messages) for (const part of message.parts) positions.set(part, ordinal++);
+    for (const message of messages)
+        for (const part of message.parts) positions.set(part, ordinal++);
     let lastProtected = -1;
-    for (const part of protectedParts) lastProtected = Math.max(lastProtected, positions.get(part) ?? -1);
+    for (const part of protectedParts)
+        lastProtected = Math.max(lastProtected, positions.get(part) ?? -1);
     const result = new Map<number, TagTarget>();
     for (const [tag, target] of targets) {
-        const coordinates = target.mutationParts ?? (target.message ? target.message.parts.map(part => ({ message: target.message!, part })) : []);
-        const prefixEdit = prefixBound && coordinates.some(({ part }) => (positions.get(part) ?? Infinity) < lastProtected);
-        const dropsThinking = target.dropReasoningParts?.some(part => protectedParts.has(part)) === true;
-        if (!prefixEdit && !dropsThinking) { result.set(tag, target); continue; }
+        const coordinates =
+            target.mutationParts ??
+            (target.message
+                ? target.message.parts.map((part) => ({ message: target.message!, part }))
+                : []);
+        const prefixEdit =
+            prefixBound &&
+            coordinates.some(({ part }) => (positions.get(part) ?? Infinity) < lastProtected);
+        const dropsThinking =
+            target.dropReasoningParts?.some((part) => protectedParts.has(part)) === true;
+        if (!prefixEdit && !dropsThinking) {
+            result.set(tag, target);
+            continue;
+        }
         result.set(tag, {
             ...target,
             thinkingDropProtected: true,
@@ -102,7 +118,10 @@ export function protectNewTagMutations(
             skeletonStripped: () => "incomplete",
             editMarker: () => "incomplete",
             editMarkerStripped: () => "incomplete",
-            setContent: (content, options) => prefixEdit || options?.keepReasoning !== true ? false : target.setContent(content, options),
+            setContent: (content, options) =>
+                prefixEdit || options?.keepReasoning !== true
+                    ? false
+                    : target.setContent(content, options),
         });
     }
     return result;
@@ -117,14 +136,33 @@ export function retainedActiveThinkingParts(args: {
     bindingIds: ReadonlySet<string>;
     removedIds?: ReadonlySet<string>;
 }): Set<unknown> {
-    if (!hasActiveAnthropicThinkingTurn(args.messages, args.providerID, args.modelID)) return new Set();
-    const copies = args.messages.map(message => ({ info: message.info, parts: message.parts.map(part => {
-        if (!isRecord(part) || THINKING_TYPES.has(String(part.type)) || !isRecord(part.metadata)) return part;
-        return { ...part, metadata: { ...part.metadata, ...(isRecord(part.metadata.openrouter) ? { openrouter: { ...part.metadata.openrouter } } : {}) } };
-    }) }));
+    if (!hasActiveAnthropicThinkingTurn(args.messages, args.providerID, args.modelID))
+        return new Set();
+    const copies = args.messages.map((message) => ({
+        info: message.info,
+        parts: message.parts.map((part) => {
+            if (
+                !isRecord(part) ||
+                THINKING_TYPES.has(String(part.type)) ||
+                !isRecord(part.metadata)
+            )
+                return part;
+            return {
+                ...part,
+                metadata: {
+                    ...part.metadata,
+                    ...(isRecord(part.metadata.openrouter)
+                        ? { openrouter: { ...part.metadata.openrouter } }
+                        : {}),
+                },
+            };
+        }),
+    }));
     stripClearedReasoning(copies);
     stripReasoningFromAssistantIds(copies, args.providerID, args.bindingIds);
-    stripReasoningFromMergedAssistants(copies, args.providerID, { frozenMessageIds: args.mergedIds });
+    stripReasoningFromMergedAssistants(copies, args.providerID, {
+        frozenMessageIds: args.mergedIds,
+    });
     if (args.removedIds?.size) removeReasoningParts(copies, args.removedIds, args.providerID);
     const retained = new Set<unknown>();
     for (let i = latestAssistantTurnStart(args.messages); i < copies.length; i++) {

@@ -5981,6 +5981,10 @@ describe("Rust mode authority adapter", () => {
                     { type: "text", text: "answer" },
                 ],
             },
+            {
+                info: { id: "next-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "Next turn" }],
+            },
         ] as unknown as MessageLike[];
         recordDetectedContextLimit(db, sessionId, 200_000, "anthropic/fable-5-1");
         recordToolDefinition("anthropic", "fable-5-1", undefined, "read", "read fixture", {

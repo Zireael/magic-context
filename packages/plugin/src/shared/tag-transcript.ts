@@ -1157,7 +1157,10 @@ function buildAggregateTarget(
     };
 
     return {
-        mutationParts: occurrences.map(occ => ({ message: { info: occ.message.info, parts: [] }, part: occ.part })),
+        mutationParts: occurrences.map((occ) => ({
+            message: { info: occ.message.info, parts: [] },
+            part: occ.part,
+        })),
         measureReclaim(skeleton) {
             let beforeTools = 0;
             let afterTools = 0;

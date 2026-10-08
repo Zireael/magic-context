@@ -160,6 +160,7 @@ fn new_reasoning_clear_units(
                 && proof.ck_fingerprints == snapshot.meta.served_output_fingerprint
         });
     let mut units = Vec::new();
+    let protected_thinking = protected_thinking_turn_mids(req);
     for message in &req.messages {
         let tag = message_tag_number(message, tag_numbers);
         if message.ck.meta.synthetic
@@ -172,6 +173,9 @@ fn new_reasoning_clear_units(
             || output_message_strip_unit(&lookup, "reasoning_clear", &message.mid).is_some()
             || !message.ck.content.iter().any(is_reasoning_block)
         {
+            continue;
+        }
+        if protected_thinking.contains(message.mid.as_str()) && !legacy_ck_clear_matches(&snapshot, &lookup, &previous, message) {
             continue;
         }
         if can_mutate_provider_prefix {

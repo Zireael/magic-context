@@ -136,14 +136,15 @@ export function piReasoningClearCutoff(args: {
 	let cutoff = maxTag - args.clearReasoningAge;
 	if (maxTag === 0 || cutoff <= 0) return 0;
 
+	const active = args.protectLatestTurn
+		? latestAssistantTurnMessages(args.messages)
+		: new Set<unknown>();
+	let newestSeen = false;
 	for (let i = args.messages.length - 1; i >= 0; i--) {
 		const raw = args.messages[i] as { role?: unknown } | null;
-		if (
-			args.protectLatestTurn &&
-			!latestAssistantTurnMessages(args.messages).has(raw)
-		)
-			continue;
 		if (!raw || typeof raw !== "object" || raw.role !== "assistant") continue;
+		if (newestSeen && !active.has(raw)) continue;
+		newestSeen = true;
 		const id = args.piMessageStableId(raw, i);
 		const newestTag = id ? (args.messageIdToMaxTag.get(id) ?? 0) : 0;
 		if (newestTag > 0) cutoff = Math.min(cutoff, newestTag - 1);
@@ -219,6 +220,9 @@ export function piPrefixBoundReasoningCutoff(args: {
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 	alreadyGone?: (id: string) => boolean;
 }): number {
+	const protectedMessages = args.protectLatestTurn
+		? latestAssistantTurnMessages(args.messages)
+		: new Set<unknown>();
 	let maxTag = 0;
 	for (const t of args.messageIdToMaxTag.values()) if (t > maxTag) maxTag = t;
 	const ageCutoff = maxTag - args.clearReasoningAge;
@@ -249,6 +253,7 @@ export function piPrefixBoundReasoningCutoff(args: {
 		if (id && !inline && args.alreadyGone?.(id)) continue;
 		const tag = tagAt(i);
 		const removable =
+			!protectedMessages.has(raw) &&
 			i !== newestIndex &&
 			id !== undefined &&
 			tag > 0 &&

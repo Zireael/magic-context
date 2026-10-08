@@ -84,9 +84,10 @@ test("mock rejects edited, missing and reordered latest-turn thinking across too
 	}
 });
 
-for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "drops" }, { band: 76, mode: "legacy-accepted" }, { band: 76, mode: "legacy-rejected" }]) {
-	test(mode === "drops" ? `Anthropic task preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
+for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "drops" }, { band: 76, mode: "primary" }, { band: 76, mode: "legacy-accepted" }, { band: 76, mode: "legacy-rejected" }]) {
+	test(mode === "primary" ? "Anthropic primary long tool loop defers thinking-changing queued drops" : mode === "drops" ? `Anthropic task preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
         let enforceLegacy = mode !== "legacy-accepted";
+        const modelID = mode.startsWith("legacy-") ? "mock-sonnet" : "claude-sonnet-5-5";
 		const oldTmp = process.env.TMPDIR;
 		const taskRoot = join(tmpdir(), "magic-context", "issue-630");
 		mkdirSync(taskRoot, { recursive: true });
@@ -94,7 +95,8 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 		let h: TestHarness;
 		try {
 			h = await TestHarness.create({
-				mockProviderID: "anthropic",
+                mockProviderID: "anthropic",
+                mockModelID: modelID,
 				prepareContextDatabase: !process.env.MC_E2E_PLUGIN_ENTRY,
 				thinkingScope: (body) => !enforceLegacy ? undefined :
 					bytes(body.system).includes("ISSUE-630-WORKER")
@@ -110,10 +112,10 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 				openCodeConfigExtra: {
 					agent: {
 						"thinking-worker": {
-							mode: "subagent",
+							mode: mode === "primary" ? "primary" : "subagent",
 							description: "Thinking worker",
 							prompt: "ISSUE-630-WORKER",
-							model: "anthropic/mock-sonnet",
+                            model: `anthropic/${modelID}`,
 							permission: { "*": "allow" },
 						},
 					},
@@ -158,7 +160,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 				writeFileSync(join(proof, "lsof-proof.txt"), lsof.stdout);
 			};
 			contain();
-			for (const name of ["a", "b"])
+			for (const name of ["a", "b", "c"])
 				writeFileSync(
 					join(h.workdir, `${name}.txt`),
 					`SPENT-${name}\n` +
@@ -212,20 +214,21 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 						command: `cat ${pass === 1 ? "a" : "b"}.txt`,
 						description: "Read spent output",
 					});
-				if (pass === 4) {
+				if (pass === 3 && (mode === "drops" || mode === "primary")) return tool("bash", { command: "cat c.txt", description: "Displace the protected output floor" });
+                if (pass === 4) {
 					const child = h
 						.contextDb()
 						.query("SELECT session_id FROM session_meta WHERE is_subagent = 1")
 						.get() as { session_id: string };
-					childId = child.session_id;
+					if (mode !== "primary") childId = child.session_id;
 					const tags = h
 						.contextDb()
 						.query(
 							"SELECT tag_number FROM tags WHERE session_id = ? AND type = 'tool' AND status = 'active' ORDER BY tag_number",
 						)
 						.all(childId) as Array<{ tag_number: number }>;
-					tag = tags[0]!.tag_number;
-                    if (mode !== "drops") {
+					tag = tags[1]!.tag_number;
+                    if (mode.startsWith("legacy-")) {
                         const owners = h.contextDb().query("SELECT tool_owner_message_id AS id FROM tags WHERE session_id = ? AND type = 'tool' ORDER BY tag_number").all(childId) as Array<{ id: string }>;
                         writeFileSync(join(h.workdir, "seed-legacy.ts"), `import {Database} from "bun:sqlite"; import {join} from "node:path"; const db = new Database(join(process.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db")); db.exec("PRAGMA busy_timeout = 10000"); db.query("UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?").run(${JSON.stringify(JSON.stringify([`binding_mismatch:${owners[1]!.id}`, `binding_mismatch:${owners[2]!.id}`]))}, ${JSON.stringify(childId)}); db.close(); console.log("Legacy seed installed");`);
                         return { ...tool("bash", { command: "bun seed-legacy.ts", description: "Seed recorded legacy thinking decision" }), usage: { ...usage, cache_read_input_tokens: Math.ceil(band * (100_000 - 8192) / 100) } };
@@ -257,7 +260,8 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 				return { text: "Worker done", usage };
 			});
 			const parent = await h.createSession();
-			await h.sendPrompt(parent, "Delegate to thinking-worker.", { timeoutMs: 90_000 });
+            if (mode === "primary") childId = parent;
+            await h.sendPrompt(parent, "Delegate to thinking-worker.", mode === "primary" ? { timeoutMs: 90_000, agent: "thinking-worker" } : { timeoutMs: 90_000 });
 			contain();
 			writeFileSync(
 				join(proof, "requests.json"),
@@ -270,7 +274,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 			console.log(
 				JSON.stringify({ version, pid: h.opencode.pid, root, band, pass, tag }),
 			);
-            if (mode !== "drops") {
+            if (mode.startsWith("legacy-")) {
                 if (mode === "legacy-rejected") {
                     expect(pass).toBe(4);
                     expect(h.mock.requests().filter(r => r.thinkingViolation)).toHaveLength(1);
@@ -302,7 +306,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
                 return;
             }
 			expect(pass).toBe(7);
-			expect(bytes(wire[4])).toContain("SPENT-a");
+			expect(bytes(wire[4])).toContain("SPENT-b");
 			expect(bytes(wire[4]!.slice(0, wire[3]!.length))).toBe(bytes(wire[3]));
 			expect(
 				h
@@ -315,7 +319,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 				timeoutMs: 30_000,
 				agent: "thinking-worker",
 			});
-			expect(bytes(wire.at(-1))).not.toContain("SPENT-a");
+			expect(bytes(wire.at(-1))).not.toContain("SPENT-b");
 			expect(
 				h
 					.contextDb()

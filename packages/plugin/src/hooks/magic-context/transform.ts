@@ -1,4 +1,3 @@
-import { captureLatestTurnOriginals, prepareLatestThinkingRecovery } from "./latest-thinking-recovery";
 import type { ProtectedTokensTierOverrides } from "../../config/project-security";
 import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
 import {
@@ -128,6 +127,10 @@ import {
     hasActiveAnthropicThinkingTurn,
     latestAssistantTurnMessages,
 } from "./latest-assistant-turn";
+import {
+    captureLatestTurnOriginals,
+    prepareLatestThinkingRecovery,
+} from "./latest-thinking-recovery";
 import { saveLkgSlotToDb } from "./lkg-persist";
 import { captureLkgSlot, createLkgEntryProjector, resolveLkgModelKeys } from "./lkg-replay";
 import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
@@ -1131,10 +1134,14 @@ export function createTransform(deps: TransformDeps) {
         // as they always have: a session with nothing frozen yet, and one the
         // host has never resolved (no stored project binding), whose frozen
         // pair was itself rendered with the launch directory.
-        const activeThinkingModel = findLastAssistantModel(messages) ?? deps.liveModelBySession?.get(sessionId);
-        const thinkingRecovery = prepareLatestThinkingRecovery({ db, sessionId, messages,
-            id: message => (message as MessageLike)?.info.id,
-            parts: message => (message as MessageLike)?.parts ?? [],
+        const activeThinkingModel =
+            findLastAssistantModel(messages) ?? deps.liveModelBySession?.get(sessionId);
+        const thinkingRecovery = prepareLatestThinkingRecovery({
+            db,
+            sessionId,
+            messages,
+            id: (message) => (message as MessageLike)?.info.id,
+            parts: (message) => (message as MessageLike)?.parts ?? [],
         });
         if (thinkingRecovery.ended) deps.pendingMaterializationSessions?.add(sessionId);
         let restoreLatestTurnOriginals: (() => void) | undefined;
@@ -1144,7 +1151,11 @@ export function createTransform(deps: TransformDeps) {
             activeThinkingModel?.modelID,
         );
         let freezeM0M1 =
-            (activeThinkingTurn && isPrefixBoundThinkingModel(activeThinkingModel?.providerID, activeThinkingModel?.modelID)) ||
+            (activeThinkingTurn &&
+                isPrefixBoundThinkingModel(
+                    activeThinkingModel?.providerID,
+                    activeThinkingModel?.modelID,
+                )) ||
             (sessionDirectoryFellBack &&
                 sessionMeta.cachedM0Bytes != null &&
                 sessionMeta.cachedM1Bytes != null &&
@@ -1505,7 +1516,9 @@ export function createTransform(deps: TransformDeps) {
             resolvedProviderID,
             modelForBudget?.modelID,
         );
-        freezeM0M1 ||= activeThinkingTurn && isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID);
+        freezeM0M1 ||=
+            activeThinkingTurn &&
+            isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID);
         const canUseEmptySentinels = modelAcceptsEmptyContent(resolvedProviderID);
         const protectedThinkingMessages =
             activeThinkingTurn ||
@@ -2218,7 +2231,8 @@ export function createTransform(deps: TransformDeps) {
                     servedMessages: messages,
                 });
                 targets = result.targets;
-                if (thinkingRecovery.restore) restoreLatestTurnOriginals = captureLatestTurnOriginals(messages);
+                if (thinkingRecovery.restore)
+                    restoreLatestTurnOriginals = captureLatestTurnOriginals(messages);
                 reasoningByMessage = result.reasoningByMessage;
                 messageTagNumbers = result.messageTagNumbers;
                 batch = result.batch;
@@ -2725,7 +2739,9 @@ export function createTransform(deps: TransformDeps) {
             // this transform pass, including cold DB-recovered passes.
             resolvedProviderID,
             activeThinkingTurn,
-            protectedThinkingMessages: thinkingRecovery.restore ? protectedThinkingMessages : undefined,
+            protectedThinkingMessages: thinkingRecovery.restore
+                ? protectedThinkingMessages
+                : undefined,
             restoreLatestTurnOriginals,
             resolvedModelID: modelForBudget?.modelID,
             thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(

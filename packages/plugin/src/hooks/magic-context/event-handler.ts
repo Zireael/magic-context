@@ -1,11 +1,9 @@
-import { armBindingRecoverySafely, armLatestThinkingRecovery } from "./latest-thinking-recovery";
-import { isAnthropicFamilyRoute } from "./sentinel";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
 import {
-    detectOverflow,
     detectLatestTurnThinkingMismatch,
+    detectOverflow,
     detectThinkingBindingMismatch,
     isPrefixBoundThinkingModel,
 } from "../../features/magic-context/overflow-detection";
@@ -76,6 +74,7 @@ import {
     resolveModelKey,
     resolveSessionId,
 } from "./event-resolvers";
+import { armBindingRecoverySafely, armLatestThinkingRecovery } from "./latest-thinking-recovery";
 import { lkgProviderInputTotal, noteLkgProviderResponse } from "./lkg-measured-request";
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
@@ -87,6 +86,7 @@ import {
 } from "./read-session-db";
 import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
 import { type NotificationParams, sendStatusNotification } from "./send-session-notification";
+import { isAnthropicFamilyRoute } from "./sentinel";
 import { clearMessageTokensCache } from "./transform";
 import { resetDegradedCacheCount } from "./transform-postprocess-phase";
 
@@ -360,7 +360,10 @@ export function createEventHandler(deps: EventHandlerDeps) {
             try {
                 if (detectLatestTurnThinkingMismatch(errInfo.error)) {
                     const model = findLastAssistantModelFromOpenCodeDb(errInfo.sessionID);
-                    if (!deps.compactionOff && isAnthropicFamilyRoute(model?.providerID, model?.modelID)) {
+                    if (
+                        !deps.compactionOff &&
+                        isAnthropicFamilyRoute(model?.providerID, model?.modelID)
+                    ) {
                         armLatestThinkingRecovery(deps.db, errInfo.sessionID);
                         dropSlot(errInfo.sessionID, "latest-thinking-recovery-arm");
                         deps.onSessionCacheInvalidated?.(errInfo.sessionID);
@@ -578,7 +581,11 @@ export function createEventHandler(deps: EventHandlerDeps) {
             let messageHadOverflowError = false;
 
             if (info.error !== undefined && info.error !== null) {
-                if (detectLatestTurnThinkingMismatch(info.error) && !deps.compactionOff && isAnthropicFamilyRoute(info.providerID, info.modelID)) {
+                if (
+                    detectLatestTurnThinkingMismatch(info.error) &&
+                    !deps.compactionOff &&
+                    isAnthropicFamilyRoute(info.providerID, info.modelID)
+                ) {
                     armLatestThinkingRecovery(deps.db, info.sessionID);
                     dropSlot(info.sessionID, "latest-thinking-recovery-arm");
                     deps.onSessionCacheInvalidated?.(info.sessionID);

@@ -590,7 +590,9 @@ export function createToolDropTarget(
 
     return {
         dropReasoningParts: thinkingParts,
-        mutationParts: index.get(compositeKey)?.occurrences.map(({ message, part }) => ({ message, part })) ?? [],
+        mutationParts:
+            index.get(compositeKey)?.occurrences.map(({ message, part }) => ({ message, part })) ??
+            [],
         measureReclaim: (skeleton) => {
             const entry = index.get(compositeKey);
             const parts = entry?.occurrences.map((occ) => occ.part) ?? [];

@@ -1,9 +1,7 @@
-import { armBindingRecoverySafely, armLatestThinkingRecovery, LATEST_THINKING_RESTORE } from "@magic-context/core/hooks/magic-context/latest-thinking-recovery";
-import { isAnthropicFamilyRoute } from "@magic-context/core/hooks/magic-context/sentinel";
 import {
-	detectOverflow,
 	detectLatestTurnThinkingMismatch,
-    detectThinkingBindingMismatch,
+	detectOverflow,
+	detectThinkingBindingMismatch,
 	isPrefixBoundThinkingModel,
 } from "@magic-context/core/features/magic-context/overflow-detection";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -17,7 +15,13 @@ import {
 	thinkingBindingRecoveryFrozenId,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { latestAssistantTurnMessages } from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
+import {
+	armBindingRecoverySafely,
+	armLatestThinkingRecovery,
+	LATEST_THINKING_RESTORE,
+} from "@magic-context/core/hooks/magic-context/latest-thinking-recovery";
 import { dropSlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import { isAnthropicFamilyRoute } from "@magic-context/core/hooks/magic-context/sentinel";
 import { log } from "@magic-context/core/shared/logger";
 
 import { clearPiLkgSessionState } from "./pi-lkg";
@@ -70,12 +74,16 @@ export function handlePiProviderFailure(args: {
 		typeof message.provider === "string" ? message.provider : undefined;
 	const model = typeof message.model === "string" ? message.model : undefined;
 	const binding = detectThinkingBindingMismatch(message.errorMessage);
-    if (detectLatestTurnThinkingMismatch(message.errorMessage) && !args.compactionOff && isAnthropicFamilyRoute(provider, model)) {
-        armLatestThinkingRecovery(args.db, args.sessionId);
-        clearPiLkgSessionState(args.sessionId);
-        dropSlot(args.sessionId, "latest-thinking-recovery-arm");
-        return { kind: "thinking_binding", armed: true };
-    }
+	if (
+		detectLatestTurnThinkingMismatch(message.errorMessage) &&
+		!args.compactionOff &&
+		isAnthropicFamilyRoute(provider, model)
+	) {
+		armLatestThinkingRecovery(args.db, args.sessionId);
+		clearPiLkgSessionState(args.sessionId);
+		dropSlot(args.sessionId, "latest-thinking-recovery-arm");
+		return { kind: "thinking_binding", armed: true };
+	}
 	if (binding.isBindingMismatch) {
 		const enabled =
 			args.thinkingBindingRecoveryEnabled !== false &&
@@ -205,10 +213,15 @@ export function applyPiThinkingBindingRecovery(args: {
 	const protectedMessages = latestAssistantTurnMessages(args.messages);
 	const frozenEntryIds = frozenBindingEntryIds(args.db, args.sessionId);
 
-	const flagTargetCandidate = isPrefixBoundThinkingModel(args.provider, args.model)
+	const flagTargetCandidate = isPrefixBoundThinkingModel(
+		args.provider,
+		args.model,
+	)
 		? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
 		: null;
-    const flagTarget = flagTargetCandidate?.startsWith(LATEST_THINKING_RESTORE) ? null : flagTargetCandidate;
+	const flagTarget = flagTargetCandidate?.startsWith(LATEST_THINKING_RESTORE)
+		? null
+		: flagTargetCandidate;
 	let applied: PiThinkingBindingApplication | null = null;
 	if (flagTarget) {
 		const entryIds = new Set<string>();
@@ -239,8 +252,8 @@ export function applyPiThinkingBindingRecovery(args: {
 	}
 
 	for (let index = 0; index < args.messages.length; index += 1) {
-        const entryId = args.entryIds[index];
-        if (entryId && frozenEntryIds.has(entryId))
+		const entryId = args.entryIds[index];
+		if (entryId && frozenEntryIds.has(entryId))
 			stripThinkingParts(args.messages[index]);
 	}
 	return applied;
