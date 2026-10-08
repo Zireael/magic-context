@@ -5,12 +5,12 @@ import {
 	queuePendingOp,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
-import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import {
 	addMergedReasoningStrippedIds,
 	getThinkingBindingRecoveryTarget,
 	THINKING_BINDING_STRIP_ORDER_END_MARKER,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	clearContextHandlerSession,
@@ -247,9 +247,7 @@ for (const order of ["start", "end"] as const) {
 					const content = (message as { content?: unknown }).content;
 					return Array.isArray(content) ? content : [];
 				})
-				.find(
-					(part) => (part as { thinking?: unknown }).thinking === text,
-				);
+				.find((part) => (part as { thinking?: unknown }).thinking === text);
 		try {
 			await pass();
 			addMergedReasoningStrippedIds(db, sessionId, [

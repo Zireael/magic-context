@@ -122,7 +122,10 @@ export function prepareLatestThinkingRecovery(args: {
         return { restore: false, ended: false };
     }
     const armedAnchor = target.startsWith(ARMED) ? target.slice(ARMED.length) : undefined;
-    if (target === LATEST_THINKING_RESTORE || (armedAnchor !== undefined && armedAnchor !== anchor)) {
+    if (
+        target === LATEST_THINKING_RESTORE ||
+        (armedAnchor !== undefined && armedAnchor !== anchor)
+    ) {
         // Unbound, or the rejected turn already ended with a real user message:
         // nothing was restored yet, so disarm without touching this turn.
         args.db

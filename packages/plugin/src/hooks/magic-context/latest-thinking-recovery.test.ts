@@ -93,7 +93,9 @@ test("a rejection bound to its turn is disarmed by a later real user before any 
         { info: { id: "next", role: "user" }, parts: [{ type: "text", text: "new turn" }] },
         {
             info: { id: "next-a", role: "assistant" },
-            parts: [{ type: "reasoning", text: "new", metadata: { anthropic: { signature: "s" } } }],
+            parts: [
+                { type: "reasoning", text: "new", metadata: { anthropic: { signature: "s" } } },
+            ],
         },
     );
     expect(prepare()).toEqual({ restore: false, ended: false });
