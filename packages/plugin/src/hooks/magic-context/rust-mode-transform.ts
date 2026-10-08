@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 import {
     resolveProjectIdentity,
@@ -90,6 +89,14 @@ import {
 } from "./final-wire-token-estimate";
 import { createHistorianHostRunner } from "./historian-host-runner";
 import {
+    hasActiveAnthropicThinkingTurn,
+    latestAssistantTurnMessages,
+} from "./latest-assistant-turn";
+import {
+    captureLatestTurnOriginals,
+    prepareLatestThinkingRecovery,
+} from "./latest-thinking-recovery";
+import {
     claimLkgRequestIdentity,
     type LkgRequestIdentity,
     noteCapturedLkgRequest,
@@ -163,6 +170,7 @@ import {
     type RustLkgReplayParticipant,
     registerRustLkgReplayParticipant,
 } from "./rust-lkg-freeze-registry";
+import { isAnthropicFamilyRoute } from "./sentinel";
 import { SharedCompartmentBoundaryError } from "./shared-compartment-boundaries";
 import { singleStoreMigrationRequiredFailure } from "./single-store-refusal";
 import { StorageBusyRefusalError } from "./storage-busy-refusal";
@@ -2473,6 +2481,17 @@ export function createRustModeTransform(
             );
         }
         const inputCount = messages.length;
+        const inputHasActiveThinking = hasActiveAnthropicThinkingTurn(messages, "anthropic");
+        const thinkingRecovery = prepareLatestThinkingRecovery({
+            db: deps.db,
+            sessionId,
+            messages,
+            id: (message) => (message as MessageLike)?.info.id,
+            parts: (message) => (message as MessageLike)?.parts ?? [],
+        });
+        const restoreLatestTurnOriginals = thinkingRecovery.restore
+            ? captureLatestTurnOriginals(messages as MessageLike[])
+            : undefined;
         let requestInputTokens = 0;
         let decision = "error";
         let materializeReason = "none";
@@ -4219,7 +4238,19 @@ export function createRustModeTransform(
                             if (!isTransientSqliteError(error)) throw error;
                         }
                     }
+                    const protectedThinkingMessages = latestAssistantTurnMessages(
+                        appliedMessages as MessageLike[],
+                    );
+                    const activeThinkingTurn =
+                        inputHasActiveThinking &&
+                        isAnthropicFamilyRoute(model?.providerID, model?.modelID);
                     const postprocess = runRustModePostprocess({
+                        activeThinkingTurn,
+                        protectedThinkingMessages: thinkingRecovery.restore
+                            ? protectedThinkingMessages
+                            : undefined,
+                        restoreLatestTurnOriginals: () =>
+                            restoreLatestTurnOriginals?.(appliedMessages as MessageLike[]),
                         db: deps.db,
                         sessionId,
                         messages: appliedMessages as MessageLike[],

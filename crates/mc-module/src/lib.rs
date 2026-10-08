@@ -26926,12 +26926,20 @@ mod tests {
                 bytes.len(),
                 Sha256::digest(&bytes)
             );
+            if pass == 3 {
+                eprintln!("issue630-byte-audit {}", String::from_utf8_lossy(&bytes));
+            }
             // Captured on the pre-compaction implementation with the identical fixture.
+            // Pass 3 is the one exception: the whole fixture is a single Anthropic
+            // turn with signed thinking on a prefix-bound model, and its priced pass
+            // used to release the earlier steps' native reasoning, removing signed
+            // thinking from the active turn (rejected by the provider). It now keeps
+            // that reasoning; the compacted/uncompacted differential above is unchanged.
             let baseline = [
                 "44e6c96da02972ffb728ac3e84cbcc7367e7cc907a80dc348bfb520f5b1d2ee3",
                 "48be75604d237c4c5d166ce849670b9c6ca0f1441349e403b9bf74bd4bf3b789",
                 "0545fea19343e3bb11358897ff80fa974b5b37992515617423c22b6493e87e15",
-                "b7405b3032dd3b08e721edc579173ac316385a80d626f7937173a9b084cbe217",
+                "bc265068c217dc390b2e46cb9696a23ac576694c8f914daad3e2df383c5e7c3e",
             ];
             if pass < 4 {
                 assert_eq!(
@@ -27013,6 +27021,21 @@ mod tests {
         priced_request["render_config"] = json!("independent-priced-config-change");
         let priced = call_transform_request(&handler, priced_request).await;
         assert_eq!(priced["action"], "HARD");
+        // step-0 belongs to the active Anthropic turn (no real user message follows
+        // it), so a priced pass must keep replaying its signed reasoning unchanged.
+        assert!(store
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "strip:native_reasoning_keep:step-0"));
+        // A real user request ends that turn; the next priced pass releases the keep.
+        native.push(json!({"info":{"id":"next-user","role":"user"},"parts":[{"type":"text","text":"next request"}]}));
+        let mut released_request = make_request(&native);
+        released_request["render_config"] = json!("second-priced-config-change");
+        let released = call_transform_request(&handler, released_request).await;
+        assert_eq!(released["action"], "HARD");
         assert!(!store
             .load("ses")
             .unwrap()

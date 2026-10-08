@@ -3197,7 +3197,7 @@ describe("createTransform", () => {
         expect(text(secondPass[0], 1)).toContain("actual user message");
     });
 
-    it("clears thinking parts when a text part in the same message is dropped", async () => {
+    it("clears thinking with a text drop only after a real user ends the thinking turn", async () => {
         //#given
         useTempDataHome("context-transform-thinking-");
         const shouldExecute = mock<Scheduler["shouldExecute"]>(() => "defer");
@@ -3261,10 +3261,20 @@ describe("createTransform", () => {
         //#when
         await transform({}, { messages: secondPass });
 
-        //#then — under Anthropic the cleared thinking becomes an empty sentinel;
-        // then the dropped-placeholder-only assistant is neutralized to one empty
-        // whole-message sentinel (filtered before the wire by OpenCode).
-        expect(secondPass).toHaveLength(2);
+        expect(secondPass[1].parts[0]).toEqual({
+            type: "thinking",
+            thinking: "long internal reasoning that eats context",
+        });
+        expect(getPendingOps(db, "ses-think").map((op) => op.tagId)).toContain(assistantTextTag);
+        secondPass.push({
+            info: { id: "next-user", role: "user", sessionID: "ses-think" },
+            parts: [{ type: "text", text: "Next turn" }],
+        });
+        await transform({}, { messages: secondPass });
+
+        //#then — outside the active turn the existing representation still clears
+        // thinking with its dropped text and keeps the canonical empty sentinel.
+        expect(secondPass).toHaveLength(3);
         expect(text(secondPass[0], 0)).toContain("user prompt");
         expect(secondPass[1].parts).toEqual([{ type: "text", text: "" }]);
     });
@@ -4928,3 +4938,244 @@ describe("Channel 1 reminder copy changes", () => {
         expect(fresh.output).not.toContain("natural stopping point");
     });
 });
+
+for (const generation of ["v1", "v2"] as const) {
+    it(`${generation} Anthropic task queues reductions for the whole thinking turn, including force`, async () => {
+        useTempDataHome(`latest-turn-${generation}-`);
+        const db = openDatabase()!;
+        const sessionId = `latest-turn-${generation}`;
+        const usage = new Map<
+            string,
+            { usage: ContextUsage; updatedAt: number; hasUsageTokens: boolean }
+        >();
+        getOrCreateSessionMeta(db, sessionId);
+        updateSessionMeta(db, sessionId, { isSubagent: true });
+        const transform = createTransform({
+            db,
+            storeGeneration: generation,
+            tagger: createTagger(),
+            scheduler: createScheduler({ executeThresholdPercentage: 65 }),
+            liveModelBySession: new Map([
+                [sessionId, { providerID: "anthropic", modelID: "claude-opus-5-5" }],
+            ]),
+            contextUsageMap: usage,
+            clearReasoningAge: 1,
+            protectedTokens: 4000,
+            historyRefreshSessions: new Set(),
+            pendingMaterializationSessions: new Set(),
+            lastHeuristicsTurnId: new Map(),
+        });
+        const raw: TestMessage[] = [
+            {
+                info: { id: "prompt", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "task" }],
+            },
+        ];
+        for (let n = 1; n <= 3; n++)
+            raw.push({
+                info: {
+                    id: `step-${n}`,
+                    role: "assistant",
+                    sessionID: sessionId,
+                    providerID: "anthropic",
+                    modelID: "claude-opus-5-5",
+                },
+                parts: [
+                    { type: "reasoning", text: `signed thinking ${n}` },
+                    { type: "text", text: `spent assistant ${n}` },
+                    {
+                        type: "tool",
+                        tool: "read",
+                        callID: `call-${n}`,
+                        state: { status: "completed", output: `spent-${n} `.repeat(5000) },
+                    },
+                ],
+            });
+        const pass = async () => {
+            const messages = structuredClone(raw);
+            await transform({}, { messages });
+            return messages;
+        };
+        try {
+            const baseline = await pass();
+            const tag = getTagsBySession(db, sessionId).find(
+                (t) => t.type === "message" && t.messageId.startsWith("step-1"),
+            )!;
+            expect(tag).toBeDefined();
+            queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+            for (const percentage of [76, 85]) {
+                usage.set(sessionId, {
+                    usage: { percentage, inputTokens: percentage * 1000 },
+                    updatedAt: Date.now(),
+                    hasUsageTokens: true,
+                });
+                expect(JSON.stringify(await pass())).toBe(JSON.stringify(baseline));
+                expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toContain(tag.tagNumber);
+                expect(
+                    getTagsBySession(db, sessionId).find((t) => t.tagNumber === tag.tagNumber)
+                        ?.status,
+                ).toBe("active");
+            }
+            usage.set(sessionId, {
+                usage: { percentage: 95, inputTokens: 95_000 },
+                updatedAt: Date.now(),
+                hasUsageTokens: true,
+            });
+            // The trailing output was legally reclaimable at 95%. A later
+            // signed block now freezes that output too, leaving no safe drop.
+            raw.push({
+                info: {
+                    id: "last-thought",
+                    role: "assistant",
+                    sessionID: sessionId,
+                    providerID: "anthropic",
+                    modelID: "claude-opus-5-5",
+                },
+                parts: [{ type: "reasoning", text: "last immutable thought" }],
+            });
+            await expect(pass()).rejects.toThrow("ANTHROPIC_LATEST_TURN_FULL");
+            expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toContain(tag.tagNumber);
+            raw.push({
+                info: { id: "next", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "Next real user" }],
+            });
+            usage.set(sessionId, {
+                usage: { percentage: 76, inputTokens: 76_000 },
+                updatedAt: Date.now(),
+                hasUsageTokens: true,
+            });
+            await pass();
+            expect(getPendingOps(db, sessionId)).toHaveLength(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+}
+
+for (const { modelID, prefixBound } of [
+    { modelID: "claude-sonnet-5", prefixBound: false },
+    { modelID: "claude-sonnet-5-5", prefixBound: true },
+]) {
+    it(`primary ${modelID} tool loop applies queued drops only where active-turn thinking stays byte-identical`, async () => {
+        useTempDataHome(`latest-turn-primary-${modelID}-`);
+        const db = openDatabase()!;
+        const sessionId = `latest-turn-primary-${modelID}`;
+        const usage = new Map<
+            string,
+            { usage: ContextUsage; updatedAt: number; hasUsageTokens: boolean }
+        >();
+        getOrCreateSessionMeta(db, sessionId);
+        const model = { providerID: "anthropic", modelID };
+        const pendingMaterializationSessions = new Set<string>();
+        const transform = createTransform({
+            db,
+            tagger: createTagger(),
+            scheduler: createScheduler({ executeThresholdPercentage: 65 }),
+            liveModelBySession: new Map([[sessionId, model]]),
+            contextUsageMap: usage,
+            clearReasoningAge: 1000,
+            protectedTokens: 0,
+            historyRefreshSessions: new Set(),
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId: new Map(),
+        });
+        const step = (id: string, n: number, output: string): TestMessage => ({
+            info: { id, role: "assistant", sessionID: sessionId, ...model },
+            parts: [
+                { type: "reasoning", text: `signed thinking ${n}` },
+                {
+                    type: "tool",
+                    tool: "read",
+                    callID: `call-${n}`,
+                    state: { status: "completed", output: `${output} `.repeat(5000) },
+                },
+            ],
+        });
+        // A completed earlier turn, then the active tool loop after a real user request.
+        const raw: TestMessage[] = [
+            {
+                info: { id: "prompt-1", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "first task" }],
+            },
+            step("old-step", 1, "OLD-SPENT"),
+            {
+                info: { id: "old-final", role: "assistant", sessionID: sessionId, ...model },
+                parts: [{ type: "text", text: "first task done" }],
+            },
+            {
+                info: { id: "prompt-2", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "second task" }],
+            },
+            step("active-1", 2, "ACTIVE-SPENT"),
+            // The newest three calls form the protected working set.
+            step("active-2", 3, "ACTIVE-LATEST"),
+            step("active-3", 4, "ACTIVE-LATEST"),
+            step("active-4", 5, "ACTIVE-LATEST"),
+        ];
+        const pass = async () => {
+            const messages = structuredClone(raw);
+            await transform({}, { messages });
+            return messages;
+        };
+        const activeThinking = (messages: TestMessage[]) =>
+            JSON.stringify(
+                messages
+                    .slice(messages.findIndex((m) => m.info.id === "prompt-2") + 1)
+                    .map((m) => m.parts.filter((part) => part.type === "reasoning")),
+            );
+        const status = (tag: number) =>
+            getTagsBySession(db, sessionId).find((t) => t.tagNumber === tag)?.status;
+        try {
+            const baseline = await pass();
+            const tools = getTagsBySession(db, sessionId)
+                .filter((t) => t.type === "tool")
+                .sort((a, b) => a.tagNumber - b.tagNumber);
+            expect(tools).toHaveLength(5);
+            const [oldTag, activeTag] = [tools[0]!.tagNumber, tools[1]!.tagNumber];
+            queuePendingOp(db, sessionId, oldTag, "drop");
+            queuePendingOp(db, sessionId, activeTag, "drop");
+            usage.set(sessionId, {
+                usage: { percentage: 76, inputTokens: 76_000 },
+                updatedAt: Date.now(),
+                hasUsageTokens: true,
+            });
+            // A primary applies queued drops on a cache-busting pass; request one.
+            pendingMaterializationSessions.add(sessionId);
+            const executed = await pass();
+            // Either way, the active turn's thinking reaches the provider unchanged.
+            expect(activeThinking(executed)).toBe(activeThinking(baseline));
+            if (prefixBound) {
+                // Any earlier output edit would invalidate the later signed blocks of
+                // the active turn on this model, so every queued drop waits. (The
+                // busting pass may still trim the oldest thinking gap-free, which
+                // leaves the active blocks valid; that existing behavior is unchanged.)
+                expect(JSON.stringify(executed)).toContain("OLD-SPENT");
+                expect(JSON.stringify(executed)).toContain("ACTIVE-SPENT");
+                expect(
+                    getPendingOps(db, sessionId)
+                        .map((op) => op.tagId)
+                        .sort((a, b) => a - b),
+                ).toEqual([oldTag, activeTag]);
+                expect([status(oldTag), status(activeTag)]).toEqual(["active", "active"]);
+            } else {
+                // Neither output edit touches a thinking block on this model: both apply now.
+                expect(JSON.stringify(executed)).not.toContain("OLD-SPENT");
+                expect(JSON.stringify(executed)).not.toContain("ACTIVE-SPENT");
+                expect(getPendingOps(db, sessionId)).toHaveLength(0);
+                expect([status(oldTag), status(activeTag)]).toEqual(["dropped", "dropped"]);
+            }
+            // The next real user request ends the turn and releases deferred drops.
+            raw.push({
+                info: { id: "prompt-3", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "third task" }],
+            });
+            pendingMaterializationSessions.add(sessionId);
+            const released = await pass();
+            expect(JSON.stringify(released)).not.toContain("OLD-SPENT");
+            expect(JSON.stringify(released)).not.toContain("ACTIVE-SPENT");
+            expect(getPendingOps(db, sessionId)).toHaveLength(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+}

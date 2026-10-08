@@ -186,6 +186,16 @@ import {
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import {
+	ANTHROPIC_LATEST_TURN_FULL,
+	hasActiveAnthropicThinkingTurn,
+	latestAssistantTurnStart,
+	protectNewTagMutations,
+} from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
+import {
+	captureOriginalTurn,
+	prepareLatestThinkingRecovery,
+} from "@magic-context/core/hooks/magic-context/latest-thinking-recovery";
+import {
 	markNoteNudgeDelivered,
 	observeNoteNudgeServe,
 	onNoteTrigger,
@@ -3499,6 +3509,8 @@ export function registerPiContextHandler(
 						ctx.model?.api !== "openai-codex-responses" &&
 						ctx.model?.api !== "openai-responses",
 				},
+				resolvedProviderID: ctx.model?.provider,
+				resolvedModelID: ctx.model?.id,
 				canUseEmptySentinels,
 				temporalAwareness: options.injection?.temporalAwareness === true,
 				appendCompaction: resolvePiAppendCompaction(ctx),
@@ -5132,6 +5144,8 @@ function maybeFireHistorian(args: {
 	}
 }
 interface RunPipelineArgs {
+	resolvedProviderID?: string;
+	resolvedModelID?: string;
 	db: ContextDatabase;
 	tagger: Tagger;
 	sessionId: string;
@@ -5458,6 +5472,33 @@ async function runCompactionOffPipeline(
 
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.compactionOff) return runCompactionOffPipeline(args);
+	const thinkingRecovery = prepareLatestThinkingRecovery({
+		db: args.db,
+		sessionId: args.sessionId,
+		messages: args.messages,
+		id: (message, index) =>
+			resolvePiStableId(
+				message,
+				index,
+				args.entryIds,
+				args.entryIdByRef ?? undefined,
+			),
+		parts: (message) =>
+			Array.isArray((message as { content?: unknown })?.content)
+				? (message as { content: unknown[] }).content
+				: [],
+	});
+	if (thinkingRecovery.ended) signalPiPendingMaterialization(args.sessionId);
+	let restoreOriginals:
+		| ReturnType<typeof captureOriginalTurn<unknown>>
+		| undefined;
+	const activeThinkingTurn = hasActiveAnthropicThinkingTurn(
+		args.messages,
+		args.resolvedProviderID,
+		args.resolvedModelID,
+	);
+	const protectedSignedPrefix =
+		activeThinkingTurn && args.reasoningClearing?.prefixBound === true;
 	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
 		resolvePiStableId(
 			msg,
@@ -5808,7 +5849,18 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		persistedM0BeforeFold.cachedM0Bytes === null
 			? -1
 			: persistedM0BeforeFold.cachedM0MaxCompartmentSeq;
-	if ((foldDueDecision.value || softRefreshOpportunity) && piM0State) {
+	if (protectedSignedPrefix && piM0State) {
+		piM0State.preparedPrefix = prepareCachedM0M1PiReplay(
+			piM0State,
+			args.db,
+			injectionPassSnapshot?.cachedRow,
+		);
+	}
+	if (
+		!protectedSignedPrefix &&
+		(foldDueDecision.value || softRefreshOpportunity) &&
+		piM0State
+	) {
 		try {
 			// Persist the fold before opening mutation gates. The shadow array keeps
 			// this pre-execution off the outgoing wire; the normal injection below
@@ -6023,6 +6075,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		args.reusableMessageIds,
 	);
 	const tTag = performance.now();
+	// Part getters build fresh proxy objects. Reuse one view for tagging and
+	// safety coordinates; its proxies still read/write the working messages.
+	const mutationView = transcript.messages.map((message) => ({
+		...message,
+		parts: message.parts,
+	}));
 	let tagTextTokenCache = piTagTextTokenCacheBySession.get(args.sessionId);
 	if (!tagTextTokenCache) {
 		tagTextTokenCache = new Map();
@@ -6040,26 +6098,87 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		"tagging-persistence-failure",
 		() => args.tagger.cleanup(args.sessionId),
 		() =>
-			tagTranscript(args.sessionId, transcript, args.tagger, args.db, {
-				skipPrefixInjection: !ctxReduceCallable,
-				entryFingerprintByMessageId,
-				reuseMessageIds: textIdentityPlan.reusableMessageIds,
-				textIdentityDriftMessageIds: textIdentityPlan.driftedMessageIds,
-				textIdentitySourceCache: textIdentityPlan.sourceCache,
-				textTokenCache: tagTextTokenCache,
-				toolTokenCache: tagToolTokenCache,
-				onTiming: hasPiTransformTimingObserver()
-					? (phase, elapsedMs) => {
-							recordPiTransformTiming({
-								sessionId: args.sessionId,
-								stage: `tag:${phase}`,
-								elapsedMs,
-							});
-						}
-					: undefined,
-			}),
+			tagTranscript(
+				args.sessionId,
+				{ ...transcript, messages: mutationView },
+				args.tagger,
+				args.db,
+				{
+					skipPrefixInjection: !ctxReduceCallable,
+					entryFingerprintByMessageId,
+					reuseMessageIds: textIdentityPlan.reusableMessageIds,
+					textIdentityDriftMessageIds: textIdentityPlan.driftedMessageIds,
+					textIdentitySourceCache: textIdentityPlan.sourceCache,
+					textTokenCache: tagTextTokenCache,
+					toolTokenCache: tagToolTokenCache,
+					onTiming: hasPiTransformTimingObserver()
+						? (phase, elapsedMs) => {
+								recordPiTransformTiming({
+									sessionId: args.sessionId,
+									stage: `tag:${phase}`,
+									elapsedMs,
+								});
+							}
+						: undefined,
+				},
+			),
 	);
 	logTransformTiming(args.sessionId, "tagMessages", tTag);
+	const reasoningTagsForProtection = buildMessageIdToMaxTag(targets);
+	const frozenThinkingForProtection = activeThinkingTurn
+		? frozenBindingEntryIds(args.db, args.sessionId)
+		: new Set<string>();
+	const protectedThinkingProxies = new Set<unknown>();
+	if (activeThinkingTurn) {
+		for (
+			let i = latestAssistantTurnStart(workingMessages);
+			i < mutationView.length;
+			i++
+		) {
+			const id = stableIdResolver(workingMessages[i], i);
+			if (
+				!thinkingRecovery.restore &&
+				id &&
+				frozenThinkingForProtection.has(id)
+			)
+				continue;
+			for (let p = 0; p < mutationView[i].parts.length; p++) {
+				const part = mutationView[i].parts[p];
+				if (part.kind !== "thinking") continue;
+				const local = (
+					workingMessages[i] as { content?: { redacted?: boolean }[] }
+				).content?.[p];
+				if (
+					!thinkingRecovery.restore &&
+					!local?.redacted &&
+					id &&
+					(reasoningTagsForProtection.get(id) ?? Infinity) <=
+						(args.sessionMeta.clearedReasoningThroughTag ?? 0)
+				)
+					continue;
+				protectedThinkingProxies.add(part);
+			}
+		}
+	}
+	const newTargets = protectNewTagMutations(
+		mutationView.map((message) => ({
+			info: message.info,
+			parts: message.parts,
+		})),
+		targets,
+		protectedThinkingProxies,
+		args.reasoningClearing?.prefixBound === true,
+	);
+	if (thinkingRecovery.restore) {
+		transcript.commit();
+		restoreOriginals = captureOriginalTurn(
+			args.messages as unknown[],
+			(message) => (message as { content: unknown }).content,
+			(message, content) => {
+				(message as { content: unknown }).content = content;
+			},
+		);
+	}
 
 	// Legacy dropped-tool skeletons (argument marker) convert to the
 	// real-or-absent rule only on a pass whose HARD fold executed and loses the
@@ -6230,7 +6349,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			pendingOpsDidMutate = applyPendingOperations(
 				args.sessionId,
 				args.db,
-				targets,
+				newTargets,
 				new Set([
 					...(args.contextUsage.percentage >= 95
 						? []
@@ -6260,7 +6379,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			pendingOpsAppliedThisPass = true;
 			if (hasPendingMaterializeSignal) {
 				if (args.heuristics === undefined) {
-					consumePendingMaterialization(args.sessionId);
+					if (
+						!pendingOps.some(
+							(op) => newTargets.get(op.tagId)?.thinkingDropProtected,
+						)
+					)
+						consumePendingMaterialization(args.sessionId);
 				}
 			}
 			// NOTE: do NOT consume deferredMaterialization here. OpenCode only
@@ -6360,6 +6484,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		try {
 			const tReplayReasoning = performance.now();
 			const clearedReplay = replayClearedReasoningPi({
+				protectLatestTurn: false,
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
@@ -6367,6 +6492,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				piMessageStableId: stableIdResolver,
 			});
 			const inlineReplay = replayStrippedInlineThinkingPi({
+				protectLatestTurn: false,
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
@@ -6486,7 +6612,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			heuristicsResult = applyPiHeuristicCleanup(
 				args.sessionId,
 				args.db,
-				targets,
+				newTargets,
 				args.messages,
 				{
 					protectedTags: args.protectedTags,
@@ -6525,7 +6651,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				const ridingCleanup = applyPiHeuristicCleanup(
 					args.sessionId,
 					args.db,
-					targets,
+					newTargets,
 					args.messages,
 					{
 						protectedTags: args.protectedTags,
@@ -6595,7 +6721,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			heuristicsExecuted = true;
 			executedWorkThisPass = true;
 			if (hasPendingMaterializeSignal) {
-				consumePendingMaterialization(args.sessionId);
+				if (
+					!pendingOps.some(
+						(op) => newTargets.get(op.tagId)?.thinkingDropProtected,
+					)
+				)
+					consumePendingMaterialization(args.sessionId);
 			}
 			if (currentTurnId !== null) {
 				lastHeuristicsTurnIdBySession.set(args.sessionId, currentTurnId);
@@ -6665,6 +6796,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				? frozenBindingEntryIds(args.db, args.sessionId)
 				: new Set<string>();
 			const maxCutoff = piReasoningClearCutoff({
+				protectLatestTurn: activeThinkingTurn,
 				messages: workingMessages,
 				messageIdToMaxTag,
 				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
@@ -6673,6 +6805,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				alreadyGone: (id) => bindingStripped.has(id),
 			});
 			const clearOutcome = clearOldReasoningPi({
+				protectLatestTurn: activeThinkingTurn,
 				messages: workingMessages,
 				messageIdToMaxTag,
 				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
@@ -6683,6 +6816,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// message, so it never starts on a prefix-bound model; the cutoff
 			// above already stops below any text it could reach on replay.
 			const stripOutcome = stripInlineThinkingPi({
+				protectLatestTurn: activeThinkingTurn,
 				messages: workingMessages,
 				messageIdToMaxTag,
 				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
@@ -6745,6 +6879,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.reasoningClearing && shouldRunHeuristics && routineCleanupApplied) {
 		try {
 			replayStrippedInlineThinkingPi({
+				protectLatestTurn: false,
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
@@ -6767,7 +6902,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		const syntheticPendingOps = buildSyntheticToolReclaimOps({
 			db: args.db,
 			sessionId: args.sessionId,
-			targets,
+			targets: newTargets,
 			watermark: reclaimMeta.toolReclaimWatermark ?? 0,
 			protectedToolTags,
 			pendingOps,
@@ -6787,7 +6922,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			const supersessionOps = buildSupersessionReclaimOps({
 				db: args.db,
 				sessionId: args.sessionId,
-				targets,
+				targets: newTargets,
 				pendingOps,
 				recentMessageIds,
 				protectedToolTags,
@@ -6801,7 +6936,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			const editReclaim = buildEditSupersessionReclaim({
 				db: args.db,
 				sessionId: args.sessionId,
-				targets,
+				targets: newTargets,
 				pendingOps,
 				recentMessageIds,
 				protectedToolTags,
@@ -6821,7 +6956,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			autoReclaimDidMutate = applyPendingOperations(
 				args.sessionId,
 				args.db,
-				targets,
+				newTargets,
 				protectedTagNumbersForPass,
 				undefined,
 				[],
@@ -7343,6 +7478,16 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 
+	restoreOriginals?.(workingMessages);
+	if (
+		protectedThinkingProxies.size > 0 &&
+		args.contextUsage.percentage >= 95 &&
+		pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected) &&
+		!pendingOpsDidMutate &&
+		!heuristicOrReasoningDidMutate &&
+		!foldBustsServedPrefixThisPass
+	)
+		throw contextRefusalError(ANTHROPIC_LATEST_TURN_FULL);
 	const materialized = injectionResult?.m0Materialized === true;
 	if (
 		args.reasoningClearing?.prefixBound &&

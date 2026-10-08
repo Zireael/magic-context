@@ -2072,6 +2072,8 @@ struct Channel1Target {
 /// handler maps these to a clean Error frame rather than a partial/raw array.
 #[derive(Debug)]
 pub enum TransformError {
+    /// The current signed assistant turn cannot be reduced without editing thinking.
+    AnthropicLatestTurnFull,
     ProtectedToolResultsOverLimit,
     Store(McStoreError),
     /// Anthropic cannot accept an assistant-terminal retry, and moving completed output
@@ -2125,6 +2127,7 @@ pub const PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE: &str = "The tool results ke
 impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TransformError::AnthropicLatestTurnFull => write!(f, "ANTHROPIC_LATEST_TURN_FULL: Context reached 95% within a thinking-bearing assistant turn. End the tool loop and send a new user message, or clear the session to continue."),
             TransformError::ProtectedToolResultsOverLimit => write!(f,
                 "{PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE}"),
             TransformError::Store(e) => write!(f, "store: {e}"),
@@ -5120,7 +5123,10 @@ fn apply_once(
     // below can authorize new provider-visible mutations.
     // Subagents execute a reductions-only branch, not the prefix plan. Inherited
     // HARD/reconcile advisories cannot price automatic reductions without a fold.
-    let prefix_materialization_enabled = !req.is_subagent;
+    let active_thinking_turn = active_anthropic_thinking_turn(req);
+    let protected_signed_prefix =
+        active_thinking_turn && is_prefix_bound_thinking_model(req.model_key.as_deref());
+    let prefix_materialization_enabled = !req.is_subagent && !protected_signed_prefix;
     let profile_transition = !loaded.meta.last_serializer_profile.is_empty()
         && loaded.meta.last_serializer_profile != req.serializer_profile;
     // A known previous identity that differs from this request means the provider's
@@ -5211,7 +5217,7 @@ fn apply_once(
         // for queued drops and automatic cleanup, not a request to change bytes.
         || (req.is_subagent && scheduler_outcome.pass.canonical_decision() == "execute")
         || force_episode_available
-        || scheduler_outcome.pass == scheduler::PassDecision::Emergency95;
+            || scheduler_outcome.pass == scheduler::PassDecision::Emergency95;
     let pass_already_busting = supersession_ride_available;
     let emergency_minimum_waived = independent_rebuild;
     let calibration_candidate = crate::decision_calibration::DecisionCalibration::freeze_for_model(
@@ -5308,7 +5314,7 @@ fn apply_once(
         active_calibration.tools_ratio,
     );
     let tag_window_protected_block_ids = protection_window.row_identities.block_ids.clone();
-    let exempt_message_protected_block_ids = [mutation_exempt_mid, lineage_anchor_mid]
+    let mut exempt_message_protected_block_ids = [mutation_exempt_mid, lineage_anchor_mid]
         .into_iter()
         .flatten()
         .flat_map(|mid| {
@@ -5319,6 +5325,7 @@ fn apply_once(
                 .map(|block| block.id.clone())
         })
         .collect::<HashSet<_>>();
+    exempt_message_protected_block_ids.extend(active_thinking_prefix_edit_ids(&loaded.core, req));
     let mut protected_block_ids = tag_window_protected_block_ids
         .union(&exempt_message_protected_block_ids)
         .cloned()
@@ -6970,10 +6977,16 @@ fn apply_once(
     let output_meta = no_trim_meta.as_ref().unwrap_or(&meta);
     // OpenCode must replay the newest signed assistant's complete native vector. Its
     // demotion is not permission to apply previously withheld overlays on a defer.
-    // Release these keeps only when the prefix is already being repriced.
+    // Release these keeps only when the prefix is already being repriced. Keeps on the
+    // active Anthropic turn's thinking stay: releasing one would remove a signed block
+    // the provider requires unchanged until the next real user request.
     if is_provider_prefix_mutation_pass {
-        core.frozen_units
-            .retain(|unit| !unit.key.starts_with("strip:native_reasoning_keep:"));
+        let active_thinking = protected_thinking_turn_mids(req);
+        core.frozen_units.retain(|unit| {
+            unit.key
+                .strip_prefix("strip:native_reasoning_keep:")
+                .is_none_or(|mid| active_thinking.contains(mid))
+        });
     }
     if serializer_profile == Some(SerializerProfile::OpencodeAiSdk) && req.serve_native {
         let mut keep_mids = Vec::new();
@@ -7372,6 +7385,33 @@ fn apply_once(
     let scheduler_applied_reductions = frozen_red_targets(&core)
         .iter()
         .any(|target| !frozen_reductions_before.contains(target));
+    let old_units = loaded
+        .core
+        .frozen_units
+        .iter()
+        .map(|unit| unit.key.as_str())
+        .collect::<HashSet<_>>();
+    let safe_reasoning_applied = core.frozen_units.iter().any(|unit| {
+        !old_units.contains(unit.key.as_str())
+            && (unit.key.starts_with("strip:reasoning_clear:")
+                || unit.key.starts_with("strip:reasoning_age:"))
+    });
+    let active_mids = protected_thinking_turn_mids(req);
+    let retained_active_thinking = ck_messages.iter().any(|message| {
+        message
+            .meta
+            .harness_id
+            .as_deref()
+            .is_some_and(|mid| active_mids.contains(mid))
+            && message.content.iter().any(is_reasoning_block)
+    });
+    if usage_percentage >= 95.0
+        && retained_active_thinking
+        && !scheduler_applied_reductions
+        && !safe_reasoning_applied
+    {
+        return Err(TransformError::AnthropicLatestTurnFull);
+    }
     let reasoning_clear_units = core
         .frozen_units
         .iter()
@@ -8500,6 +8540,7 @@ fn new_caveman_units(
         .map(|row| (row.block_id.as_str(), row))
         .collect::<HashMap<_, _>>();
     let frozen_red = frozen_red_targets(core);
+    let unsafe_thinking_prefix = active_thinking_prefix_edit_ids(core, req);
     let mut candidates = live
         .iter()
         .filter_map(|block| {
@@ -8530,6 +8571,9 @@ fn new_caveman_units(
     let total = candidates.len();
     let mut units = Vec::new();
     for (position, (_tag_number, block_id, source)) in candidates.into_iter().enumerate() {
+        if unsafe_thinking_prefix.contains(&block_id) {
+            continue;
+        }
         let target_depth = caveman_target_depth(position, total);
         if target_depth == 0 {
             continue;
@@ -13642,6 +13686,7 @@ fn tag_age_cutoff(req: &TransformRequest, tag_numbers: &BTreeMap<String, u64>) -
 }
 
 include!("transform/reasoning_clear.rs");
+include!("transform/active_anthropic_turn.rs");
 
 fn new_frozen_strip_units(
     core: &CoreState,
@@ -13690,6 +13735,8 @@ fn new_frozen_strip_units(
         HashSet::new()
     };
     let mut units = BTreeMap::<String, FrozenUnit>::new();
+    let protected_thinking = protected_thinking_turn_mids(req);
+    let unsafe_content = active_thinking_prefix_edit_ids(core, req);
     let mut has_assistant_response = false;
 
     for index in (0..req.messages.len()).rev() {
@@ -13710,7 +13757,14 @@ fn new_frozen_strip_units(
             has_assistant_response = true;
         }
         if index < protected_start {
-            if message.ck.role != "user" && whole_system_injected(blocks) {
+            if message.ck.role != "user"
+                && whole_system_injected(blocks)
+                && !protected_thinking.contains(message.mid.as_str())
+                && !blocks
+                    .iter()
+                    .enumerate()
+                    .any(|(i, _)| unsafe_content.contains(&ck_wire::block_id(&message.mid, i)))
+            {
                 let unit = strip_unit("system_injected", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
@@ -13730,6 +13784,9 @@ fn new_frozen_strip_units(
                         continue;
                     }
                     let target = format!("{}#{block_index}", message.mid);
+                    if unsafe_content.contains(&target) {
+                        continue;
+                    }
                     let unit = strip_unit("system_injected_block", &target, &cleaned);
                     if !existing_keys.contains(unit.key.as_str()) {
                         units.insert(unit.key.clone(), unit);
@@ -13744,6 +13801,7 @@ fn new_frozen_strip_units(
             // this already-busting pass and replays unchanged on defers; selection.rs continues to
             // exclude every reasoning block from ReductionDecision targets.
             let cc_aged = message.ck.role == "assistant"
+                && !protected_thinking.contains(message.mid.as_str())
                 && reasoning_mutation_exempt_mid != Some(message.mid.as_str())
                 && cc_reasoning_cutoff.is_some_and(|cutoff| {
                     let tag = message_tag_number(message, tag_numbers);
@@ -13760,13 +13818,19 @@ fn new_frozen_strip_units(
                 && index < protected_start
                 && blocks.iter().any(is_reduce_block)
                 && !protected_reduce
+                && !blocks
+                    .iter()
+                    .enumerate()
+                    .any(|(i, _)| unsafe_content.contains(&ck_wire::block_id(&message.mid, i)))
             {
                 let unit = strip_unit("stale_reduce", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
                 }
             }
-            if whole_marker_or_blank_message(blocks) {
+            if whole_marker_or_blank_message(blocks)
+                && !protected_thinking.contains(message.mid.as_str())
+            {
                 let unit = strip_unit("placeholder", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
@@ -13874,6 +13938,7 @@ fn opencode_reasoning_removal_mids<'a>(
     let prefix_bound = is_prefix_bound_thinking_model(req.model_key.as_deref());
     let newest = latest_assistant_mid(&req.messages);
     let exempt = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let protected_thinking = protected_thinking_turn_mids(req);
     // `@openrouter/ai-sdk-provider` keeps copies of the reasoning as
     // `metadata.openrouter.reasoning_details` on other parts of the message. This lane
     // cannot strip those, so such messages are skipped whatever the provider id is.
@@ -13907,6 +13972,7 @@ fn opencode_reasoning_removal_mids<'a>(
         }
         let tag = message_tag_number(message, tag_numbers);
         let eligible = !mid.is_empty()
+            && !protected_thinking.contains(mid)
             && !openrouter_shaped.contains(mid)
             && Some(mid) != newest
             && Some(mid) != exempt
@@ -15022,6 +15088,7 @@ fn new_merged_reasoning_strip_units(
         .map(|unit| unit.key.as_str())
         .collect::<HashSet<_>>();
     let mutation_exempt_mid = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let protected_thinking = protected_thinking_turn_mids(req);
     let clear_lookup = FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units));
     let mut prev_assistant = false;
     let mut units = Vec::new();
@@ -15036,7 +15103,8 @@ fn new_merged_reasoning_strip_units(
                 && active_reasoning_clear(&clear_lookup, mid).is_none()
             {
                 let mut candidate = rendered.clone().into_message();
-                let mutation_exempt = mutation_exempt_mid == Some(mid);
+                let mutation_exempt =
+                    mutation_exempt_mid == Some(mid) || protected_thinking.contains(mid);
                 if apply_serializer_residual_to_message(
                     profile,
                     req.provider_id.as_deref(),
@@ -16265,6 +16333,84 @@ fn is_mutable_merged_reasoning_block(block: &CkWireBlock) -> bool {
             .provider_extras
             .get("opencode")
             .is_some_and(|extras| extras.contains_key("cache_control"))
+}
+
+/// Thinking-bearing assistants inside the active Anthropic turn. Membership comes from
+/// `in_active_anthropic_turn`, the one turn boundary shared with reasoning retention, so
+/// every lane agrees on which signed blocks are immutable this turn. A `[cleared]`
+/// placeholder is Magic Context's own earlier neutralization, not a block the provider
+/// returned, so it does not make a message immutable.
+fn protected_thinking_turn_mids(req: &TransformRequest) -> HashSet<&str> {
+    req.messages
+        .iter()
+        .filter(|m| {
+            m.ck.role == "assistant"
+                && m.ck
+                    .content
+                    .iter()
+                    .any(|block| is_reasoning_block(block) && !is_structural_noise(block))
+        })
+        .filter(|m| in_active_anthropic_turn(req, &m.mid))
+        .map(|m| m.mid.as_str())
+        .collect()
+}
+
+fn active_anthropic_thinking_turn(req: &TransformRequest) -> bool {
+    let protected = protected_thinking_turn_mids(req);
+    req.messages
+        .iter()
+        .any(|m| protected.contains(m.mid.as_str()) && m.ck.content.iter().any(is_reasoning_block))
+}
+
+/// Reproduce persisted reasoning decisions before protecting a new prefix edit.
+/// Already-frozen legacy omissions are not new mutations and remain authoritative.
+fn active_thinking_prefix_edit_ids(core: &CoreState, req: &TransformRequest) -> HashSet<String> {
+    if !is_prefix_bound_thinking_model(req.model_key.as_deref()) {
+        return HashSet::new();
+    }
+    let active = protected_thinking_turn_mids(req);
+    let lookup = FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units));
+    let exempt = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    let mut ordinal = 0;
+    let mut last = None;
+    let mut coordinates = Vec::new();
+    let mut previous_assistant = false;
+    for message in &req.messages {
+        let mut replay = message.ck.clone();
+        replay_reasoning_clear(&lookup, &message.mid, &mut replay);
+        remove_frozen_historical_reasoning(
+            &lookup,
+            message,
+            exempt == Some(message.mid.as_str()),
+            &mut replay,
+        );
+        if output_message_strip_unit(&lookup, "merged_reasoning", &message.mid).is_some() {
+            if let Some(profile) = SerializerProfile::parse(&req.serializer_profile) {
+                apply_serializer_residual_to_message(
+                    profile,
+                    req.provider_id.as_deref(),
+                    exempt == Some(message.mid.as_str()),
+                    !previous_assistant,
+                    &mut replay,
+                );
+            }
+        }
+        for (index, block) in message.ck.content.iter().enumerate() {
+            coordinates.push((ordinal, ck_wire::block_id(&message.mid, index)));
+            if active.contains(message.mid.as_str())
+                && is_reasoning_block(block)
+                && replay.content.iter().any(|kept| kept == block)
+            {
+                last = Some(ordinal);
+            }
+            ordinal += 1;
+        }
+        previous_assistant = message.ck.role == "assistant";
+    }
+    coordinates
+        .into_iter()
+        .filter_map(|(position, id)| last.is_some_and(|last| position < last).then_some(id))
+        .collect()
 }
 
 fn latest_assistant_mid(messages: &[CkIngressMessage]) -> Option<&str> {
@@ -19500,6 +19646,41 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn latest_thinking_turn_is_not_a_merged_reasoning_strip_candidate() {
+        let mut messages = vec![item("user", 1, "task")];
+        for (mid, ordinal) in [("a1", 2), ("a2", 3), ("a3", 4)] {
+            let mut assistant = trailing_regression_assistant(mid, ordinal, None, false);
+            assistant.ck.content.insert(
+                0,
+                CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: mid.to_string(),
+                    signature: Some(format!("signed-{mid}")),
+                }),
+            );
+            messages.push(assistant);
+        }
+        let mut request = req("latest-turn", "cfg", messages);
+        request.serializer_profile = "opencode-aisdk".to_string();
+        request.provider_id = Some("anthropic".to_string());
+        let rendered = request
+            .messages
+            .iter()
+            .map(|m| ServedMessage::from_message(m.ck.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            new_merged_reasoning_strip_units(&CoreState::default(), &request, &rendered, true)
+                .is_empty()
+        );
+        request
+            .messages
+            .push(item("next-user", 5, "next real turn"));
+        let completed =
+            new_merged_reasoning_strip_units(&CoreState::default(), &request, &rendered, true);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].key, "strip:merged_reasoning:a2");
+    }
+
     fn protection_cutoff(cutoff: Option<i64>) -> TagNumberCutoffProjection {
         TagNumberCutoffProjection {
             coordinate_space: CoordinateSpace::TagNumber,
@@ -22590,6 +22771,167 @@ pub(crate) mod tests {
     #[test]
     fn issue_619_subagent_execute_drains_queued_drops() {
         check_issue_619_subagent_ride(true, true, true);
+    }
+
+    #[test]
+    fn latest_thinking_turn_holds_pending_drops_through_force_and_refuses_at_95() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut first = assistant_tool_call("a1", 2, "t1");
+        first.ck.content.insert(
+            0,
+            CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed-one".to_string(),
+                signature: Some("signature-one".to_string()),
+            }),
+        );
+        first.ck.content.insert(
+            1,
+            CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: "spent assistant text".to_string(),
+            }),
+        );
+        let mut second = assistant_tool_call("a2", 4, "t2");
+        second.ck.content.insert(
+            0,
+            CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "signed-two".to_string(),
+                signature: Some("signature-two".to_string()),
+            }),
+        );
+        let mut final_thought = trailing_regression_assistant("a3", 6, None, false);
+        final_thought.ck.content.insert(
+            0,
+            CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "last signed thought".to_string(),
+                signature: Some("signature-three".to_string()),
+            }),
+        );
+        let mut request = with_usage(
+            req(
+                "latest-turn-drops",
+                "cfg",
+                vec![
+                    item("prompt", 1, "task"),
+                    first,
+                    tool_result("r1", 3, "t1", "spent output"),
+                    second,
+                    tool_result("r2", 5, "t2", "newest output"),
+                    final_thought,
+                ],
+            ),
+            76_000,
+            100_000,
+        );
+        request.is_subagent = true;
+        request.provider_id = Some("anthropic".to_string());
+        request.model_key = Some("anthropic/claude-opus-5-5".to_string());
+        request.serializer_profile = "opencode-aisdk".to_string();
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        transform(&s, &request, &ctx).unwrap();
+        let baseline = transform(&s, &request, &ctx).unwrap();
+        s.append_pending_agent_drops("latest-turn-drops", &["a1#1".into()], 1)
+            .unwrap();
+        for tokens in [76_000, 85_000] {
+            request = with_usage(request, tokens, 100_000);
+            assert_eq!(
+                transform(&s, &request, &ctx).unwrap().ck_messages,
+                baseline.ck_messages
+            );
+            assert_eq!(
+                s.load_pending_agent_drops("latest-turn-drops")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        request = with_usage(request, 95_000, 100_000);
+        assert!(matches!(
+            transform(&s, &request, &ctx),
+            Err(TransformError::AnthropicLatestTurnFull)
+        ));
+        request.messages.push(item("next-real-user", 7, "continue"));
+        request = with_usage(request, 76_000, 100_000);
+        transform(&s, &request, &ctx).unwrap();
+        assert!(s
+            .load_pending_agent_drops("latest-turn-drops")
+            .unwrap()
+            .is_empty());
+    }
+
+    fn check_review_issue630_rust_95_without_unsafe_work(is_subagent: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut assistant = assistant_tool_call("a", 2, "t");
+        assistant.ck.content.insert(
+            0,
+            CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                text: "original".into(),
+                signature: Some("sig-original".into()),
+            }),
+        );
+        let mut request = with_usage(
+            req(
+                "review-no-unsafe-work",
+                "cfg",
+                vec![
+                    item("u", 1, "task"),
+                    assistant,
+                    tool_result("r", 3, "t", "spent"),
+                ],
+            ),
+            20_000,
+            100_000,
+        );
+        request.is_subagent = is_subagent;
+        request.provider_id = Some("anthropic".into());
+        request.model_key = Some("claude-opus-5-5".into());
+        request.serializer_profile = "opencode-aisdk".into();
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        transform(&s, &request, &ctx).unwrap();
+        // Only one signed response, no queued drop, and no provider overflow.
+        // The existing 95%-usage reading still leaves room in the window.
+        request = with_usage(request, 95_000, 100_000);
+        let result = transform(&s, &request, &ctx);
+        assert!(result.is_ok(), "primary/subagent={is_subagent}: {result:?}");
+    }
+
+    #[test]
+    fn review_issue630_rust_primary_95_without_unsafe_work_still_serves() {
+        check_review_issue630_rust_95_without_unsafe_work(false);
+    }
+
+    #[test]
+    fn review_issue630_rust_subagent_95_without_unsafe_work_still_serves() {
+        check_review_issue630_rust_95_without_unsafe_work(true);
+    }
+
+    #[test]
+    fn review_issue630_rust_metadata_route_keeps_all_active_thinking() {
+        let native = vec![
+            serde_json::json!({"info":{"id":"u","role":"user"},"parts":[{"type":"text","text":"task"}]}),
+            serde_json::json!({"info":{"id":"a1","role":"assistant"},"parts":[
+                {"type":"reasoning","text":"first","metadata":{"anthropic":{"signature":"sig-first"}}},
+                {"type":"text","text":"answer one"}
+            ]}),
+            serde_json::json!({"info":{"id":"a2","role":"assistant"},"parts":[
+                {"type":"reasoning","text":"last","metadata":{"anthropic":{"signature":"sig-last"}}},
+                {"type":"text","text":"answer two"}
+            ]}),
+        ];
+        let decoded = crate::codec::decode_opencode(&native);
+        let mut request = opencode_req("review-custom-route", "cfg", decoded.messages);
+        // Custom route names are not provider evidence. The native blocks still
+        // explicitly identify their Anthropic signatures, just as in the TS fixture.
+        request.provider_id = Some("custom".into());
+        request.model_key = Some("renamed".into());
+        request.native_messages = Some(native);
+        let tags = BTreeMap::from([("a1".into(), 2), ("a2".into(), 4)]);
+        let selected = opencode_reasoning_removal_mids(&request, &tags, Some(3), &HashSet::new());
+        assert!(
+            selected.is_empty(),
+            "removed active signed thinking: {selected:?}"
+        );
     }
 
     #[test]
@@ -26908,6 +27250,18 @@ pub(crate) mod tests {
                 fixture.name
             );
 
+            // These goldens exercise historical serializer repair. A live
+            // continuation must instead retain every thinking block.
+            if fixture.expect_strip {
+                let ordinal = request
+                    .messages
+                    .last()
+                    .map_or(1, |message| message.ordinal + 1);
+                request
+                    .messages
+                    .push(item("next-real-user", ordinal, "next turn"));
+            }
+
             let response = run(&store, &request, &spine());
             assert_eq!(response.action, "HARD");
             let target = response
@@ -28578,6 +28932,10 @@ pub(crate) mod tests {
         ) -> TransformRequest {
             let mut request = profile_req(SerializerProfile::OpencodeAiSdk, session, cfg, messages);
             request.provider_id = Some("anthropic".to_string());
+            // Serializer repair is priced only for completed history.
+            request
+                .messages
+                .push(item("next-real-user", 100, "next turn"));
             request
         }
 
@@ -28701,6 +29059,10 @@ pub(crate) mod tests {
             let mut request = opencode_req(session, config, messages);
             request.provider_id = Some("anthropic".to_string());
             request.is_subagent = true;
+            // New stripping is tested outside the still-frozen assistant turn.
+            request
+                .messages
+                .push(item("next-real-user", 100, "next turn"));
             request
         }
 

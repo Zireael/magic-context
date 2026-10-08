@@ -145,6 +145,7 @@ export function selectReasoningRemovals(args: {
      * good (the binding-mismatch strip set). Only the prefix walk reads it.
      */
     alsoGone?: ReadonlySet<string>;
+    protectedMessages?: ReadonlySet<MessageLike>;
 }): string[] {
     let maxTag = 0;
     for (const tag of args.messageTagNumbers.values()) if (tag > maxTag) maxTag = tag;
@@ -168,6 +169,7 @@ export function selectReasoningRemovals(args: {
             continue;
         const tag = args.messageTagNumbers.get(message) ?? 0;
         const removable =
+            !args.protectedMessages?.has(message) &&
             id !== undefined &&
             message !== newest &&
             message !== exempt &&
@@ -197,12 +199,18 @@ export function removeReasoningParts(
     messages: MessageLike[],
     ids: ReadonlySet<string>,
     providerID: string | undefined,
+    protectedMessages?: ReadonlySet<MessageLike>,
 ): number {
     if (ids.size === 0) return 0;
     const exempt = findLatestAssistantReasoningMutationExemptMessage(messages);
     let removed = 0;
     for (const message of messages) {
-        if (message.info.role !== "assistant" || message === exempt) continue;
+        if (
+            protectedMessages?.has(message) ||
+            message.info.role !== "assistant" ||
+            message === exempt
+        )
+            continue;
         const id = message.info.id;
         if (typeof id !== "string" || !ids.has(id)) continue;
         if (!reasoningPayloadLeavesWithParts(message)) continue;

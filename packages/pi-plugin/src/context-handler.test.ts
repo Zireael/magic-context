@@ -7915,6 +7915,7 @@ describe("Pi proactive strip of invalidated thinking", () => {
 						opusAssistant("signed one", "answer one", 11),
 						userMessage("second request", 12),
 						opusAssistant("signed two", "answer two", 13),
+						userMessage("next real turn", 14),
 					];
 					return {
 						messages,
@@ -8134,7 +8135,9 @@ describe("Pi proactive strip of invalidated thinking", () => {
 			updateTagStatus(db, sessionId, dropped.tagNumber, "dropped");
 			signalPiPendingMaterialization(sessionId);
 			const dropPass = await pass(10, 96);
-			expect(dropPass.map(liveThinking)).toEqual(Array(20).fill(0));
+			// A legacy edit may repair completed turns, never strip the active
+			// turn's latest signed response. Its original thinking stays.
+			expect(dropPass.map(liveThinking)).toEqual([...Array(19).fill(0), 1]);
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);

@@ -2,6 +2,7 @@ import type { createCompactionHandler } from "../../features/magic-context/compa
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
 import {
+    detectLatestTurnThinkingMismatch,
     detectOverflow,
     detectThinkingBindingMismatch,
     isPrefixBoundThinkingModel,
@@ -10,7 +11,6 @@ import { observeSessionActivity } from "../../features/magic-context/session-act
 import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
-    armThinkingBindingRecovery,
     clearDetectedContextLimit,
     clearHistorianFailureState,
     clearPendingCompactionMarkerStateIf,
@@ -74,6 +74,7 @@ import {
     resolveModelKey,
     resolveSessionId,
 } from "./event-resolvers";
+import { armBindingRecoverySafely, armLatestThinkingRecovery } from "./latest-thinking-recovery";
 import { lkgProviderInputTotal, noteLkgProviderResponse } from "./lkg-measured-request";
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
@@ -85,6 +86,7 @@ import {
 } from "./read-session-db";
 import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
 import { type NotificationParams, sendStatusNotification } from "./send-session-notification";
+import { isAnthropicFamilyRoute } from "./sentinel";
 import { clearMessageTokensCache } from "./transform";
 import { resetDegradedCacheCount } from "./transform-postprocess-phase";
 
@@ -356,6 +358,18 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
             recordPromptSessionError(errInfo.sessionID, errInfo.error);
             try {
+                if (detectLatestTurnThinkingMismatch(errInfo.error)) {
+                    const model = findLastAssistantModelFromOpenCodeDb(errInfo.sessionID);
+                    if (
+                        !deps.compactionOff &&
+                        isAnthropicFamilyRoute(model?.providerID, model?.modelID)
+                    ) {
+                        armLatestThinkingRecovery(deps.db, errInfo.sessionID);
+                        dropSlot(errInfo.sessionID, "latest-thinking-recovery-arm");
+                        deps.onSessionCacheInvalidated?.(errInfo.sessionID);
+                    }
+                    return;
+                }
                 const bindingMismatch = detectThinkingBindingMismatch(errInfo.error);
                 if (bindingMismatch.isBindingMismatch) {
                     const model = findLastAssistantModelFromOpenCodeDb(errInfo.sessionID);
@@ -364,7 +378,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         !deps.compactionOff &&
                         isPrefixBoundThinkingModel(model?.providerID, model?.modelID)
                     ) {
-                        armThinkingBindingRecovery(deps.db, errInfo.sessionID);
+                        armBindingRecoverySafely(deps.db, errInfo.sessionID);
                         sessionLog(
                             errInfo.sessionID,
                             `thinking binding recovery armed from session.error (provider paths: failing=${bindingMismatch.failingBlockPath ?? "?"} firstChanged=${bindingMismatch.firstChangedPath ?? "?"})`,
@@ -567,6 +581,16 @@ export function createEventHandler(deps: EventHandlerDeps) {
             let messageHadOverflowError = false;
 
             if (info.error !== undefined && info.error !== null) {
+                if (
+                    detectLatestTurnThinkingMismatch(info.error) &&
+                    !deps.compactionOff &&
+                    isAnthropicFamilyRoute(info.providerID, info.modelID)
+                ) {
+                    armLatestThinkingRecovery(deps.db, info.sessionID);
+                    dropSlot(info.sessionID, "latest-thinking-recovery-arm");
+                    deps.onSessionCacheInvalidated?.(info.sessionID);
+                    return;
+                }
                 const bindingMismatch = detectThinkingBindingMismatch(info.error);
                 if (
                     bindingMismatch.isBindingMismatch &&
@@ -575,7 +599,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     isPrefixBoundThinkingModel(info.providerID, info.modelID)
                 ) {
                     try {
-                        armThinkingBindingRecovery(deps.db, info.sessionID);
+                        armBindingRecoverySafely(deps.db, info.sessionID);
                         sessionLog(
                             info.sessionID,
                             `thinking binding recovery armed from message.updated (provider paths: failing=${bindingMismatch.failingBlockPath ?? "?"} firstChanged=${bindingMismatch.firstChangedPath ?? "?"})`,
