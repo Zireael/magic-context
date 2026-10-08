@@ -26927,11 +26927,16 @@ mod tests {
                 Sha256::digest(&bytes)
             );
             // Captured on the pre-compaction implementation with the identical fixture.
+            // Pass 3 is the one exception: the whole fixture is a single Anthropic
+            // turn with signed thinking on a prefix-bound model, and its priced pass
+            // used to release the earlier steps' native reasoning, removing signed
+            // thinking from the active turn (rejected by the provider). It now keeps
+            // that reasoning; the compacted/uncompacted differential above is unchanged.
             let baseline = [
                 "44e6c96da02972ffb728ac3e84cbcc7367e7cc907a80dc348bfb520f5b1d2ee3",
                 "48be75604d237c4c5d166ce849670b9c6ca0f1441349e403b9bf74bd4bf3b789",
                 "0545fea19343e3bb11358897ff80fa974b5b37992515617423c22b6493e87e15",
-                "b7405b3032dd3b08e721edc579173ac316385a80d626f7937173a9b084cbe217",
+                "bc265068c217dc390b2e46cb9696a23ac576694c8f914daad3e2df383c5e7c3e",
             ];
             if pass < 4 {
                 assert_eq!(

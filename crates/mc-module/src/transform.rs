@@ -6977,10 +6977,16 @@ fn apply_once(
     let output_meta = no_trim_meta.as_ref().unwrap_or(&meta);
     // OpenCode must replay the newest signed assistant's complete native vector. Its
     // demotion is not permission to apply previously withheld overlays on a defer.
-    // Release these keeps only when the prefix is already being repriced.
+    // Release these keeps only when the prefix is already being repriced. Keeps on the
+    // active Anthropic turn's thinking stay: releasing one would remove a signed block
+    // the provider requires unchanged until the next real user request.
     if is_provider_prefix_mutation_pass {
-        core.frozen_units
-            .retain(|unit| !unit.key.starts_with("strip:native_reasoning_keep:"));
+        let active_thinking = protected_thinking_turn_mids(req);
+        core.frozen_units.retain(|unit| {
+            unit.key
+                .strip_prefix("strip:native_reasoning_keep:")
+                .is_none_or(|mid| active_thinking.contains(mid))
+        });
     }
     if serializer_profile == Some(SerializerProfile::OpencodeAiSdk) && req.serve_native {
         let mut keep_mids = Vec::new();
@@ -16331,11 +16337,19 @@ fn is_mutable_merged_reasoning_block(block: &CkWireBlock) -> bool {
 
 /// Thinking-bearing assistants inside the active Anthropic turn. Membership comes from
 /// `in_active_anthropic_turn`, the one turn boundary shared with reasoning retention, so
-/// every lane agrees on which signed blocks are immutable this turn.
+/// every lane agrees on which signed blocks are immutable this turn. A `[cleared]`
+/// placeholder is Magic Context's own earlier neutralization, not a block the provider
+/// returned, so it does not make a message immutable.
 fn protected_thinking_turn_mids(req: &TransformRequest) -> HashSet<&str> {
     req.messages
         .iter()
-        .filter(|m| m.ck.role == "assistant" && m.ck.content.iter().any(is_reasoning_block))
+        .filter(|m| {
+            m.ck.role == "assistant"
+                && m.ck
+                    .content
+                    .iter()
+                    .any(|block| is_reasoning_block(block) && !is_structural_noise(block))
+        })
         .filter(|m| in_active_anthropic_turn(req, &m.mid))
         .map(|m| m.mid.as_str())
         .collect()
