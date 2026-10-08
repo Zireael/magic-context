@@ -804,6 +804,7 @@ export function createPiLkgCoordinator(
 						prefix === priorOutput.inputs.length
 					? priorOutput.json
 					: `[${jsonMessages.join(",")}]`;
+			args.assertCurrentPass?.();
 			state.outputSnapshot = plainOutput
 				? {
 						inputs: outputs,
@@ -812,6 +813,7 @@ export function createPiLkgCoordinator(
 					}
 				: null;
 		} catch (error) {
+			args.assertCurrentPass?.();
 			dropSlot(snapshot.sessionId, "lkg_snapshot_serialize_failed");
 			const failedState = stateFor(snapshot.sessionId);
 			failedState.syncCaptureRequired = true;
@@ -846,6 +848,7 @@ export function createPiLkgCoordinator(
 			)
 				? ([...outputIds] as (string | null)[])
 				: undefined;
+		args.assertCurrentPass?.();
 		state.captureSequence += 1;
 		const plan: PiLkgCapturePlan = {
 			sessionId: snapshot.sessionId,
@@ -880,6 +883,7 @@ export function createPiLkgCoordinator(
 			exactReusablePrefix(plan.inputs, state.acceptedInputs) ===
 				plan.inputs.length &&
 			JSON.stringify(livePrior.piOutputEntryIds) === JSON.stringify(ownership);
+		args.assertCurrentPass?.();
 		if (unchanged && !state.syncCaptureRequired) {
 			// Provider usage can arrive before the deferred commit. Refresh the
 			// replay slot's identity in memory now without rewriting unchanged
@@ -914,7 +918,12 @@ export function createPiLkgCoordinator(
 			// been cancelled or replaced, even if its synchronous transform finished.
 			try {
 				args.assertCurrentPass?.();
-			} catch {
+			} catch (error) {
+				sessionLog(
+					plan.sessionId,
+					"DISCARDED CONTEXT RESULT: queued LKG capture",
+					error,
+				);
 				return;
 			}
 			if (plan.captureSequence !== state.captureSequence) return;
@@ -968,6 +977,7 @@ export function createPiLkgCoordinator(
 					prior.jsonPrefix === plan.jsonPrefix &&
 					JSON.stringify(prior.piOutputEntryIds) === JSON.stringify(ownership)
 				) {
+					args.assertCurrentPass?.();
 					state.acceptedInputs = plan.inputs;
 					return;
 				}
@@ -983,6 +993,7 @@ export function createPiLkgCoordinator(
 					capturedAt: plan.capturedAt,
 					captureSequence: plan.captureSequence,
 				};
+				args.assertCurrentPass?.();
 				if (!captureSlot(plan.sessionId, slot)) {
 					throw new Error("LKG slot rejected the Pi snapshot");
 				}
@@ -991,6 +1002,16 @@ export function createPiLkgCoordinator(
 				const persisted = saveLkgSlotToDb(db, plan.sessionId, slot);
 				state.syncCaptureRequired = !persisted;
 			} catch (error) {
+				try {
+					args.assertCurrentPass?.();
+				} catch (discarded) {
+					sessionLog(
+						plan.sessionId,
+						"DISCARDED CONTEXT RESULT: LKG publication",
+						discarded,
+					);
+					return;
+				}
 				if (plan.captureSequence !== state.captureSequence) return;
 				dropSlot(plan.sessionId, "lkg_async_capture_failed");
 				state.syncCaptureRequired = true;

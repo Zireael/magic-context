@@ -36,6 +36,7 @@ interface PreviousPass {
 }
 
 interface CaptureOptions {
+	assertCurrentPass?: () => void;
 	storageDir?: string;
 	now?: Date;
 	fullBodyCapture?: boolean;
@@ -46,7 +47,10 @@ interface CaptureOptions {
 const previousBySession = new Map<string, PreviousPass>();
 const servedTagNumbersBySession = new Map<string, Set<number>>();
 const sequenceBySession = new Map<string, number>();
-const pendingLinesByPath = new Map<string, string[]>();
+const pendingLinesByPath = new Map<
+	string,
+	{ line: string; assertCurrentPass?: () => void }[]
+>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let swallowedWriteCount = 0;
 let lastWriteError: string | null = null;
@@ -173,7 +177,20 @@ export function flushPiServedArrayLedger(): void {
 	if (pendingLinesByPath.size === 0) return;
 	const pending = [...pendingLinesByPath.entries()];
 	pendingLinesByPath.clear();
-	for (const [filePath, lines] of pending) appendPendingLines(filePath, lines);
+	for (const [filePath, lines] of pending) {
+		const admitted = lines
+			.filter((item) => {
+				try {
+					item.assertCurrentPass?.();
+					return true;
+				} catch (error) {
+					log("[magic-context][pi] DISCARDED CONTEXT RESULT: queued served capture", error);
+					return false;
+				}
+			})
+			.map((item) => item.line);
+		if (admitted.length) appendPendingLines(filePath, admitted);
+	}
 }
 
 function scheduleFlush(): void {
@@ -182,10 +199,14 @@ function scheduleFlush(): void {
 	flushTimer.unref?.();
 }
 
-function enqueue(filePath: string, line: string): void {
+function enqueue(
+	filePath: string,
+	line: string,
+	assertCurrentPass?: () => void,
+): void {
 	const pending = pendingLinesByPath.get(filePath);
-	if (pending) pending.push(line);
-	else pendingLinesByPath.set(filePath, [line]);
+	if (pending) pending.push({ line, assertCurrentPass });
+	else pendingLinesByPath.set(filePath, [{ line, assertCurrentPass }]);
 	scheduleFlush();
 }
 
@@ -200,6 +221,7 @@ export function capturePiServedArray(
 	messages: readonly unknown[],
 	options: CaptureOptions = {},
 ): PiServedArrayDigestRecord | undefined {
+	options.assertCurrentPass?.();
 	try {
 		const serializedMessages =
 			options.serializedOutput?.jsonMessages ?? messages.map(serializeMessage);
@@ -210,7 +232,6 @@ export function capturePiServedArray(
 		for (const match of serializedArray.matchAll(/§(\d+)§/g)) {
 			served.add(Number(match[1]));
 		}
-		servedTagNumbersBySession.set(sessionId, served);
 		const previous = previousBySession.get(sessionId);
 		const divergence = previous
 			? firstDivergence(previous.serializedMessages, serializedMessages)
@@ -233,9 +254,12 @@ export function capturePiServedArray(
 			block_vectors: messages.slice(tailStart).map(blockVector),
 		};
 		const storageDir = options.storageDir ?? getMagicContextStorageDir();
+		options.assertCurrentPass?.();
+		servedTagNumbersBySession.set(sessionId, served);
 		enqueue(
 			getPiServedArrayLedgerPath(sessionId, storageDir),
 			`${JSON.stringify(record)}\n`,
+			options.assertCurrentPass,
 		);
 		if (options.fullBodyCapture ?? fullBodyCaptureEnabled()) {
 			const bodyHeader = JSON.stringify({
@@ -248,12 +272,14 @@ export function capturePiServedArray(
 			enqueue(
 				getPiServedArrayBodyPath(sessionId, storageDir),
 				`${bodyHeader.slice(0, -1)},"messages":${serializedArray}}\n`,
+				options.assertCurrentPass,
 			);
 		}
 		previousBySession.set(sessionId, { digest, serializedMessages });
 		sequenceBySession.set(sessionId, sequence);
 		return record;
 	} catch (error) {
+		options.assertCurrentPass?.();
 		recordWriteFailure(error);
 		return undefined;
 	}

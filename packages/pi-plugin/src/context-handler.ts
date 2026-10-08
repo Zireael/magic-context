@@ -2639,6 +2639,7 @@ export function registerPiContextHandler(
 				db: options.db,
 				sessionId,
 				branchEntries,
+				assertCurrentPass,
 			});
 			let rawOrdinalCount: number | undefined;
 			const rawMessageProvider = {
@@ -3640,7 +3641,7 @@ export function registerPiContextHandler(
 					},
 					canUseEmptySentinels,
 					temporalAwareness: options.injection?.temporalAwareness === true,
-					appendCompaction: resolvePiAppendCompaction(ctx),
+					appendCompaction: guardedPiAppendCompaction(ctx, assertCurrentPass),
 					readBranchEntries: resolvePiReadBranchEntries(ctx),
 					isSubagent: sessionMeta.isSubagent,
 					compactionOff: options.compactionOff === true,
@@ -3660,39 +3661,43 @@ export function registerPiContextHandler(
 			const piDecisionSnapshotNewestAssistant = result.bustedThisPass
 				? findNewestPiAssistantEntryId(branchEntries)
 				: undefined;
-			if (piDecisionSnapshotNewestAssistant !== undefined) {
-				recordPendingPiTransformDecision(
-					sessionId,
-					{
-						tsMs: Date.now(),
-						decision: schedulerDecision,
-						materialized: result.materialized,
-						materializeReason: normalizeMaterializeReason(
-							"pi",
-							result.materializeReason,
-							result.materialized,
-						),
-						systemHashPrev: result.materialized
-							? (result.injectionResult?.systemHashPrev ?? null)
-							: null,
-						systemHashNew: result.materialized
-							? (result.injectionResult?.systemHashNew ?? null)
-							: null,
-						m0ModelKeyPrev: result.materialized
-							? (result.injectionResult?.m0ModelKeyPrev ?? null)
-							: null,
-						m0ModelKeyNew: result.materialized
-							? (result.injectionResult?.m0ModelKeyNew ?? null)
-							: null,
-						emergency: result.emergency,
-						droppedTokens: result.droppedTokens,
-						droppedCount: result.droppedCount,
-						inputTokens: usageInputTokens,
-						bustedThisPass: true,
-					},
-					piDecisionSnapshotNewestAssistant,
-				);
-			}
+			const publishTransformDecision =
+				piDecisionSnapshotNewestAssistant !== undefined
+					? () => {
+							recordPendingPiTransformDecision(
+								sessionId,
+								{
+									tsMs: Date.now(),
+									decision: schedulerDecision,
+									materialized: result.materialized,
+									materializeReason: normalizeMaterializeReason(
+										"pi",
+										result.materializeReason,
+										result.materialized,
+									),
+									systemHashPrev: result.materialized
+										? (result.injectionResult?.systemHashPrev ?? null)
+										: null,
+									systemHashNew: result.materialized
+										? (result.injectionResult?.systemHashNew ?? null)
+										: null,
+									m0ModelKeyPrev: result.materialized
+										? (result.injectionResult?.m0ModelKeyPrev ?? null)
+										: null,
+									m0ModelKeyNew: result.materialized
+										? (result.injectionResult?.m0ModelKeyNew ?? null)
+										: null,
+									emergency: result.emergency,
+									droppedTokens: result.droppedTokens,
+									droppedCount: result.droppedCount,
+									inputTokens: usageInputTokens,
+									bustedThisPass: true,
+								},
+								piDecisionSnapshotNewestAssistant,
+								assertCurrentPass,
+							);
+						}
+					: undefined;
 			logTransformTiming(
 				sessionId,
 				"transformDecisionAndReuseState",
@@ -4274,7 +4279,10 @@ export function registerPiContextHandler(
 				});
 			}
 			assertCurrentPass();
-			capturePiServedArray(sessionId, outputMessages, { serializedOutput });
+			capturePiServedArray(sessionId, outputMessages, {
+				serializedOutput,
+				assertCurrentPass,
+			});
 			if (thinkingBindingRecoveryApplied) {
 				try {
 					clearThinkingBindingRecoveryIf(
@@ -4290,6 +4298,7 @@ export function registerPiContextHandler(
 				}
 			}
 			assertCurrentPass();
+			publishTransformDecision?.();
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;
 			};
@@ -4298,7 +4307,11 @@ export function registerPiContextHandler(
 			budget.stage = "recovery";
 			if (err instanceof PiLkgAdmissionReplay && sessionIdForError) {
 				budget.assertOutcome();
-				capturePiServedArray(sessionIdForError, err.messages);
+				capturePiServedArray(sessionIdForError, err.messages, {
+					assertCurrentPass: budget.assertOutcome,
+				});
+				budget.assertOutcome();
+				budget.recovery = "fitting LKG before writer retries";
 				return { messages: err.messages } as {
 					messages: typeof event.messages;
 				};
@@ -4368,7 +4381,9 @@ export function registerPiContextHandler(
 							`${failureLabel} ${reason}: LKG replay served ${replay.messages.length} messages instead of raw ${rawMessageCount}`,
 						);
 						budget.assertOutcome();
-						capturePiServedArray(sessionIdForError, replay.messages);
+						capturePiServedArray(sessionIdForError, replay.messages, {
+							assertCurrentPass: budget.assertOutcome,
+						});
 						budget.assertOutcome();
 						budget.recovery = "fitting LKG replay";
 						return { messages: replay.messages } as unknown as {
@@ -4879,6 +4894,19 @@ function resolvePiAppendCompaction(
 		| undefined;
 	if (typeof sm?.appendCompaction !== "function") return undefined;
 	return sm.appendCompaction.bind(sm);
+}
+
+function guardedPiAppendCompaction(
+	ctx: ExtensionContext,
+	assertCurrentPass: () => void,
+): PiHistorianDeps["appendCompaction"] {
+	const append = resolvePiAppendCompaction(ctx);
+	return append
+		? (...args) => {
+				assertCurrentPass();
+				return append(...args);
+			}
+		: undefined;
 }
 
 function resolvePiReadBranchEntries(
@@ -7354,6 +7382,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	let preserveDeferredMaterializationForMarkerDrain = false;
 	if (deferredHistoryDrainEligible) {
 		try {
+			args.assertCurrentPass?.();
 			const pending = getPendingPiCompactionMarkerState(
 				args.db,
 				args.sessionId,
@@ -7392,6 +7421,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					"Pi compaction-marker drain skipped: sessionManager appendCompaction/getBranch or folding system state unavailable; preserving deferred signals",
 				);
 			} else {
+				args.assertCurrentPass?.();
 				const outcome = applyDeferredPiCompactionMarker(
 					{
 						db: args.db,
@@ -7476,6 +7506,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				}
 			}
 		} catch (err) {
+			args.assertCurrentPass?.();
 			sessionLog(
 				args.sessionId,
 				`Pi compaction-marker drain failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
