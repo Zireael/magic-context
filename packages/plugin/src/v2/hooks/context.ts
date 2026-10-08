@@ -65,13 +65,13 @@ import {
     createToolExecuteAfterHook,
 } from "../../hooks/magic-context/hook-handlers";
 import { materializeM0 } from "../../hooks/magic-context/inject-compartments";
+import { armLatestThinkingRecoveryFromError } from "../../hooks/magic-context/latest-thinking-recovery";
 import {
     beginV2LkgRequest,
     lkgProviderInputTotal,
     noteLkgProviderResponse,
 } from "../../hooks/magic-context/lkg-measured-request";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
-import { armLatestThinkingRecoveryFromError } from "../../hooks/magic-context/latest-thinking-recovery";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
 import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";

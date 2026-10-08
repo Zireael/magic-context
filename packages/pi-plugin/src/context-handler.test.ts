@@ -8135,9 +8135,9 @@ describe("Pi proactive strip of invalidated thinking", () => {
 			updateTagStatus(db, sessionId, dropped.tagNumber, "dropped");
 			signalPiPendingMaterialization(sessionId);
 			const dropPass = await pass(10, 96);
-            // A legacy edit may repair completed turns, never strip the active
-            // turn's latest signed response. Its original thinking stays.
-            expect(dropPass.map(liveThinking)).toEqual([...Array(19).fill(0), 1]);
+			// A legacy edit may repair completed turns, never strip the active
+			// turn's latest signed response. Its original thinking stays.
+			expect(dropPass.map(liveThinking)).toEqual([...Array(19).fill(0), 1]);
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);

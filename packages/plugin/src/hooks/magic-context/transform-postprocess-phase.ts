@@ -2220,7 +2220,11 @@ export async function runPostTransformPhase(
     const hasPendingUserOps = pendingOps.length > 0;
     // Preserve the requested application opportunity when thinking safety, not
     // cache policy, prevents this batch. The next real user releases the veto.
-    if (args.schedulerDecision === "execute" && pendingOps.some(op => newTargets.get(op.tagId)?.thinkingDropProtected)) args.pendingMaterializationSessions.add(args.sessionId);
+    if (
+        args.schedulerDecision === "execute" &&
+        pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
+    )
+        args.pendingMaterializationSessions.add(args.sessionId);
     const formatPendingOpsDepth = (): string => {
         const depth = getPendingOpsCount(args.db, args.sessionId);
         return depth === null ? "not loaded (deferred pass)" : String(depth);
