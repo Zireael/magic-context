@@ -15,6 +15,9 @@
  * whose column value no longer equals the recorded count was written without
  * a model (by a release before this check, or by a path that does not record
  * one), so nothing says which model proved it: it is dropped on first use.
+ * Legacy model-keyed records are re-derived once from accepted assistant usage
+ * on the session branch. New records mark that measured basis explicitly; neither
+ * a calibrated local estimate nor a back-derived percentage establishes capacity.
  */
 
 import {
@@ -23,6 +26,8 @@ import {
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
 import { sessionLog } from "@magic-context/core/shared/logger";
+import { providerResponseFailed } from "@magic-context/core/shared/provider-response-completion";
+import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
 
 const FLOOR_STATE_KEY = "piProvenInputFloor";
 
@@ -33,6 +38,53 @@ export interface PiProvenFloorRecord {
 	/** `provider/id` exactly as Pi reports the model that served the request. */
 	modelKey: string;
 	tokens: number;
+}
+
+/** Only assistant provider usage proves capacity; Pi's live estimates do not. */
+function largestAcceptedInput(
+	entries: readonly unknown[],
+	modelKey: string,
+): number {
+	let largest = 0;
+	for (const entry of entries) {
+		if (!entry || typeof entry !== "object") continue;
+		const row = entry as { type?: unknown; message?: unknown };
+		if (
+			row.type !== "message" ||
+			!row.message ||
+			typeof row.message !== "object"
+		)
+			continue;
+		const message = row.message as {
+			provider?: unknown;
+			model?: unknown;
+			stopReason?: unknown;
+			errorMessage?: unknown;
+		};
+		if (
+			piProvenFloorModelKey({
+				provider: message.provider,
+				id: message.model,
+			}) !== modelKey ||
+			providerResponseFailed({
+				finish: message.stopReason,
+				error: message.errorMessage,
+			})
+		)
+			continue;
+		const pressure = computePiPressure(extractAssistantUsage(message), 0);
+		if (pressure) largest = Math.max(largest, pressure.inputTokens);
+	}
+	return largest;
+}
+
+function hasMeasuredBasis(raw: unknown): boolean {
+	if (typeof raw !== "string") return false;
+	try {
+		return JSON.parse(raw)?.[FLOOR_STATE_KEY]?.basis === "provider_usage_v1";
+	} catch {
+		return false;
+	}
 }
 
 /** `provider/id` for a Pi model, or undefined when either part is missing. */
@@ -104,8 +156,9 @@ export function readPiProvenFloorRecord(
 }
 
 /**
- * Record the model a floor was proven on. Merged into the state object with
- * json_set so the other keys in it are kept.
+ * Record the model and largest provider-measured accepted input, without scaling.
+ * Call only with accepted assistant usage, never a live or calibrated estimate.
+ * Merged with json_set so unrelated decision calibration state is kept.
  */
 export function recordPiProvenFloorModel(
 	db: ContextDatabase,
@@ -122,7 +175,10 @@ export function recordPiProvenFloorModel(
 		               THEN deferred_execute_state ELSE '{}' END,
 		          '$.${FLOOR_STATE_KEY}', json(?))
 		  WHERE session_id = ?`,
-	).run(JSON.stringify({ modelKey, tokens }), sessionId);
+	).run(
+		JSON.stringify({ modelKey, tokens, basis: "provider_usage_v1" }),
+		sessionId,
+	);
 }
 
 /**
@@ -140,6 +196,8 @@ export function resolvePiProvenInputFloor(args: {
 	db: ContextDatabase;
 	sessionId: string;
 	modelKey: string | undefined;
+	/** Read lazily, only to re-derive a legacy floor on upgrade. */
+	readBranch?: () => readonly unknown[] | undefined;
 }): number {
 	const row = readFloorRow(args.db, args.sessionId);
 	const observed = row.observed;
@@ -166,6 +224,37 @@ export function resolvePiProvenInputFloor(args: {
 			);
 		}
 		return 0;
+	}
+	if (!hasMeasuredBasis(row.state)) {
+		// Neither a legacy latch nor last_input_tokens proves a measured accepted
+		// request: the latter may hold a live estimate. Rebuild from the session's
+		// assistant usage, without applying decision/tokenizer calibration.
+		let measured = 0;
+		try {
+			measured = largestAcceptedInput(
+				args.readBranch?.() ?? [],
+				record.modelKey,
+			);
+		} catch {
+			// If the branch is unavailable, discard unverified capacity rather than
+			// continuing to suppress compaction with a potentially inflated floor.
+		}
+		updateSessionMeta(args.db, args.sessionId, {
+			observedSafeInputTokens: measured,
+			cacheAlertSent: false,
+			lastUsageContextLimit: 0,
+		});
+		recordPiProvenFloorModel(
+			args.db,
+			args.sessionId,
+			record.modelKey,
+			measured,
+		);
+		sessionLog(
+			args.sessionId,
+			`legacy proven input floor ${observed} re-derived from accepted provider usage: ${measured}`,
+		);
+		return measured;
 	}
 	return observed;
 }

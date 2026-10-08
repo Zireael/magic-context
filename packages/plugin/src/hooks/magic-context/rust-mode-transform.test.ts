@@ -77,7 +77,7 @@ import {
     startSqliteWriteLocker,
 } from "../../shared/sqlite-write-locker-test-support";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
-import { deriveWindowGeometry } from "../../shared/window-geometry";
+import { applyProvenInputFloor, deriveWindowGeometry } from "../../shared/window-geometry";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
 import {
     applyDeferredCompactionMarker,
@@ -357,6 +357,17 @@ function authoritySeqMismatch(durableSeq: number): Error & {
 }
 
 describe("Rust mode authority adapter", () => {
+    it("transports accepted provider floors unchanged to Rust geometry", () => {
+        const base = deriveWindowGeometry("cursor", "grok-4.7", { context: 256_000 });
+        expect(base).toBeDefined();
+        for (const measured of [757_872, 1_328_370]) {
+            const geometry = applyProvenInputFloor(base!, measured).geometry;
+            const wire = __rustModeTransformTest.transformGeometryForWire(geometry);
+            expect(wire?.usable_soft).toBe(measured);
+            expect(wire?.usable_hard).toBe(measured);
+            expect(wire?.absolute_wall).toBe(measured);
+        }
+    });
     function markerFaultFixture(
         fault:
             | "fence"

@@ -3065,6 +3065,7 @@ export function registerPiContextHandler(
 				db: options.db,
 				sessionId,
 				modelKey: currentModelKey,
+				readBranch: () => branchEntries ?? undefined,
 			});
 			if (
 				baseWindowGeometry &&
@@ -4832,6 +4833,7 @@ function maybeFireHistorian(args: {
 					db,
 					sessionId,
 					modelKey: resolvePiContextModelKey(ctx),
+					readBranch: () => ctx.sessionManager.getBranch(),
 				}) || undefined,
 		});
 		if (

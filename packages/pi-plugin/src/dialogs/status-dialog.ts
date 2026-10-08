@@ -78,13 +78,20 @@ import {
 import { checkLocalStatusSource } from "@magic-context/core/shared/status-view-check";
 import { resolveTailHygieneStatus } from "@magic-context/core/shared/tail-hygiene-status";
 import type { UserFacingFailureKey } from "@magic-context/core/shared/user-facing-codes";
-import type { WindowGeometryResult } from "@magic-context/core/shared/window-geometry";
+import {
+	formatWindowSource,
+	type WindowGeometryResult,
+} from "@magic-context/core/shared/window-geometry";
 import packageJson from "../../package.json";
 import { resolveSessionId } from "../commands/pi-command-utils";
 import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
 import { readHostSystemPrompt } from "../host-system-prompt";
 import { resolvePiWindowGeometry } from "../pi-context-limit";
 import { resolvePiStatusPressureSnapshot } from "../pi-pressure";
+import {
+	piProvenFloorModelKey,
+	resolvePiProvenInputFloor,
+} from "../pi-proven-floor";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 
 /** Refresh cadence while dialog is open. */
@@ -405,7 +412,7 @@ function piStatusWarnings(s: StatusDialogDetail): UserFacingFailureKey[] {
 
 /** Chat-text status for a Pi host without an interactive UI to draw a dialog on. */
 export function formatPiStatusSummary(s: StatusDialogDetail): string {
-	const summary = renderUserStatusSummary(
+	const summary = `${renderUserStatusSummary(
 		{
 			inputTokens: s.inputTokens,
 			usableContextTokens: s.contextLimit,
@@ -437,7 +444,7 @@ export function formatPiStatusSummary(s: StatusDialogDetail): string {
 			dreamerSkipped: s.dreamer.skipped,
 		},
 		"plain",
-	);
+	)}\nWindow source: ${formatWindowSource(s.windowGeometry)}; denominator: ${Math.round(s.contextLimit)} tokens`;
 	return s.configGeneration === undefined
 		? summary
 		: `${summary}\nConfig generation: ${s.configGeneration} (adopted ${s.configAdoptedAt ? new Date(s.configAdoptedAt).toLocaleString() : "unknown"})${s.configReloadFailure ? `\nConfig reload failed ${s.configReloadFailure.path}: ${s.configReloadFailure.message}` : ""}`;
@@ -696,6 +703,12 @@ export function buildPiStatusDetail(
 	sessionId: string,
 ): StatusDialogDetail {
 	const usage = ctx.getContextUsage?.();
+	const provenInputTokens = resolvePiProvenInputFloor({
+		db: deps.db,
+		sessionId,
+		modelKey: piProvenFloorModelKey(ctx.model),
+		readBranch: () => ctx.sessionManager.getBranch(),
+	});
 	const meta = getOrCreateSessionMeta(deps.db, sessionId);
 	let detectedContextLimit: number | undefined;
 	try {
@@ -709,6 +722,7 @@ export function buildPiStatusDetail(
 		rawContextWindowSource: "catalog",
 		model: ctx.model,
 		detectedContextLimit,
+		provenInputTokens: provenInputTokens || undefined,
 		persistedInputTokens: meta.lastInputTokens,
 		persistedPercentage: meta.lastContextPercentage,
 	});

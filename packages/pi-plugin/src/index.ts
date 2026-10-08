@@ -733,6 +733,7 @@ export async function persistPiPressureFromMessageEnd(args: {
 	piTokens?: number;
 	/** `piTokens` is Pi's raw-branch estimate (see isPiLiveUsageRawBranchEstimate). */
 	piTokensIsRawBranchEstimate?: boolean;
+	readBranch?: () => readonly unknown[] | undefined;
 	notifyIssue?: (message: string) => unknown | Promise<unknown>;
 }): Promise<void> {
 	// Pi emits message_end before it appends the message to the branch, so the
@@ -779,7 +780,13 @@ export async function persistPiPressureFromMessageEnd(args: {
 	// configured figure that can be smaller than what the model serves; a
 	// reading past it is real overflow of the user's limit. Only after an
 	// overflow error (no accepted request) is the reading clamped at the wall.
-	const requestAccepted = !messageHadOverflowError;
+	const requestAccepted =
+		!messageHadOverflowError &&
+		!providerResponseFailed({
+			finish: (args.message as { stopReason?: unknown } | undefined)
+				?.stopReason,
+			error: msg?.errorMessage,
+		});
 	if (readingAboveTrustedWall && unboundedPressure && trustedAbsoluteWall) {
 		if (requestAccepted) {
 			logPiUsageAboveWindowOnce(
@@ -826,6 +833,7 @@ export async function persistPiPressureFromMessageEnd(args: {
 		db: args.db,
 		sessionId: args.sessionId,
 		modelKey: floorModelKey,
+		readBranch: args.readBranch,
 	});
 	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
 	const updates: Partial<{
@@ -2851,6 +2859,7 @@ async function startPiMagicContextRuntime(
 				// Both Pi hosts report the configured model window here, not a provider-observed limit.
 				piContextWindowSource: "catalog",
 				piModel: ctx.model,
+				readBranch: () => ctx.sessionManager.getBranch(),
 				piTokens:
 					piUsage && typeof piUsage.tokens === "number"
 						? piUsage.tokens

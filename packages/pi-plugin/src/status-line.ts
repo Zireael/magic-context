@@ -5,6 +5,10 @@ import type {
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { resolvePiWindowGeometry } from "./pi-context-limit";
 import { resolvePiStatusPressureSnapshot } from "./pi-pressure";
+import {
+	piProvenFloorModelKey,
+	resolvePiProvenInputFloor,
+} from "./pi-proven-floor";
 
 const STATUS_KEY = "magic-context";
 const RECENT_FAILURE_MS = 60_000;
@@ -86,6 +90,12 @@ export function renderStatusText(
 	sessionId: string,
 ): string {
 	const usage = ctx.getContextUsage?.();
+	const provenInputTokens = resolvePiProvenInputFloor({
+		db,
+		sessionId,
+		modelKey: piProvenFloorModelKey(ctx.model),
+		readBranch: () => ctx.sessionManager.getBranch(),
+	});
 	const meta = readSessionMetaStatus(db, sessionId);
 	const liveInputTokens =
 		typeof usage?.tokens === "number" && Number.isFinite(usage.tokens)
@@ -106,11 +116,9 @@ export function renderStatusText(
 			meta.detected_context_limit > 0
 				? meta.detected_context_limit
 				: undefined,
+		provenInputTokens: provenInputTokens || undefined,
 		persistedInputTokens,
-		persistedPercentage:
-			typeof meta?.last_context_percentage === "number"
-				? meta.last_context_percentage
-				: undefined,
+		persistedPercentage: meta?.last_context_percentage ?? undefined,
 	});
 	const pressure =
 		liveInputTokens !== undefined || persistedInputTokens !== undefined

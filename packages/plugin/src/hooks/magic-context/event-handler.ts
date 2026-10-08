@@ -59,7 +59,7 @@ import {
 import { hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { removeCompactionMarkerForSession } from "./compaction-marker-manager";
-import { noteContextLimitResolution, provenFloorForModel } from "./context-limit-resolution";
+import { noteContextLimitResolution } from "./context-limit-resolution";
 import {
     getMessageRemovedInfo,
     getMessageUpdatedAssistantInfo,
@@ -77,6 +77,10 @@ import {
 import { lkgProviderInputTotal, noteLkgProviderResponse } from "./lkg-measured-request";
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
+import {
+    recordOpenCodeProvenInputFloor,
+    resolveOpenCodeProvenInputFloor,
+} from "./opencode-proven-floor";
 import { readRawSessionMessages } from "./read-session-chunk";
 import {
     clearTrackedOpenCodeSession,
@@ -845,7 +849,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 let refreshLimitsAfterRecording: (() => Promise<void>) | undefined;
                 if (hasUsageTokens) {
                     const pressureInputTokens = totalInputTokens;
-                    const requestSucceeded = !messageHadOverflowError;
+                    const requestSucceeded = !messageHadOverflowError && !responseFailed;
                     const successfulUsageProof = requestSucceeded && !aboveTrustedWall;
                     // A limit learned from an earlier overflow error is stale
                     // once the provider accepts a larger request, whatever the
@@ -883,9 +887,9 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     // proved it, the same rule resolveContextLimit applies. Carrying
                     // another model's floor over would give this model a limit none
                     // of its own requests supports.
-                    const observedSafeInputTokens = provenFloorForModel(
-                        sessionMeta.observedSafeInputTokens,
-                        sessionMeta.lastObservedModelKey,
+                    const observedSafeInputTokens = resolveOpenCodeProvenInputFloor(
+                        deps.db,
+                        info.sessionID,
                         modelKey,
                     );
                     const provenSafeInputTokens = successfulUsageProof
@@ -1081,6 +1085,14 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
 
                 updateSessionMeta(deps.db, info.sessionID, updates);
+                if (modelKey && updates.observedSafeInputTokens !== undefined) {
+                    recordOpenCodeProvenInputFloor(
+                        deps.db,
+                        info.sessionID,
+                        modelKey,
+                        updates.observedSafeInputTokens,
+                    );
+                }
                 if (refreshLimitsAfterRecording) {
                     await refreshLimitsAfterRecording();
                 }

@@ -340,7 +340,8 @@ Reclaimable: 3 spent tool outputs (~14k tokens)
 Memory: 0 memories · 0 notes
 Search indexing: Off
 Warning: The last context update did not finish. Send another message to retry. (MC-S02)
-Warning: History compression could not finish this turn. It will retry automatically. (MC-H01)`);
+Warning: History compression could not finish this turn. It will retry automatically. (MC-H01)
+Window source: catalog; denominator: 100000 tokens`);
 			for (const value of ["1.0%", "65.0%", "1h (your config)"]) {
 				expect(summary).toContain(value);
 			}
