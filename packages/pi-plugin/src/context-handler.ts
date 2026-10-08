@@ -357,6 +357,7 @@ import { replayPiReminderStrips } from "./reminder-strip-pi";
 import {
 	capturePiServedArray,
 	clearPiServedArraySession,
+	getPiServedTagNumbers,
 } from "./served-array-ledger";
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
@@ -2207,12 +2208,12 @@ function readAdoptablePiFallbackFingerprints(
 }
 
 /**
- * Pi fallback-tag adoption pre-pass. Runs BEFORE tagging. Message text tags are
- * matched by raw-message fingerprint; tool tags are owner-driven from stored
- * `pi-msg-*` owners to the current real assistant entry id by `(timestamp,
- * callId)`. Collision folds keep the synthetic row's tag number/drop metadata,
- * merge size/token accounting by MAX, retarget pending ops, and update the
- * tagger's in-memory aliases before `tagTranscript` looks anything up.
+ * Replace temporary `pi-msg-*` identities when Pi supplies real entry ids.
+ * Match message tags by raw content fingerprint and tool tags by their owning
+ * assistant's `(timestamp, callId)`. If both identities have rows, merge them
+ * without changing the actually served number or losing dropped status, queued
+ * reductions, or maximum size/token accounting. Update the tagger's lookup keys
+ * before `tagTranscript` can allocate a second number for the same message.
  */
 function adoptPiFallbackTags(
 	db: ContextDatabase,
@@ -2308,6 +2309,7 @@ function adoptPiFallbackTags(
 						c.tagNumber,
 						c.messageId,
 						realContentId,
+						getPiServedTagNumbers(sessionId),
 					);
 					if (adoption.action !== "skipped") {
 						// Drop stale fallback and collision aliases, then bind the survivor
@@ -2339,6 +2341,7 @@ function adoptPiFallbackTags(
 					row.callId,
 					row.toolOwnerMessageId,
 					realOwnerId,
+					getPiServedTagNumbers(sessionId),
 				);
 				if (adoption.action !== "skipped") {
 					tagger.unbindToolTag(sessionId, row.toolOwnerMessageId, row.callId);

@@ -44,6 +44,7 @@ interface CaptureOptions {
 }
 
 const previousBySession = new Map<string, PreviousPass>();
+const servedTagNumbersBySession = new Map<string, Set<number>>();
 const sequenceBySession = new Map<string, number>();
 const pendingLinesByPath = new Map<string, string[]>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -53,7 +54,13 @@ let lastWriteError: string | null = null;
 /** Release transcript-sized state without discarding already queued ledger rows. */
 export function clearPiServedArraySession(sessionId: string): void {
 	previousBySession.delete(sessionId);
+	servedTagNumbersBySession.delete(sessionId);
 	sequenceBySession.delete(sessionId);
+}
+
+/** Numbers observed in returned arrays, not merely allocated by a writer. */
+export function getPiServedTagNumbers(sessionId: string): ReadonlySet<number> {
+	return servedTagNumbersBySession.get(sessionId) ?? new Set<number>();
 }
 
 function sha256(value: string): string {
@@ -199,6 +206,11 @@ export function capturePiServedArray(
 		const serializedArray =
 			options.serializedOutput?.json ?? `[${serializedMessages.join(",")}]`;
 		const digest = sha256(serializedArray);
+		const served = new Set(servedTagNumbersBySession.get(sessionId));
+		for (const match of serializedArray.matchAll(/§(\d+)§/g)) {
+			served.add(Number(match[1]));
+		}
+		servedTagNumbersBySession.set(sessionId, served);
 		const previous = previousBySession.get(sessionId);
 		const divergence = previous
 			? firstDivergence(previous.serializedMessages, serializedMessages)
@@ -255,6 +267,7 @@ export const __test = {
 	reset(): void {
 		flushPiServedArrayLedger();
 		previousBySession.clear();
+		servedTagNumbersBySession.clear();
 		sequenceBySession.clear();
 		pendingLinesByPath.clear();
 		swallowedWriteCount = 0;

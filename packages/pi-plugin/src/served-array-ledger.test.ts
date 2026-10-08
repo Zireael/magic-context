@@ -11,6 +11,7 @@ import {
 	flushPiServedArrayLedger,
 	getPiServedArrayBodyPath,
 	getPiServedArrayLedgerPath,
+	getPiServedTagNumbers,
 	PI_SERVED_ARRAY_TAIL_MESSAGES,
 } from "./served-array-ledger";
 
@@ -40,6 +41,21 @@ function message(index: number): Record<string, unknown> {
 }
 
 describe("Pi served-array digest ledger", () => {
+	test("records served numbers across normal and detached LKG arrays until cleanup", () => {
+		const storageDir = temporaryDirectory();
+		expect(getPiServedTagNumbers("numbers").size).toBe(0);
+		capturePiServedArray("numbers", ["§3§ served"], { storageDir });
+		capturePiServedArray("numbers", [], {
+			storageDir,
+			serializedOutput: {
+				jsonMessages: ['"[dropped §8§]"'],
+				json: '["[dropped §8§]"]',
+			},
+		});
+		expect([...getPiServedTagNumbers("numbers")]).toEqual([3, 8]);
+		clearPiServedArraySession("numbers");
+		expect(getPiServedTagNumbers("numbers").size).toBe(0);
+	});
 	test("creates every ledger artifact without group or world access", () => {
 		if (process.platform === "win32") return;
 		const storageDir = join(

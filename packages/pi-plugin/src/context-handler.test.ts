@@ -94,6 +94,7 @@ import {
 	setPiChannel1Baseline,
 } from "./ctx-reduce-nudge-pi";
 import { injectM0M1Pi, mustMaterializePi } from "./inject-compartments-pi";
+import { capturePiServedArray } from "./served-array-ledger";
 import {
 	assistantMessage,
 	assistantToolCall,
@@ -1460,6 +1461,7 @@ describe("Pi fallback tag adoption", () => {
 			queuePendingOp(db, sessionId, 71, "drop", 200);
 			tagger.bindTag(sessionId, `${fallbackId}:p0`, 70);
 			tagger.bindTag(sessionId, `${realId}:p0`, 71);
+			capturePiServedArray(sessionId, [userMessage("§71§ hello", 70)]);
 
 			contextHandlerInternals.adoptPiFallbackTags(
 				db,
