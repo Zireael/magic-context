@@ -915,6 +915,7 @@ export function stripReasoningFromMergedAssistants(
         mutationExemptMessage?: MessageLike;
         frozenMessageIds?: ReadonlySet<string>;
         protectedMessages?: ReadonlySet<MessageLike>;
+        restoreMessages?: ReadonlySet<MessageLike>;
     },
 ): number {
     // Anthropic-only workaround for @ai-sdk/anthropic's groupIntoBlocks
@@ -932,7 +933,7 @@ export function stripReasoningFromMergedAssistants(
     // look eligible to keep on the next request. Only legacy bare ids still
     // use that layout-dependent rule, preserving their pre-deployment bytes.
     for (const message of messages) {
-        if (message.info.role !== "assistant") continue;
+        if (message.info.role !== "assistant" || options?.restoreMessages?.has(message)) continue;
         const parts = frozenParts.get(message.info.id ?? "");
         if (!parts) continue;
         for (let index = 0; index < message.parts.length; index += 1) {
@@ -947,10 +948,12 @@ export function stripReasoningFromMergedAssistants(
     // Bare legacy ids lack exact part evidence. Replay the established layout
     // rule rather than first-stripping a previously kept sibling on a defer.
     // Active-turn protection applies to first selection, not frozen replay.
+    // An anchored recovery may explicitly retain the rejected turn's originals.
     for (const entry of planMergedAssistantReasoningStrip(
         messages,
         options?.mutationExemptMessage,
         new Set(frozenParts.keys()),
+        options?.frozenMessageIds ? options.restoreMessages : options?.protectedMessages,
     )) {
         if (options?.frozenMessageIds) {
             const id = entry.message.info.id;

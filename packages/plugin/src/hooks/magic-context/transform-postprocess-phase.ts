@@ -1645,6 +1645,7 @@ interface RunPostTransformPhaseArgs {
      */
     resolvedProviderID?: string;
     protectedThinkingMessages?: ReadonlySet<MessageLike>;
+    restoreThinkingMessageIds?: ReadonlySet<string>;
     restoreLatestTurnOriginals?: () => void;
     activeThinkingTurn?: boolean;
     resolvedModelID?: string;
@@ -1811,16 +1812,19 @@ export interface FinalizeMessageRepresentationOptions {
     reasoningMutatedMessages?: Iterable<MessageLike>;
     reasoningMutationExemptMessage?: MessageLike;
     mergedReasoningStrippedIds?: ReadonlySet<string>;
-    thinkingBindingRecoveryMessageIds?: ReadonlySet<string>;
+    /** Persisted omissions replay on every pass, including active turns. */
+    frozenThinkingBindingMessageIds?: ReadonlySet<string>;
+    /** Only an anchored provider rejection may authorize active-turn originals. */
+    restoreThinkingMessageIds?: ReadonlySet<string>;
     trailingBlankDecisions?: ReadonlyMap<string, TrailingBlankDecision>;
     skipMergedReasoningStrip?: boolean;
     skipTrailingWhitespaceStrip?: boolean;
 }
 
 /**
- * The host passes the active turn's original message references as protection.
- * This low-level representation helper otherwise retains its historical byte
- * contract for completed history and serializer repair fixtures.
+ * Protection prevents first selection; it never cancels a persisted omission.
+ * Only explicitly authorized, anchored recovery may keep the active turn's raw
+ * originals instead of replaying those omissions. Completed history always replays.
  */
 export function finalizeMessageRepresentation(
     messages: MessageLike[],
@@ -1828,6 +1832,14 @@ export function finalizeMessageRepresentation(
     options?: FinalizeMessageRepresentationOptions,
 ): { clearedParts: number; mergedReasoningParts: number } {
     const protectedMessages = options?.protectedThinkingMessages ?? new Set<MessageLike>();
+    const restoredMessages = new Set(
+        messages.filter(
+            (message) =>
+                protectedMessages.has(message) &&
+                typeof message.info.id === "string" &&
+                options?.restoreThinkingMessageIds?.has(message.info.id),
+        ),
+    );
     let clearedParts = 0;
     if (modelAcceptsEmptyContent(resolvedProviderID)) {
         const prependedMessageCount = Math.min(
@@ -1846,7 +1858,7 @@ export function finalizeMessageRepresentation(
         }
         if (targetedMessages.length > 0) {
             clearedParts = stripClearedReasoning(
-                targetedMessages.filter((message) => !protectedMessages.has(message)),
+                targetedMessages.filter((message) => !restoredMessages.has(message)),
             );
         }
     }
@@ -1855,8 +1867,8 @@ export function finalizeMessageRepresentation(
         : stripReasoningFromAssistantIds(
               messages,
               resolvedProviderID,
-              options?.thinkingBindingRecoveryMessageIds ?? new Set(),
-              protectedMessages,
+              options?.frozenThinkingBindingMessageIds ?? new Set(),
+              restoredMessages,
           );
     const mergedReasoningParts =
         bindingRecoveryParts +
@@ -1866,6 +1878,7 @@ export function finalizeMessageRepresentation(
                   mutationExemptMessage: options?.reasoningMutationExemptMessage,
                   frozenMessageIds: options?.mergedReasoningStrippedIds,
                   protectedMessages,
+                  restoreMessages: restoredMessages,
               }));
     if (!options?.skipTrailingWhitespaceStrip && modelAcceptsEmptyContent(resolvedProviderID)) {
         applyFrozenTrailingBlankDecisions(messages, options?.trailingBlankDecisions ?? new Map());
@@ -3765,19 +3778,21 @@ export async function runPostTransformPhase(
     // stale ctx_reduce and processed images. Detection opens only on the shared
     // cache-busting gate; replay applies the persisted id set on every pass.
     // Persist before first mutation so a fresh defer rebuild can always reproduce
-    // any stripped bytes. The newest assistant is excluded from both detection
-    // and replay because Anthropic requires its signed blocks byte-identically.
+    // any stripped bytes. First selection excludes the newest assistant and
+    // active Anthropic thinking.
+    // Persisted omissions replay even if a host subset makes those messages active;
+    // only anchored recovery may authorize their originals after a rejection.
     const mergedReasoningStrippedIds = new Set(replaySnapshot?.mergedReasoningStrippedIds ?? []);
-    // Binding recovery keeps its replay ids separate from the first-edit record;
-    // restoring those ids must not invalidate newly appended thinking again.
-    const thinkingBindingRecoveryMessageIds = new Set<string>();
+    // Persisted binding strips are replay evidence, not restore authorization.
+    // Keep them separate from merged-part choices and anchored recovery ids.
+    const frozenThinkingBindingMessageIds = new Set<string>();
     let thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null = null;
     if (!compactionOff) {
         try {
             for (const id of mergedReasoningStrippedIds) {
                 if (id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) {
                     const messageId = id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
-                    if (messageId.length > 0) thinkingBindingRecoveryMessageIds.add(messageId);
+                    if (messageId.length > 0) frozenThinkingBindingMessageIds.add(messageId);
                 }
             }
 
@@ -3792,7 +3807,7 @@ export async function runPostTransformPhase(
                     messages: args.messages,
                     flagTarget,
                     protectedMessages: args.protectedThinkingMessages,
-                    recoveredMessageIds: thinkingBindingRecoveryMessageIds,
+                    recoveredMessageIds: frozenThinkingBindingMessageIds,
                 });
                 if (thinkingBindingRecovery) {
                     for (const messageId of thinkingBindingRecovery.messageIds) {
@@ -4014,7 +4029,8 @@ export async function runPostTransformPhase(
         reasoningMutatedMessages,
         reasoningMutationExemptMessage,
         mergedReasoningStrippedIds,
-        thinkingBindingRecoveryMessageIds,
+        frozenThinkingBindingMessageIds,
+        restoreThinkingMessageIds: args.restoreThinkingMessageIds,
         trailingBlankDecisions,
         skipMergedReasoningStrip: compactionOff,
         skipTrailingWhitespaceStrip: compactionOff,
@@ -4065,7 +4081,7 @@ export async function runPostTransformPhase(
         stripReasoningFromAssistantIds(
             remaining,
             args.resolvedProviderID,
-            thinkingBindingRecoveryMessageIds,
+            frozenThinkingBindingMessageIds,
         );
         stripReasoningFromMergedAssistants(remaining, args.resolvedProviderID, {
             frozenMessageIds: mergedReasoningStrippedIds,
@@ -4128,12 +4144,12 @@ export async function runPostTransformPhase(
             sessionId: args.sessionId,
             messages: args.messages,
             protectedMessages: protectedThinkingMessages,
-            alreadyFrozen: thinkingBindingRecoveryMessageIds,
+            alreadyFrozen: frozenThinkingBindingMessageIds,
         });
         if (outcome.strip) {
             proactiveThinkingStrip = outcome.strip;
             for (const messageId of outcome.strip.messageIds) {
-                thinkingBindingRecoveryMessageIds.add(messageId);
+                frozenThinkingBindingMessageIds.add(messageId);
                 mergedReasoningStrippedIds.add(thinkingBindingRecoveryFrozenId(messageId));
             }
             bustedThisPass = true;

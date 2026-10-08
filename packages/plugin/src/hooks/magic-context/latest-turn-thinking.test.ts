@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { MERGED_REASONING_PARTS_PREFIX } from "../../features/magic-context/merged-reasoning-decisions";
 import {
     hasActiveAnthropicThinkingTurn,
     latestAssistantTurnMessages,
@@ -37,12 +38,49 @@ for (const provider of ["anthropic", "vertex-eu-anthropic"]) {
         const before = JSON.stringify(messages);
         finalizeMessageRepresentation(messages, provider, {
             protectedThinkingMessages: latestAssistantTurnMessages(messages),
-            thinkingBindingRecoveryMessageIds: new Set(["a1", "a2"]),
+            restoreThinkingMessageIds: new Set(["a1", "a2"]),
             mergedReasoningStrippedIds: new Set(["a1", "a2"]),
         });
         expect(JSON.stringify(messages)).toBe(before);
     });
 }
+
+test("persisted binding omissions stay stripped without anchored recovery authorization", () => {
+    const expected = fixture();
+    expected[1]!.parts[0] = { type: "text", text: "" };
+    expected[3]!.parts[0] = { type: "text", text: "" };
+    expected[3]!.parts[1] = { type: "text", text: "" };
+    const frozen = new Set(["a1", "a2"]);
+    for (let pass = 0; pass < 3; pass++) {
+        const messages = fixture();
+        finalizeMessageRepresentation(messages, "anthropic", {
+            protectedThinkingMessages: latestAssistantTurnMessages(messages),
+            frozenThinkingBindingMessageIds: frozen,
+            mergedReasoningStrippedIds: frozen,
+        });
+        expect(JSON.stringify(messages)).toBe(JSON.stringify(expected));
+    }
+});
+
+test("frozen exact-part omissions absorb active protection until explicit recovery", () => {
+    const frozen = new Set(["a2", MERGED_REASONING_PARTS_PREFIX + JSON.stringify(["a2", [1]])]);
+    const expected = fixture();
+    expected[3]!.parts[1] = { type: "text", text: "" };
+    const messages = fixture();
+    finalizeMessageRepresentation(messages, "anthropic", {
+        protectedThinkingMessages: latestAssistantTurnMessages(messages),
+        mergedReasoningStrippedIds: frozen,
+    });
+    expect(JSON.stringify(messages)).toBe(JSON.stringify(expected));
+
+    const recovered = fixture();
+    finalizeMessageRepresentation(recovered, "anthropic", {
+        protectedThinkingMessages: latestAssistantTurnMessages(recovered),
+        mergedReasoningStrippedIds: frozen,
+        restoreThinkingMessageIds: new Set(["a2"]),
+    });
+    expect(JSON.stringify(recovered)).toBe(JSON.stringify(fixture()));
+});
 
 test("completed primary turns keep the existing representation bytes", () => {
     const messages = fixture();
@@ -57,7 +95,7 @@ test("completed primary turns keep the existing representation bytes", () => {
     expected[3]!.parts[0] = { type: "text", text: "" };
     expected[3]!.parts[1] = { type: "text", text: "" };
     finalizeMessageRepresentation(messages, "anthropic", {
-        thinkingBindingRecoveryMessageIds: new Set(["a1", "a2"]),
+        frozenThinkingBindingMessageIds: new Set(["a1", "a2"]),
         mergedReasoningStrippedIds: new Set(),
     });
     expect(JSON.stringify(messages)).toBe(JSON.stringify(expected));

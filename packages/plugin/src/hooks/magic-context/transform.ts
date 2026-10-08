@@ -2767,6 +2767,13 @@ export function createTransform(deps: TransformDeps) {
             protectedThinkingMessages: thinkingRecovery.restore
                 ? protectedThinkingMessages
                 : undefined,
+            restoreThinkingMessageIds: thinkingRecovery.restore
+                ? new Set(
+                      [...protectedThinkingMessages].flatMap((message) =>
+                          typeof message.info.id === "string" ? [message.info.id] : [],
+                      ),
+                  )
+                : undefined,
             restoreLatestTurnOriginals,
             resolvedModelID: modelForBudget?.modelID,
             thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(

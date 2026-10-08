@@ -40,6 +40,7 @@ import {
 	hasAnthropicReasoning,
 	isInActiveAnthropicTurn,
 } from "@magic-context/core/hooks/magic-context/active-anthropic-turn";
+import { latestAssistantTurnMessages } from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import {
 	reasoningBudgetCutoff,
@@ -50,7 +51,6 @@ import type {
 	TagTarget,
 } from "@magic-context/core/hooks/magic-context/tag-messages";
 import { isRecord } from "@magic-context/core/shared/record-type-guard";
-import { latestAssistantTurnMessages } from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
 
 type PiTextContent = { type: "text"; text: string };
 type PiThinkingContent = {
