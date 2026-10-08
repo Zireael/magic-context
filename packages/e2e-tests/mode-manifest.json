@@ -27,6 +27,14 @@
             "hosts": ["opencode2"]
         },
         {
+            "path": "tests/opencode2/latest-turn-thinking-recovery.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 2.0.22 Anthropic tool loop against the provider-side thinking oracle: a replayed legacy omission in the active turn is rejected once, the host's session event arms recovery bound to the turn's real user message, a same-id resubmission reaches no provider, and the synthetic resume ends the turn, disarms without restoring and is accepted. Host PID lsof proves throwaway containment.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE", "OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/checkout-claim.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
