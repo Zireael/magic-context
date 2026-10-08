@@ -145,6 +145,7 @@ export function selectReasoningRemovals(args: {
      * good (the binding-mismatch strip set). Only the prefix walk reads it.
      */
     alsoGone?: ReadonlySet<string>;
+    protectedMessages?: ReadonlySet<MessageLike>;
 }): string[] {
     const cutoff = args.cutoff;
     if (cutoff <= 0) return [];
@@ -166,6 +167,7 @@ export function selectReasoningRemovals(args: {
             continue;
         const tag = args.messageTagNumbers.get(message) ?? 0;
         const removable =
+            !args.protectedMessages?.has(message) &&
             id !== undefined &&
             message !== newest &&
             message !== exempt &&
@@ -183,10 +185,9 @@ export function selectReasoningRemovals(args: {
 
 /**
  * Splice every reasoning part (including drop-neutralized ones) out of the
- * assistant messages named in `ids`, on every pass. The newest assistant with
- * replayable content is skipped, matching Rust's exempt-message rule; a
- * removed message can only become that message if newer history disappears,
- * which already rewrites the cache. On OpenRouter the message's
+ * assistant messages named in `ids`, on every pass. First selection protects
+ * active thinking, but replay must not restore a saved removal when a host
+ * subset makes that assistant newest or active again. On OpenRouter the message's
  * `reasoning_details` copies leave with it. When an earlier drop has already
  * emptied a message, a whole-message placeholder keeps it from being sent
  * empty.

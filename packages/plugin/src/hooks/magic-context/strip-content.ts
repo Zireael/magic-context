@@ -493,6 +493,7 @@ function planMergedAssistantReasoningStrip(
     messages: MessageLike[],
     mutationExemptMessage?: MessageLike,
     frozenMessageIds?: ReadonlySet<string>,
+    protectedMessages?: ReadonlySet<MessageLike>,
 ): MergedReasoningStripPlan[] {
     const plan: MergedReasoningStripPlan[] = [];
     let prevRole: string | undefined;
@@ -510,7 +511,11 @@ function planMergedAssistantReasoningStrip(
         const firstInRun = prevRole !== "assistant";
         if (firstInRun) keptReasoningInRun = false;
 
-        if (message === mutationExemptMessage || frozenMessageIds?.has(message.info.id ?? "")) {
+        if (
+            protectedMessages?.has(message) ||
+            message === mutationExemptMessage ||
+            frozenMessageIds?.has(message.info.id ?? "")
+        ) {
             prevRole = role;
             continue;
         }
@@ -783,7 +788,7 @@ export function applyFrozenTrailingBlankDecisions(
 export function findMergedReasoningStripCandidateIds(
     messages: MessageLike[],
     providerID?: string,
-    options?: { mutationExemptMessage?: MessageLike },
+    options?: { mutationExemptMessage?: MessageLike; protectedMessages?: ReadonlySet<MessageLike> },
 ): string[] {
     if (providerID !== "anthropic") return [];
 
@@ -847,11 +852,13 @@ export function stripReasoningFromAssistantIds(
     messages: MessageLike[],
     providerID: string | undefined,
     messageIds: ReadonlySet<string>,
+    protectedMessages?: ReadonlySet<MessageLike>,
 ): number {
     if (messageIds.size === 0) return 0;
     const emptySentinels = modelAcceptsEmptyContent(providerID);
     let stripped = 0;
     for (const message of messages) {
+        if (protectedMessages?.has(message)) continue;
         const id = message.info.id;
         if (typeof id !== "string" || !messageIds.has(id)) continue;
         for (let index = 0; index < message.parts.length; index += 1) {
@@ -879,7 +886,7 @@ export function findMergedReasoningStripDecisions(
     messages: MessageLike[],
     providerID: string | undefined,
     frozenIds: ReadonlySet<string>,
-    options?: { mutationExemptMessage?: MessageLike },
+    options?: { mutationExemptMessage?: MessageLike; protectedMessages?: ReadonlySet<MessageLike> },
 ): string[] {
     if (providerID !== "anthropic") return [];
     const frozenParts = readFrozenMergedReasoningParts(frozenIds);
@@ -888,6 +895,7 @@ export function findMergedReasoningStripDecisions(
         messages,
         options?.mutationExemptMessage,
         new Set(frozenParts.keys()),
+        options?.protectedMessages,
     )) {
         const id = entry.message.info.id;
         if (typeof id !== "string" || id.length === 0 || frozenParts.has(id)) continue;
@@ -906,6 +914,7 @@ export function stripReasoningFromMergedAssistants(
     options?: {
         mutationExemptMessage?: MessageLike;
         frozenMessageIds?: ReadonlySet<string>;
+        protectedMessages?: ReadonlySet<MessageLike>;
     },
 ): number {
     // Anthropic-only workaround for @ai-sdk/anthropic's groupIntoBlocks
@@ -937,6 +946,7 @@ export function stripReasoningFromMergedAssistants(
     }
     // Bare legacy ids lack exact part evidence. Replay the established layout
     // rule rather than first-stripping a previously kept sibling on a defer.
+    // Active-turn protection applies to first selection, not frozen replay.
     for (const entry of planMergedAssistantReasoningStrip(
         messages,
         options?.mutationExemptMessage,

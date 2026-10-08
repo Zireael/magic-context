@@ -1,4 +1,37 @@
 #[test]
+fn integration_reasoning_budget_metadata_route_protects_active_thinking_until_real_user() {
+    let mut native = vec![
+        json!({"info":{"id":"u","role":"user"},"parts":[{"type":"text","text":"task"}]}),
+        json!({"info":{"id":"a1","role":"assistant"},"parts":[
+            {"type":"reasoning","text":"first","metadata":{"anthropic":{"signature":"sig-first"}}},
+            {"type":"text","text":"answer one"}
+        ]}),
+        json!({"info":{"id":"a2","role":"assistant"},"parts":[
+            {"type":"reasoning","text":"last","metadata":{"anthropic":{"signature":"sig-last"}}},
+            {"type":"text","text":"answer two"}
+        ]}),
+    ];
+    let tags = BTreeMap::from([("a1".into(), 2), ("a2".into(), 4)]);
+    let cutoff = |native: &[Value]| {
+        let decoded = crate::codec::decode_opencode(native);
+        let mut request = opencode_req("integration-budget-custom-route", "cfg", decoded.messages);
+        request.provider_id = Some("custom".into());
+        request.model_key = Some("renamed".into());
+        request.keep_reasoning_tokens_effective = Some(0);
+        request.native_messages = Some(native.to_vec());
+        reasoning_budget_cutoff(
+            &request,
+            &tags,
+            &CoreState::default(),
+            ReasoningBudgetScope::default(),
+        )
+    };
+    assert_eq!(cutoff(&native), 0, "metadata identifies an active Anthropic turn");
+    native.push(json!({"info":{"id":"next-u","role":"user"},"parts":[{"type":"text","text":"next task"}]}));
+    assert_eq!(cutoff(&native), 2, "a real user releases historical budget selection");
+}
+
+#[test]
 fn review_reasoning_budget_reported_count_survives_an_empty_summary() {
     let mut request = opencode_openai_removal_request(3, "openai", "gpt-6.1-sol");
     for message in &mut request.messages {

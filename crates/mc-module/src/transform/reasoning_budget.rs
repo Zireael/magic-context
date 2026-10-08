@@ -45,11 +45,12 @@ fn reasoning_budget_cutoff(
             message.ck.role == "assistant" && !message.ck.meta.synthetic && scope.visible(message)
         })
         .collect();
+    let route = active_turn_route_request(req);
     let is_exempt = |message: &&CkIngressMessage| {
         Some(message.mid.as_str()) == newest
             || Some(message.mid.as_str()) == exempt
             || Some(message.mid.as_str()) == scope.anchor
-            || in_active_anthropic_turn(req, message.mid.as_str())
+            || in_active_anthropic_turn(&route, message.mid.as_str())
     };
     let off_wire = |message: &CkIngressMessage| removed.contains(message.mid.as_str());
     let cost = |message: &CkIngressMessage| {

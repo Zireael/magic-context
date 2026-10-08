@@ -50,6 +50,7 @@ import type {
 	TagTarget,
 } from "@magic-context/core/hooks/magic-context/tag-messages";
 import { isRecord } from "@magic-context/core/shared/record-type-guard";
+import { latestAssistantTurnMessages } from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
 
 type PiTextContent = { type: "text"; text: string };
 type PiThinkingContent = {
@@ -168,6 +169,7 @@ export function piReasoningClearCutoff(args: {
 	messages: unknown[];
 	messageIdToMaxTag: Map<string, number>;
 	keepReasoningTokens: number;
+	protectLatestTurn?: boolean;
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 	prefixBound: boolean;
 	proseRatio?: number;
@@ -333,12 +335,16 @@ export function piPrefixBoundReasoningCutoff(args: {
 	messages: unknown[];
 	messageIdToMaxTag: Map<string, number>;
 	keepReasoningTokens: number;
+	protectLatestTurn?: boolean;
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 	alreadyGone?: (id: string) => boolean;
 	proseRatio?: number;
 }): number {
 	const ageCutoff = piBudgetCutoff({ ...args, prefixBound: true });
 	if (ageCutoff <= 0) return 0;
+	const protectedMessages = args.protectLatestTurn
+		? latestAssistantTurnMessages(args.messages)
+		: new Set<unknown>();
 
 	let newestIndex = -1;
 	for (let i = args.messages.length - 1; i >= 0; i--) {
@@ -365,6 +371,7 @@ export function piPrefixBoundReasoningCutoff(args: {
 		if (id && !inline && args.alreadyGone?.(id)) continue;
 		const tag = tagAt(i);
 		const removable =
+			!protectedMessages.has(raw) &&
 			i !== newestIndex &&
 			id !== undefined &&
 			tag > 0 &&
@@ -408,6 +415,7 @@ export function piPrefixBoundReasoningCutoff(args: {
 export function clearOldReasoningPi(args: {
 	messages: unknown[];
 	messageIdToMaxTag: Map<string, number>;
+	protectLatestTurn?: boolean;
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 	/** Frozen cutoff selected by piReasoningClearCutoff on this execute pass. */
 	maxCutoff: number;
@@ -421,8 +429,12 @@ export function clearOldReasoningPi(args: {
 	let cleared = 0;
 	let newWatermark = 0;
 
+	const protectedMessages = args.protectLatestTurn
+		? latestAssistantTurnMessages(messages)
+		: new Set<unknown>();
 	for (let i = 0; i < messages.length; i++) {
 		const raw = messages[i];
+		if (protectedMessages.has(raw)) continue;
 		if (!raw || typeof raw !== "object") continue;
 		const msg = raw as PiAssistantMessage;
 		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
@@ -478,6 +490,7 @@ export function clearOldReasoningPi(args: {
 export function stripInlineThinkingPi(args: {
 	messages: unknown[];
 	messageIdToMaxTag: Map<string, number>;
+	protectLatestTurn?: boolean;
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 	/** Frozen cutoff selected by piReasoningClearCutoff on this execute pass. */
 	maxCutoff: number;
@@ -491,8 +504,12 @@ export function stripInlineThinkingPi(args: {
 	let stripped = 0;
 	let newWatermark = 0;
 
+	const protectedMessages = args.protectLatestTurn
+		? latestAssistantTurnMessages(messages)
+		: new Set<unknown>();
 	for (let i = 0; i < messages.length; i++) {
 		const raw = messages[i];
+		if (protectedMessages.has(raw)) continue;
 		if (!raw || typeof raw !== "object") continue;
 		const msg = raw as PiAssistantMessage;
 		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
@@ -536,6 +553,7 @@ export function replayClearedReasoningPi(args: {
 	sessionId: string;
 	messages: unknown[];
 	messageIdToMaxTag: Map<string, number>;
+	protectLatestTurn?: boolean;
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 }): number {
 	const { db, sessionId, messages, messageIdToMaxTag, piMessageStableId } =
@@ -546,8 +564,12 @@ export function replayClearedReasoningPi(args: {
 	if (watermark <= 0) return 0;
 
 	let cleared = 0;
+	const protectedMessages = args.protectLatestTurn
+		? latestAssistantTurnMessages(messages)
+		: new Set<unknown>();
 	for (let i = 0; i < messages.length; i++) {
 		const raw = messages[i];
+		if (protectedMessages.has(raw)) continue;
 		if (!raw || typeof raw !== "object") continue;
 		const msg = raw as PiAssistantMessage;
 		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
@@ -595,6 +617,7 @@ export function replayStrippedInlineThinkingPi(args: {
 	sessionId: string;
 	messages: unknown[];
 	messageIdToMaxTag: Map<string, number>;
+	protectLatestTurn?: boolean;
 	piMessageStableId: (msg: unknown, index: number) => string | undefined;
 }): number {
 	const { db, sessionId, messages, messageIdToMaxTag, piMessageStableId } =
@@ -605,8 +628,12 @@ export function replayStrippedInlineThinkingPi(args: {
 	if (watermark <= 0) return 0;
 
 	let stripped = 0;
+	const protectedMessages = args.protectLatestTurn
+		? latestAssistantTurnMessages(messages)
+		: new Set<unknown>();
 	for (let i = 0; i < messages.length; i++) {
 		const raw = messages[i];
+		if (protectedMessages.has(raw)) continue;
 		if (!raw || typeof raw !== "object") continue;
 		const msg = raw as PiAssistantMessage;
 		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
