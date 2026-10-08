@@ -36,11 +36,24 @@ Primary sessions with completed turns followed by a real user message have no pr
 
 ## Implementation and final verification
 
-To be filled after the failing-first diagnosis above; reproduction limitations and final gate counts will remain explicit.
+**Rule as implemented.** An edit is deferred only if applying it would alter or remove a thinking or redacted-thinking block inside the active Anthropic turn: directly, or on a prefix-bound model (Fable 5.1, Opus 5.5, Sonnet 5.5) because an earlier edit would invalidate the later signed blocks. On other Anthropic models (Sonnet 5, the reporter's model) older-turn and active-turn output edits that leave thinking byte-identical still apply on the same pass. Deferred edits keep their queue entry and active tag status and apply on the first rebuilding pass after the next real user message. Magic Context's own `[cleared]` reasoning placeholders are not protected thinking (Rust).
 
-## Delivery status: incomplete, not ready to merge
+**Active turn.** One definition shared with the reasoning-budget branch for issue 620: `isInActiveAnthropicTurn` (`packages/plugin/src/hooks/magic-context/active-anthropic-turn.ts`) and `in_active_anthropic_turn` (`crates/mc-module/src/transform/active_anthropic_turn.rs`) are copied verbatim from that branch. `latestAssistantTurnStart` and Rust `protected_thinking_turn_mids` derive from them. Upstream detail kept as-is: the TS predicate treats a user message with an empty parts list as a real request, while the Rust one does not.
 
-The diagnosis and enforcing-mock experiments are complete, but the product patch is **not a completed fix**. The current TypeScript/Pi/Rust gates are too broad: they withhold safe older-turn operations whenever an active thinking block exists. This breaks primary-session byte contracts and must be replaced with selective dependency protection. Do not merge the provisional implementation as-is.
+**Hosts.** OpenCode 1 and 2 share `createTransform` (defer). OpenCode 2 now arms the restore-once recovery from its session event stream (`armLatestThinkingRecoveryFromError`), as OpenCode 1 already did from `session.error`. Pi uses the shared protection and its own recovery. In Rust, a priced pass no longer releases `native_reasoning_keep` for active-turn messages.
+
+**Real-host evidence (OpenCode 1.18.35, the reporter's version, `npm pack opencode-darwin-arm64@1.18.35`, throwaway roots proven with `lsof -p <pid> -Fn`).** `tests/latest-turn-thinking.test.ts`, 7 pass / 106 assertions. Failing first on base `f364d4c0` (archived and bundled inside this worktree, loaded through its package entry):
+
+- subagent at 76%: request five arrives with every thinking block removed, the enforcing provider rejects it, and the worker stops at 4 of 7 passes;
+- primary long tool loop at 85%: the host fails with the exact issue error, `thinking or redacted_thinking blocks in the latest assistant message cannot be modified`.
+
+The primary at 76% on base never applies the drop (`no originating cache-bust opportunity`), so it fails only the release assertion. It is not counted as thinking evidence. `cat` through the host bash tool intermittently returns `(no output)` on 1.18.35. That is a host fixture flake, seen on both base and fixed runs.
+
+**Mutation proofs:** see the delivery record. Neutralizing the Rust protection reproduces the old pinned hash for pass 3 of `compact_projection_multi_pass_served_bytes_match_baseline` (`b7405b30…`). That confirms the old bytes came from releasing active-turn thinking. Skipping the in-pass `restoreLatestTurnOriginals` call is not detected by any test, because the recovery flag already stops legacy replay from stripping the active turn. Forcing `prepareLatestThinkingRecovery` to `restore:false` turns the host retry back into the provider 400.
+
+## Delivery status
+
+The selective protection replaces the earlier global hold. Gates and changed legacy tests are listed in the delivery record and commit messages.
 
 ### Parent decisions
 
@@ -53,7 +66,7 @@ On OpenCode 1.18.30, the enforcing-mock accepted-legacy test passes. Its provide
 
 The rejected-legacy test also passes: a throwaway-store fixture seeds previously recorded strips for two actual host assistant ids; the enforcing provider rejects the next request once. The error is durably learned. Re-sending the same real user message **with its original message id and text-part ids**, not adding a new user turn, restores signed blocks 2 and 3 and finishes the worker's tool loop. Empty prompt parts are not a valid OpenCode continuation: the host rejects them with `Your message hadn't finished arriving`; that attempted driver is not counted as recovery evidence. Latest successful rejected-turn proof root: `$TMPDIR/magic-context/issue-630/opencode-e2e-70gvV5`; durable artifacts are in its sibling timestamped proof directory. All host database files were checked with `lsof`; no local Rust host binary was launched.
 
-### Verification performed and unresolved gates
+### Earlier provisional-patch verification (superseded by the delivery record)
 
 - Bun 1.4.2, TypeScript 5.9.3, Biome 2.5.1, Cargo 1.99.0, rustfmt 1.10.0-stable.
 - Both production package typechecks passed after adding recovery.
@@ -72,4 +85,4 @@ The rejected-legacy test also passes: a throwaway-store fixture seeds previously
 - Pi's old multi-assistant recovery fixture ended in an open tool round yet expected all thinking removed. It now explicitly ends with a real user, retaining its completed-history repair/replay assertions. A fresh-thinking test additionally proves a bust alone does not release thinking, but a real user does.
 - The TypeScript index-staleness fixture was given a real-user boundary before testing historical cleanup, preserving its original pruning/clearing assertions. That final fixture change needs verification.
 
-No production migration or change to ARCHITECTURE.md/STRUCTURE.md was made. The next action is to finish selective operation protection (especially safe older reasoning trimming and already-frozen replay), run the failed/impacted gates, prove the silent guards with staged safe mutations, and only then commit a mergeable fix.
+No production migration or change to ARCHITECTURE.md/STRUCTURE.md was made.
