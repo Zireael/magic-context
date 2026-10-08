@@ -186,7 +186,6 @@ import {
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import {
-	ANTHROPIC_LATEST_TURN_FULL,
 	hasActiveAnthropicThinkingTurn,
 	latestAssistantTurnStart,
 	protectNewTagMutations,
@@ -7479,15 +7478,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	}
 
 	restoreOriginals?.(workingMessages);
-	if (
-		protectedThinkingProxies.size > 0 &&
-		args.contextUsage.percentage >= 95 &&
-		pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected) &&
-		!pendingOpsDidMutate &&
-		!heuristicOrReasoningDidMutate &&
-		!foldBustsServedPrefixThisPass
-	)
-		throw contextRefusalError(ANTHROPIC_LATEST_TURN_FULL);
 	const materialized = injectionResult?.m0Materialized === true;
 	if (
 		args.reasoningClearing?.prefixBound &&

@@ -5023,6 +5023,9 @@ for (const generation of ["v1", "v2"] as const) {
             });
             // The trailing output was legally reclaimable at 95%. A later
             // signed block now freezes that output too, leaving no safe drop.
+            // Holding the unsafe drop never refuses the turn on its own: the
+            // unchanged turn is served, because only a proven final-wire
+            // overflow refuses a request.
             raw.push({
                 info: {
                     id: "last-thought",
@@ -5033,7 +5036,9 @@ for (const generation of ["v1", "v2"] as const) {
                 },
                 parts: [{ type: "reasoning", text: "last immutable thought" }],
             });
-            await expect(pass()).rejects.toThrow("ANTHROPIC_LATEST_TURN_FULL");
+            const held = await pass();
+            expect(JSON.stringify(held.slice(0, baseline.length))).toBe(JSON.stringify(baseline));
+            expect(held.at(-1)?.parts).toEqual(raw.at(-1)?.parts);
             expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toContain(tag.tagNumber);
             raw.push({
                 info: { id: "next", role: "user", sessionID: sessionId },

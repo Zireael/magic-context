@@ -80,7 +80,7 @@ test("Pi thinking spans every tool round until the next real user", () => {
 	}
 });
 
-test("Pi Anthropic task retains queued drops at execute and force and refuses at 95%", async () => {
+test("Pi Anthropic task retains queued drops at execute, force and 95% without refusing", async () => {
 	const db = createTestDb();
 	const sessionId = "pi-latest-turn-pipeline";
 	getOrCreateSessionMeta(db, sessionId);
@@ -154,7 +154,10 @@ test("Pi Anthropic task retains queued drops at execute and force and refuses at
 			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toContain(2);
 		}
 		tokens = 95_000;
-		await expect(pass()).rejects.toThrow("ANTHROPIC_LATEST_TURN_FULL");
+		// Holding the unsafe drop never refuses the turn on its own: the unchanged
+		// turn is served, because only a proven final-wire overflow refuses.
+		expect(JSON.stringify((await pass()).messages)).toBe(before);
+		expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toContain(2);
 		messages.push(userMessage("next real user", 4));
 		tokens = 76_000;
 		await pass();

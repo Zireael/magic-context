@@ -2072,8 +2072,6 @@ struct Channel1Target {
 /// handler maps these to a clean Error frame rather than a partial/raw array.
 #[derive(Debug)]
 pub enum TransformError {
-    /// The current signed assistant turn cannot be reduced without editing thinking.
-    AnthropicLatestTurnFull,
     ProtectedToolResultsOverLimit,
     Store(McStoreError),
     /// Anthropic cannot accept an assistant-terminal retry, and moving completed output
@@ -2127,7 +2125,6 @@ pub const PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE: &str = "The tool results ke
 impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransformError::AnthropicLatestTurnFull => write!(f, "ANTHROPIC_LATEST_TURN_FULL: Context reached 95% within a thinking-bearing assistant turn. End the tool loop and send a new user message, or clear the session to continue."),
             TransformError::ProtectedToolResultsOverLimit => write!(f,
                 "{PROTECTED_TOOL_RESULTS_OVER_LIMIT_MESSAGE}"),
             TransformError::Store(e) => write!(f, "store: {e}"),
@@ -7385,33 +7382,6 @@ fn apply_once(
     let scheduler_applied_reductions = frozen_red_targets(&core)
         .iter()
         .any(|target| !frozen_reductions_before.contains(target));
-    let old_units = loaded
-        .core
-        .frozen_units
-        .iter()
-        .map(|unit| unit.key.as_str())
-        .collect::<HashSet<_>>();
-    let safe_reasoning_applied = core.frozen_units.iter().any(|unit| {
-        !old_units.contains(unit.key.as_str())
-            && (unit.key.starts_with("strip:reasoning_clear:")
-                || unit.key.starts_with("strip:reasoning_age:"))
-    });
-    let active_mids = protected_thinking_turn_mids(req);
-    let retained_active_thinking = ck_messages.iter().any(|message| {
-        message
-            .meta
-            .harness_id
-            .as_deref()
-            .is_some_and(|mid| active_mids.contains(mid))
-            && message.content.iter().any(is_reasoning_block)
-    });
-    if usage_percentage >= 95.0
-        && retained_active_thinking
-        && !scheduler_applied_reductions
-        && !safe_reasoning_applied
-    {
-        return Err(TransformError::AnthropicLatestTurnFull);
-    }
     let reasoning_clear_units = core
         .frozen_units
         .iter()
@@ -16341,6 +16311,7 @@ fn is_mutable_merged_reasoning_block(block: &CkWireBlock) -> bool {
 /// placeholder is Magic Context's own earlier neutralization, not a block the provider
 /// returned, so it does not make a message immutable.
 fn protected_thinking_turn_mids(req: &TransformRequest) -> HashSet<&str> {
+    let route = active_turn_route_request(req);
     req.messages
         .iter()
         .filter(|m| {
@@ -16350,9 +16321,49 @@ fn protected_thinking_turn_mids(req: &TransformRequest) -> HashSet<&str> {
                     .iter()
                     .any(|block| is_reasoning_block(block) && !is_structural_noise(block))
         })
-        .filter(|m| in_active_anthropic_turn(req, &m.mid))
+        .filter(|m| in_active_anthropic_turn(&route, &m.mid))
         .map(|m| m.mid.as_str())
         .collect()
+}
+
+/// The request the active-turn predicate should judge. A custom provider or model name
+/// says nothing about the serializer, but an OpenCode reasoning part carrying
+/// `metadata.anthropic` was signed by Anthropic, so its turn is protected exactly as the
+/// TypeScript transform treats it. Only that case pays for a copy whose route names
+/// Anthropic; a request already named for the family is judged as it is.
+fn active_turn_route_request(req: &TransformRequest) -> std::borrow::Cow<'_, TransformRequest> {
+    let named = |value: Option<&str>| {
+        value.is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("anthropic") || value.contains("claude")
+        })
+    };
+    if named(req.provider_id.as_deref())
+        || named(req.model_key.as_deref())
+        || !req.messages.iter().any(|message| {
+            message.ck.role == "assistant"
+                && message
+                    .ck
+                    .content
+                    .iter()
+                    .any(has_anthropic_reasoning_metadata)
+        })
+    {
+        return std::borrow::Cow::Borrowed(req);
+    }
+    let mut view = req.clone();
+    view.provider_id = Some("anthropic".to_string());
+    std::borrow::Cow::Owned(view)
+}
+
+fn has_anthropic_reasoning_metadata(block: &CkWireBlock) -> bool {
+    is_reasoning_block(block)
+        && block
+            .provider_extras
+            .get("opencode")
+            .and_then(|extras| extras.get("metadata"))
+            .and_then(|metadata| metadata.get("anthropic"))
+            .is_some_and(serde_json::Value::is_object)
 }
 
 fn active_anthropic_thinking_turn(req: &TransformRequest) -> bool {
@@ -22774,7 +22785,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn latest_thinking_turn_holds_pending_drops_through_force_and_refuses_at_95() {
+    fn latest_thinking_turn_holds_pending_drops_through_force_and_95_without_refusing() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let mut first = assistant_tool_call("a1", 2, "t1");
@@ -22846,10 +22857,18 @@ pub(crate) mod tests {
             );
         }
         request = with_usage(request, 95_000, 100_000);
-        assert!(matches!(
-            transform(&s, &request, &ctx),
-            Err(TransformError::AnthropicLatestTurnFull)
-        ));
+        // Holding the unsafe drop never refuses the turn on its own: the unchanged
+        // turn is served, because only a proven final-wire overflow refuses.
+        assert_eq!(
+            transform(&s, &request, &ctx).unwrap().ck_messages,
+            baseline.ck_messages
+        );
+        assert_eq!(
+            s.load_pending_agent_drops("latest-turn-drops")
+                .unwrap()
+                .len(),
+            1
+        );
         request.messages.push(item("next-real-user", 7, "continue"));
         request = with_usage(request, 76_000, 100_000);
         transform(&s, &request, &ctx).unwrap();

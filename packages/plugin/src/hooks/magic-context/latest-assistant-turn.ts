@@ -70,9 +70,6 @@ export function hasActiveAnthropicThinkingTurn(
     return false;
 }
 
-export const ANTHROPIC_LATEST_TURN_FULL =
-    "ANTHROPIC_LATEST_TURN_FULL: Context reached 95% within a thinking-bearing assistant turn. Its signed thinking cannot be reduced safely; end the tool loop and send a new user message, or /clear to continue.";
-
 /** First-application safety view. Never use this map for already-frozen replay. */
 export function protectNewTagMutations(
     messages: MessageLike[],

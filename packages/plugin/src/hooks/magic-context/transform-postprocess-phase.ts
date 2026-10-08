@@ -138,11 +138,7 @@ import {
     prepareCachedM0M1Replay,
     renderCompartmentInjection,
 } from "./inject-compartments";
-import {
-    ANTHROPIC_LATEST_TURN_FULL,
-    protectNewTagMutations,
-    retainedActiveThinkingParts,
-} from "./latest-assistant-turn";
+import { protectNewTagMutations, retainedActiveThinkingParts } from "./latest-assistant-turn";
 import { markNoteNudgeDelivered, observeNoteNudgeServe, peekNoteNudgeText } from "./note-nudger";
 import { hasVisibleNoteReadCall } from "./note-visibility";
 import type { PassDegradationKind, PassDegradationSite, PassOutcome } from "./pass-outcome";
@@ -4169,15 +4165,6 @@ export async function runPostTransformPhase(
         : 0;
 
     args.restoreLatestTurnOriginals?.();
-    if (
-        activeThinkingTurn &&
-        args.contextUsage.percentage >= 95 &&
-        !pendingOpsDidMutate &&
-        !heuristicOrReasoningDidMutate &&
-        !foldBustsServedPrefixThisPass
-    ) {
-        throw contextRefusalError(ANTHROPIC_LATEST_TURN_FULL);
-    }
     sessionLog(
         args.sessionId,
         `final representation: clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts} removedReasoningParts=${removedReasoningParts} settledDroppedReasoning=${settledDroppedReasoning}`,
