@@ -89,7 +89,10 @@ import { createTransform, type TransformDeps } from "../../hooks/magic-context/t
 import { UnmanagedOverWindowError } from "../../hooks/magic-context/unmanaged-over-window";
 import { UnresolvedHistoryBoundaryError } from "../../hooks/magic-context/unresolved-history-boundary";
 import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
-import { createMessagesTransformHandler } from "../../plugin/messages-transform";
+import {
+    createMessagesTransformHandler,
+    tryMessagesTransformLkgReplay,
+} from "../../plugin/messages-transform";
 import { registerRpcHandlers } from "../../plugin/rpc-handlers";
 import { hideSubagentTools } from "../../plugin/subagent-tool-policy";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
@@ -150,6 +153,9 @@ import { V2LkgSystemReplay } from "./lkg-system";
 import { modelLimitCacheWarm, warmModelLimitCacheFromCatalog } from "./model-limit-cache";
 import { adaptPayload, HEAD_IDS } from "./payload";
 import { interruptBeforeProvider, V2ContextRefusal } from "./refusal";
+
+class V2LkgAdmissionReplay extends Error {}
+
 import { RestoredRowCache } from "./restore-rows";
 import { createV2RpcLiveSessionState } from "./rpc-live-state";
 import { createV2RustRefusalRecovery, resolveV2RustModeModuleClient } from "./rust-mode";
@@ -1400,7 +1406,26 @@ export async function registerContext(context: V2Context) {
             // their own busy timeout. No transform callback runs in this transaction.
             const admissionDb = db ?? storage.current();
             if (!compactionOff && admissionDb)
-                await withAsyncPrivilegedWriter(admissionDb, () => undefined);
+                await withAsyncPrivilegedWriter(admissionDb, () => undefined, {
+                    beforeRetry: (error) => {
+                        const mapped = adaptPayload(draft);
+                        if (
+                            tryMessagesTransformLkgReplay({
+                                output: mapped as unknown as Parameters<
+                                    ReturnType<typeof createMessagesTransformHandler>
+                                >[1],
+                                sessionId: draft.sessionID,
+                                error,
+                                agent: draft.agent,
+                                rust: transform?.getRustReplayParticipant() ?? undefined,
+                                onLkgReplay: restoreLkgSystem,
+                            })
+                        ) {
+                            mapped.commit();
+                            throw new V2LkgAdmissionReplay();
+                        }
+                    },
+                });
             // Hidden maintenance carriers returned above with their explicit
             // allow-lists. Only this request's map changes, never registrations
             // or the primary session's cached tool definitions.
@@ -1811,6 +1836,7 @@ export async function registerContext(context: V2Context) {
                 lkgSystems.capture(draft.sessionID, capturedSlot, systemAtEntry, draft.system);
             }
         } catch (error) {
+            if (error instanceof V2LkgAdmissionReplay) return;
             if (error instanceof V2ContextRefusal) throw error;
             if (
                 !compactionOff &&
