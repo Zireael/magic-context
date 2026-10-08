@@ -27018,6 +27018,21 @@ mod tests {
         priced_request["render_config"] = json!("independent-priced-config-change");
         let priced = call_transform_request(&handler, priced_request).await;
         assert_eq!(priced["action"], "HARD");
+        // step-0 belongs to the active Anthropic turn (no real user message follows
+        // it), so a priced pass must keep replaying its signed reasoning unchanged.
+        assert!(store
+            .load("ses")
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "strip:native_reasoning_keep:step-0"));
+        // A real user request ends that turn; the next priced pass releases the keep.
+        native.push(json!({"info":{"id":"next-user","role":"user"},"parts":[{"type":"text","text":"next request"}]}));
+        let mut released_request = make_request(&native);
+        released_request["render_config"] = json!("second-priced-config-change");
+        let released = call_transform_request(&handler, released_request).await;
+        assert_eq!(released["action"], "HARD");
         assert!(!store
             .load("ses")
             .unwrap()
