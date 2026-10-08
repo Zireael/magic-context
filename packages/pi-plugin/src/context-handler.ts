@@ -233,6 +233,7 @@ import {
 	guardSqliteTransformPass,
 	withAsyncPrivilegedWriter,
 	withoutSqliteTransformPass,
+	withSqliteBackgroundWriter,
 } from "@magic-context/core/shared/sqlite";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
@@ -303,6 +304,7 @@ import {
 	resolvePiWindowGeometry,
 } from "./pi-context-limit";
 import {
+	clearPiContextReceipt,
 	PiContextSupersededError,
 	registerPiGuardedContext,
 } from "./pi-context-refusal";
@@ -1059,14 +1061,6 @@ export function recordPiLiveModel(
 	}
 	liveModelBySession.set(sessionId, modelKey);
 	return true;
-}
-
-function summarizeTransformError(error: unknown): string {
-	const raw = error instanceof Error ? error.message : String(error);
-	const normalized = raw.replace(/\s+/g, " ").trim();
-	return normalized.length > 180
-		? `${normalized.slice(0, 177).trimEnd()}...`
-		: normalized || "Unknown transform error";
 }
 
 function persistLastTransformErrorIfChanged(
@@ -2526,19 +2520,27 @@ export function registerPiContextHandler(
 		sessionLog(sessionId, message);
 	});
 
-	registerPiGuardedContext(pi, async (event, ctx, budget) => {
+	const contextHandler: Parameters<typeof registerPiGuardedContext>[1] = async (
+		event,
+		ctx,
+		budget,
+	) => {
 		const passSessionId = ctx.sessionManager
 			? resolveSessionId(ctx)
 			: undefined;
 		const generation = Symbol();
-		if (passSessionId) contextPassGeneration.set(passSessionId, generation);
+		if (passSessionId && !budget.sideTurn)
+			contextPassGeneration.set(passSessionId, generation);
 		const signal =
 			(event as { signal?: AbortSignal }).signal ??
 			(ctx as { signal?: AbortSignal }).signal;
+		const assertOperation = budget.assertOwner;
 		budget.assertOwner = () => {
+			assertOperation();
 			// Supersession takes precedence over cancellation: the old context's
 			// abort API belongs to the session and could cancel its replacement.
 			if (
+				!budget.sideTurn &&
 				passSessionId &&
 				contextPassGeneration.get(passSessionId) !== generation
 			)
@@ -2569,9 +2571,6 @@ export function registerPiContextHandler(
 		let rawMessageCount = 0;
 		let rawFallbackLimit: number | undefined;
 		let sessionIdForError: string | undefined;
-		let sessionMetaForPass:
-			| ReturnType<typeof getOrCreateSessionMeta>
-			| undefined;
 		let lkgPassSnapshot: PiLkgPassSnapshot | undefined;
 		let lkgCompactionOff = baseOptions.compactionOff === true;
 		let lkgEmergencyRecoveryArmed = false;
@@ -2626,6 +2625,7 @@ export function registerPiContextHandler(
 
 			const tEntryBranch = performance.now();
 			const branchEntries = readPiBranchEntriesForContext(ctx, sessionId);
+			assertCurrentPass();
 			// Pi's live usage figure is a whole-raw-branch estimate while a context
 			// edit or compaction follows the last recorded usage (e.g. after a
 			// retried request); such a figure is never used as pressure.
@@ -2635,7 +2635,9 @@ export function registerPiContextHandler(
 				sessionId,
 				piLiveUsageIsRawBranchEstimate,
 			);
-			schedulePiTransformDecisionResolve({
+			assertCurrentPass();
+			// Raw side-turn snapshots are not acknowledgments of the main served prefix.
+			if (!budget.sideTurn) schedulePiTransformDecisionResolve({
 				db: options.db,
 				sessionId,
 				branchEntries,
@@ -2722,6 +2724,7 @@ export function registerPiContextHandler(
 			lkgPassSnapshot = snapshot;
 			let checkedReplay = false;
 			budget.stage = "writer admission";
+			assertCurrentPass();
 			const sessionMetaForUsage = await guardAwait(
 				withAsyncPrivilegedWriter(
 					options.db,
@@ -2826,7 +2829,6 @@ export function registerPiContextHandler(
 				}
 			}
 			const tMeta = performance.now();
-			sessionMetaForPass = sessionMetaForUsage;
 			const historianStateForPass = options.compactionOff
 				? EMPTY_PI_HISTORIAN_STATE_SNAPSHOT
 				: (() => {
@@ -3662,7 +3664,7 @@ export function registerPiContextHandler(
 				? findNewestPiAssistantEntryId(branchEntries)
 				: undefined;
 			const publishTransformDecision =
-				piDecisionSnapshotNewestAssistant !== undefined
+				!budget.sideTurn && piDecisionSnapshotNewestAssistant !== undefined
 					? () => {
 							recordPendingPiTransformDecision(
 								sessionId,
@@ -4247,7 +4249,7 @@ export function registerPiContextHandler(
 			}
 			let serializedOutput: PiLkgSerializedOutput | undefined;
 			budget.stage = "LKG/served publication";
-			if (!lkgCompactionOff && lkgPassSnapshot) {
+			if (!budget.sideTurn && !lkgCompactionOff && lkgPassSnapshot) {
 				let hostEnvelopeSignature: string | undefined;
 				try {
 					hostEnvelopeSignature = readPiLkgFitEnvelope(
@@ -4279,10 +4281,11 @@ export function registerPiContextHandler(
 				});
 			}
 			assertCurrentPass();
-			capturePiServedArray(sessionId, outputMessages, {
-				serializedOutput,
-				assertCurrentPass,
-			});
+			if (!budget.sideTurn)
+				capturePiServedArray(sessionId, outputMessages, {
+					serializedOutput,
+					assertCurrentPass,
+				});
 			if (thinkingBindingRecoveryApplied) {
 				try {
 					clearThinkingBindingRecoveryIf(
@@ -4307,9 +4310,10 @@ export function registerPiContextHandler(
 			budget.stage = "recovery";
 			if (err instanceof PiLkgAdmissionReplay && sessionIdForError) {
 				budget.assertOutcome();
-				capturePiServedArray(sessionIdForError, err.messages, {
-					assertCurrentPass: budget.assertOutcome,
-				});
+				if (!budget.sideTurn)
+					capturePiServedArray(sessionIdForError, err.messages, {
+						assertCurrentPass: budget.assertOutcome,
+					});
 				budget.assertOutcome();
 				budget.recovery = "fitting LKG before writer retries";
 				return { messages: err.messages } as {
@@ -4381,9 +4385,10 @@ export function registerPiContextHandler(
 							`${failureLabel} ${reason}: LKG replay served ${replay.messages.length} messages instead of raw ${rawMessageCount}`,
 						);
 						budget.assertOutcome();
-						capturePiServedArray(sessionIdForError, replay.messages, {
-							assertCurrentPass: budget.assertOutcome,
-						});
+						if (!budget.sideTurn)
+							capturePiServedArray(sessionIdForError, replay.messages, {
+								assertCurrentPass: budget.assertOutcome,
+							});
 						budget.assertOutcome();
 						budget.recovery = "fitting LKG replay";
 						return { messages: replay.messages } as unknown as {
@@ -4416,16 +4421,6 @@ export function registerPiContextHandler(
 			// Keep refusal outside the replay try/catch: it must reach Pi, not be
 			// mistaken for another replay failure and swallowed into raw fallthrough.
 			if (transientStorageFailure) throw new PiStorageBusyError({ cause: err });
-			if (sessionIdForError && !transientStorageFailure) {
-				// baseOptions.db (not the per-pass `options`, which is scoped to
-				// the try). The DB handle is shared across all projects.
-				persistLastTransformErrorIfChanged(
-					baseOptions.db,
-					sessionIdForError,
-					summarizeTransformError(err),
-					sessionMetaForPass?.lastTransformError,
-				);
-			}
 			// Fit is not enough: raw messages omit persisted decisions even when
 			// small. Only a validated last-good replay may serve a failed pass.
 			// Without a resolved session there are no persisted decisions to omit
@@ -4448,6 +4443,34 @@ export function registerPiContextHandler(
 			// messages, equivalent to a no-op transform pass.
 			return;
 		}
+	};
+	registerPiGuardedContext(pi, contextHandler, {
+		compactionOff: (ctx) =>
+			(baseOptions.resolveForProject?.(ctx.cwd) ?? baseOptions)
+				.compactionOff === true,
+		onRefusal: (ctx, budget, message, isCurrent) => {
+			const sessionId = resolveSessionId(ctx);
+			if (!sessionId) return;
+			withoutSqliteTransformPass(() =>
+				setImmediate(() => {
+					if (!isCurrent()) return;
+					try {
+						withSqliteBackgroundWriter(() =>
+							persistLastTransformErrorIfChanged(
+								baseOptions.db,
+								sessionId,
+								message,
+							),
+						);
+					} catch (error) {
+						log(
+							`[magic-context][pi] refused-turn diagnostic not persisted ${budget.diagnostic()}`,
+							error,
+						);
+					}
+				}),
+			);
+		},
 	});
 	log(
 		"[magic-context][pi] registered context handler (tagging + drops + nudges)",
@@ -8281,6 +8304,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	deferredMaterializationSessions.delete(sessionId);
 	firstContextPassSeenBySession.delete(sessionId);
 	contextPassGeneration.delete(sessionId);
+	clearPiContextReceipt(sessionId);
 	commitSeenLastPass.delete(sessionId);
 	liveModelBySession.delete(sessionId);
 	latestAssistantModelTimestampBySession.delete(sessionId);

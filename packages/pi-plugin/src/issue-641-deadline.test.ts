@@ -35,7 +35,9 @@ test("emergency foreground never joins a still-running historian", async () => {
 			},
 		);
 		const started = performance.now();
-		const result = await fake.handlers.get("context")!({ messages: raw }, ctx);
+		const handler = fake.handlers.get("context");
+		if (!handler) throw new Error("context handler missing");
+		const result = await handler({ messages: raw }, ctx);
 		expect(performance.now() - started).toBeLessThan(2000);
 		expect(JSON.stringify(result)).toContain("§1§ available state");
 		let joined = false;

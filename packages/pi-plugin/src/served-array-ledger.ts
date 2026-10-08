@@ -184,7 +184,10 @@ export function flushPiServedArrayLedger(): void {
 					item.assertCurrentPass?.();
 					return true;
 				} catch (error) {
-					log("[magic-context][pi] DISCARDED CONTEXT RESULT: queued served capture", error);
+					log(
+						"[magic-context][pi] DISCARDED CONTEXT RESULT: queued served capture",
+						error,
+					);
 					return false;
 				}
 			})

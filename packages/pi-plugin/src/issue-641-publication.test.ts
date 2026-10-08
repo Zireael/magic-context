@@ -2,12 +2,12 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
 	__test as decisions,
 	recordPendingPiTransformDecision,
 	schedulePiTransformDecisionResolve,
 } from "@magic-context/core/features/magic-context/transform-decision-log";
-import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
 	getSlot,
 	resetLkgSlotsForTest,

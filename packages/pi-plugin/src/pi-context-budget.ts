@@ -18,6 +18,7 @@ export class PiContextDeadlineError extends Error {}
 
 /** One clock shared by preparation, admission, normal work and recovery. */
 export class PiContextBudget {
+	sideTurn = false;
 	stage = "entry";
 	recovery = "not attempted";
 	abandoned = false;
