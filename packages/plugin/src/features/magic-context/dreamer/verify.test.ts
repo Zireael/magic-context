@@ -57,12 +57,31 @@ function tempProject(): string {
     return dir;
 }
 
+/**
+ * Git run for fixtures only, isolated from the caller's git setup. Agent shells
+ * inject `core.hooksPath` through GIT_CONFIG_* and some users sign commits; a
+ * fixture commit that runs hooks or a signer can stall past its timeout under
+ * load, so both are switched off here.
+ */
+function fixtureGit(dir: string, args: string[], extraEnv: Record<string, string> = {}): void {
+    const env: Record<string, string | undefined> = { ...process.env, ...extraEnv };
+    for (const key of Object.keys(env)) {
+        if (key.startsWith("GIT_CONFIG_")) delete env[key];
+    }
+    execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args], {
+        windowsHide: true,
+        cwd: dir,
+        timeout: 10_000,
+        env,
+    });
+}
+
 function gitProject(): string {
     const dir = tempProject();
-    execFileSync("git", ["init", "--quiet"], { windowsHide: true, cwd: dir, timeout: 10_000 });
-    execFileSync("git", ["add", "."], { windowsHide: true, cwd: dir, timeout: 10_000 });
-    execFileSync(
-        "git",
+    fixtureGit(dir, ["init", "--quiet"]);
+    fixtureGit(dir, ["add", "."]);
+    fixtureGit(
+        dir,
         [
             "-c",
             "user.name=Magic Context Tests",
@@ -73,16 +92,7 @@ function gitProject(): string {
             "-m",
             "Initial source",
         ],
-        {
-            windowsHide: true,
-            cwd: dir,
-            timeout: 10_000,
-            env: {
-                ...process.env,
-                GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
-                GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
-            },
-        },
+        { GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z" },
     );
     return dir;
 }
