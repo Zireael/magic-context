@@ -287,7 +287,8 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
                 if (mode === "legacy-rejected") {
                     expect(pass).toBe(4);
                     expect(h.mock.requests().filter(r => r.thinkingViolation)).toHaveLength(1);
-                    expect((h.contextDb().query("SELECT thinking_binding_recovery_target AS target FROM session_meta WHERE session_id = ?").get(childId) as { target: string }).target).toBe("latest_thinking_original");
+                    // The arm binds to the real user message that started the rejected turn.
+                    expect((h.contextDb().query("SELECT thinking_binding_recovery_target AS target FROM session_meta WHERE session_id = ?").get(childId) as { target: string }).target).toMatch(/^latest_thinking_original_armed:\S+$/);
                 }
                 if (mode === "legacy-accepted") {
                     expect(pass).toBe(7);

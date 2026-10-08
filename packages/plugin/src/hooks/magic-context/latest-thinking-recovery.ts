@@ -17,21 +17,38 @@ import { TOOL_SWEEP_SCOPED_MARKER } from "./tool-sweep-policy";
 
 export const LATEST_THINKING_RESTORE = "latest_thinking_original";
 const knownRejectedSessions = new Set<string>();
+/**
+ * The real user message that started the active turn of each session's most
+ * recent pass. That pass built the request a provider may reject next, so arming
+ * binds recovery to this turn rather than to whichever turn rebuilds after it.
+ */
+const lastPassTurnAnchor = new Map<string, string>();
 const ACTIVE = `${LATEST_THINKING_RESTORE}:`;
+/** Armed for one rejected turn, before any pass has restored it. */
+const ARMED = `${LATEST_THINKING_RESTORE}_armed:`;
 const UNRECOVERABLE = `${LATEST_THINKING_RESTORE}_unavailable`;
 export const LATEST_THINKING_UNSAFE =
     "ANTHROPIC_LATEST_TURN_EDIT_UNSAFE: The provider rejected edits to this thinking turn and its original context cannot be safely replayed. Send a new user message or /clear to continue.";
 
-/** Use the existing recovery column; accepted legacy replay never arms this path. */
+/**
+ * Use the existing recovery column; accepted legacy replay never arms this path.
+ * A first rejection records the real user message that started the rejected
+ * turn. With no pass in this process to name it, the rejection stays unbound
+ * and the next pass declines to restore, because it cannot tell the rejected
+ * turn from a later one.
+ */
 export function armLatestThinkingRecovery(db: ContextDatabase, sessionId: string): void {
     knownRejectedSessions.add(sessionId);
     ensureSessionMetaRow(db, sessionId);
     const current = getThinkingBindingRecoveryTarget(db, sessionId);
+    const anchor = lastPassTurnAnchor.get(sessionId);
     const next = current?.startsWith(ACTIVE)
         ? UNRECOVERABLE + ":" + current.slice(ACTIVE.length)
-        : current?.startsWith(UNRECOVERABLE)
+        : current?.startsWith(UNRECOVERABLE) || current?.startsWith(ARMED)
           ? current
-          : LATEST_THINKING_RESTORE;
+          : anchor !== undefined
+            ? ARMED + anchor
+            : LATEST_THINKING_RESTORE;
     db.prepare(
         "UPDATE session_meta SET thinking_binding_recovery_target = ? WHERE session_id = ?",
     ).run(next, sessionId);
@@ -75,8 +92,9 @@ export interface LatestThinkingRecovery {
 }
 
 /**
- * Only a provider rejection authorizes restoration. Keep the override durable
- * for the rest of this turn; a second rejection fails locally rather than looping.
+ * Only a provider rejection authorizes restoration, and only for the turn it
+ * rejected. Keep the override durable for the rest of that turn; a second
+ * rejection fails locally rather than looping.
  */
 export function prepareLatestThinkingRecovery(args: {
     db: ContextDatabase;
@@ -85,6 +103,10 @@ export function prepareLatestThinkingRecovery(args: {
     id: (message: unknown, index: number) => string | undefined;
     parts: (message: unknown) => readonly unknown[];
 }): LatestThinkingRecovery {
+    const start = latestAssistantTurnStart(args.messages);
+    const anchor = start > 0 ? args.id(args.messages[start - 1], start - 1) : undefined;
+    if (anchor === undefined) lastPassTurnAnchor.delete(args.sessionId);
+    else lastPassTurnAnchor.set(args.sessionId, anchor);
     let target: string | null;
     try {
         target = getThinkingBindingRecoveryTarget(args.db, args.sessionId);
@@ -99,9 +121,19 @@ export function prepareLatestThinkingRecovery(args: {
         knownRejectedSessions.delete(args.sessionId);
         return { restore: false, ended: false };
     }
+    const armedAnchor = target.startsWith(ARMED) ? target.slice(ARMED.length) : undefined;
+    if (target === LATEST_THINKING_RESTORE || (armedAnchor !== undefined && armedAnchor !== anchor)) {
+        // Unbound, or the rejected turn already ended with a real user message:
+        // nothing was restored yet, so disarm without touching this turn.
+        args.db
+            .prepare(
+                "UPDATE session_meta SET thinking_binding_recovery_target = '' WHERE session_id = ? AND thinking_binding_recovery_target = ?",
+            )
+            .run(args.sessionId, target);
+        knownRejectedSessions.delete(args.sessionId);
+        return { restore: false, ended: false };
+    }
     knownRejectedSessions.add(args.sessionId);
-    const start = latestAssistantTurnStart(args.messages);
-    const anchor = start > 0 ? args.id(args.messages[start - 1], start - 1) : undefined;
     const savedAnchor = target.startsWith(ACTIVE)
         ? target.slice(ACTIVE.length)
         : target.startsWith(UNRECOVERABLE + ":")
@@ -118,7 +150,7 @@ export function prepareLatestThinkingRecovery(args: {
     }
     if (target.startsWith(UNRECOVERABLE) || !anchor)
         throw contextRefusalError(LATEST_THINKING_UNSAFE);
-    if (target === LATEST_THINKING_RESTORE) {
+    if (armedAnchor !== undefined) {
         args.db
             .prepare(
                 "UPDATE session_meta SET thinking_binding_recovery_target = ? WHERE session_id = ? AND thinking_binding_recovery_target = ?",
@@ -145,6 +177,36 @@ export function prepareLatestThinkingRecovery(args: {
             throw contextRefusalError(LATEST_THINKING_UNSAFE + ` [missing-original:${id}]`);
     }
     return { restore: true, ended: false };
+}
+
+/**
+ * Read-only: whether a provider rejection armed or is restoring recovery for
+ * this array's active turn. Hosts that replay frozen thinking omissions outside
+ * `prepareLatestThinkingRecovery` (Pi, at the start or the end of its pass) skip
+ * the active turn's entries while this holds, so the original thinking the
+ * rejection asked for is neither removed before it is checked nor removed again
+ * after it is restored. Older turns keep their omissions.
+ */
+export function latestThinkingRecoveryCoversActiveTurn(args: {
+    db: ContextDatabase;
+    sessionId: string;
+    messages: readonly unknown[];
+    id: (message: unknown, index: number) => string | undefined;
+}): boolean {
+    let target: string | null;
+    try {
+        target = getThinkingBindingRecoveryTarget(args.db, args.sessionId);
+    } catch {
+        return false;
+    }
+    const bound = target?.startsWith(ARMED)
+        ? target.slice(ARMED.length)
+        : target?.startsWith(ACTIVE)
+          ? target.slice(ACTIVE.length)
+          : undefined;
+    if (bound === undefined) return false;
+    const start = latestAssistantTurnStart(args.messages);
+    return start > 0 && args.id(args.messages[start - 1], start - 1) === bound;
 }
 
 /** Capture after tagging, before destructive legacy replay, to retain wire tags. */

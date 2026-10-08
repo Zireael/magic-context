@@ -19,12 +19,14 @@ import {
 	armBindingRecoverySafely,
 	armLatestThinkingRecovery,
 	LATEST_THINKING_RESTORE,
+	latestThinkingRecoveryCoversActiveTurn,
 } from "@magic-context/core/hooks/magic-context/latest-thinking-recovery";
 import { dropSlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { isAnthropicFamilyRoute } from "@magic-context/core/hooks/magic-context/sentinel";
 import { log } from "@magic-context/core/shared/logger";
 
 import { clearPiLkgSessionState } from "./pi-lkg";
+import { resolvePiStableId } from "./read-session-pi";
 
 function reportBindingRecovery(
 	sessionId: string,
@@ -251,7 +253,19 @@ export function applyPiThinkingBindingRecovery(args: {
 		}
 	}
 
+	// A provider rejection of this turn asks for its original thinking back.
+	// Replaying the turn's frozen omissions here would delete that original
+	// before recovery checks it (start of pass) or after it restored it (end
+	// of pass), resending the rejected bytes. Older turns stay omitted.
+	const restoringActiveTurn = latestThinkingRecoveryCoversActiveTurn({
+		db: args.db,
+		sessionId: args.sessionId,
+		messages: args.messages,
+		id: (message, index) => resolvePiStableId(message, index, args.entryIds),
+	});
 	for (let index = 0; index < args.messages.length; index += 1) {
+		if (restoringActiveTurn && protectedMessages.has(args.messages[index]))
+			continue;
 		const entryId = args.entryIds[index];
 		if (entryId && frozenEntryIds.has(entryId))
 			stripThinkingParts(args.messages[index]);
