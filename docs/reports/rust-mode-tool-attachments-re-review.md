@@ -233,3 +233,113 @@ locally against the worktree's prepared dependencies.
 The three red tests are intentional committed review artifacts, not a green
 package claim. Fix both triggers without adding defer writes or bypassing the
 shared prefix permission, then rerun them and the original controls before merge.
+
+
+## Follow-up repair: provisional replay and additive adoption
+
+The historical verdict above describes `7237303f15`. The follow-up imports
+`b08d39ca8d8bfa8b49e0ebf64dbad677f1951d47` into current master without reverting
+master's intervening work (merge commit `b8968a9e`). Both remaining findings are
+now repaired; the three re-review witnesses keep their original expectations.
+Only `transform.rs`, appended upgrade-review controls, and this report changed
+in the follow-up repair itself. The other delivery files are inherited from the
+requested review/repair branch.
+
+### A: persisted served evidence, with a conservative fallback
+
+Recognition now checks the **served result block fingerprint** when the assistant
+has no stored identity. A match against either the raw media-bearing result or
+that result with its already-persisted overlays proves the media-bearing CK form
+was already served. This evidence survives restart and prevents the repair from
+removing an image that was admitted earlier. Reading evidence does not mint tags,
+change metadata, or commit a new discovery record.
+
+Otherwise, an identity-less result that was served, or belongs to the current or
+last-observed provisional tail of an initialized session, replays the historical
+scalar form until independent prefix permission arrives. **I chose the safe
+fallback for ambiguous first-sight provisional results.** The persisted hashes
+cannot identify a result never recorded by the old process, so an absence of a
+pin/hash cannot safely certify first sight. A genuinely new provisional
+screenshot can therefore wait for the next permitted rebuild, as allowed by the
+brief. Fresh bootstrap still admits media on its already-permitted first render.
+
+Pinned messages still require the entire reconstructed block vector to match.
+Recognition replaces only scalar slots matching their stored fingerprint, so a
+mixed previously-provisional assistant can keep an already-admitted image while
+another lossy result waits. No arbitrary tool-input/sibling drift is exempted.
+
+### B: adopt and serve atomically on the permitted additive rebuild
+
+The compaction-off dispatch now passes the recognized upgrade into the additive
+path. That path forwards its re-adoptions through `apply_ingress_meta` only when
+the existing plan permits a rebuild, committing the restored identity with the
+served media. It also records OpenCode served fingerprints on permitted additive
+rebuilds, so later identity-less provisional replays can prove media was admitted.
+It does **not** add fingerprint writes on additive defers, relax the identity
+fence, add an epoch/schema change, or originate a bust. Both paths reject an
+attempt to adopt a recognized upgrade if the retry loses rebuild permission.
+
+### Additional controls and containment
+
+Five controls were appended: compaction-on/off provisional first-sight deferral,
+compaction-on/off media admitted at bootstrap and replayed from persisted hashes,
+and a mixed scalar/media vector's read-only recognition before and after pinning.
+The four native-byte controls reopen tempfile stores, check actual attachments,
+check growing history after demotion, and check settled identical defers remain
+write-free. The mixed-vector control seeds real served fingerprints and checks
+recognition without involving unrelated native multi-tool normalization. During
+fixture development, the attempted multi-tool bootstrap control did not retain
+its first tool; that path was not changed in this repair. An initial extra
+provisional test incorrectly expected no pin immediately after explicit additive
+adoption; the final control checks absence after provisional replay removes the
+pin and proves the subsequent hash-only replay.
+
+No live store, daemon, host, or provider was opened. Rust stores are tempfile
+fixtures. Bun tests used `target/attachment-rereview-ts-root` for HOME, XDG paths,
+TMPDIR, OpenCode DB, context storage and logs. Existing prepared dependencies were
+used; no manifest/lockfile install changes were needed.
+
+### Final gates
+
+Tools: Cargo **1.99.0**, rustc **1.99.0**, rustfmt **1.10.0-stable**, Bun **1.4.2**,
+TypeScript **5.9.3**. Cargo gates ran serially on Linux with
+`CARGO_TARGET_DIR=target/attachment-rereview-repair`. The final gate chain used a
+60-minute hard timeout and foreground `wait:true` under the worker's serial-build
+policy, rather than starting concurrent background builds.
+
+* Imported baseline: `cargo test --locked -p mc-module --lib attachment_rereview
+  -- --nocapture`: exactly **3 failed**, matching findings A and B.
+* Final `cargo test --locked -p mc-module --lib attachment -- --nocapture`:
+  **25 passed**, 0 failed (all five original assertions and all three new witnesses).
+* Final `cargo test --locked -p mc-module --lib codec:: -- --nocapture`:
+  **51 passed**, 0 failed.
+* Final `cargo test --locked -p mc-module --lib attachment_rereview -- --nocapture`:
+  **3 passed**, 0 failed, original expectations unchanged.
+* Final `cargo test --locked -p mc-module --lib`: **1,672 passed**, **22 ignored**,
+  0 failed; 1,694 discovered tests, 248.87 seconds. Compilation is the Rust
+  authoritative typecheck.
+* `bun run --cwd packages/plugin typecheck`: all **3 configured tsc commands
+  passed** (silent success, TypeScript 5.9.3).
+* Adapter `bun test` on `module-wire.attachments-review.test.ts` and
+  `module-wire.test.ts`: **29 passed / 150 assertions**.
+* Pi transcript `bun test`: **17 passed / 61 assertions**.
+* `bun run --cwd packages/e2e-tests test:validate-manifest`:
+  **7 passed / 63 assertions**.
+* `bun run build`: all **3 package builds passed**, including
+  **4 v2 server tests / 19 assertions** and declaration emission.
+* `cargo fmt --all --check`, explicit included-test `rustfmt --edition 2021
+  --check`, and `git diff --check`: passed (silent success).
+* AFT inspection remained **partial**: Rust analyzer still indexing and this
+  checkout's call graph unavailable; the compiled full Cargo suite is authoritative.
+* Not repeated: real-host/provider e2e, full Rust workspace tests/clippy, full Bun
+  package suites, and e2e TypeScript checking (no e2e source edits beyond the
+  imported previously-reviewed harness/tests). No new host-acceptance claim.
+
+Two staged/restored `NON-VACUITY BREAK` controls were applied to `transform.rs`:
+ignoring identity-less discovery reddened only
+`attachment_rereview_provisional_discovery_does_not_write_on_defer` (Some(3)
+versus Some(2)); suppressing additive identity adoption reddened only
+`attachment_rereview_compaction_off_restoration_replays_on_the_next_defer`, with
+both provisional re-review tests still green. Each mutation had a non-empty
+working diff while applied and an empty working diff after checkout-and-touch
+restoration. The final complete green gates ran after both mutations were removed.

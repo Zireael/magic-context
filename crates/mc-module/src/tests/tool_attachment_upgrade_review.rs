@@ -619,3 +619,157 @@ fn attachment_rereview_provisional_discovery_does_not_write_on_defer() {
     assert!(!deferred.prefix_bust_permitted);
     assert_eq!(store.load(session).unwrap().row_version, baseline.row_version, "discovering media on an already-served provisional result must not introduce a defer write");
 }
+
+// Exercise both the conservative first-sight fallback and positive served-hash
+// evidence. No identity pin may be required for a provisional assistant's media.
+fn attachment_repair_assert_provisional_media_replays(compaction_enabled: bool, prime: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let (native, fixed) = attachment_review_fixture();
+    let session = "attachment-repair-provisional-media";
+    let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+    ctx.compaction_enabled = compaction_enabled;
+    if prime {
+        let initial = attachment_review_request(&native[..1], fixed[..1].to_vec(), session);
+        transform(&store, &initial, &ctx).unwrap();
+    }
+    let mut request = attachment_review_request(&native[..2], fixed[..2].to_vec(), session);
+    request.mid_turn = true;
+    let first = transform(&store, &request, &ctx).unwrap();
+    let screenshot = |response: &TransformResponse, raw: &[serde_json::Value]| {
+        attachment_review_native(response, raw)
+            .into_iter()
+            .find(|message| message["info"]["id"] == "screenshot")
+            .unwrap()
+    };
+    let restored = if prime {
+        assert!(!first.prefix_bust_permitted);
+        assert!(
+            screenshot(&first, &native[..2])["parts"][0]["state"]
+                .get("attachments")
+                .is_none(),
+            "an ambiguous first-sight provisional result waits for permission"
+        );
+        let mut loaded = store.load(session).unwrap();
+        loaded.meta.soft_refresh_pending = true;
+        store
+            .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let restored = transform(&store, &request, &ctx).unwrap();
+        assert!(restored.prefix_bust_permitted);
+        restored
+    } else {
+        assert!(first.prefix_bust_permitted);
+        first
+    };
+    let restored_native = screenshot(&restored, &native[..2]);
+    assert_eq!(
+        restored_native["parts"][0]["state"]["attachments"],
+        native[1]["parts"][0]["state"]["attachments"]
+    );
+    drop(store);
+    let reopened = crate::transform::tests::store(dir.path());
+    // The proof must survive a process restart, including tags in the normal
+    // pipeline and the raw result in the compaction-off pipeline.
+    for _ in 0..3 {
+        let replay = transform(&reopened, &request, &ctx).unwrap();
+        assert!(!replay.prefix_bust_permitted);
+        assert_eq!(screenshot(&replay, &native[..2]), restored_native);
+    }
+    assert!(!reopened
+        .load(session)
+        .unwrap()
+        .meta
+        .block_identity_by_mid
+        .contains_key("screenshot"));
+    let version = reopened.load(session).unwrap().row_version;
+    transform(&reopened, &request, &ctx).unwrap();
+    assert_eq!(reopened.load(session).unwrap().row_version, version);
+    let historical = attachment_review_request(&native, fixed, session);
+    let demoted = transform(&reopened, &historical, &ctx).unwrap();
+    assert!(!demoted.prefix_bust_permitted);
+    assert_eq!(screenshot(&demoted, &native), restored_native);
+}
+
+#[test]
+fn attachment_repair_provisional_first_sight_waits_then_replays_restored_media() {
+    attachment_repair_assert_provisional_media_replays(true, true);
+}
+
+#[test]
+fn attachment_repair_compaction_off_provisional_first_sight_waits_then_replays_restored_media() {
+    attachment_repair_assert_provisional_media_replays(false, true);
+}
+
+#[test]
+fn attachment_repair_provisional_bootstrap_media_replays_from_served_fingerprint() {
+    attachment_repair_assert_provisional_media_replays(true, false);
+}
+
+#[test]
+fn attachment_repair_compaction_off_provisional_bootstrap_media_replays_from_served_fingerprint() {
+    attachment_repair_assert_provisional_media_replays(false, false);
+}
+
+#[test]
+fn attachment_repair_mixed_provisional_results_keep_admitted_media_while_lossy_result_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let (mut native, _) = attachment_review_fixture();
+    let mut second = native[1]["parts"][0].clone();
+    second["callID"] = json!("second-screen");
+    second["state"]["output"] = json!("Second screenshot");
+    second["state"]["attachments"][0]["id"] = json!("second-screen-id");
+    second["state"]["attachments"][0]["url"] = json!("data:image/png;base64,c2Vjb25k");
+    native[1]["parts"].as_array_mut().unwrap().push(second);
+    let fixed = crate::codec::decode_opencode(&native).messages;
+    let session = "attachment-repair-mixed-provisional";
+    let prime = attachment_review_request(&native[..1], fixed[..1].to_vec(), session);
+    run(&store, &prime, &[]);
+    let old = attachment_review_request(
+        &native,
+        attachment_review_old_ingress(fixed.clone()),
+        session,
+    );
+    let old_projection = project_messages(&old.messages).unwrap();
+    let mut loaded = store.load(session).unwrap();
+    // Isolate recognition from native multi-tool normalization. This is the
+    // durable evidence a provisional response leaves: served hashes, no pin.
+    let served = old
+        .messages
+        .iter()
+        .map(|message| ServedMessage::from_message(message.ck.clone()))
+        .collect::<Vec<_>>();
+    loaded.meta.served_output_fingerprint = served_output_fingerprints(&served, &[]);
+    assert!(!loaded.meta.block_identity_by_mid.contains_key("screenshot"));
+    store
+        .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+        .unwrap();
+    let upgraded = attachment_review_request(&native, fixed, session);
+    let replay = attachment_projection_replay(&store, &upgraded)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.mids, BTreeSet::from(["screenshot".to_string()]));
+    assert_eq!(
+        replay.legacy.messages[1], old.messages[1],
+        "the admitted second image must not join the lossy first result's replay"
+    );
+    // A historical pass can pin this mixed vector. Subsequent detection must
+    // still strip only its scalar slot and match the full stored identity.
+    let mut loaded = store.load(session).unwrap();
+    loaded.meta.block_identity_by_mid.insert(
+        "screenshot".into(),
+        old_projection.identity_by_mid["screenshot"].clone(),
+    );
+    store
+        .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+        .unwrap();
+    let version = store.load(session).unwrap().row_version;
+    for _ in 0..3 {
+        let replay = attachment_projection_replay(&store, &upgraded)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.legacy.messages[1], old.messages[1]);
+        assert_eq!(store.load(session).unwrap().row_version, version);
+    }
+}

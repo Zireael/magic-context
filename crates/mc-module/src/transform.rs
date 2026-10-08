@@ -3489,6 +3489,7 @@ fn apply_additive_only(
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
+    attachment_upgrade: Option<&AttachmentProjectionUpgrade>,
     replay_attachments: bool,
 ) -> Result<TransformWithProjection, TransformError> {
     let total_started_at = Instant::now();
@@ -3694,12 +3695,14 @@ fn apply_additive_only(
     if let PassPlan::Reject(message) = plan {
         return Err(TransformError::UnknownShape(message));
     }
-    if replay_attachments
-        && matches!(
-            plan,
-            PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
-        )
-    {
+    let prefix_rebuild_permitted = matches!(
+        plan,
+        PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
+    );
+    if replay_attachments && prefix_rebuild_permitted {
+        return Err(TransformError::AttachmentProjectionBust);
+    }
+    if attachment_upgrade.is_some() && !replay_attachments && !prefix_rebuild_permitted {
         return Err(TransformError::AttachmentProjectionBust);
     }
     let additive_shape_clean = loaded.core.boundary_id.is_empty()
@@ -3735,7 +3738,20 @@ fn apply_additive_only(
         meta.last_render_config = effective_render_config.clone();
     }
     let provisional_tail_mid = provisional_tail_mid(req);
-    apply_ingress_meta(&mut meta, req, &projection, provisional_tail_mid, None, &[]);
+    // Restored media and its recognized identity are one serving decision. Keeping
+    // the scalar identity here would make the next defer undo this permitted rebuild.
+    let attachment_re_adoptions = attachment_upgrade
+        .filter(|_| !replay_attachments && prefix_rebuild_permitted)
+        .map(|upgrade| attachment_identity_re_adoptions(&loaded.meta, &projection, upgrade))
+        .unwrap_or_default();
+    apply_ingress_meta(
+        &mut meta,
+        req,
+        &projection,
+        provisional_tail_mid,
+        None,
+        &attachment_re_adoptions,
+    );
     let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
     meta.cc_u1_active = cc_u1_active;
     meta.tagging_surface_active = tagging_surface_requested;
@@ -3940,6 +3956,15 @@ fn apply_additive_only(
     timings.tail_messages_emitted = req.messages.len();
     timings.frozen_units = core.frozen_units.len();
 
+    if prefix_rebuild_permitted && serializer_profile == Some(SerializerProfile::OpencodeAiSdk) {
+        // A provisional assistant deliberately has no identity pin. Record the
+        // admitted serving bytes with the rebuild so its next defer can prove
+        // media was already shown, without adding fingerprint writes on defers.
+        let mut frame_block_stems = vec![None; messages.len()];
+        frame_block_stems[leading_systems] = Some("mc_m0");
+        frame_block_stems[leading_systems + 1] = Some("mc_m1");
+        meta.served_output_fingerprint = served_output_fingerprints(&messages, &frame_block_stems);
+    }
     let state_changed = core != loaded.core || meta != loaded.meta;
     if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
@@ -4116,7 +4141,14 @@ fn apply_once(
     profile_start!(_perf_apply, "apply_once");
     *boundary_divergence_detected = false;
     if !ctx.compaction_enabled {
-        return apply_additive_only(store, req, ctx, estimate_tokens, replay_attachments);
+        return apply_additive_only(
+            store,
+            req,
+            ctx,
+            estimate_tokens,
+            attachment_upgrade,
+            replay_attachments,
+        );
     }
     let total_started_at = Instant::now();
     let mut timings = TransformTimings::default();
@@ -4784,15 +4816,11 @@ fn apply_once(
             provisional_tail_mid,
             lineage_anchor_mid,
         )?;
-        for mid in &upgrade.mids {
-            adoptions.push(TailIdentityReAdoption {
-                mid: mid.clone(),
-                old_hash_prefix: block_identity_hash_prefix(
-                    &loaded.meta.block_identity_by_mid[mid],
-                ),
-                new_hash_prefix: block_identity_hash_prefix(&projection.identity_by_mid[mid]),
-            });
-        }
+        adoptions.extend(attachment_identity_re_adoptions(
+            &loaded.meta,
+            &projection,
+            upgrade,
+        ));
         Ok(adoptions)
     })?;
     timings.identity_enforce = elapsed_ms(identity_enforce_started_at);
@@ -7676,8 +7704,9 @@ struct AttachmentProjectionUpgrade {
 }
 
 // Recognize only the old OpenCode adapter's Text -> Content projection change.
-// Full message identities must match after removing attachments; arbitrary edits
+// Pinned message identities must match after removing attachments; arbitrary edits
 // to text, call inputs, polarity or siblings still go through the ordinary fence.
+// Provisional assistants have no pin, so their served fingerprints govern replay.
 fn attachment_projection_replay(
     store: &McStore,
     req: &TransformRequest,
@@ -7735,9 +7764,40 @@ fn attachment_projection_replay(
     // on a defer; the repaired identities commit only with the restoring bust.
     let loaded = store.load(&req.session_id)?;
     let current = project_messages(&req.messages)?;
-    replacements.retain(|(mid, _), _| {
-        loaded.meta.block_identity_by_mid.contains_key(mid)
-            && loaded.meta.block_identity_by_mid.get(mid) != current.identity_by_mid.get(mid)
+    let served_with_media =
+        attachment_results_served_with_media(store, req, &current, &loaded.meta, &replacements)?;
+    let provisional_mid = provisional_tail_mid(req);
+    let previous_tail_mid = loaded
+        .meta
+        .newest_live_block_id
+        .as_deref()
+        .and_then(split_block_id)
+        .map(|(mid, _)| mid);
+    replacements.retain(|(mid, index), old| {
+        if let Some(stored) = loaded.meta.block_identity_by_mid.get(mid) {
+            // A formerly provisional message may have frozen a mix of already
+            // admitted media and lossy results. Replace only the scalar slots;
+            // the full reconstructed vector below must still match its pin.
+            let old_fingerprint = ck_wire::fingerprint(
+                &serde_json::to_string(old).expect("validated CK block serializes"),
+            );
+            return Some(stored) != current.identity_by_mid.get(mid)
+                && stored
+                    .get(*index)
+                    .is_some_and(|identity| identity.byte_fingerprint == old_fingerprint);
+        }
+        // A served result can outlive its provisional assistant without ever
+        // gaining a block-identity pin. Missing identity is not first-sight proof.
+        // If the served fingerprint cannot prove media was already shown, keep
+        // the lossy form. An unseen provisional result on an initialized session
+        // also waits for permission rather than risking a cached-prefix rewrite.
+        loaded.meta.initialized
+            && !served_with_media.contains(&(mid.clone(), *index))
+            && (overlay_target_was_served(
+                &loaded.meta.served_output_fingerprint,
+                &ck_wire::block_id(mid, *index),
+            ) || provisional_mid == Some(mid.as_str())
+                || previous_tail_mid == Some(mid.as_str()))
     });
     if replacements.is_empty() {
         return Ok(None);
@@ -7757,7 +7817,12 @@ fn attachment_projection_replay(
         .identity_by_mid
         .iter()
         .filter(|(mid, vector)| {
-            loaded.meta.block_identity_by_mid.get(*mid) == Some(*vector)
+            replacements.keys().any(|(candidate, _)| candidate == *mid)
+                && loaded
+                    .meta
+                    .block_identity_by_mid
+                    .get(*mid)
+                    .is_none_or(|stored| stored == *vector)
                 && current.identity_by_mid.get(*mid) != Some(*vector)
         })
         .map(|(mid, _)| mid.clone())
@@ -7772,6 +7837,98 @@ fn attachment_projection_replay(
         }
     }
     Ok(Some(AttachmentProjectionUpgrade { legacy, mids }))
+}
+
+// A matching served hash is positive evidence, even after restart, that the
+// identity-less result already included media. Reproduce only persisted overlays:
+// discovery must neither mint a new decision nor introduce a defer write.
+fn attachment_results_served_with_media(
+    store: &McStore,
+    req: &TransformRequest,
+    projection: &FlatProjection,
+    meta: &ModuleMeta,
+    replacements: &BTreeMap<(String, usize), CkWireBlock>,
+) -> Result<BTreeSet<(String, usize)>, TransformError> {
+    let unpinned_mids: BTreeSet<&str> = replacements
+        .keys()
+        .filter(|(mid, _)| !meta.block_identity_by_mid.contains_key(mid))
+        .map(|(mid, _)| mid.as_str())
+        .collect();
+    if unpinned_mids.is_empty() || meta.served_output_fingerprint.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let snapshot = store.load_transform_snapshot(&req.session_id)?;
+    let tags = load_cached_tags(store, &req.session_id)?;
+    let overlay = tag_overlay_state(
+        &tags,
+        &snapshot.temporal_marks,
+        &snapshot.user_hints,
+        &snapshot.channel1_appends,
+        &meta.pending_tag_block_ids,
+        &meta.pending_user_hint_block_ids,
+    );
+    let blocks_by_mid = projection_blocks_by_mid(projection);
+    let served_hashes: HashMap<&str, &str> = meta
+        .served_output_fingerprint
+        .iter()
+        .map(|block| (block.block_id.as_str(), block.content_hash.as_str()))
+        .collect();
+    let mut matches = BTreeSet::new();
+    for message in &req.messages {
+        if !unpinned_mids.contains(message.mid.as_str()) {
+            continue;
+        }
+        let mut rendered = message.ck.clone();
+        let blocks = blocks_by_mid
+            .get(message.mid.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        apply_tag_overlay_to_message(
+            &mut rendered,
+            message,
+            blocks,
+            Some(&overlay),
+            |_| false,
+            false,
+        );
+        for block in blocks {
+            if !replacements.contains_key(&(message.mid.clone(), block.block_index)) {
+                continue;
+            }
+            let Some(previous_hash) = served_hashes.get(block.id.as_str()) else {
+                continue;
+            };
+            let raw_hash = ck_wire::fingerprint_digest(&block.content_hash);
+            let overlaid_hash = ck_wire::fingerprint(
+                &serde_json::to_string(&rendered.content[block.block_index])
+                    .expect("validated CK block serializes"),
+            );
+            if *previous_hash == raw_hash || *previous_hash == overlaid_hash {
+                matches.insert((message.mid.clone(), block.block_index));
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn attachment_identity_re_adoptions(
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    upgrade: &AttachmentProjectionUpgrade,
+) -> Vec<TailIdentityReAdoption> {
+    upgrade
+        .mids
+        .iter()
+        .map(|mid| TailIdentityReAdoption {
+            mid: mid.clone(),
+            old_hash_prefix: meta
+                .block_identity_by_mid
+                .get(mid)
+                .map(|vector| block_identity_hash_prefix(vector))
+                .unwrap_or_default(),
+            new_hash_prefix: block_identity_hash_prefix(&projection.identity_by_mid[mid]),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
