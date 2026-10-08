@@ -1299,11 +1299,35 @@ async fn hostless_store_init_first_transform_through_real_daemon() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let bytes = consumer.call(target, identity, serde_json::to_vec(&json!({
+    // The module answers the first transform with a retryable `store_opening`
+    // while its store is still opening in the background, as a host would see.
+    // Retry that one code until the deadline, like any host; anything else fails.
+    let request = serde_json::to_vec(&json!({
         "kind": "transform", "v": 2, "serializer_profile": "owned-llmrunner",
         "session_id": "hostless", "render_config": "cfg0", "full_array_fingerprint": "fp-hostless",
         "messages": [ck("first", 1, "hello")]
-    })).unwrap(), fast_call_options()).await.unwrap();
+    }))
+    .unwrap();
+    let bytes = loop {
+        match consumer
+            .call(
+                target.clone(),
+                identity.clone(),
+                request.clone(),
+                fast_call_options(),
+            )
+            .await
+        {
+            Err(e) if format!("{e:?}").contains("store_opening") => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "store never finished opening: {e:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => break other.unwrap(),
+        }
+    };
     let response: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         response["status"], "ok",
