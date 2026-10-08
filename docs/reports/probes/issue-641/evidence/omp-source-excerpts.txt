@@ -1,0 +1,315 @@
+OMP @oh-my-pi/pi-coding-agent 18.8.6; MIT; Stencil Labs, Inc. / Mario Zechner.
+Original line numbers preserved below.
+
+src/extensibility/extensions/runner.ts SHA256 cdf3f8b2d80da336a443c6cbd5616f84859624b8d73fd5b8347b5572fed5f28c
+130: export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
+131: let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
+132:
+133: function throwUnsupportedServiceTierAction(): never {
+134: 	throw new Error("This extension host does not support service-tier actions");
+135: }
+136:
+137: export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
+138: 	extensionHandlerTimeoutMs = timeoutMs;
+139: }
+140:
+141: function normalizeHandlerTimeout(timeoutMs: number): number {
+142: 	return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : EXTENSION_HANDLER_TIMEOUT_MS;
+143: }
+261: /**
+262:  * Scope `ctx` to a single handler run without spreading it: `{ ...ctx }` would
+263:  * snapshot live accessors (notably the `model` getter), so a handler calling
+264:  * `pi.setModel()` and then reading `ctx.model` would see a stale model.
+265:  * Prototype delegation keeps every getter live while overriding `ui`.
+266:  */
+267: function createHandlerContext(
+268: 	ctx: ExtensionContext,
+269: 	handlerSignal: AbortSignal,
+270: 	timeoutBudget?: HandlerTimeoutBudget,
+271: ): ExtensionContext {
+272: 	const scoped: ExtensionContext = Object.create(ctx);
+273: 	Object.defineProperty(scoped, "ui", {
+274: 		value: createHandlerUIContext(ctx.ui, handlerSignal, timeoutBudget),
+275: 		enumerable: true,
+276: 		configurable: true,
+277: 	});
+278: 	return scoped;
+279: }
+293: async function raceHandlerWithTimeout<T>(
+294: 	work: (handlerSignal: AbortSignal, timeoutBudget: HandlerTimeoutBudget) => Promise<T> | T,
+295: 	timeoutMs: number,
+296: 	signal?: AbortSignal,
+297: ): Promise<T | typeof EXTENSION_HANDLER_TIMEOUT | typeof EXTENSION_HANDLER_ABORTED> {
+298: 	if (signal?.aborted) return EXTENSION_HANDLER_ABORTED;
+299:
+300: 	const timeoutController = new AbortController();
+301: 	const handlerSignal = signal ? AbortSignal.any([signal, timeoutController.signal]) : timeoutController.signal;
+302: 	const { promise: interruptPromise, resolve: resolveInterrupt } = Promise.withResolvers<
+303: 		typeof EXTENSION_HANDLER_TIMEOUT | typeof EXTENSION_HANDLER_ABORTED
+304: 	>();
+305: 	const onAbort = () => resolveInterrupt(EXTENSION_HANDLER_ABORTED);
+306: 	signal?.addEventListener("abort", onAbort, { once: true });
+307: 	let timer: Timer | undefined;
+308: 	let remainingMs = timeoutMs;
+309: 	let activeSince = performance.now();
+310: 	let pauseDepth = 0;
+311: 	let settled = false;
+312: 	const clearTimer = () => {
+313: 		if (timer === undefined) return;
+314: 		clearTimeout(timer);
+315: 		timer = undefined;
+316: 	};
+317: 	const expire = () => {
+318: 		if (settled) return;
+319: 		settled = true;
+320: 		clearTimer();
+321: 		timeoutController.abort(new DOMException(`Handler timed out after ${timeoutMs}ms`, "TimeoutError"));
+322: 		resolveInterrupt(EXTENSION_HANDLER_TIMEOUT);
+323: 	};
+324: 	const armTimer = () => {
+325: 		if (settled || pauseDepth > 0) return;
+326: 		activeSince = performance.now();
+327: 		timer = setTimeout(expire, Math.max(0, remainingMs));
+328: 	};
+329: 	const settle = () => {
+330: 		if (settled) return;
+331: 		settled = true;
+332: 		clearTimer();
+333: 	};
+334: 	const timeoutBudget: HandlerTimeoutBudget = {
+335: 		pause: () => {
+336: 			if (settled) return;
+337: 			pauseDepth++;
+338: 			if (pauseDepth !== 1) return;
+339: 			remainingMs = Math.max(0, remainingMs - (performance.now() - activeSince));
+340: 			clearTimer();
+341: 			if (remainingMs <= 0) expire();
+342: 		},
+343: 		resume: () => {
+344: 			if (settled || pauseDepth === 0) return;
+345: 			pauseDepth--;
+346: 			if (pauseDepth === 0) armTimer();
+347: 		},
+348: 	};
+349: 	armTimer();
+350: 	try {
+351: 		if (signal?.aborted) return EXTENSION_HANDLER_ABORTED;
+352: 		const workPromise = Promise.resolve(work(handlerSignal, timeoutBudget));
+353: 		const result = await Promise.race([workPromise, interruptPromise]);
+354: 		if (result === EXTENSION_HANDLER_TIMEOUT) {
+355: 			await Promise.race([
+356: 				workPromise.then(
+357: 					() => undefined,
+358: 					() => undefined,
+359: 				),
+360: 				Bun.sleep(0),
+361: 			]);
+362: 		}
+363: 		return result;
+364: 	} finally {
+365: 		settle();
+366: 		signal?.removeEventListener("abort", onAbort);
+367: 	}
+368: }
+1490: 		event: TEvent,
+1491: 		ctx: ExtensionContext,
+1492: 		ext: Extension,
+1493: 		timeoutMs: number,
+1494: 		onFailure?: (kind: "timeout" | "error", message: string) => R,
+1495: 		outerSignal?: AbortSignal,
+1496: 	): Promise<R | undefined> {
+1497: 		// `session_stop` carries its own signal on the event; `tool_call` receives
+1498: 		// the outer dispatch signal (loop request or wrapper execute) so an abort
+1499: 		// while a handler awaits a human dialog cancels the dialog and settles the
+1500: 		// gate without executing the underlying tool. Compose whichever apply.
+1501: 		const sessionStopSignal =
+1502: 			event.type === "session_stop" && "signal" in event && event.signal instanceof AbortSignal
+1503: 				? event.signal
+1504: 				: undefined;
+1505: 		const signals = [outerSignal, sessionStopSignal].filter((s): s is AbortSignal => s !== undefined);
+1506: 		const signal = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+1507: 		if (signal?.aborted) return undefined;
+1508: 		const registrationScope: ToolRegistrationScope = { pending: new Set(), closed: false };
+1509: 		let handlerResult: R | typeof EXTENSION_HANDLER_TIMEOUT | typeof EXTENSION_HANDLER_ABORTED | undefined;
+1510: 		let handlerFailure: { error: unknown } | undefined;
+1511: 		try {
+1512: 			handlerResult = await withActiveSettings(this.settings, () =>
+1513: 				raceHandlerWithTimeout(
+1514: 					async (handlerSignal, budget) => {
+1515: 						registrationScope.signal = handlerSignal;
+1516: 						let result: R | undefined;
+1517: 						try {
+1518: 							const handlerContext = createHandlerContext(
+1519: 								ctx,
+1520: 								handlerSignal,
+1521: 								event.type === "tool_call" ? budget : undefined,
+1522: 							);
+1523: 							result = await this.#toolRegistrationScope.run(registrationScope, () =>
+1524: 								handler(event, handlerContext),
+1525: 							);
+1526: 						} catch (error) {
+1527: 							handlerFailure = { error };
+1528: 						} finally {
+1529: 							registrationScope.closed = true;
+1530: 						}
+1531: 						try {
+1532: 							await this.#flushToolRegistrations(registrationScope.pending);
+1533: 						} catch (error) {
+1534: 							handlerFailure ??= { error };
+1535: 						}
+1536: 						return result;
+1537: 					},
+1538: 					timeoutMs,
+1539: 					signal,
+1540: 				),
+1541: 			);
+1542: 		} catch (error) {
+1543: 			handlerFailure = { error };
+1544: 		} finally {
+1545: 			registrationScope.closed = true;
+1546: 		}
+1547: 		if (handlerResult === EXTENSION_HANDLER_ABORTED) return undefined;
+1548: 		if (handlerResult === EXTENSION_HANDLER_TIMEOUT) {
+1549: 			const error = `handler timed out after ${timeoutMs}ms`;
+1550: 			logger.warn("Extension handler timed out", {
+1551: 				extensionPath: ext.path,
+1552: 				event: event.type,
+1553: 				timeoutMs,
+1554: 			});
+1555: 			this.emitError({
+1556: 				extensionPath: ext.path,
+1557: 				event: event.type,
+1558: 				error,
+1559: 			});
+1560: 			return onFailure?.("timeout", error);
+1561: 		}
+1562: 		if (handlerFailure) {
+1563: 			const message =
+1564: 				handlerFailure.error instanceof Error ? handlerFailure.error.message : String(handlerFailure.error);
+1565: 			const stack = handlerFailure.error instanceof Error ? handlerFailure.error.stack : undefined;
+1566: 			this.emitError({
+1567: 				extensionPath: ext.path,
+1568: 				event: event.type,
+1569: 				error: message,
+1570: 				stack,
+1571: 			});
+1572: 			return onFailure?.("error", message);
+1573: 		}
+1574: 		return handlerResult as R | undefined;
+1575: 	}
+1969: 	async emitContext(messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> {
+1970: 		// Check if any extensions actually have context handlers before building
+1971: 		// the context object or cloning; this runs on every provider request.
+1972: 		if (!this.hasHandlers("context")) return messages;
+1973: 		const ctx = this.createContext();
+1974:
+1975: 		let currentMessages: AgentMessage[];
+1976: 		try {
+1977: 			currentMessages = structuredClone(messages);
+1978: 		} catch {
+1979: 			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
+1980: 			// or ProviderPayload). Fall back to a shallow array clone — extensions should
+1981: 			// return new message arrays rather than mutating in place.
+1982: 			currentMessages = [...messages];
+1983: 		}
+1984: 		for (let index = 0; index < currentMessages.length; index++) {
+1985: 			const message = currentMessages[index];
+1986: 			if (message) setContextHistoryIndex(message, index);
+1987: 		}
+1988:
+1989: 		for (const ext of this.extensions) {
+1990: 			const handlers = ext.handlers.get("context");
+1991: 			if (!handlers || handlers.length === 0) continue;
+1992:
+1993: 			for (const handler of handlers) {
+1994: 				const event: ContextEvent = { type: "context", messages: currentMessages };
+1995: 				const handlerResult = await this.#runHandlerWithTimeout(
+1996: 					handler,
+1997: 					event,
+1998: 					ctx,
+1999: 					ext,
+2000: 					extensionHandlerTimeoutMs,
+2001: 					undefined,
+2002: 					signal,
+2003: 				);
+2004:
+2005: 				if (handlerResult && (handlerResult as ContextEventResult).messages) {
+2006: 					const nextMessages = (handlerResult as ContextEventResult).messages!;
+2007: 					for (let index = 0; index < nextMessages.length; index++) {
+2008: 						const message = nextMessages[index];
+2009: 						if (!message || getContextHistoryIndex(message) !== undefined) continue;
+2010: 						const previousMessage = currentMessages[index];
+2011: 						if (!previousMessage) continue;
+2012: 						const historyIndex = getContextHistoryIndex(previousMessage);
+2013: 						if (historyIndex === undefined) continue;
+2014: 						setContextHistoryIndex(message, historyIndex);
+2015: 						if (!Bun.deepEquals(message, previousMessage)) clearContextHistoryIndex(message);
+2016: 					}
+2017: 					currentMessages = nextMessages;
+2018: 				}
+2019: 			}
+2020: 		}
+2021:
+2022: 		for (const message of currentMessages) {
+2023: 			const historyIndex = getContextHistoryIndex(message);
+2024: 			const historyMessage = historyIndex === undefined ? undefined : messages[historyIndex];
+2025: 			if (historyMessage && historyIndex !== undefined) setContextHistoryIndex(historyMessage, historyIndex);
+2026: 			const unchanged = historyMessage !== undefined && Bun.deepEquals(message, historyMessage);
+2027: 			clearContextHistoryIndex(message);
+2028: 			if (historyMessage) clearContextHistoryIndex(historyMessage);
+2029: 			if (!unchanged) markPerCallContextMessage(message);
+2030: 		}
+2031: 		for (const message of messages) clearContextHistoryIndex(message);
+2032: 		// An aborted handler is skipped and its input kept unchanged. Never hand that
+2033: 		// untransformed (possibly unredacted) context back to a caller as if every hook ran.
+2034: 		signal?.throwIfAborted();
+2035: 		return currentMessages;
+2036: 	}
+2038: 	/** Runs request payload hooks with the model used for that provider request. */
+2039: 	async emitBeforeProviderRequest(
+2040: 		payload: unknown,
+2041: 		model?: Model,
+2042: 		signal?: AbortSignal,
+2043: 	): Promise<BeforeProviderRequestEventResult> {
+2044: 		if (!this.hasHandlers("before_provider_request")) return payload;
+2045: 		const ctx = this.createContext(model);
+2046: 		let currentPayload = payload;
+2047:
+2048: 		for (const ext of this.extensions) {
+2049: 			const handlers = ext.handlers.get("before_provider_request");
+2050: 			if (!handlers || handlers.length === 0) continue;
+2051:
+2052: 			for (const handler of handlers) {
+2053: 				const event: BeforeProviderRequestEvent = {
+2054: 					type: "before_provider_request",
+2055: 					payload: currentPayload,
+2056: 				};
+2057: 				const handlerResult = await this.#runHandlerWithTimeout(
+2058: 					handler,
+2059: 					event,
+2060: 					ctx,
+2061: 					ext,
+2062: 					extensionHandlerTimeoutMs,
+2063: 					undefined,
+2064: 					signal,
+2065: 				);
+2066: 				if (handlerResult !== undefined) {
+2067: 					currentPayload = handlerResult;
+2068: 				}
+2069: 			}
+2070: 		}
+2071:
+2072: 		return currentPayload;
+2073: 	}
+
+src/sdk.ts SHA256 707784e32bee345e310b17bc087de49d203af6348e21768474298523fc6f04be
+4141: 		const convertToLlmFinal = (messages: AgentMessage[]): Message[] => {
+4142: 			const converted = filterProviderReplayMessages(convertToLlmWithBlockImages(messages));
+4143: 			if (!obfuscator?.hasSecrets()) return converted;
+4144: 			return obfuscateMessages(obfuscator, converted);
+4145: 		};
+4146:
+4147: 		const transformContext = async (messages: AgentMessage[], signal?: AbortSignal) => {
+4148: 			const withContext = await extensionRunner.emitContext(messages, signal);
+4149: 			return wrapSteeringForModel(withContext);
+4150: 		};

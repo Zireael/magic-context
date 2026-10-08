@@ -1,0 +1,33 @@
+Final verification record
+
+Bun: 1.4.2 (744846f84)
+TypeScript: 5.9.3
+OMP host: omp/18.8.6
+
+Linux command:
+  bun --version && bun packages/pi-plugin/node_modules/typescript/bin/tsc --version && bun packages/pi-plugin/node_modules/typescript/bin/tsc -p docs/reports/probes/issue-641/tsconfig.json && printf 'TypeScript check passed: 1 project, 5 probe entrypoints plus imported sources\n'
+Result: exit 0; 1 scoped TypeScript project, 5 probe entrypoints plus imported sources; 11 seconds.
+
+Local host commands (five actual CLI/RPC runs, all isolated):
+  bun docs/reports/probes/issue-641/host.ts slow
+  bun docs/reports/probes/issue-641/host.ts fast
+  bun docs/reports/probes/issue-641/host.ts refuse
+  bun docs/reports/probes/issue-641/host.ts late-mc
+  bun docs/reports/probes/issue-641/host.ts fenced
+Results: all exit 0. HTTP request counts respectively 1, 1, 0, 1, 0. Slow sent original text at 30089ms; fast sent transformed text; late-mc sent original at 30227ms. Fenced provider audit managed=false. lsof assertions passed on handler entry and before shutdown for each host.
+
+Local fixture commands:
+  bun docs/reports/probes/issue-641/fixture.ts
+  bun docs/reports/probes/issue-641/snapshot.ts ff8d438a16ebbc3eae82acd29ea572731b086971
+Results: both exit 0; 8 handler invocations per revision (6 successful stage-sampled passes and 2 held-writer refusals), 16 invocations total. Each large DB is 399183872 bytes. Emergency historian wait exceeded 30000ms in both revisions; tip writer refusals measured 16582.94ms and 16566.17ms. Fixture/locker lsof assertions passed.
+
+Local replay command:
+  bun docs/reports/probes/issue-641/replay.ts <disposable late-mc host root recorded in receipts.json>
+Result: exit 0; coordinator replay accepted a 5-message array using the never-applied late LKG. Original unmanaged text was present in the real captured HTTP request.
+
+Measured snapshot identity:
+  git rev-parse ff8d438a16ebbc3eae82acd29ea572731b086971:packages/plugin/src/shared/sqlite.ts ff8d438a16ebbc3eae82acd29ea572731b086971:packages/pi-plugin/src/context-handler.ts
+  git hash-object .cache/issue-641/ff8d438a16ebbc3eae82acd29ea572731b086971/packages/plugin/src/shared/sqlite.ts .cache/issue-641/ff8d438a16ebbc3eae82acd29ea572731b086971/packages/pi-plugin/src/context-handler.ts
+Both pairs: ed18fb64375d0132a5ebdef2cd54278f695788e3; cac697ed2da915b562e36cff4e35bd19f4e19827. Snapshot import-resolution receipt is committed.
+
+Editor inspection was PARTIAL: TypeScript SDK unavailable and analysis categories unavailable; explicit scoped TypeScript verification above is authoritative. Sidekick reviewed the new script comments and report prose; clarifying edits were made, including an explicit master/tip citation convention. No product code, repository manifests or lockfiles changed. The task-giver supplied the prepared build as passing (13.6s); this report-only delivery did not rebuild it or run full package suites.

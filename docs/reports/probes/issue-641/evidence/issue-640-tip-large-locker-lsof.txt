@@ -1,0 +1,17 @@
+COMMAND   PID        USER   FD   TYPE             DEVICE  SIZE/OFF                NODE NAME
+Python  30656 ufukaltinok  cwd    DIR               1,15       480          2643670260 /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_4dd22bbb75facec2/.cache/issue-641/ff8d438a16ebbc3eae82acd29ea572731b086971/packages/pi-plugin
+Python  30656 ufukaltinok  txt    REG               1,15     52128          1273198841 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
+Python  30656 ufukaltinok  txt    REG               1,15     77368          2640054263 /private/var/db/diagnostics/logd/.plist-cache.387nj2jg
+Python  30656 ufukaltinok  txt    REG               1,15    753664          2643680811 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/fixture-a5COg0/large.db-shm
+Python  30656 ufukaltinok  txt    REG               1,15   4129840 1152921500312609216 /usr/lib/dyld
+Python  30656 ufukaltinok  txt    REG               1,15    107312          1273199533 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/math.cpython-39-darwin.so
+Python  30656 ufukaltinok  txt    REG               1,15    141520          1273199445 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_datetime.cpython-39-darwin.so
+Python  30656 ufukaltinok  txt    REG               1,15     85488          1273199455 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_heapq.cpython-39-darwin.so
+Python  30656 ufukaltinok  txt    REG               1,15    115056          1273199493 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_sqlite3.cpython-39-darwin.so
+Python  30656 ufukaltinok  txt    REG               1,15   2949168          1273198831 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Python3
+Python  30656 ufukaltinok    0r   CHR                3,2       0t0                 336 /dev/null
+Python  30656 ufukaltinok    1u  unix 0xaf4ed82e4ccb4a11       0t0                     ->0x8c2313b44035612c
+Python  30656 ufukaltinok    2u  unix 0x1d77bdde7a5eb5dc       0t0                     ->0x757cbab008ffe947
+Python  30656 ufukaltinok    3u   REG               1,15 409509888          2643680808 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/fixture-a5COg0/large.db
+Python  30656 ufukaltinok    4u   REG               1,15   3489672          2643680810 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/fixture-a5COg0/large.db-wal
+Python  30656 ufukaltinok    5u   REG               1,15    753664          2643680811 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/fixture-a5COg0/large.db-shm

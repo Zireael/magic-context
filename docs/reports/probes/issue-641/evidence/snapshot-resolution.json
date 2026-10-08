@@ -1,0 +1,7 @@
+{
+  "ref": "ff8d438a16ebbc3eae82acd29ea572731b086971",
+  "snapshot": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_4dd22bbb75facec2/.cache/issue-641/ff8d438a16ebbc3eae82acd29ea572731b086971",
+  "resolution": {
+    "sqlite": "file:///Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_4dd22bbb75facec2/.cache/issue-641/ff8d438a16ebbc3eae82acd29ea572731b086971/packages/plugin/src/shared/sqlite.ts"
+  }
+}

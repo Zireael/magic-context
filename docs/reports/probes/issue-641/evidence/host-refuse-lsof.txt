@@ -1,0 +1,58 @@
+COMMAND   PID        USER   FD     TYPE             DEVICE  SIZE/OFF                NODE NAME
+bun     79685 ufukaltinok  cwd      DIR               1,15        64          2642942469 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/work
+bun     79685 ufukaltinok  txt      REG               1,15  61884464          1288160918 /Users/ufukaltinok/.bun/bin/bun
+bun     79685 ufukaltinok  txt      REG               1,15     77368          2640054263 /private/var/db/diagnostics/logd/.plist-cache.387nj2jg
+bun     79685 ufukaltinok  txt      REG               1,15    236480          2474481942 /private/var/db/timezone/tz/2026d.1.0/icutz/icutz44l.dat
+bun     79685 ufukaltinok  txt      REG               1,15     32768          2642942700 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/agent.db-shm
+bun     79685 ufukaltinok  txt      REG               1,15     32768          2642942705 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/models.db-shm
+bun     79685 ufukaltinok  txt      REG               1,15     32768          2642942718 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/cache/legacy-pi-extension-cache.db-shm
+bun     79685 ufukaltinok  txt      REG               1,15     32768          2642942731 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/skill-descriptions.db-shm
+bun     79685 ufukaltinok  txt      REG               1,15       110 1152921500312109332 /System/Library/CoreServices/SystemVersion.bundle/English.lproj/SystemVersion.strings
+bun     79685 ufukaltinok  txt      REG               1,15     32768          2642942490 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/data/cortexkit/magic-context/context.db-shm
+bun     79685 ufukaltinok  txt      REG               1,15    273184          2642838883 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-applefm-426625c9e74357ce.dylib
+bun     79685 ufukaltinok  txt      REG               1,15     77647 1152921500312158089 /System/Library/Frameworks/CoreFoundation.framework/Versions/A/Resources/Error.loctable
+bun     79685 ufukaltinok  txt      REG               1,15   4129840 1152921500312609216 /usr/lib/dyld
+bun     79685 ufukaltinok  txt      REG               1,15  36103568 1152921500312619766 /usr/share/icu/icudt78l.dat
+bun     79685 ufukaltinok  txt      REG               1,15 177035328          2642733644 /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_4dd22bbb75facec2/.cache/issue-641/host/node_modules/@oh-my-pi/pi-natives-darwin-arm64/pi_natives.darwin-arm64.node
+bun     79685 ufukaltinok    0u    unix   0x9e39b056ee1650       0t0                     ->0x70a9b16e149629a7
+bun     79685 ufukaltinok    1u    unix  0x16fd7bf513a0c13       0t0                     ->0x3539128fba264404
+bun     79685 ufukaltinok    2u    unix 0x3145e6498364821d       0t0                     ->0xc933605af12d07a3
+bun     79685 ufukaltinok    3u  KQUEUE                                                  count=0, state=0x12
+bun     79685 ufukaltinok    4u  KQUEUE                                                  count=0, state=0xa
+bun     79685 ufukaltinok    5u  KQUEUE                                                  count=0, state=0xa
+bun     79685 ufukaltinok    6u  KQUEUE                                                  count=0, state=0xa
+bun     79685 ufukaltinok    7u    unix 0xcb5f54cf2bb03888       0t0                     ->0x9048c6fe0317a149
+bun     79685 ufukaltinok    8u    unix 0x9048c6fe0317a149       0t0                     ->0xcb5f54cf2bb03888
+bun     79685 ufukaltinok    9u    unix 0xcb5f54cf2bb03888       0t0                     ->0x9048c6fe0317a149
+bun     79685 ufukaltinok   10u    unix  0x16fd7bf513a0c13       0t0                     ->0x3539128fba264404
+bun     79685 ufukaltinok   11u    unix 0x3145e6498364821d       0t0                     ->0xc933605af12d07a3
+bun     79685 ufukaltinok   12u     REG               1,15      4096          2642942697 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/agent.db
+bun     79685 ufukaltinok   13u     REG               1,15    486192          2642942699 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/agent.db-wal
+bun     79685 ufukaltinok   14u     REG               1,15     32768          2642942700 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/agent.db-shm
+bun     79685 ufukaltinok   15u     REG               1,15      4096          2642942697 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/agent.db
+bun     79685 ufukaltinok   16u     REG               1,15    486192          2642942699 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/agent.db-wal
+bun     79685 ufukaltinok   17u     REG               1,15   4063232          2642942702 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/models.db
+bun     79685 ufukaltinok   18u     REG               1,15   3675072          2642942704 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/models.db-wal
+bun     79685 ufukaltinok   19u     REG               1,15     32768          2642942705 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/models.db-shm
+bun     79685 ufukaltinok   20u     REG               1,15      4096          2642942715 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/cache/legacy-pi-extension-cache.db
+bun     79685 ufukaltinok   21u     REG               1,15     20632          2642942717 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/cache/legacy-pi-extension-cache.db-wal
+bun     79685 ufukaltinok   22u     REG               1,15     32768          2642942718 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/cache/legacy-pi-extension-cache.db-shm
+bun     79685 ufukaltinok   23u     REG               1,15      4096          2642942475 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/data/cortexkit/magic-context/context.db
+bun     79685 ufukaltinok   24u  KQUEUE                                                  count=0, state=0x12
+bun     79685 ufukaltinok   25u     REG               1,15         0          2642963579 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/run/session-owners/01a11d3b-514e-708d-ae00-3941cbcde96e.lock
+bun     79685 ufukaltinok   26u     REG               1,15      4096          2642942728 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/skill-descriptions.db
+bun     79685 ufukaltinok   27u     REG               1,15     12392          2642942730 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/skill-descriptions.db-wal
+bun     79685 ufukaltinok   28u     REG               1,15     32768          2642942731 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/agent/skill-descriptions.db-shm
+bun     79685 ufukaltinok   29u    unix 0xc8450a49732f13bb       0t0                     ->0x68634690a9335678
+bun     79685 ufukaltinok   30u    IPv4  0x7fce902ac2b2818       0t0                 TCP 192.168.1.41:65340->104.21.49.202:https (ESTABLISHED)
+bun     79685 ufukaltinok   31u     REG               1,15   3563832          2642942489 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/data/cortexkit/magic-context/context.db-wal
+bun     79685 ufukaltinok   32u     REG               1,15     32768          2642942490 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/data/cortexkit/magic-context/context.db-shm
+bun     79685 ufukaltinok   33u    IPv4 0xb3a5e44b2e1c603d       0t0                 TCP 192.168.1.41:65346->172.67.75.165:https (ESTABLISHED)
+bun     79685 ufukaltinok   34u  KQUEUE                                                  count=0, state=0x10
+bun     79685 ufukaltinok   35u    IPv4 0x4b9c3d682cfd9704       0t0                 TCP 192.168.1.41:65349->64.239.109.129:https (ESTABLISHED)
+bun     79685 ufukaltinok   36u    IPv4 0xa6eeb65354756704       0t0                 TCP 192.168.1.41:65364->wi-in-f121.1e100.net:https (ESTABLISHED)
+bun     79685 ufukaltinok   37u    IPv4 0x373f53593fd863cb       0t0                 TCP 192.168.1.41:65378->160.79.104.10:https (ESTABLISHED)
+bun     79685 ufukaltinok   38u    IPv4 0xc34c163355306443       0t0                 TCP 192.168.1.41:65354->104.18.28.226:https (ESTABLISHED)
+bun     79685 ufukaltinok   40u    IPv4 0x4cdbd7ef60a75d79       0t0                 TCP 192.168.1.41:65358->172.65.90.66:https (ESTABLISHED)
+bun     79685 ufukaltinok   41w     REG               1,15      1784          2642942734 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk/.omp/logs/omp.2026-10-08.79685.log
+bun     79685 ufukaltinok   42u    IPv4  0x857f6e524b01536       0t0                 TCP 192.168.1.41:65359->43.106.123.215:https (ESTABLISHED)

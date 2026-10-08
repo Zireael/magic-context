@@ -1,0 +1,43 @@
+[
+  {
+    "mode": "slow",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-wCUJSh",
+    "requestBodySha256": [
+      "0f8129dc6b798a90d1a1f560e4c17256ada685c91f4043b0848b2872b6839515"
+    ]
+  },
+  {
+    "mode": "fast",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-9LZtse",
+    "requestBodySha256": [
+      "145783401ae9a11d04abad0599a09558a8d5ac3a6eb8dee75354d75918a22048"
+    ]
+  },
+  {
+    "mode": "refuse",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-uwyGwk",
+    "requestBodySha256": []
+  },
+  {
+    "mode": "late-mc",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-E7FR6t",
+    "requestBodySha256": [
+      "636b7b75a6c2c57cdcef3daf1f8645db3c3e64feb3f8b088da609feaa497a8bf"
+    ]
+  },
+  {
+    "mode": "fenced",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-KOVkyb",
+    "requestBodySha256": []
+  },
+  {
+    "kind": "fixture",
+    "label": "master",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/fixture-PoQtBF"
+  },
+  {
+    "kind": "fixture",
+    "label": "issue-640-tip",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/fixture-a5COg0"
+  }
+]

@@ -1,0 +1,17 @@
+COMMAND   PID        USER   FD   TYPE             DEVICE SIZE/OFF                NODE NAME
+Python  19213 ufukaltinok  cwd    DIR               1,15     1824          2642050856 /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_4dd22bbb75facec2
+Python  19213 ufukaltinok  txt    REG               1,15    52128          1273198841 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
+Python  19213 ufukaltinok  txt    REG               1,15    77368          2640054263 /private/var/db/diagnostics/logd/.plist-cache.387nj2jg
+Python  19213 ufukaltinok  txt    REG               1,15    32768          2643670813 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/fixture-PoQtBF/small.db-shm
+Python  19213 ufukaltinok  txt    REG               1,15   107312          1273199533 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/math.cpython-39-darwin.so
+Python  19213 ufukaltinok  txt    REG               1,15    85488          1273199455 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_heapq.cpython-39-darwin.so
+Python  19213 ufukaltinok  txt    REG               1,15   141520          1273199445 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_datetime.cpython-39-darwin.so
+Python  19213 ufukaltinok  txt    REG               1,15  4129840 1152921500312609216 /usr/lib/dyld
+Python  19213 ufukaltinok  txt    REG               1,15  2949168          1273198831 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Python3
+Python  19213 ufukaltinok  txt    REG               1,15   115056          1273199493 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_sqlite3.cpython-39-darwin.so
+Python  19213 ufukaltinok    0r   CHR                3,2      0t0                 336 /dev/null
+Python  19213 ufukaltinok    1u  unix 0xa981a2a6b816374e      0t0                     ->0xd5893a46d7f0cf7
+Python  19213 ufukaltinok    2u  unix 0xb806cb73c7a0c36f      0t0                     ->0x494511889db1e2bc
+Python  19213 ufukaltinok    3u   REG               1,15 11304960          2643670795 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/fixture-PoQtBF/small.db
+Python  19213 ufukaltinok    4u   REG               1,15   778712          2643670812 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/fixture-PoQtBF/small.db-wal
+Python  19213 ufukaltinok    5u   REG               1,15    32768          2643670813 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/fixture-PoQtBF/small.db-shm

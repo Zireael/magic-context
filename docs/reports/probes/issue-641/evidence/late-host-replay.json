@@ -1,0 +1,111 @@
+{
+  "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-E7FR6t",
+  "slot": {
+    "capturedAt": 1791491858412,
+    "modelKey": "mock/mock-model"
+  },
+  "providerReceivedAt": 1791491856297,
+  "original": {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "MC641_ORIGINAL"
+      }
+    ],
+    "attribution": "user",
+    "timestamp": 1791491826071
+  },
+  "providerMessages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<system-reminder>\nToday: 2026-10-08; current working directory: '/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-E7FR6t/work'. Do not repeat this information in your reply.\n</system-reminder>\nMC641_ORIGINAL",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    }
+  ],
+  "replay": {
+    "ok": true,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "<session-history></session-history>"
+          }
+        ],
+        "timestamp": 1791491826069
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "<session-history-since>(no new content since last materialization)</session-history-since>"
+          }
+        ],
+        "timestamp": 1791491826070
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "§1§ MC641_ORIGINAL"
+          }
+        ],
+        "attribution": "user",
+        "timestamp": 1791491826071
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "mock reply"
+          }
+        ],
+        "api": "anthropic-messages",
+        "provider": "mock",
+        "model": "mock-model",
+        "usage": {
+          "input": 1000,
+          "output": 10,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 1010,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "stop",
+        "timestamp": 1791491856280,
+        "responseId": "msg_de5606fb6ff4472695b9a3e8",
+        "duration": 19.75954200000342,
+        "ttft": 19.17462500000329,
+        "completedAt": 1791491856322,
+        "contextSnapshot": {
+          "promptTokens": 1000,
+          "nonMessageTokens": 11985,
+          "compactionEpoch": 0
+        }
+      },
+      {
+        "role": "user",
+        "content": "Continue safely",
+        "timestamp": 1791493031001
+      }
+    ]
+  }
+}

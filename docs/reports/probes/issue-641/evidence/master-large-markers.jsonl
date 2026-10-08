@@ -1,0 +1,1 @@
+{"type":"compaction","id":"marker-0","parentId":"search-tail","timestamp":"2026-10-08T20:53:34.873Z","summary":"Synthetic deadline marker","firstKeptEntryId":"synthetic-entry-000003","tokensBefore":573414,"details":{"source":"magic-context","lastCompactedOrdinal":3},"fromHook":true}
