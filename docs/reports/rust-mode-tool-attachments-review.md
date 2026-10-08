@@ -1,5 +1,9 @@
 # Adversarial review: Rust-mode tool-result attachments
 
+Historical failing-first review. The five findings below retain their original
+evidence; fixes and current verification are in
+[the repair report](rust-mode-tool-attachments-repair.md).
+
 Reviewed master merge `1f0c5ec94e54fa2ef9bd4d83bf1f9d9888d4c321`, relative to its
 first parent. Read `rust-mode-tool-attachments.md` first, then
 `ARCHITECTURE.md:50–91`. This delivery changes **tests and this report only**;

@@ -27,6 +27,14 @@
             "hosts": ["opencode"]
         },
         {
+            "path": "tests/rust-tool-attachment-upgrade.test.ts",
+            "tier": "rust-only",
+            "invocation": { "ts": false, "rust": true },
+            "rationale": "Real OpenCode 1 old-adapter upgrade preserves previously served attachment-free bytes on three defers across restart, restores once on acknowledged independent module flush permission, then replays media byte-identically on three tail deltas; host PID lsof proves throwaway-store containment",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/checkout-claim.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

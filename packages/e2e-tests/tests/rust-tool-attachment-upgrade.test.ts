@@ -7,7 +7,7 @@ import { createIsolatedEnv, PLUGIN_ENTRY } from "../src/opencode-runner/spawn";
 import { RustTestHarness, stableSerialize } from "../src/rust-harness";
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-type Block = { type?: string; tool_use_id?: string; text?: string; content?: Block[]; source?: { data?: string } };
+type Block = { type?: string; tool_use_id?: string; text?: string; content?: Block[] | string; source?: { data?: string } };
 function screenshot(body: { messages?: Array<{ content: unknown }> }): Block {
     return body.messages!.flatMap(m => Array.isArray(m.content) ? m.content as Block[] : [])
         .find(b => b.type === "tool_result" && b.tool_use_id === "upgrade-screen")!;
@@ -52,6 +52,7 @@ test("Rust real-host adapter upgrade defers losslessly then restores once on flu
         } }) } });`);
     const config = { execute_threshold_percentage: 80, output_reserve: 0,
         historian: { disable: true }, dreamer: { disable: true }, memory: { enabled: false }, embedding: { provider: "off" } };
+    console.log(`OpenCode ${execFileSync("timeout", ["10s", "opencode", "--version"], { encoding: "utf8" }).trim()}, Bun ${Bun.version}`);
     const previousEntry = process.env.MC_E2E_PLUGIN_ENTRY;
     process.env.MC_E2E_PLUGIN_ENTRY = oldEntry;
     let h: RustTestHarness | undefined;
@@ -65,6 +66,7 @@ test("Rust real-host adapter upgrade defers losslessly then restores once on flu
             expect(paths.length).toBeGreaterThan(0);
             expect(paths.every(path => path.startsWith(root + "/"))).toBe(true);
             writeFileSync(join(taskRoot, `upgrade-lsof-${h!.opencode.pid}.txt`), inventory);
+            console.log(`upgrade host ${h!.opencode.pid} lsof: ${JSON.stringify(paths)}`);
         };
         containment();
         let issued = false;
@@ -79,36 +81,59 @@ test("Rust real-host adapter upgrade defers losslessly then restores once on flu
         });
         const id = await h.createSession();
         await h.sendPrompt(id, "UPGRADE_FIRST inspect the screenshot");
+        const beforeUpgrade = await h.waitForRustPasses(2);
+        expect(beforeUpgrade.at(-1)!.raw).toContain("prefix_bust_permitted=false");
         const old = screenshot(h.mainRequests().at(-1)!.body);
         expect(old).toBeDefined();
-        expect(old.content!.some(b => b.type === "image")).toBe(false);
-        expect(old.content!.some(b => b.type === "text" && /^§\d+§ /.test(b.text ?? ""))).toBe(true);
+        // Anthropic's SDK encodes the old, text-only result as a scalar string.
+        expect(typeof old.content).toBe("string");
+        expect(old.content).toMatch(/^§\d+§ UPGRADE_SCREEN screenshot/);
         const oldBytes = stableSerialize(old);
         process.env.MC_E2E_PLUGIN_ENTRY = PLUGIN_ENTRY;
-        await h.restart({ magicContextConfig: config });
+        // Keep the tool schema unchanged across restart: removing the fixture
+        // would independently authorize a tools-fingerprint rebuild.
+        await h.restart({ magicContextConfig: config,
+            openCodeConfigExtra: { plugin: [`file://${PLUGIN_ENTRY}`, `file://${fixture}`] } });
         containment();
         for (let pass = 0; pass < 3; pass++) {
             await h.sendPrompt(id, `UPGRADE_DEFER_${pass} continue`);
+            const served = await h.waitForRustPasses(beforeUpgrade.length + pass + 1);
+            expect(served.at(-1)!.raw).toContain("prefix_bust_permitted=false");
             expect(stableSerialize(screenshot(h.mainRequests().at(-1)!.body))).toBe(oldBytes);
         }
         const deferred = await h.waitForRustPasses(3);
         expect(deferred.slice(-3).every(p => / scheduler=defer(?: |$)/.test(p.raw))).toBe(true);
-        // Use the host's public flush command, which supplies independent bust permission.
-        const flush = await fetch(`${h.opencode.url}/session/${id}/command`, {
-            method: "POST", headers: { "content-type": "application/json" },
-            body: JSON.stringify({ command: "ctx-flush", arguments: "" }),
-        });
-        expect(flush.status).toBe(204);
+        // Use the public module management API behind /ctx-flush. Its acknowledged
+        // arm is independent bust permission; an HTTP 204 from the host command
+        // endpoint only acknowledges asynchronous delivery, not completion.
+        const flush = await h.subc.moduleRequest(id, env.workdir, { method: "session.flush" });
+        expect(flush).toMatchObject({ ok: true, armed: true });
         await h.sendPrompt(id, "UPGRADE_REBUILD restore on the flush");
+        const rebuilt = await h.waitForRustPasses(deferred.length + 1);
+        expect(rebuilt.at(-1)!.raw).toContain("prefix_bust_permitted=true");
         const restored = screenshot(h.mainRequests().at(-1)!.body);
-        expect(restored.content!.filter(b => b.type === "image")).toHaveLength(1);
-        expect(restored.content!.find(b => b.type === "image")!.source!.data).toBe(PNG);
+        expect(Array.isArray(restored.content)).toBe(true);
+        const content = restored.content as Block[];
+        expect(content.filter(b => b.type === "image")).toHaveLength(1);
+        expect(content.find(b => b.type === "image")!.source!.data).toBe(PNG);
+        expect(content.some(b => b.type === "text" && /^§\d+§ /.test(b.text ?? ""))).toBe(true);
         const restoredBytes = stableSerialize(restored);
         for (let pass = 0; pass < 3; pass++) {
             await h.sendPrompt(id, `UPGRADE_REPLAY_${pass} continue`);
             expect(stableSerialize(screenshot(h.mainRequests().at(-1)!.body))).toBe(restoredBytes);
         }
+        const replayed = await h.waitForRustPasses(deferred.length + 4);
+        expect(replayed.slice(-3).every(p => / scheduler=defer(?: |$)/.test(p.raw))).toBe(true);
+        expect(replayed.every(p => p.decision !== "error" && p.decision !== "parked")).toBe(true);
+        console.log(`upgrade Rust passes: ${replayed.map(p => p.raw).join("\n")}`);
         containment();
+    } catch (error) {
+        if (h) {
+            console.error(`upgrade failed Rust passes: ${JSON.stringify(h.readRustPasses())}`);
+            console.error(h.diagnosticLog());
+            console.error(h.opencode.stderr());
+        }
+        throw error;
     } finally {
         if (previousEntry === undefined) delete process.env.MC_E2E_PLUGIN_ENTRY; else process.env.MC_E2E_PLUGIN_ENTRY = previousEntry;
         await h?.dispose();

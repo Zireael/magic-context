@@ -69,19 +69,20 @@ The notice depends only on immutable stored data and the frozen served CK block;
 the native attachment cache and a cache-miss rebuild make the same decision.
 Explicit frozen reductions retain their existing placeholder instead.
 
-The parent approved a **one-time next-normal-pass repair**, not a new persisted
-renderer transition. Placement will coincide with the fleet's OpenCode restart
-window (persona/tool rewrite), when ck-mc's process-local CK/native caches are
-empty anyway. An already-served tagged result containing attachments is restored
-on the next normal module pass that installs the module output, including a defer;
-its provider prefix changes from the first such message onward. More generally,
-any non-exempt result previously re-encoded without its attachments is repaired,
-not just results carrying visible tags. An existing persisted last-served/LKG
-snapshot can continue replaying old bytes under its existing admission/hold rules;
-this change does not force-release that snapshot. Repair happens when normal
-module serving resumes. Sessions without attachment-bearing tool results must be
-byte-identical across the upgrade. No database migration or live-store edits are
-involved.
+The initial implementation restored already-served attachments on a defer. The
+[adversarial review](rust-mode-tool-attachments-review.md) rejected that policy:
+a restart does not erase the provider's cached prefix or durable frozen identities.
+The corrected implementation replays the historical Text/ErrorText projection
+until the shared prefix-bust gate independently permits a prefix edit. It adopts
+the attachment-bearing identities atomically with that restoring bust, without
+persisting upgrade discovery on a defer or relaxing unrelated identity fences.
+The process-local delta cache retains the full attachment-bearing ingress during
+the wait, rather than losing pending media to the old served projection. Restoration
+is not a reasoning-only trim. Existing LKG hold/release and explicit frozen-drop
+rules are unchanged; attachment-free sessions retain their old bytes. No database
+migration or live-store edits are involved. The original measurements below are
+historical; current acceptance is in
+[the repair report](rust-mode-tool-attachments-repair.md).
 
 ## Verification
 
