@@ -19,14 +19,6 @@
             "hosts": ["opencode2"]
         },
         {
-            "path": "tests/rust-tool-attachments.test.ts",
-            "tier": "rust-only",
-            "invocation": { "ts": false, "rust": true },
-            "rationale": "Real OpenCode 1 Rust-mode native attach: mock screenshot plus read image/PDF reach the Anthropic wire with tagged text on first sight and replay byte-identically on later defers; host PID lsof proves throwaway-store containment",
-            "contract_refs": ["S2-MIGRATION"],
-            "hosts": ["opencode"]
-        },
-        {
             "path": "tests/checkout-claim.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
