@@ -144,6 +144,10 @@ import {
 import { readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import { extractInMemoryMessageViews } from "./read-session-raw";
+import {
+    projectOpencodeReasoningBudgetCutoff,
+    resolveKeepReasoningTokens,
+} from "./reasoning-budget";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
@@ -448,7 +452,9 @@ export interface TransformDeps {
      *  sent to the model are byte-identical to the age-based-only behavior. */
     smartDrops?: boolean;
     protectedTools?: Readonly<Record<string, number>>;
-    clearReasoningAge: number;
+    keepReasoningTokens?: number | Record<string, number>;
+    /** Deprecated caller input. Ignored; retained for old integrations. */
+    clearReasoningAge?: number;
     /** Commit-cluster historian trigger config (`commit_cluster_trigger`). */
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
     /**
@@ -2013,13 +2019,29 @@ export function createTransform(deps: TransformDeps) {
                     sessionMeta.lastContextPercentage,
                     boundaryExecuteThreshold,
                     deriveTriggerBudget(boundaryContextLimit, boundaryExecuteThreshold),
-                    deps.clearReasoningAge,
+                    resolveKeepReasoningTokens(
+                        deps.keepReasoningTokens,
+                        currentModelKeyForBoundary,
+                    ),
                     historianRun?.commitClusterTrigger ?? deps.commitClusterTrigger,
                     undefined,
                     boundaryContextLimit,
                     inMemoryTail,
                     taggerFloor,
-                    { providerID: resolvedProviderID },
+                    {
+                        providerID: resolvedProviderID,
+                        budgetCutoff: projectOpencodeReasoningBudgetCutoff(
+                            db,
+                            sessionId,
+                            messages,
+                            resolveKeepReasoningTokens(
+                                deps.keepReasoningTokens,
+                                currentModelKeyForBoundary,
+                            ),
+                            sessionMeta.clearedReasoningThroughTag,
+                            sessionDecisionCalibration(db, sessionId).proseRatio,
+                        ),
+                    },
                     {
                         hardFold: false,
                         force:
@@ -2664,7 +2686,10 @@ export function createTransform(deps: TransformDeps) {
             deferredHistoryRefreshSessions,
             deferredMaterializationSessions,
             lastHeuristicsTurnId: deps.lastHeuristicsTurnId,
-            clearReasoningAge: deps.clearReasoningAge,
+            keepReasoningTokens: resolveKeepReasoningTokens(
+                deps.keepReasoningTokens,
+                currentModelKeyForBoundary,
+            ),
             protectedTagIds,
             protectedTagNumbers,
             protectedCutoff,

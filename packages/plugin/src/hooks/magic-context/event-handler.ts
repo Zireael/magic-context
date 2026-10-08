@@ -127,7 +127,7 @@ export interface EventHandlerDeps {
     rustSessionCleanup?: boolean;
     allowHomeProject?: boolean;
     config: {
-        clear_reasoning_age?: number;
+        clear_reasoning_age?: unknown;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
         cache_ttl: CacheTtlConfig;

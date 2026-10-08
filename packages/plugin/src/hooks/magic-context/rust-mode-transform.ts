@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-
 import { DEFAULT_HISTORIAN_TIMEOUT_MS } from "../../config/schema/magic-context";
 import {
     resolveProjectIdentity,
@@ -158,6 +157,8 @@ import { RECOVERY_NO_HEAD_LIMIT } from "./protected-tail-boundary";
 import { RawFallbackContextLimitError } from "./raw-fallback-context-limit";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { RawMessageOrdinalAnchor } from "./read-session-raw";
+import { resolveKeepReasoningTokens } from "./reasoning-budget";
+import { captureOpencodeReasoningBudgetStatus } from "./reasoning-budget-status";
 import {
     nextRustPassStamp,
     type RustLkgReplayParticipant,
@@ -1654,7 +1655,7 @@ function buildTransformBody(args: {
         historian_model_limits: args.passInputs.historian_model_limits,
         historian_model_variants: args.passInputs.historian_model_variants,
         historian_timeout_ms: args.passInputs.historian_timeout_ms,
-        clear_reasoning_age: args.passInputs.clear_reasoning_age,
+        keep_reasoning_tokens_effective: args.passInputs.keep_reasoning_tokens_effective,
         caveman_enabled: args.passInputs.caveman_enabled === true,
         caveman_min_chars: args.passInputs.caveman_min_chars ?? 500,
         cache_ttl: args.passInputs.cache_ttl,
@@ -3155,7 +3156,10 @@ export function createRustModeTransform(
                     historianRun?.timeoutMs ??
                     deps.historianTimeoutMs ??
                     DEFAULT_HISTORIAN_TIMEOUT_MS,
-                clear_reasoning_age: deps.clearReasoningAge,
+                keep_reasoning_tokens_effective: resolveKeepReasoningTokens(
+                    deps.keepReasoningTokens,
+                    modelKey ?? undefined,
+                ),
                 caveman_enabled:
                     !sessionMeta.isSubagent && deps.cavemanTextCompression?.enabled === true,
                 caveman_min_chars: deps.cavemanTextCompression?.minChars ?? 500,
@@ -4627,6 +4631,12 @@ export function createRustModeTransform(
                 agentName: deps.getNotificationParams?.(sessionId)?.agent,
                 systemPromptHash: sessionMeta.systemPromptHash,
             });
+            captureOpencodeReasoningBudgetStatus(
+                sessionId,
+                output.messages as MessageLike[],
+                resolveKeepReasoningTokens(deps.keepReasoningTokens, modelKey ?? undefined),
+                isPrefixBoundThinkingModel(model?.providerID, model?.modelID),
+            );
             finishPass(true);
             // Validation, message replacement, synchronous LKG persistence and
             // bookkeeping have finished. Clear the persisted replay block last; if

@@ -320,12 +320,9 @@ export function clearOldReasoning(
     messages: MessageLike[],
     reasoningByMessage: Map<MessageLike, ThinkingLikePart[]>,
     messageTagNumbers: Map<MessageLike, number>,
-    clearReasoningAge: number,
+    cutoff: number,
 ): number {
-    const maxTag = findMaxTag(messageTagNumbers);
-    if (maxTag === 0) return 0;
-
-    const ageCutoff = maxTag - clearReasoningAge;
+    const ageCutoff = cutoff;
     let cleared = 0;
 
     for (const message of messages) {
@@ -351,14 +348,6 @@ export function clearOldReasoning(
     }
 
     return cleared;
-}
-
-function findMaxTag(messageTagNumbers: Map<MessageLike, number>): number {
-    let max = 0;
-    for (const tag of messageTagNumbers.values()) {
-        if (tag > max) max = tag;
-    }
-    return max;
 }
 
 const CLEARED_REASONING_TYPES = new Set(["thinking", "reasoning"]);
@@ -409,12 +398,9 @@ const INLINE_THINKING_PATTERN = /<(?:thinking|think)>[\s\S]*?<\/(?:thinking|thin
 export function stripInlineThinking(
     messages: MessageLike[],
     messageTagNumbers: Map<MessageLike, number>,
-    clearReasoningAge: number,
+    cutoff: number,
 ): number {
-    const maxTag = findMaxTag(messageTagNumbers);
-    if (maxTag === 0) return 0;
-
-    const ageCutoff = maxTag - clearReasoningAge;
+    const ageCutoff = cutoff;
     let stripped = 0;
 
     for (const message of messages) {
@@ -937,8 +923,7 @@ export function stripReasoningFromMergedAssistants(
     // look eligible to keep on the next request. Only legacy bare ids still
     // use that layout-dependent rule, preserving their pre-deployment bytes.
     for (const message of messages) {
-        if (message === options?.mutationExemptMessage || message.info.role !== "assistant")
-            continue;
+        if (message.info.role !== "assistant") continue;
         const parts = frozenParts.get(message.info.id ?? "");
         if (!parts) continue;
         for (let index = 0; index < message.parts.length; index += 1) {
@@ -950,6 +935,8 @@ export function stripReasoningFromMergedAssistants(
             stripped++;
         }
     }
+    // Bare legacy ids lack exact part evidence. Replay the established layout
+    // rule rather than first-stripping a previously kept sibling on a defer.
     for (const entry of planMergedAssistantReasoningStrip(
         messages,
         options?.mutationExemptMessage,

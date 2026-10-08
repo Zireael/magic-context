@@ -460,7 +460,7 @@ describe("postprocess replay-or-refuse", () => {
                     case "reasoning-removal-committed-read-failure":
                         args.resolvedProviderID = "openai";
                         args.pendingMaterializationSessions.add(sessionId);
-                        args.clearReasoningAge = 0;
+                        args.keepReasoningTokens = 0;
                         messages.forEach((message, index) => {
                             args.messageTagNumbers.set(message, index + 1);
                         });
@@ -6390,7 +6390,7 @@ describe("postprocess empty-sentinel provider gate", () => {
                 contextUsage: { percentage: 60, inputTokens: 6000 },
                 currentTurnId: "turn-clear-write",
                 resolvedProviderID: "github-copilot",
-                clearReasoningAge: 1,
+                keepReasoningTokens: 0,
                 reasoningByMessage: new Map([[oldMsg, [oldThinking]]]) as never,
                 messageTagNumbers: new Map([
                     [oldMsg, 1],
@@ -6426,7 +6426,7 @@ describe("postprocess empty-sentinel provider gate", () => {
                 contextUsage: { percentage: 60, inputTokens: 6000 },
                 currentTurnId: "turn-clear-write-anthropic",
                 resolvedProviderID: "anthropic",
-                clearReasoningAge: 1,
+                keepReasoningTokens: 0,
                 reasoningByMessage: new Map([[oldMsg, [oldThinking]]]) as never,
                 messageTagNumbers: new Map([
                     [oldMsg, 1],
@@ -11309,14 +11309,20 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
     const boundLoop = (sessionId: string, steps: number, options: { untagged?: number } = {}) => {
         const messages: MessageLike[] = [
             {
-                info: { id: "user-0", role: "user", sessionID: sessionId },
+                // A historical context carrier, not the active real-user request.
+                info: { id: "user-0", role: "user", sessionID: sessionId, synthetic: true },
                 parts: [{ type: "text", text: "do the work" }],
             } as unknown as MessageLike,
         ];
         const tags = new Map<MessageLike, number>([[messages[0], 1]]);
         for (let step = 0; step < steps; step += 1) {
             const message = {
-                info: { id: `assistant-${step}`, role: "assistant", sessionID: sessionId },
+                info: {
+                    id: `assistant-${step}`,
+                    role: "assistant",
+                    sessionID: sessionId,
+                    tokens: { reasoning: 100 },
+                },
                 parts: [
                     {
                         type: "reasoning",
@@ -11359,7 +11365,7 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
                 resolvedProviderID: PROVIDER,
                 thinkingBindingRecoveryEnabledForModel: true,
                 messageTagNumbers: session.tags,
-                clearReasoningAge: options.clearReasoningAge ?? 3,
+                keepReasoningTokens: options.clearReasoningAge === 999 ? 100_000 : 300,
                 fullFeatureMode: options.fullFeatureMode ?? true,
                 contextUsage: options.force
                     ? { percentage: 96, inputTokens: 96_000 }

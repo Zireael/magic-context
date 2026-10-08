@@ -1512,7 +1512,7 @@ export async function registerContext(context: V2Context) {
                 pendingMaterializationSessions,
                 lastHeuristicsTurnId,
                 variantBySession: variants,
-                clearReasoningAge: config.clear_reasoning_age,
+                keepReasoningTokens: config.keep_reasoning_tokens,
                 directory,
                 sessionDirectoryBySession: sessionDirectories,
                 projectPath: directory,

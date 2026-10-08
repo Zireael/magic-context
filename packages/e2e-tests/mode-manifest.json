@@ -35,6 +35,14 @@
             "hosts": ["opencode"]
         },
         {
+            "path": "tests/reasoning-token-budget.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 1 thinking-capable mock proves an over-budget defer retains identical provider bytes, a rebuilding pass keeps whole steps within budget, and later defers replay the frozen watermark; host PID lsof proves throwaway-store containment. Pi and Rust have corresponding module/unit gates.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/checkout-claim.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },

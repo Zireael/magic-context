@@ -53,6 +53,7 @@ import { resolveExecuteThresholdDetail } from "@magic-context/core/hooks/magic-c
 import { countCompartmentsNeedingUpgrade } from "@magic-context/core/hooks/magic-context/legacy-compartments";
 import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0-token-breakdown";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import { reasoningBudgetStatusLine } from "@magic-context/core/hooks/magic-context/reasoning-budget-status";
 import {
 	formatCacheTtlDisplay,
 	resolveCacheTtlDisplay,
@@ -134,6 +135,7 @@ export interface StatusDialogDeps {
 }
 
 export interface StatusDialogDetail {
+	reasoningBudgetLine?: string;
 	sessionId: string;
 	activeProfile: string | null;
 	configGeneration?: number;
@@ -447,7 +449,7 @@ export function formatPiStatusSummary(s: StatusDialogDetail): string {
 			dreamerSkipped: s.dreamer.skipped,
 		},
 		"plain",
-	)}\nWindow source: ${formatWindowSource(s.windowGeometry)}; denominator: ${Math.round(s.contextLimit)} tokens`;
+	)}\nWindow source: ${formatWindowSource(s.windowGeometry)}; denominator: ${Math.round(s.contextLimit)} tokens${s.reasoningBudgetLine ? `\n${s.reasoningBudgetLine}` : ""}`;
 	return s.configGeneration === undefined
 		? summary
 		: `${summary}\nConfig generation: ${s.configGeneration} (adopted ${s.configAdoptedAt ? new Date(s.configAdoptedAt).toLocaleString() : "unknown"})${s.configReloadFailure ? `\nConfig reload failed ${s.configReloadFailure.path}: ${s.configReloadFailure.message}` : ""}`;
@@ -598,6 +600,8 @@ export function renderPiStatusOverlay(
 		),
 	);
 	if (view.windowLine) lines.push(theme.fg("muted", view.windowLine));
+	if (s.reasoningBudgetLine)
+		lines.push(theme.fg("muted", s.reasoningBudgetLine));
 
 	const bar = renderBar(view.bar, innerWidth);
 	if (bar) lines.push(bar);
@@ -925,6 +929,7 @@ export function buildPiStatusDetail(
 
 	return {
 		sessionId,
+		reasoningBudgetLine: reasoningBudgetStatusLine(sessionId),
 		activeProfile: deps.activeProfile ?? null,
 		configGeneration: deps.configGeneration,
 		configAdoptedAt: deps.configAdoptedAt,

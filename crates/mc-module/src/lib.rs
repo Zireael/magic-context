@@ -4816,6 +4816,7 @@ impl McHandler {
                 execute_threshold_project_config: None,
                 protected_tokens_user: None,
                 protected_tokens_project: None,
+                keep_reasoning_tokens: None,
                 compaction_enabled: true,
                 memory_enabled: true,
                 auto_search: crate::config::AutoSearchConfig::default(),
@@ -10325,6 +10326,13 @@ impl McHandler {
             }
             _ => {}
         }
+        if parsed.keep_reasoning_tokens_effective.is_none() {
+            parsed.keep_reasoning_tokens_effective = Some(
+                binding
+                    .config
+                    .resolve_keep_reasoning_tokens(parsed.model_key.as_deref()),
+            );
+        }
         let parsed = Arc::new(parsed);
         let projection_cache_lookup_started_at = Instant::now();
         let projection_cache_input = native_delta_frontier
@@ -14956,12 +14964,17 @@ fn encode_full_native_messages(
         .iter()
         .map(|message| message.deref().clone())
         .collect::<Vec<_>>();
+    // Raw newest-vector replay protects live signed thinking, not a cleared
+    // response. Cleared mids must retain the served tagged/sentinel layout.
+    let cleared_mids = transform::reasoning_native_clear_mids(reasoning_clear_units);
     let mutation_exempt_mids = [mutation_exempt_mid, lineage_anchor_mid]
         .into_iter()
         .flatten()
+        .filter(|mid| !cleared_mids.contains(mid))
         .collect::<Vec<_>>();
     let reasoning_exempt_mid =
-        transform::latest_assistant_reasoning_mutation_exempt_mid(&request.messages);
+        transform::latest_assistant_reasoning_mutation_exempt_mid(&request.messages)
+            .filter(|mid| !cleared_mids.contains(mid));
     profile_end!(perf_prepare);
     profile_start!(perf_encode, "native_reference_encode");
     let mut native_messages =
@@ -15128,12 +15141,15 @@ fn attach_native_messages_incremental(
         }
         None
     });
+    let cleared_mids = transform::reasoning_native_clear_mids(reasoning_clear_units);
     let mutation_exempt_mids = [mutation_exempt_mid, lineage_anchor_mid]
         .into_iter()
         .flatten()
+        .filter(|mid| !cleared_mids.contains(mid))
         .collect::<Vec<_>>();
     let newest_assistant_mid =
-        transform::latest_assistant_reasoning_mutation_exempt_mid(&request.messages);
+        transform::latest_assistant_reasoning_mutation_exempt_mid(&request.messages)
+            .filter(|mid| !cleared_mids.contains(mid));
     let ingress_ordinals = request
         .messages
         .iter()
@@ -15148,7 +15164,6 @@ fn attach_native_messages_incremental(
         .as_mut()
         .map(|snapshot| std::mem::take(&mut snapshot.sidecar_sizes))
         .unwrap_or_default();
-    let cleared_mids = transform::reasoning_native_clear_mids(reasoning_clear_units);
     profile_end!(perf_indexes);
     profile_start!(perf_keys, "native_message_keys");
     let mut message_keys = Vec::with_capacity(response.messages().len());
@@ -15315,6 +15330,7 @@ fn attach_native_messages_incremental(
         codec::opencode::NativeEncodeExemptions {
             mutation_mids: &mutation_exempt_mids,
             reasoning_mid: newest_assistant_mid,
+            reasoning_policy_resolved: true,
         },
         transition_consumed,
         suffix_start,
@@ -21996,6 +22012,7 @@ mod tests {
             execute_threshold_project_config: None,
             protected_tokens_user: None,
             protected_tokens_project: None,
+            keep_reasoning_tokens: None,
             compaction_enabled: true,
             memory_enabled: true,
             auto_search: crate::config::AutoSearchConfig::default(),
@@ -25635,6 +25652,108 @@ mod tests {
                 .expect("native ASTRO target");
             assert_eq!(target.as_ref(), &raw[0]);
         }
+    }
+
+    #[test]
+    fn native_newest_shortcut_preserves_live_signed_bytes_and_keys_clear_transitions() {
+        let raw = vec![json!({"info":{"id":"newest","role":"assistant"},"parts":[
+            {"id":"r","type":"reasoning","text":"signed original","metadata":{"anthropic":{"signature":"sig-original"}}},
+            {"id":"t","type":"text","text":"answer"}
+        ]})];
+        let ingress = codec::decode_opencode(&raw).messages;
+        let request = native_cache_request(
+            "newest-clear-shortcut",
+            ingress.clone(),
+            raw.clone(),
+            "same-input",
+        );
+        let mut served = ingress[0].ck.clone();
+        served.content[0].kind = ck_wire::CkKind::Reasoning {
+            text: String::new(),
+            signature: None,
+        };
+        served.content[0].mark_modified();
+        served.content[1].kind = ck_wire::CkKind::Text {
+            text: "§1§ answer".into(),
+        };
+        served.content[1].mark_modified();
+        served.mark_modified();
+        let cache = Mutex::new(NativeAttachmentCache::new(1024 * 1024));
+        let tags = BTreeMap::from([("newest".to_string(), 1)]);
+        let clear = vec![mc_core::FrozenUnit {
+            key: "strip:reasoning_clear:newest".into(),
+            kind: "strip_reasoning_clear".into(),
+            frozen_payload: String::new(),
+            durability_class: mc_core::DurabilityClass::Lineage,
+            reset_rule: String::new(),
+        }];
+        let control = transform::TransformResponse::passthrough(
+            vec![served.clone()],
+            request.full_array_fingerprint.clone(),
+        );
+        // The unchanged master shortcut serves a non-cleared newest response raw,
+        // including its signed thinking, even when a working CK clone differs.
+        assert_eq!(
+            encode_full_native_messages(&control, &request, &[], &tags, None, None, true),
+            raw
+        );
+        let (live, _) = run_native_cache_pass_with_clear_units(
+            &cache,
+            &request,
+            vec![served.clone()],
+            &[],
+            &tags,
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert_eq!(live.native_messages.as_ref().unwrap()[0].as_ref(), &raw[0]);
+        let expected_clear =
+            encode_full_native_messages(&control, &request, &clear, &tags, None, None, true);
+        assert!(serde_json::to_string(&expected_clear)
+            .unwrap()
+            .contains("§1§ answer"));
+        assert!(!serde_json::to_string(&expected_clear)
+            .unwrap()
+            .contains("signed original"));
+        let (cleared, stats) = run_native_cache_pass_with_clear_units(
+            &cache,
+            &request,
+            vec![served.clone()],
+            &clear,
+            &tags,
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(
+            stats.encoded_messages > 0,
+            "clear transition reused a stale raw newest vector"
+        );
+        assert_eq!(
+            cleared.native_messages.as_ref().unwrap()[0].as_ref(),
+            &expected_clear[0]
+        );
+        // Exercise the cache key's exemption bits in both directions. This is
+        // an encoder control, not permission for a session to restore a clear.
+        let (live_again, stats) = run_native_cache_pass_with_clear_units(
+            &cache,
+            &request,
+            vec![served],
+            &[],
+            &tags,
+            true,
+            0,
+            NativeCacheKeyMode::Normal,
+        );
+        assert!(
+            stats.encoded_messages > 0,
+            "shortcut transition reused stale cleared bytes"
+        );
+        assert_eq!(
+            live_again.native_messages.as_ref().unwrap()[0].as_ref(),
+            &raw[0]
+        );
     }
 
     #[test]

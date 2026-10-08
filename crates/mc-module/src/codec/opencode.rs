@@ -366,6 +366,9 @@ pub(crate) fn encode_opencode_with_transition_state(
 pub(crate) struct NativeEncodeExemptions<'a> {
     pub(crate) mutation_mids: &'a [&'a str],
     pub(crate) reasoning_mid: Option<&'a str>,
+    /// None can mean a resolved policy with no eligible raw shortcut, not a
+    /// request to rediscover newest reasoning while encoding a cached suffix.
+    pub(crate) reasoning_policy_resolved: bool,
 }
 
 pub(crate) fn encode_opencode_with_transition_state_and_reasoning_exemption(
@@ -384,6 +387,7 @@ pub(crate) fn encode_opencode_with_transition_state_and_reasoning_exemption(
         NativeEncodeExemptions {
             mutation_mids: mutation_exempt_mids,
             reasoning_mid: reasoning_exempt_mid,
+            reasoning_policy_resolved: true,
         },
         transition_consumed,
         0,
@@ -418,6 +422,7 @@ fn encode_opencode_impl(
         NativeEncodeExemptions {
             mutation_mids: mutation_exempt_mids,
             reasoning_mid: None,
+            reasoning_policy_resolved: false,
         },
         transition_consumed,
         0,
@@ -487,7 +492,7 @@ pub(crate) fn encode_opencode_chunks_with_transition_state(
                 meta,
                 preserve_compaction,
                 preserve_native_reasoning,
-                exemptions.reasoning_mid.is_some(),
+                exemptions.reasoning_policy_resolved,
             ),
             None => encode_new_message(msg, session_id),
         };
@@ -3132,6 +3137,7 @@ mod tests {
             NativeEncodeExemptions {
                 mutation_mids: &[],
                 reasoning_mid: Some("new"),
+                reasoning_policy_resolved: true,
             },
             true,
             0,
