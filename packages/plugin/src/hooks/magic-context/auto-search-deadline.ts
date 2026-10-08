@@ -1,23 +1,37 @@
 import { Worker } from "node:worker_threads";
 import {
+    type AutoSearchHintDecision,
     type AutoSearchHintNoHintReason,
     appendAutoSearchHintDecision,
 } from "../../features/magic-context/storage-meta-persisted";
+import {
+    cancelAutoSearchSessionWrites,
+    registerAutoSearchWriter,
+} from "../../shared/auto-search-hint-fence";
 import { getHarness } from "../../shared/harness";
 import { type Database, getSqliteDatabasePath } from "../../shared/sqlite";
 
 export const AUTO_SEARCH_TIMEOUT_MS = 3_000;
+const operationDeadlines = new WeakMap<AbortSignal, number>();
 
-const skippedTurns = new Map<
-    string,
-    WeakMap<Database, { messageId: string; persistence: Promise<boolean> }>
->();
+export function autoSearchDeadlineUnixMs(signal?: AbortSignal): number {
+    const deadline = signal && operationDeadlines.get(signal);
+    return (
+        Date.now() +
+        (deadline === undefined
+            ? AUTO_SEARCH_TIMEOUT_MS
+            : Math.max(0, deadline - performance.now()))
+    );
+}
+
+const skippedTurns = new Map<string, WeakMap<Database, Map<string, Promise<boolean>>>>();
 
 export function wasAutoSearchSkipped(db: Database, sessionId: string, messageId: string): boolean {
-    return skippedTurns.get(sessionId)?.get(db)?.messageId === messageId;
+    return skippedTurns.get(sessionId)?.get(db)?.has(messageId) ?? false;
 }
 
 export function clearAutoSearchTimeoutForSession(sessionId?: string): void {
+    cancelAutoSearchSessionWrites(sessionId);
     if (sessionId === undefined) skippedTurns.clear();
     else skippedTurns.delete(sessionId);
 }
@@ -34,13 +48,22 @@ export function persistAutoSearchSkip(
         turns = new WeakMap();
         skippedTurns.set(sessionId, turns);
     }
-    const prior = turns.get(db);
-    if (prior?.messageId === messageId) return prior.persistence;
+    let messages = turns.get(db);
+    if (!messages) {
+        messages = new Map();
+        turns.set(db, messages);
+    }
+    const prior = messages.get(messageId);
+    if (prior) return prior;
     const path = getSqliteDatabasePath(db);
+    const incarnation = db
+        .prepare("SELECT rowid AS id FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { id: number } | undefined;
     // In-memory databases have neither file locks nor WAL checkpoint I/O. They
     // are used by isolated tests; runtime stores use the off-thread path below.
     const persistence = path
         ? new Promise<boolean>((resolve) => {
+              const registration = registerAutoSearchWriter(sessionId);
               const worker = new Worker(
                   new URL(
                       new URL(import.meta.url).pathname.endsWith(".ts")
@@ -54,16 +77,25 @@ export function persistAutoSearchSkip(
                           sessionId,
                           harness: getHarness(),
                           skipDecision: { messageId, decision: "no-hint", reason },
+                          cancellation: registration.cancellation,
+                          expectedRowid: incarnation?.id ?? null,
+                          deadlineUnixMs: Date.now() + 250,
                       },
                   },
               );
               const finish = (ok: boolean) => {
+                  registration.done();
                   resolve(ok);
                   void worker.terminate();
               };
-              worker.on("message", (reply: { ok?: boolean }) => finish(reply.ok === true));
+              worker.on("message", (reply: { ok?: boolean; decision?: AutoSearchHintDecision }) =>
+                  finish(reply.ok === true && reply.decision?.decision === "no-hint"),
+              );
               worker.on("error", () => finish(false));
-              worker.on("exit", () => resolve(false));
+              worker.on("exit", () => {
+                  registration.done();
+                  resolve(false);
+              });
               worker.unref();
           })
         : Promise.resolve(
@@ -73,7 +105,7 @@ export function persistAutoSearchSkip(
                   reason,
               }).ok,
           );
-    turns.set(db, { messageId, persistence });
+    messages.set(messageId, persistence);
     return persistence;
 }
 
@@ -92,6 +124,7 @@ export async function withAutoSearchDeadline<T>(
     const remaining = deadline - performance.now();
     if (remaining <= 0) return null;
     const controller = new AbortController();
+    operationDeadlines.set(controller.signal, deadline);
     const checkDeadline = (): boolean => {
         if (!controller.signal.aborted && performance.now() >= deadline) controller.abort();
         return controller.signal.aborted;

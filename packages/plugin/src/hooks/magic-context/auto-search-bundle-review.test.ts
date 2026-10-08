@@ -106,7 +106,12 @@ for (const [runtime, directory, harness, packed] of [
                         "--pack-destination",
                         fixtureRoot,
                     ],
-                    { cwd: join(repo, packageDirectory), stdout: "pipe", stderr: "pipe" },
+                    {
+                        windowsHide: true,
+                        cwd: join(repo, packageDirectory),
+                        stdout: "pipe",
+                        stderr: "pipe",
+                    },
                 );
                 const [json, error, code] = await Promise.all([
                     new Response(pack.stdout).text(),
@@ -124,7 +129,7 @@ for (const [runtime, directory, harness, packed] of [
                 expect(metadata.files.some((file) => file.path === relative)).toBe(true);
                 const unpack = Bun.spawn(
                     ["tar", "-xzf", join(fixtureRoot, metadata.filename), "-C", fixtureRoot],
-                    { stdout: "pipe", stderr: "pipe" },
+                    { windowsHide: true, stdout: "pipe", stderr: "pipe" },
                 );
                 expect(await unpack.exited).toBe(0);
                 workerEntry = join(fixtureRoot, "package", relative);
@@ -165,6 +170,7 @@ for (const [runtime, directory, harness, packed] of [
                   ]
                 : [runtime, driverPath, ...argumentsForDriver];
             const child = Bun.spawn(command, {
+                windowsHide: true,
                 cwd: host ? fixtureRoot : repo,
                 stdin: "pipe",
                 env: {

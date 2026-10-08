@@ -119,7 +119,12 @@ export type AutoSearchHintNoHintReason =
     | "too-short";
 
 export type AutoSearchHintDecision =
-    | { messageId: string; decision: "hint"; text: string }
+    | {
+          messageId: string;
+          decision: "hint";
+          text: string;
+          publication?: { token: string; state: "provisional" | "accepted" };
+      }
     | { messageId: string; decision: "no-hint"; reason: AutoSearchHintNoHintReason };
 
 export type NoteNudgeDeliveryOutcome =
@@ -289,12 +294,40 @@ function isValidAutoSearchHintDecision(value: unknown): value is AutoSearchHintD
     const row = value as Record<string, unknown>;
     if (typeof row.messageId !== "string" || row.messageId.length === 0) return false;
     if (row.decision === "hint") {
-        return typeof row.text === "string" && row.text.length > 0;
+        const publication = row.publication as { token?: unknown; state?: unknown } | undefined;
+        return (
+            typeof row.text === "string" &&
+            row.text.length > 0 &&
+            (publication === undefined ||
+                (publication !== null &&
+                    typeof publication.token === "string" &&
+                    publication.token.length > 0 &&
+                    (publication.state === "provisional" || publication.state === "accepted")))
+        );
     }
     if (row.decision === "no-hint") {
         return typeof row.reason === "string" && AUTO_SEARCH_NO_HINT_REASONS.has(row.reason);
     }
     return false;
+}
+
+/** Publication lives in the existing JSON column so every connection/process sees
+ * the same decision. Rows written before the protocol are already accepted. */
+export function decodeServedAutoSearchHintDecisions(
+    json: string | null | undefined,
+): AutoSearchHintDecision[] {
+    return parseJsonArray(json, isValidAutoSearchHintDecision)
+        .filter(
+            (entry) =>
+                entry.decision !== "hint" ||
+                entry.publication === undefined ||
+                entry.publication.state === "accepted",
+        )
+        .map((entry) =>
+            entry.decision === "hint"
+                ? { messageId: entry.messageId, decision: "hint" as const, text: entry.text }
+                : entry,
+        );
 }
 
 function parseJsonArray<T>(
@@ -1578,7 +1611,7 @@ export function getAutoSearchHintDecisions(
     const row = db
         .prepare("SELECT auto_search_hint_decisions FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { auto_search_hint_decisions?: string | null } | undefined;
-    return parseJsonArray(row?.auto_search_hint_decisions, isValidAutoSearchHintDecision).filter(
+    return decodeServedAutoSearchHintDecisions(row?.auto_search_hint_decisions).filter(
         (decision) =>
             decision.decision !== "hint" ||
             !isAutoSearchHintPending(db, sessionId, decision.messageId),
@@ -1711,35 +1744,102 @@ export function appendAutoSearchHintDecision(
     db: Database,
     sessionId: string,
     entry: AutoSearchHintDecision,
+    options?: { ensureRow?: boolean },
 ): AppendAutoSearchHintOutcome {
-    if (!entry.messageId) return { ok: false, kind: "cas-exhausted" };
-    let staged: { kind: "appended" | "already-present"; decision: AutoSearchHintDecision } | null =
-        null;
-    const casOk = casUpdateJsonArrayColumn(
-        db,
-        sessionId,
-        "auto_search_hint_decisions",
-        isValidAutoSearchHintDecision,
-        (current) => {
-            const existing = current.find((decision) => decision.messageId === entry.messageId);
-            if (existing) {
-                staged = { kind: "already-present", decision: existing };
-                return null;
+    return db
+        .transaction((): AppendAutoSearchHintOutcome => {
+            if (!entry.messageId) return { ok: false, kind: "cas-exhausted" };
+            let staged: {
+                kind: "appended" | "already-present";
+                decision: AutoSearchHintDecision;
+            } | null = null;
+            const casOk = casUpdateJsonArrayColumn(
+                db,
+                sessionId,
+                "auto_search_hint_decisions",
+                isValidAutoSearchHintDecision,
+                (current) => {
+                    const existing = current.find(
+                        (decision) => decision.messageId === entry.messageId,
+                    );
+                    if (existing) {
+                        staged = { kind: "already-present", decision: existing };
+                        return null;
+                    }
+                    staged = { kind: "appended", decision: entry };
+                    return [...current, entry];
+                },
+                options,
+            );
+            if (!casOk) return { ok: false, kind: "cas-exhausted" };
+            const committed = staged as {
+                kind: "appended" | "already-present";
+                decision: AutoSearchHintDecision;
+            } | null;
+            if (!committed) {
+                sessionLog(sessionId, "auto-search: CAS reported success with no staged outcome");
+                return { ok: false, kind: "cas-exhausted" };
             }
-            staged = { kind: "appended", decision: entry };
-            return [...current, entry];
-        },
-    );
-    if (!casOk) return { ok: false, kind: "cas-exhausted" };
-    const committed = staged as {
-        kind: "appended" | "already-present";
-        decision: AutoSearchHintDecision;
-    } | null;
-    if (!committed) {
-        sessionLog(sessionId, "auto-search: CAS reported success with no staged outcome");
-        return { ok: false, kind: "cas-exhausted" };
-    }
-    return { ok: true, kind: committed.kind, decision: committed.decision };
+            return { ok: true, kind: committed.kind, decision: committed.decision };
+        })
+        .immediate();
+}
+
+/** Only the owner that received a timely writer acknowledgement may publish the
+ * reserved hint. Token matching prevents another connection adopting a pending row. */
+export function acceptAutoSearchHintDecision(
+    db: Database,
+    sessionId: string,
+    entry: AutoSearchHintDecision,
+    deadlineUnixMs: number,
+): AppendAutoSearchHintOutcome {
+    return db
+        .transaction((): AppendAutoSearchHintOutcome => {
+            let accepted: AutoSearchHintDecision | undefined;
+            const ok = casUpdateJsonArrayColumn(
+                db,
+                sessionId,
+                "auto_search_hint_decisions",
+                isValidAutoSearchHintDecision,
+                (current) => {
+                    if (
+                        Date.now() >= deadlineUnixMs ||
+                        entry.decision !== "hint" ||
+                        !entry.publication
+                    )
+                        return null;
+                    const stored = current.find(
+                        (decision) => decision.messageId === entry.messageId,
+                    );
+                    if (
+                        stored?.decision !== "hint" ||
+                        stored.publication?.token !== entry.publication.token
+                    )
+                        return null;
+                    accepted = {
+                        ...stored,
+                        publication: { ...stored.publication, state: "accepted" },
+                    };
+                    return current.map((decision) =>
+                        decision === stored ? (accepted as AutoSearchHintDecision) : decision,
+                    );
+                },
+                { ensureRow: false },
+            );
+            return ok && accepted
+                ? {
+                      ok: true,
+                      kind: "appended",
+                      decision: {
+                          messageId: accepted.messageId,
+                          decision: "hint",
+                          text: (accepted as Extract<AutoSearchHintDecision, { decision: "hint" }>)
+                              .text,
+                      },
+                  }
+                : { ok: false, kind: "cas-exhausted" };
+        })
+        .immediate();
 }
 
 /** A worker committed this hint but missed its served-turn deadline. Undo only
@@ -1759,6 +1859,7 @@ export function retireUnservedAutoSearchHintDecision(
                 decision.messageId === entry.messageId &&
                 decision.decision === "hint" &&
                 entry.decision === "hint" &&
+                (!entry.publication || decision.publication?.token === entry.publication.token) &&
                 decision.text === entry.text
                     ? {
                           messageId: entry.messageId,
@@ -3055,9 +3156,8 @@ export function loadPostprocessReplaySnapshot(
         strippedPlaceholderIds: new Set(placeholders.ids),
         hiddenSeamPlaceholderIds: new Set(placeholders.hiddenSeamIds),
         noteNudgeAnchors: parseJsonArray(row?.note_nudge_anchors, isValidNoteNudgeAnchor),
-        autoSearchHintDecisions: parseJsonArray(
+        autoSearchHintDecisions: decodeServedAutoSearchHintDecisions(
             row?.auto_search_hint_decisions,
-            isValidAutoSearchHintDecision,
         ).filter(
             (decision) =>
                 decision.decision !== "hint" ||

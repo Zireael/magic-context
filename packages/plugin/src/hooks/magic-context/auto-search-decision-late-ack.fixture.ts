@@ -11,9 +11,11 @@ const input = workerData as {
     sessionId: string;
     decision: AutoSearchHintDecision;
     harness: HarnessId;
+    deadlineUnixMs: number;
 };
 setHarness(input.harness);
 const db = new Database(input.path);
+db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(input.deadlineUnixMs - Date.now()))}`);
 const outcome = appendAutoSearchHintDecision(db, input.sessionId, input.decision);
 // The commit was timely but its acknowledgement reaches the owner too late.
 Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3600);

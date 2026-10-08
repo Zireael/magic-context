@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import {
     embedBatchForProject,
@@ -21,7 +22,11 @@ import { isEmbeddingHostBusy } from "../../shared/embedding-activity";
 import { getHarness, type HarnessId } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import { type Database, getSqliteDatabasePath } from "../../shared/sqlite";
-import { AUTO_SEARCH_TIMEOUT_MS, withAutoSearchDeadline } from "./auto-search-deadline";
+import {
+    AUTO_SEARCH_TIMEOUT_MS,
+    autoSearchDeadlineUnixMs,
+    withAutoSearchDeadline,
+} from "./auto-search-deadline";
 
 const pendingRegistrations = new WeakMap<Database, Set<string>>();
 const pendingTurns = new WeakMap<Database, Map<string, Map<string, Promise<unknown>>>>();
@@ -143,68 +148,103 @@ export async function persistAutoSearchDecision(
 ): Promise<ReturnType<typeof appendAutoSearchHintDecision> | null> {
     const path = getSqliteDatabasePath(db);
     const fenced = path !== null && decision.decision === "hint";
-    let writerFinished = false;
+    const reserved: AutoSearchHintDecision =
+        fenced && decision.decision === "hint"
+            ? { ...decision, publication: { token: randomUUID(), state: "provisional" } }
+            : decision;
     let rejected = false;
     let retirementQueued = false;
+    // A rejected publication can be retired immediately: its durable provisional
+    // state cannot be promoted without a timely owner command.
     const retireIfReady = () => {
-        if (fenced && path && writerFinished && rejected && !retirementQueued) {
+        if (fenced && path && rejected && !retirementQueued) {
             retirementQueued = true;
-            retireRejectedHint(db, path, sessionId, decision);
+            retireRejectedHint(db, path, sessionId, reserved);
         }
     };
-    const result = await withAutoSearchDeadline(async (signal) => {
-        if (fenced) markAutoSearchHintPending(db, sessionId, decision.messageId);
-        if (!path) return appendAutoSearchHintDecision(db, sessionId, decision);
-        return new Promise<ReturnType<typeof appendAutoSearchHintDecision> | null>((resolve) => {
-            const worker = new Worker(entry, {
-                workerData: {
-                    path,
-                    sessionId,
-                    harness: getHarness(),
-                    decision,
-                    deadlineUnixMs:
-                        Date.now() +
-                        Math.max(0, AUTO_SEARCH_TIMEOUT_MS - (performance.now() - startedAt)),
-                },
-            });
-            const abort = () => {
-                // Do not kill a worker in COMMIT: it must be allowed to retire a
-                // hint whose commit completed after the served-turn deadline.
-                worker.unref();
-                resolve(null);
-            };
-            let finished = false;
-            const finish = (outcome: ReturnType<typeof appendAutoSearchHintDecision> | null) => {
-                if (finished) return;
-                finished = true;
-                writerFinished = true;
-                signal.removeEventListener("abort", abort);
-                resolve(signal.aborted ? null : outcome);
-                void worker.terminate();
-                retireIfReady();
-            };
-            signal.addEventListener("abort", abort, { once: true });
-            worker.on(
-                "message",
-                (
-                    reply:
-                        | ReturnType<typeof appendAutoSearchHintDecision>
-                        | { kind: "error"; error: string }
-                        | null,
-                ) =>
-                    finish(
-                        reply === null
-                            ? null
-                            : "ok" in reply
-                              ? reply
-                              : { ok: false, kind: "cas-exhausted" },
-                    ),
-            );
-            worker.on("error", () => finish({ ok: false, kind: "cas-exhausted" }));
-            worker.on("exit", () => finish({ ok: false, kind: "cas-exhausted" }));
-            if (signal.aborted) abort();
-        });
-    }, startedAt);
+    const result = await withAutoSearchDeadline(
+        async (signal): Promise<ReturnType<typeof appendAutoSearchHintDecision> | null> => {
+            if (fenced) markAutoSearchHintPending(db, sessionId, decision.messageId);
+            if (!path) return appendAutoSearchHintDecision(db, sessionId, decision);
+            const write = (command: Record<string, AutoSearchHintDecision>, target = entry) =>
+                new Promise<ReturnType<typeof appendAutoSearchHintDecision> | null>((resolve) => {
+                    const worker = new Worker(target, {
+                        workerData: {
+                            path,
+                            sessionId,
+                            harness: getHarness(),
+                            ...command,
+                            deadlineUnixMs:
+                                Date.now() +
+                                Math.max(
+                                    0,
+                                    AUTO_SEARCH_TIMEOUT_MS - (performance.now() - startedAt),
+                                ),
+                        },
+                    });
+                    const abort = () => {
+                        // Do not kill a worker in COMMIT: it must be allowed to retire a
+                        // hint whose commit completed after the served-turn deadline.
+                        worker.unref();
+                        resolve(null);
+                    };
+                    let finished = false;
+                    const finish = (
+                        outcome: ReturnType<typeof appendAutoSearchHintDecision> | null,
+                    ) => {
+                        if (finished) return;
+                        finished = true;
+                        signal.removeEventListener("abort", abort);
+                        resolve(signal.aborted ? null : outcome);
+                        void worker.terminate();
+                        retireIfReady();
+                    };
+                    signal.addEventListener("abort", abort, { once: true });
+                    worker.on(
+                        "message",
+                        (
+                            reply:
+                                | ReturnType<typeof appendAutoSearchHintDecision>
+                                | { kind: "error"; error: string }
+                                | null,
+                        ) => {
+                            if (
+                                reply &&
+                                "ok" in reply &&
+                                reply.ok &&
+                                reply.decision.decision === "hint" &&
+                                reply.decision.publication?.state === "provisional" &&
+                                !signal.aborted
+                            ) {
+                                if (
+                                    reserved.decision !== "hint" ||
+                                    reply.decision.publication.token !== reserved.publication?.token
+                                ) {
+                                    finish({ ok: false, kind: "cas-exhausted" });
+                                } else
+                                    worker.postMessage({
+                                        kind: "publish",
+                                        token: reserved.publication.token,
+                                    });
+                                return;
+                            }
+                            finish(
+                                reply === null
+                                    ? null
+                                    : "ok" in reply
+                                      ? reply
+                                      : { ok: false, kind: "cas-exhausted" },
+                            );
+                        },
+                    );
+                    worker.on("error", () => finish({ ok: false, kind: "cas-exhausted" }));
+                    worker.on("exit", () => finish({ ok: false, kind: "cas-exhausted" }));
+                    if (signal.aborted) abort();
+                });
+            return write({ decision: reserved });
+        },
+        startedAt,
+    );
     rejected = result === null || !result.ok;
     if (rejected) retireIfReady();
     else if (fenced) settleAutoSearchHint(db, sessionId, decision.messageId);
@@ -224,6 +264,7 @@ export interface AutoSearchWorkerInput {
     embeddingRuntimeEnabled: boolean;
     embeddingHostBusy: boolean;
     snapshot: ReturnType<typeof getProjectEmbeddingSnapshot>;
+    deadlineUnixMs?: number;
 }
 export type AutoSearchWorkerReply =
     | { kind: "result"; results: UnifiedSearchResult[] }
@@ -234,7 +275,14 @@ export type AutoSearchEmbeddingReply = {
     id: number;
     embeddingHostBusy?: boolean;
     result?: CapturedQueryEmbedding | Float32Array | null;
-    vectors?: (Float32Array | null)[];
+    passage?: {
+        vectors: (Float32Array | null)[];
+        modelId: string;
+        generation: number;
+        providerIdentity: string;
+        runtimeFingerprint: string;
+        dimensions: number | null;
+    } | null;
     error?: string;
 };
 
@@ -278,6 +326,7 @@ export async function searchAutoHint(
         embeddingRuntimeEnabled: isEmbeddingRuntimeEnabled?.() ?? false,
         embeddingHostBusy: isEmbeddingHostBusy(),
         snapshot,
+        deadlineUnixMs: autoSearchDeadlineUnixMs(signal),
     };
     return new Promise((resolve, reject) => {
         const worker = new Worker(entry, { workerData: input });
@@ -316,16 +365,26 @@ export async function searchAutoHint(
             try {
                 if (reply.kind === "query")
                     response.result = (await embedQuery?.(reply.text, signal)) ?? null;
-                else
-                    response.vectors =
-                        (
-                            await embedBatchForProject(
-                                projectPath,
-                                reply.texts,
-                                signal,
-                                reply.purpose,
-                            )
-                        )?.vectors ?? reply.texts.map(() => null);
+                else {
+                    const passage = await embedBatchForProject(
+                        projectPath,
+                        reply.texts,
+                        signal,
+                        reply.purpose,
+                    );
+                    const current = getProjectEmbeddingSnapshot(projectPath);
+                    response.passage =
+                        passage && current
+                            ? {
+                                  ...passage,
+                                  providerIdentity: current.providerIdentity,
+                                  runtimeFingerprint: current.runtimeFingerprint,
+                                  dimensions:
+                                      passage.vectors.find((vector) => vector !== null)?.length ??
+                                      null,
+                              }
+                            : null;
+                }
             } catch (error) {
                 response.error = error instanceof Error ? error.message : String(error);
             }

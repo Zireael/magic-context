@@ -13,6 +13,7 @@ const input = workerData as {
     deadlineUnixMs: number;
 };
 const db = new Database(input.path);
+db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(input.deadlineUnixMs - Date.now()))}`);
 const outcome = appendAutoSearchHintDecision(db, input.sessionId, input.decision);
 // Emulate a slow COMMIT/checkpoint acknowledgement after the hint row was written.
 Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3600);
