@@ -2999,11 +2999,10 @@ describe("registerPiContextHandler", () => {
 			const meta = getOrCreateSessionMeta(db, sessionId);
 			expect(meta.observedSafeInputTokens).toBe(0);
 			expect(meta.lastUsageContextLimit).toBe(204_000);
-			// The reply was accepted, so its usage is the real prompt size and
-			// counts in full against the configured limit instead of being clamped
-			// at the configured window; only the persisted proof is healed.
-			expect(meta.lastInputTokens).toBe(593_717);
-			expect(meta.lastContextPercentage).toBeCloseTo((593_717 / 204_000) * 100);
+			// An accepted reply can carry billing usage that exceeds one request's
+			// window. Reject it as pressure as well as healing the stale proof.
+			expect(meta.lastInputTokens).toBe(0);
+			expect(meta.lastContextPercentage).toBe(0);
 			expect(meta.cacheAlertSent).toBe(false);
 		} finally {
 			closeQuietly(db);

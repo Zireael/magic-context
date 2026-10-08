@@ -230,7 +230,6 @@ import {
 	TEXT_TAG_IDENTITY_MARKER,
 	tagTranscript,
 } from "@magic-context/core/shared/tag-transcript";
-import { hasTrustedAbsoluteWall } from "@magic-context/core/shared/window-geometry";
 import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
 import {
 	clearAutoSearchForPiSession,
@@ -312,6 +311,9 @@ import {
 	clearPiLiveUsageClassification,
 	formatPiPressureForLog,
 	isPiLiveUsageRawBranchEstimate,
+	noteRejectedPiUsage,
+	piPressureEvidenceLimit,
+	piProviderUsageWasRejected,
 	recordPiLiveUsageClassification,
 	resolvePiPressureSnapshotWithEstimateGuard,
 } from "./pi-pressure";
@@ -3061,46 +3063,15 @@ export function registerPiContextHandler(
 				detectedContextLimit,
 			});
 			rawFallbackLimit = baseWindowGeometry?.usableHard ?? rawFallbackLimit;
-			let provenInputTokens = resolvePiProvenInputFloor({
+			const providerInputLimit = piPressureEvidenceLimit(baseWindowGeometry);
+			const provenInputTokens = resolvePiProvenInputFloor({
 				db: options.db,
 				sessionId,
 				modelKey: currentModelKey,
+				readBranch: () => branchEntries ?? undefined,
+				providerInputLimit,
 			});
-			if (
-				baseWindowGeometry &&
-				hasTrustedAbsoluteWall(baseWindowGeometry) &&
-				provenInputTokens > baseWindowGeometry.derivation.absoluteWall
-			) {
-				sessionLog(
-					sessionId,
-					`transform: persisted proven floor ${provenInputTokens} exceeds trusted absolute wall ${baseWindowGeometry.derivation.absoluteWall}; cleared and re-resolved to ${baseWindowGeometry.usableSoft}`,
-				);
-				updateSessionMeta(options.db, sessionId, {
-					observedSafeInputTokens: 0,
-					cacheAlertSent: false,
-					lastUsageContextLimit: baseWindowGeometry.usableSoft,
-					lastInputTokens:
-						sessionMeta.lastInputTokens >
-						baseWindowGeometry.derivation.absoluteWall
-							? baseWindowGeometry.derivation.absoluteWall
-							: sessionMeta.lastInputTokens,
-					lastContextPercentage:
-						sessionMeta.lastInputTokens >
-						baseWindowGeometry.derivation.absoluteWall
-							? (baseWindowGeometry.derivation.absoluteWall /
-									baseWindowGeometry.usableSoft) *
-								100
-							: sessionMeta.lastContextPercentage,
-				});
-				provenInputTokens = 0;
-				sessionMeta.observedSafeInputTokens = 0;
-				sessionMeta.cacheAlertSent = false;
-				if (usageInputTokens > baseWindowGeometry.derivation.absoluteWall) {
-					usageInputTokens = baseWindowGeometry.derivation.absoluteWall;
-					usagePercentage =
-						(usageInputTokens / baseWindowGeometry.usableSoft) * 100;
-				}
-			}
+
 			const windowGeometry = resolvePiWindowGeometry({
 				rawContextWindow: usageContextLimit,
 				rawContextWindowSource: usageContextWindowSource,
@@ -3135,8 +3106,48 @@ export function registerPiContextHandler(
 			) {
 				usagePercentage = (usageInputTokens / usageContextLimit) * 100;
 			}
+			let fallbackInputTokens: number | undefined;
+			const suspectReading = Math.max(usageInputTokens, piUsage?.tokens ?? 0);
+			if (
+				suspectReading > providerInputLimit ||
+				piProviderUsageWasRejected(sessionId)
+			) {
+				if (suspectReading > providerInputLimit)
+					noteRejectedPiUsage(
+						sessionId,
+						suspectReading,
+						providerInputLimit,
+						"transform",
+					);
+				// Count request messages, replaying the last served prefix where it is
+				// available. Pi rebuilds raw history on every pass; counting that old
+				// prefix again would forget reductions already served to the model.
+				const replay =
+					!lkgCompactionOff && lkgPassSnapshot
+						? lkgCoordinator.replay(
+								lkgPassSnapshot,
+								(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
+							)
+						: undefined;
+				const counts = tokenizePiMessages(
+					replay?.ok ? replay.messages : event.messages,
+				);
+				const envelope = readPiLkgFitEnvelope(
+					ctx,
+					pi,
+					currentModelKey,
+					sessionDecisionCalibration(options.db, sessionId),
+				);
+				fallbackInputTokens =
+					counts.conversation +
+					counts.toolCall +
+					(envelope?.systemTokens ?? 0) +
+					(envelope?.toolDefinitionTokens ?? 0);
+			}
 			({ percentage: usagePercentage, inputTokens: usageInputTokens } =
 				resolvePiPressureSnapshotWithEstimateGuard({
+					providerInputLimit,
+					fallbackInputTokens,
 					sessionId,
 					source: "transform",
 					liveIsRawBranchEstimate: piLiveUsageIsRawBranchEstimate,
@@ -3576,6 +3587,10 @@ export function registerPiContextHandler(
 					taggerFloor,
 					sessionMeta,
 					piUsage,
+					pressureSnapshot: {
+						percentage: usagePercentage,
+						inputTokens: usageInputTokens,
+					},
 					minimumPercentage: usagePercentage,
 					liveIsRawBranchEstimate: piLiveUsageIsRawBranchEstimate,
 					historianStateSnapshot: historianStateForPass,
@@ -4746,6 +4761,8 @@ function maybeFireHistorian(args: {
 	};
 	taggerFloor?: number;
 	sessionMeta: ReturnType<typeof getOrCreateSessionMeta>;
+	/** The transform and reclaim already admitted this request-pressure pair. */
+	pressureSnapshot?: { percentage: number; inputTokens: number };
 	liveIsRawBranchEstimate?: boolean;
 	piUsage:
 		| ReturnType<NonNullable<ExtensionContext["getContextUsage"]>>
@@ -4791,7 +4808,7 @@ function maybeFireHistorian(args: {
 	let usage: { percentage: number; inputTokens: number };
 	let usageContextLimit: number | undefined;
 	try {
-		let usageSource: "session_meta" | "piUsage fallback";
+		let usageSource: "session_meta" | "piUsage fallback" | "request snapshot";
 		// Sane-bound (isSaneLimit, NOT `> 0`) so a garbage-but-positive window
 		// can't drive the trigger budget — mirrors the main pressure pass.
 		usageContextLimit = isSaneLimit(piUsage?.contextWindow)
@@ -4832,9 +4849,21 @@ function maybeFireHistorian(args: {
 					db,
 					sessionId,
 					modelKey: resolvePiContextModelKey(ctx),
+					readBranch: () => ctx.sessionManager.getBranch(),
+					providerInputLimit: piPressureEvidenceLimit(
+						resolvePiWindowGeometry({
+							rawContextWindow: usageContextLimit,
+							rawContextWindowSource: usageContextWindowSource,
+							model: ctx.model,
+							detectedContextLimit,
+						}),
+					),
 				}) || undefined,
 		});
-		if (
+		if (args.pressureSnapshot) {
+			usage = args.pressureSnapshot;
+			usageSource = "request snapshot";
+		} else if (
 			sessionMeta.lastContextPercentage > 0 &&
 			sessionMeta.lastInputTokens > 0
 		) {
@@ -4874,17 +4903,19 @@ function maybeFireHistorian(args: {
 			};
 			usageSource = "piUsage fallback";
 		}
-		usage = resolvePiPressureSnapshotWithEstimateGuard({
-			sessionId,
-			source: "historian trigger",
-			liveIsRawBranchEstimate: args.liveIsRawBranchEstimate,
-			persistedFromLive: usageSource === "piUsage fallback",
-			persistedPercentage: usage.percentage,
-			persistedInputTokens: usage.inputTokens,
-			liveInputTokens: piUsage?.tokens,
-			usableContextLimit: usageContextLimit,
-			minimumPercentage: args.minimumPercentage,
-		});
+		usage =
+			args.pressureSnapshot ??
+			resolvePiPressureSnapshotWithEstimateGuard({
+				sessionId,
+				source: "historian trigger",
+				liveIsRawBranchEstimate: args.liveIsRawBranchEstimate,
+				persistedFromLive: usageSource === "piUsage fallback",
+				persistedPercentage: usage.percentage,
+				persistedInputTokens: usage.inputTokens,
+				liveInputTokens: piUsage?.tokens,
+				usableContextLimit: usageContextLimit,
+				minimumPercentage: args.minimumPercentage,
+			});
 		sessionLog(
 			sessionId,
 			`historian trigger eval: usage=${usage.percentage.toFixed(1)}% (${usage.inputTokens} tokens) [${usageSource}], checking trigger...`,
