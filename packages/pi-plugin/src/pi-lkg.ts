@@ -213,6 +213,8 @@ export interface PiLkgCoordinator {
 		entryIds: readonly (string | undefined)[] | null;
 		modelKey: string | null;
 		providerKey: string | null;
+		apiKey?: string | null;
+		transport?: string | null;
 	}): PiLkgPassSnapshot;
 	replay(
 		snapshot: PiLkgPassSnapshot,
@@ -418,6 +420,7 @@ function plainOutputFields(
 function snapshotInputs(
 	messages: readonly unknown[],
 	entryIds: readonly (string | undefined)[] | null,
+	omitsBookkeeping: boolean,
 ): { inputs: PiLkgInputSnapshot[]; failure: string | null } {
 	if (!entryIds || entryIds.length !== messages.length) {
 		return { inputs: [], failure: "lkg_entry_ids_unavailable" };
@@ -431,7 +434,7 @@ function snapshotInputs(
 	const inputs: PiLkgInputSnapshot[] = [];
 	const seen = new Set<string>();
 	for (let index = 0; index < entryIds.length; index += 1) {
-		const fields = lkgContentFields(piProviderInput(messages[index]));
+		const fields = lkgContentFields(omitsBookkeeping ? piProviderInput(messages[index]) : messages[index]);
 		if (!fields) return { inputs: [], failure: "lkg_content_snapshot_failed" };
 		// Host extensions can inject entries absent from JSONL. A detached full-
 		// content digest gives those entries a stable identity without guessing a
@@ -452,15 +455,43 @@ function snapshotInputs(
 	return { inputs, failure: null };
 }
 
+// Explicit constructors, not whole-context transports. References are to
+// @earendil-works/pi-ai 0.83 dist/api and @oh-my-pi/pi-ai 18.8.5 src/providers.
+const bookkeepingOmittingApis = new Set([
+	// Pi anthropic-messages.js:838; OMP anthropic.ts:5136.
+	"anthropic-messages",
+	// Pi google-shared.js:77; OMP google-shared.ts:161.
+	"google-generative-ai",
+	// Pi openai-completions.js:764; OMP openai-completions.ts:2278.
+	"openai-completions",
+	// Pi openai-responses-shared.js:61; OMP openai-shared.ts:2076.
+	"openai-responses",
+	// Pi uses openai-responses-shared.js:61; OMP Codex builder:1545 / converter:4936.
+	"openai-codex-responses",
+]);
+
+function omitsRootBookkeeping(args: Parameters<PiLkgCoordinator["beginPass"]>[0]): boolean {
+	// OMP pi-native-client.ts:184 and Pi pi-messages.js:248 serialize the entire
+	// context. Any transport override or unproved API therefore keeps all fields.
+	if (args.transport != null) return false;
+	let api = args.apiKey;
+	if (api === undefined) {
+		// Standalone coordinators may have only native assistant records. Require
+		// one unambiguous API; production always supplies the current model's API.
+		const apis = new Set(args.messages.flatMap((message) => {
+			const value = message as { role?: unknown; api?: unknown } | null;
+			return value?.role === "assistant" && typeof value.api === "string" ? [value.api] : [];
+		}));
+		if (apis.size === 1) api = [...apis][0];
+	}
+	return typeof api === "string" && bookkeepingOmittingApis.has(api);
+}
+
 function piProviderInput(message: unknown): unknown {
 	if (!message || typeof message !== "object" || Array.isArray(message))
 		return message;
-	// Oh My Pi's @oh-my-pi/pi-ai 18.8.5 src/providers/{anthropic,openai-completions,
-	// openai-responses,google-shared}.ts constructs wire messages from content,
-	// never completedAt (message_end timing) or contextSnapshot (local usage).
-	// Pi's @earendil-works/pi-ai 0.83 dist/api/* likewise constructs messages, not a spread
-	// of the host record. Exclude only these two root bookkeeping fields; nested
-	// fields, including identically named tool arguments, remain fenced.
+	// Called only for the explicit constructors above. Exclude their two omitted
+	// root bookkeeping fields, never identically named nested tool arguments.
 	const descriptors = Object.getOwnPropertyDescriptors(message);
 	delete descriptors.completedAt;
 	delete descriptors.contextSnapshot;
@@ -510,7 +541,7 @@ export function createPiLkgCoordinator(
 	};
 
 	const beginPass: PiLkgCoordinator["beginPass"] = (args) => {
-		const snapped = snapshotInputs(args.messages, args.entryIds);
+		const snapped = snapshotInputs(args.messages, args.entryIds, omitsRootBookkeeping(args));
 		const slot = getSlot(args.sessionId);
 		if (snapped.failure || !slot) {
 			return {

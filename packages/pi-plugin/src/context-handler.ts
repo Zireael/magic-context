@@ -2657,6 +2657,8 @@ export function registerPiContextHandler(
 				entryIds: lkgEntryIds,
 				modelKey: lkgModelKey,
 				providerKey: lkgProviderKey,
+				apiKey: ctx.model?.api ?? null,
+				transport: (ctx.model as { transport?: string } | undefined)?.transport,
 			});
 			lkgPassSnapshot = snapshot;
 			let checkedReplay = false;
