@@ -388,7 +388,7 @@ fn native_mid_bytes(native: &ReasoningNativeHarness, mid: &str) -> Vec<u8> {
 }
 
 #[test]
-fn reasoning_clear_reexemption_and_native_keep_collision_change_only_on_priced_passes() {
+fn reasoning_clear_reexemption_and_native_keep_collision_remain_absorbing() {
     let dir = tempfile::tempdir().unwrap();
     let (db, mut request, _) = load_pre_fix_reasoning_fixture(dir.path());
     let mut ctx = pctx("git:fixture", "/nonexistent-docs", 0);
@@ -428,14 +428,24 @@ fn reasoning_clear_reexemption_and_native_keep_collision_change_only_on_priced_p
     request.messages =
         crate::codec::decode_opencode(request.native_messages.as_ref().unwrap()).messages;
     let mut reexempt = transform_with_projection(&db, &request, &ctx).unwrap();
-    assert_eq!(reexempt.response.action, "HARD");
-    assert_eq!(
+    // Contract change: a durably removed signed block stays absent when its
+    // assistant becomes newest; there is no restoration to price or suspend.
+    assert_eq!(reexempt.response.action, "SOFT+");
+    assert_ne!(
         reexempt.response.materialize_reason.as_deref(),
         Some("reasoning_exemption_repair")
     );
     native.attach(&db, &mut reexempt, &request);
-    let kept_bytes = native_mid_bytes(&native, "old");
-    assert!(String::from_utf8_lossy(&kept_bytes).contains("thinking-old"));
+    assert_eq!(native_mid_bytes(&native, "old"), clear_bytes);
+    assert!(
+        db.load(&request.session_id)
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .filter(|unit| unit.key == "strip:reasoning_clear:old")
+            .all(|unit| unit.reset_rule.is_empty())
+    );
     for arm in 0..3 {
         if arm == 1 {
             request.native_messages = Some(with_new.clone());
@@ -447,8 +457,8 @@ fn reasoning_clear_reexemption_and_native_keep_collision_change_only_on_priced_p
         native.attach(&db, &mut deferred, &request);
         assert_eq!(
             native_mid_bytes(&native, "old"),
-            kept_bytes,
-            "a suspended clear resumed without permission"
+            clear_bytes,
+            "re-exemption or keep/clear collision restored a frozen block"
         );
     }
     request.render_config = "priced-resume".to_string();
@@ -458,7 +468,7 @@ fn reasoning_clear_reexemption_and_native_keep_collision_change_only_on_priced_p
 }
 
 #[test]
-fn reasoning_clear_lineage_anchor_suspension_requires_permission() {
+fn reasoning_clear_lineage_anchor_preserves_absence_without_suspension() {
     let mut request = reasoning_clear_fixture();
     let mut newer = request.messages[1].clone();
     newer.mid = "new".to_string();
@@ -468,21 +478,50 @@ fn reasoning_clear_lineage_anchor_suspension_requires_permission() {
     let mut core = CoreState::default();
     core.frozen_units
         .push(strip_unit("reasoning_clear", "old", ""));
-    assert!(!reasoning_clear_exemption_changed(&core, &request, None));
-    assert!(reasoning_clear_exemption_changed(
-        &core,
-        &request,
-        Some("old")
-    ));
-    refresh_reasoning_clear_exemptions(&mut core, &request, false, Some("old"));
-    assert_eq!(core.frozen_units[0].reset_rule, "");
-    refresh_reasoning_clear_exemptions(&mut core, &request, true, Some("old"));
-    assert_eq!(core.frozen_units[0].reset_rule, REASONING_CLEAR_SUSPENDED);
-    assert!(!reasoning_clear_exemption_changed(
-        &core,
-        &request,
-        Some("old")
-    ));
+    // Contract change: an anchor exemption protects first selection, not replay
+    // of a signed block already removed. Neither defer nor bust may suspend it.
+    let original = &request.messages[1].ck;
+    let mut cleared = original.clone();
+    replay_reasoning_clear(
+        &FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units)),
+        "old",
+        &mut cleared,
+    );
+    let meta = ModuleMeta {
+        reasoning_cleared_through_tag: 5,
+        ..Default::default()
+    };
+    let tags = BTreeMap::from([("old".to_string(), 2), ("new".to_string(), 16)]);
+    let projection = ck_wire::project_messages(&request.messages).unwrap();
+    for can_bust in [false, true] {
+        assert!(
+            new_reasoning_clear_units(
+                &core,
+                &meta,
+                &request,
+                &tags,
+                can_bust,
+                Some("old"),
+                ReasoningClearSnapshot {
+                    meta: &meta,
+                    row_version: None,
+                    projection: &projection
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(core.frozen_units[0].reset_rule, "");
+        let mut anchored = original.clone();
+        replay_reasoning_clear(
+            &FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units)),
+            "old",
+            &mut anchored,
+        );
+        assert_eq!(
+            serde_json::to_value(anchored).unwrap(),
+            serde_json::to_value(&cleared).unwrap()
+        );
+    }
 }
 
 #[test]

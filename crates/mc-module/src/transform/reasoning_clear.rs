@@ -1,4 +1,3 @@
-const REASONING_CLEAR_SUSPENDED: &str = "newest-assistant-keep";
 const LEGACY_REASONING_CLEAR_PREFIX: &str = "strip:reasoning_clear_legacy:";
 
 struct ReasoningClearSnapshot<'a> {
@@ -16,32 +15,6 @@ pub(crate) fn reasoning_native_source_hash(req: &TransformRequest) -> String {
         &serde_json::to_string(&(&req.messages, &req.native_messages, &req.render_config))
             .expect("native source is serializable"),
     )
-}
-
-fn reasoning_clear_exemption_changed(
-    _core: &CoreState,
-    _req: &TransformRequest,
-    _anchor: Option<&str>,
-) -> bool {
-    false
-}
-
-/// A frozen removal is absorbing. Retire obsolete suspension flags on priced
-/// passes, but never restore a signed block because its visibility changed.
-fn refresh_reasoning_clear_exemptions(
-    core: &mut CoreState,
-    _req: &TransformRequest,
-    can_bust: bool,
-    _anchor: Option<&str>,
-) {
-    if !can_bust {
-        return;
-    }
-    for unit in &mut core.frozen_units {
-        if unit.key.starts_with("strip:reasoning_clear:") {
-            unit.reset_rule.clear();
-        }
-    }
 }
 
 fn legacy_ck_clear_matches(

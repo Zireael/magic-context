@@ -56,7 +56,6 @@ fn review_reasoning_clear_never_restores_a_frozen_block_on_exemption_change() {
     )));
     // A transient subset or undo can make a removed message newest again. The
     // frozen decision remains authoritative even on an otherwise priced rebuild.
-    refresh_reasoning_clear_exemptions(&mut core, &request, true, None);
     let mut after = original.clone();
     replay_reasoning_clear(
         &FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units)),
@@ -92,13 +91,14 @@ fn re_review_merged_strip_keeps_the_first_thinking_block_on_its_first_priced_pas
     request.render_config = "priced-merged".to_string();
     let result = transform_with_projection(&db, &request, &ctx).unwrap();
     assert_eq!(result.response.action, "HARD");
-    assert!(db
-        .load(&request.session_id)
-        .unwrap()
-        .core
-        .frozen_units
-        .iter()
-        .any(|unit| unit.key == "strip:merged_reasoning:old"));
+    assert!(
+        db.load(&request.session_id)
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == "strip:merged_reasoning:old")
+    );
     let bytes = reasoning_clear_target(&result.response);
     assert!(!String::from_utf8_lossy(&bytes).contains("interleaved-second"));
     // The serializer repair selected only the interleaved second block. A

@@ -187,3 +187,50 @@ A final scoped run of the renamed contract regression,
 (one test, exit 0) on the final Rust sources. The final small parity edit restores the
 merged serializer's existing exemption input in both render and cost preview; it does
 not change fresh selection or broaden a bare merged flag into whole-block removal.
+
+## Final durable-clear contract cleanup
+
+The full-suite failures reported by the parent were obsolete restoration claims.
+`reasoning_clear_reexemption_and_native_keep_collision_remain_absorbing` now requires
+SOFT+ on re-exemption, no `reasoning_exemption_repair`, identical cleared native bytes,
+no suspension flag, and stable keep/clear collision replay across all later defers and
+an independently priced render change. `reasoning_clear_lineage_anchor_preserves_absence_without_suspension`
+now checks that neither defer nor bust eligibility for a lineage anchor creates a new
+clear or changes the already-cleared representation. Both comments explicitly identify
+the preserved-thinking contract change.
+
+Removed the obsolete suspension constant, exemption-change detector, reset-rule refresh
+and all exemption-repair HARD pricing/attribution. Persisted obsolete flags are no longer
+consulted; durable replay remains authoritative without an otherwise unreachable repair
+path. The full locked mc-module library gate is run against this cleanup, not merely
+against the two renamed tests. No TypeScript, provider, store schema or live-store changes
+are included in this final step.
+
+The first full locked cleanup run completed with 1,657 passes, one failure and 22
+ignored tests. The anchor contract passed; the remaining byte-identity failure exposed
+an additional native boundary issue: a cleared assistant becoming newest still took the
+raw-vector shortcut, changing tagged text and sentinel shape even though its thinking
+stayed absent. The parent approved excluding durably/legacy-cleared mids from that
+shortcut in both reference/full and incremental encoding. The incremental key now uses
+that same effective exemption predicate (its mutation/reasoning exemption bits already
+participate in the key), preventing stale cached vectors when the path changes.
+
+Added `native_newest_shortcut_preserves_live_signed_bytes_and_keys_clear_transitions`:
+it proves that a non-cleared newest assistant still serves its original raw signed bytes
+through both encoders, that a cleared newest serves the normal tagged representation,
+and that both shortcut/normal transitions force re-encoding rather than stale cache reuse.
+The existing re-exemption byte-identity assertion is unchanged.
+
+Filtering the shortcut also exposed a cache-shape dependency: the codec previously
+interpreted a missing exempt mid as an unresolved policy and rediscovered reasoning while
+encoding suffixes. Added an explicit `reasoning_policy_resolved` flag so full and incremental
+encoders use the same established decision even when no raw shortcut is eligible. The
+native cache key's effective exemption bits match those passed to the encoder; resolved
+policy is stable across these passes, avoiding unrelated sibling shape changes.
+
+Final authoritative gate: `cargo test --locked -p mc-module --lib` passed **1,659 tests,
+zero failed, 22 ignored** (1,681 total; Cargo/rustc 1.99.0). It ran in background and
+was watched to completion. Both renamed durable-clear contract regressions, all original
+and second-review witnesses, and the new full/incremental shortcut/cache-key control
+passed in this whole-suite run. Rustfmt 1.10.0 formatting also passes. The unchanged
+base's clippy type-complexity issue is not part of this cleanup and was not modified.

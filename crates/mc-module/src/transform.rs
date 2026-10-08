@@ -5084,14 +5084,9 @@ fn apply_once(
                 .or_else(|| req.usage.as_ref().map(|usage| usage.context_limit_tokens))
                 .unwrap_or(200_000),
         );
-    let reasoning_exemption_repair = !req.is_subagent
-        && reasoning_clear_exemption_changed(&loaded.core, req, lineage_anchor_mid);
     // Every trigger below asks for a HARD. Whether that HARD may also price automatic
     // reductions and the other bust-only lanes depends on whether it can re-render the
     // served prefix byte-identically:
-    // - reasoning_exemption_repair: the repair exists to change which reasoning blocks the
-    //   tail serves, so the pass changes provider-visible bytes by construction (in the
-    //   tail, which the m0/m1 head comparison would not see). It keeps pricing.
     // - first_fold_due: folds the session's first compartment and mints the first
     //   boundary, so m0 and the coverage anchor change by construction. It keeps pricing.
     // - boundary_divergence_recut: re-cuts compartments to a new boundary, so coverage and
@@ -5106,8 +5101,7 @@ fn apply_once(
     // Reconcile (the boundary left the live array after a revert) and lineage descent (a new
     // host conversation epoch) are separate HARD inputs below; both serve a different
     // message array than the cached one, so they keep pricing too.
-    let hard_fold_requested = reasoning_exemption_repair
-        || pre_snapshot_inputs_changed
+    let hard_fold_requested = pre_snapshot_inputs_changed
         || first_fold_due
         || boundary_divergence_recut.is_some()
         || idle_fold_due
@@ -5146,8 +5140,7 @@ fn apply_once(
         && (external_revision_changed
             || project_memory_epoch_hard_due
             || pre_snapshot_inputs_changed)
-        && !(reasoning_exemption_repair
-            || first_fold_due
+        && !(first_fold_due
             || boundary_divergence_recut.is_some()
             || system_absorb_hard_due
             || hard_fold_loses_provider_cache)
@@ -5566,9 +5559,6 @@ fn apply_once(
     }
     if pre_snapshot_inputs_changed {
         materialize_reason = Some("protected_tokens_inputs_changed".to_string());
-    }
-    if reasoning_exemption_repair {
-        materialize_reason = Some("reasoning_exemption_repair".to_string());
     }
     // Attribution belongs to this expired provider request, even if the head was
     // already prepared by an aborted attempt and the materializer only replays it.
@@ -6949,7 +6939,6 @@ fn apply_once(
             }
         }
     }
-    refresh_reasoning_clear_exemptions(&mut core, req, is_bust_pass, lineage_anchor_mid);
     let frozen_units_before_reasoning_clear = core.frozen_units.len();
     core.frozen_units.extend(new_reasoning_clear_units(
         &core,
@@ -15937,10 +15926,8 @@ fn build_output_with_tags_inner(
             .is_some_and(|(anchor_mid, _)| anchor_mid == msg.mid);
         let mutation_exempt =
             mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
-        let reasoning_mutation_exempt = reasoning_mutation_exempt_mid == Some(msg.mid.as_str())
-            || lineage_anchor_exempt
-            || output_message_strip_unit(&frozen_units, "reasoning_clear", &msg.mid)
-                .is_some_and(|unit| unit.reset_rule == REASONING_CLEAR_SUSPENDED);
+        let reasoning_mutation_exempt =
+            reasoning_mutation_exempt_mid == Some(msg.mid.as_str()) || lineage_anchor_exempt;
         let first_assistant_in_run = msg.ck.role == "assistant" && !prev_assistant;
         let blocks = blocks_by_mid
             .get(msg.mid.as_str())
