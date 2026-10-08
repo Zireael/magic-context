@@ -227,6 +227,7 @@ export interface PiLkgCoordinator {
 		parentOf?: (id: string) => string | null | undefined,
 	): PiMeasuredPrefixFit | undefined;
 	captureAppliedPass(args: {
+		assertCurrentPass?: () => void;
 		snapshot: PiLkgPassSnapshot;
 		outputMessages: readonly unknown[];
 		outputEntryIds?: readonly (string | null | undefined)[];
@@ -763,6 +764,7 @@ export function createPiLkgCoordinator(
 	};
 
 	const captureAppliedPass: PiLkgCoordinator["captureAppliedPass"] = (args) => {
+		args.assertCurrentPass?.();
 		const { snapshot } = args;
 		if (snapshot.preparationFailure || snapshot.inputs.length === 0) return;
 		const state = stateFor(snapshot.sessionId);
@@ -896,6 +898,9 @@ export function createPiLkgCoordinator(
 		// supersedes this callback or invalidates reuse at its first id/field mismatch,
 		// while session cleanup increments and clears this session's capture state.
 		const commit = (): void => {
+			// A queued capture must not overwrite replay state after this turn has
+			// been cancelled or replaced, even if its synchronous transform finished.
+			try { args.assertCurrentPass?.(); } catch { return; }
 			if (plan.captureSequence !== state.captureSequence) return;
 			const startedAt = performance.now();
 			let reusedPrefix = 0;

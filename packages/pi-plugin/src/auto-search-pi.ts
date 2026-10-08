@@ -263,8 +263,11 @@ export async function runAutoSearchHintForPi(args: {
 	ensureProjectRegistered?: () => Promise<void>;
 	/** Per-context projection loaded with note anchors so sticky replay reads session_meta once. */
 	decisions?: readonly AutoSearchHintDecision[];
+	passGuard?: { assert(): void; wait<T>(pending: Promise<T>): Promise<T> };
 }): Promise<AgentMessage[]> {
 	const startedAt = performance.now();
+	args.passGuard?.assert();
+	const wait = args.passGuard?.wait ?? (<T>(pending: Promise<T>) => pending);
 	const { sessionId, db, messages, options, entryIdByRef } = args;
 	const entryIds =
 		args.entryIds === undefined
@@ -321,6 +324,7 @@ export async function runAutoSearchHintForPi(args: {
 	const writeNoHintAndReconcile = (
 		reason: AutoSearchHintNoHintReason,
 	): void => {
+		args.passGuard?.assert();
 		const outcome = appendAutoSearchHintDecision(db, sessionId, {
 			messageId: userMsgId,
 			decision: "no-hint",
@@ -356,8 +360,10 @@ export async function runAutoSearchHintForPi(args: {
 
 	let results: UnifiedSearchResult[] | null;
 	try {
-		results = await withAutoSearchDeadline(async (signal, checkDeadline) => {
-			await args.ensureProjectRegistered?.();
+		results = await wait(withAutoSearchDeadline(async (signal, checkDeadline) => {
+			args.passGuard?.assert();
+			await wait(args.ensureProjectRegistered?.() ?? Promise.resolve());
+			args.passGuard?.assert();
 			if (checkDeadline()) return null;
 			const snapshot = getProjectEmbeddingSnapshot(options.projectPath);
 			const memoryEnabled = snapshot?.features.memoryEnabled ?? true;
@@ -371,12 +377,13 @@ export async function runAutoSearchHintForPi(args: {
 				embeddingEnabled,
 				gitCommitsEnabled,
 				embedQuery: async (text, signal) => {
-					const result = await embedTextForProject(
+					const result = await wait(embedTextForProject(
 						options.projectPath,
 						text,
 						signal,
 						"query",
-					);
+					));
+					args.passGuard?.assert();
 					checkDeadline();
 					return result?.vector ?? null;
 				},
@@ -386,13 +393,14 @@ export async function runAutoSearchHintForPi(args: {
 				// cached request prefixes. Explicit ctx_search and the dashboard expose them.
 				sources: ["memory", "message", "git_commit"],
 			};
-			return unifiedSearch(db, sessionId, options.projectPath, rawPrompt, {
+			return wait(unifiedSearch(db, sessionId, options.projectPath, rawPrompt, {
 				...searchOptions,
 				signal,
 				countRetrievals: false,
-			});
-		}, startedAt);
+			}));
+		}, startedAt));
 	} catch (error) {
+		args.passGuard?.assert();
 		// Retryable failure — do not persist a permanent no-hint decision, or the
 		// same user message would be suppressed even though a later pass may succeed.
 		log(
@@ -401,6 +409,7 @@ export async function runAutoSearchHintForPi(args: {
 		return messages;
 	}
 
+	args.passGuard?.assert();
 	if (results === null) {
 		// Timeout is also retryable, matching OpenCode's auto-search runner.
 		sessionLog(
@@ -436,6 +445,7 @@ export async function runAutoSearchHintForPi(args: {
 	// Prefix with double newline so the hint is a separate block, matching
 	// OpenCode lines 268-270.
 	const payload = `\n\n${hintText}`;
+	args.passGuard?.assert();
 	const outcome = appendAutoSearchHintDecision(db, sessionId, {
 		messageId: userMsgId,
 		decision: "hint",

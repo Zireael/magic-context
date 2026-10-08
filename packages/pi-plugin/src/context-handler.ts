@@ -2498,14 +2498,19 @@ export function registerPiContextHandler(
 				);
 			signal?.throwIfAborted();
 		};
-		const toolWireSchema = await loadPiToolWireSchema();
+		const guardAwait = async <T>(pending: Promise<T>): Promise<T> => {
+			try { return await pending; }
+			finally { assertCurrentPass(); }
+		};
+		const passGuard = { assert: assertCurrentPass, wait: guardAwait };
+		const toolWireSchema = await guardAwait(loadPiToolWireSchema());
 		if (processOptions.checkoutClaim) {
 			const claimSessionId = resolveSessionId(ctx);
 			if (claimSessionId) {
-				const refusal = await processOptions.checkoutClaim.refusal(
+				const refusal = await guardAwait(processOptions.checkoutClaim.refusal(
 					claimSessionId,
 					ctx.cwd,
-				);
+				));
 				if (refusal) throw refusal;
 			}
 		}
@@ -3403,13 +3408,14 @@ export function registerPiContextHandler(
 				const histPromise = inFlightHistorian.get(sessionId);
 				if (histPromise) {
 					try {
-						await withTimeout(histPromise, 30_000);
+						await guardAwait(withTimeout(histPromise, 30_000));
 						sessionLog(
 							sessionId,
 							"EMERGENCY: historian wait completed (or timed out)",
 						);
 					} catch {
 						// Historian already logged its own failure; just continue.
+						assertCurrentPass();
 					}
 				}
 
@@ -3511,7 +3517,9 @@ export function registerPiContextHandler(
 
 			logTransformTiming(sessionId, "prePipelineTotal", transformStartTime);
 			const tRunPipeline = performance.now();
-			const result = await runPipeline({
+			assertCurrentPass();
+			const result = await guardAwait(runPipeline({
+				assertCurrentPass,
 				db: options.db,
 				tagger,
 				sessionId,
@@ -3595,7 +3603,7 @@ export function registerPiContextHandler(
 				isSubagent: sessionMeta.isSubagent,
 				compactionOff: options.compactionOff === true,
 				injectionPassSnapshot: piM0M1PassSnapshot,
-			});
+			}));
 			logTransformTiming(sessionId, "runPipeline", tRunPipeline);
 			const postPipelineStart = performance.now();
 			const tTransformDecision = performance.now();
@@ -3603,6 +3611,7 @@ export function registerPiContextHandler(
 			// the current branch must take one full derivation pass if it later returns,
 			// and bounding the set to the live branch prevents session-long growth.
 			if (strictEntryIds) {
+				assertCurrentPass();
 				recordSuccessfulTaggedMessageIds(sessionId, strictEntryIds);
 			}
 			const piDecisionSnapshotNewestAssistant = result.bustedThisPass
@@ -3738,7 +3747,8 @@ export function registerPiContextHandler(
 			const tAutoSearch = performance.now();
 			if (options.autoSearch?.enabled && !options.compactionOff) {
 				try {
-					outputMessages = await runAutoSearchHintForPi({
+					outputMessages = await guardAwait(runAutoSearchHintForPi({
+						passGuard,
 						sessionId,
 						db: options.db,
 						messages: outputMessages,
@@ -3762,8 +3772,9 @@ export function registerPiContextHandler(
 							// `language` is user-level only; a project config cannot set it.
 							wordRules: cavemanWordRulesForLanguage(options.language),
 						},
-					});
+					}));
 				} catch (err) {
+					assertCurrentPass();
 					sessionLog(
 						sessionId,
 						`auto-search failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -4186,7 +4197,9 @@ export function registerPiContextHandler(
 				} catch {
 					/* Missing optional attribution must not prevent capturing the good prefix. */
 				}
+				assertCurrentPass();
 				serializedOutput = lkgCoordinator.captureAppliedPass({
+					assertCurrentPass,
 					hostEnvelopeSignature,
 					snapshot: lkgPassSnapshot,
 					outputMessages,
@@ -4202,6 +4215,7 @@ export function registerPiContextHandler(
 					cacheBusting: result.bustedThisPass,
 				});
 			}
+			assertCurrentPass();
 			capturePiServedArray(sessionId, outputMessages, { serializedOutput });
 			if (thinkingBindingRecoveryApplied) {
 				try {
@@ -4217,12 +4231,14 @@ export function registerPiContextHandler(
 					);
 				}
 			}
+			assertCurrentPass();
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;
 			};
 		} catch (err) {
 			assertCurrentPass();
 			if (err instanceof PiLkgAdmissionReplay && sessionIdForError) {
+				assertCurrentPass();
 				capturePiServedArray(sessionIdForError, err.messages);
 				return { messages: err.messages } as {
 					messages: typeof event.messages;
@@ -4292,6 +4308,7 @@ export function registerPiContextHandler(
 							sessionIdForError,
 							`${failureLabel} ${reason}: LKG replay served ${replay.messages.length} messages instead of raw ${rawMessageCount}`,
 						);
+						assertCurrentPass();
 						capturePiServedArray(sessionIdForError, replay.messages);
 						return { messages: replay.messages } as unknown as {
 							messages: typeof event.messages;
@@ -4302,6 +4319,7 @@ export function registerPiContextHandler(
 						`${failureLabel} ${piStorageErrorReason(err)}: LKG unavailable (${replay.reason}); refusing unreduced ${rawMessageCount}-message input`,
 					);
 				} catch (replayError) {
+					assertCurrentPass();
 					if (replayError instanceof PiStorageBusyError) throw replayError;
 					logPiLkgRecovery(
 						sessionIdForError,
@@ -5231,6 +5249,7 @@ function maybeFireHistorian(args: {
 	}
 }
 interface RunPipelineArgs {
+	assertCurrentPass?: () => void;
 	db: ContextDatabase;
 	tagger: Tagger;
 	sessionId: string;
@@ -5556,6 +5575,7 @@ async function runCompactionOffPipeline(
 }
 
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
+	args.assertCurrentPass?.();
 	if (args.compactionOff) return runCompactionOffPipeline(args);
 	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
 		resolvePiStableId(
@@ -6097,6 +6117,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// indexed gate is empty, only the newly observed tail needs fingerprints.
 		hasFallbackMessageTags,
 	);
+	args.assertCurrentPass?.();
 	adoptPiFallbackTags(
 		args.db,
 		args.sessionId,
@@ -6138,8 +6159,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const { targets } = runPersistedReplayStage(
 		"tagging-persistence-failure",
 		() => args.tagger.cleanup(args.sessionId),
-		() =>
-			tagTranscript(args.sessionId, transcript, args.tagger, args.db, {
+		() => {
+			args.assertCurrentPass?.();
+			return tagTranscript(args.sessionId, transcript, args.tagger, args.db, {
 				skipPrefixInjection: !ctxReduceCallable,
 				entryFingerprintByMessageId,
 				reuseMessageIds: textIdentityPlan.reusableMessageIds,
@@ -6156,7 +6178,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 							});
 						}
 					: undefined,
-			}),
+			});
+		},
 	);
 	logTransformTiming(args.sessionId, "tagMessages", tTag);
 
