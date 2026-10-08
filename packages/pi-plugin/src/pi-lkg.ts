@@ -431,7 +431,7 @@ function snapshotInputs(
 	const inputs: PiLkgInputSnapshot[] = [];
 	const seen = new Set<string>();
 	for (let index = 0; index < entryIds.length; index += 1) {
-		const fields = lkgContentFields(messages[index]);
+		const fields = lkgContentFields(piProviderInput(messages[index]));
 		if (!fields) return { inputs: [], failure: "lkg_content_snapshot_failed" };
 		// Host extensions can inject entries absent from JSONL. A detached full-
 		// content digest gives those entries a stable identity without guessing a
@@ -450,6 +450,21 @@ function snapshotInputs(
 		});
 	}
 	return { inputs, failure: null };
+}
+
+function piProviderInput(message: unknown): unknown {
+	if (!message || typeof message !== "object" || Array.isArray(message))
+		return message;
+	// Oh My Pi's @oh-my-pi/pi-ai 18.8.5 src/providers/{anthropic,openai-completions,
+	// openai-responses,google-shared}.ts constructs wire messages from content,
+	// never completedAt (message_end timing) or contextSnapshot (local usage).
+	// Pi's @earendil-works/pi-ai 0.83 dist/api/* likewise constructs messages, not a spread
+	// of the host record. Exclude only these two root bookkeeping fields; nested
+	// fields, including identically named tool arguments, remain fenced.
+	const descriptors = Object.getOwnPropertyDescriptors(message);
+	delete descriptors.completedAt;
+	delete descriptors.contextSnapshot;
+	return Object.create(Object.getPrototypeOf(message), descriptors);
 }
 
 /** Compact JSON arrays preserve the exact serialized rows before their closing

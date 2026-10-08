@@ -1598,7 +1598,7 @@ describe("Pi fallback tag adoption", () => {
 		}
 	});
 
-	it("cheap-gate: does not build the owner map when no pi-msg tool owners exist", () => {
+	it("prepares tool owners outside the writer even if discovery found no synthetic owners", () => {
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-pi-tool-owner-cheap-gate";
@@ -1616,8 +1616,9 @@ describe("Pi fallback tag adoption", () => {
 				0,
 				"entry-real",
 			);
-			// Split a gate hole from a wrong test premise: the tool-owner gate MUST
-			// be false here (no pi-msg-* owners), so the branch-walk never runs.
+			// A sibling can add a synthetic tool-owner tag before BEGIN. Prepare
+			// assistant/call identities even when no such tag is visible yet, so
+			// resolving the new tag needs no branch walk while holding the writer.
 			expect(hasPiFallbackToolOwnerTags(db, sessionId)).toBe(false);
 
 			let resolverCalls = 0;
@@ -1629,15 +1630,14 @@ describe("Pi fallback tag adoption", () => {
 				{
 					messages: [assistantToolCall("call-real", "Read", {}, 90)],
 					resolveStableId: () => {
+						expect(db.inTransaction).toBe(false);
 						resolverCalls += 1;
 						return "entry-real";
 					},
 				},
 			);
 
-			// The cheap hasPiFallbackToolOwnerTags gate short-circuits before any
-			// branch walk, so the resolver is never consulted.
-			expect(resolverCalls).toBe(0);
+			expect(resolverCalls).toBe(1);
 		} finally {
 			closeQuietly(db);
 		}

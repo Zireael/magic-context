@@ -12,6 +12,8 @@ const ENTRY_TYPE = "magic-context-turn-refused";
 const RETRY_MESSAGE =
 	"Magic Context could not safely prepare this turn; send your message again.";
 
+export class PiContextSupersededError extends Error {}
+
 /**
  * Pi catches context-hook exceptions and continues with its original messages.
  * Escaping errors here are deliberate refusals: abort the operation as well as
@@ -32,11 +34,15 @@ export function registerPiGuardedContext(
 	);
 	pi.on("context", async (event, ctx) => {
 		try {
-			// Share at most 250 ms of synchronous writer waiting across the turn,
-			// including autocommit statements, as in OpenCode.
+			// Share at most 250 ms of synchronous waiting for later turn writes,
+			// including autocommit statements. Initial session-meta admission uses
+			// the separate yielding writer budget shared with OpenCode.
 			// Do not rerun the handler: it may already have committed earlier writes.
 			return await withSqliteTransformPass(() => handler(event, ctx));
 		} catch (error) {
+			// A newer pass owns this session now. Calling its session-wide abort
+			// API from the abandoned hook would cancel the replacement turn.
+			if (error instanceof PiContextSupersededError) throw error;
 			log("[magic-context][pi] turn refused", error);
 			// A checkout-claim refusal is not a retryable preparation failure: the
 			// user has to move the agent first, so show its own message instead.

@@ -131,6 +131,10 @@ import {
 import { getNativeReplayState } from "@magic-context/core/features/magic-context/storage-native-replay";
 import { getSourceContents } from "@magic-context/core/features/magic-context/storage-source";
 import {
+	hasPiFallbackMessageTags as hasPersistedPiFallbackMessageTags,
+	hasPiFallbackToolOwnerTags as hasPersistedPiFallbackToolOwnerTags,
+} from "@magic-context/core/features/magic-context/storage-tags";
+import {
 	createTagger,
 	type Tagger,
 } from "@magic-context/core/features/magic-context/tagger";
@@ -225,6 +229,7 @@ import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provid
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
+import { withAsyncPrivilegedWriter } from "@magic-context/core/shared/sqlite";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
 	TEXT_TAG_IDENTITY_MARKER,
@@ -258,10 +263,7 @@ import {
 import { runPiDebugAssertion } from "./debug-assertions-pi";
 import { detectRecentCommit } from "./detect-recent-commit";
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
-import {
-	hasPiFallbackMessageTags,
-	hasPiFallbackToolOwnerTags,
-} from "./fallback-tag-probes-pi";
+import { hasPiFallbackMessageTags } from "./fallback-tag-probes-pi";
 import {
 	applyPiHeuristicCleanup,
 	type PiHeuristicCleanupResult,
@@ -295,7 +297,10 @@ import {
 	resolvePiUsableContextLimit,
 	resolvePiWindowGeometry,
 } from "./pi-context-limit";
-import { registerPiGuardedContext } from "./pi-context-refusal";
+import {
+	PiContextSupersededError,
+	registerPiGuardedContext,
+} from "./pi-context-refusal";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
 import {
 	clearPiLkgSessionState,
@@ -323,6 +328,7 @@ import {
 	PiStorageBusyError,
 } from "./pi-raw-fallback";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
+import { loadPiToolWireSchema } from "./pi-tool-wire-schema";
 import {
 	applyPiProactiveThinkingStrip,
 	applyPiThinkingBindingRecovery,
@@ -615,6 +621,13 @@ const activeContextHandlerSessions = new Set<string>();
 const lastHeuristicsTurnIdBySession = new Map<string, string>();
 const routinePressureAppliedBySession = new Map<string, boolean>();
 const firstContextPassSeenBySession = new Set<string>();
+const contextPassGeneration = new Map<string, symbol>();
+
+class PiLkgAdmissionReplay extends Error {
+	constructor(readonly messages: unknown[]) {
+		super("Saved request served before writer wait");
+	}
+}
 const liveModelBySession = new Map<string, string>();
 const latestAssistantModelTimestampBySession = new Map<string, number>();
 const taggedStableMessageIdsBySession = new Map<string, Set<string>>();
@@ -2149,58 +2162,19 @@ interface AdoptPiFallbackTagsOptions {
 	hasFallbackToolOwnerTags?: boolean;
 }
 
-function hasAdoptablePiFallbackMessageTags(
-	db: ContextDatabase,
-	sessionId: string,
-	fingerprintById: ReadonlyMap<string, string>,
-): boolean {
-	const fingerprints = [
-		...new Set(
-			[...fingerprintById]
-				.filter(([id]) => !id.startsWith("pi-msg-"))
-				.map(([, fingerprint]) => fingerprint),
-		),
-	];
-	// Historical fallback rows can remain unmatchable indefinitely. Probe all
-	// visible candidates in bounded batches, not one SQLite call per message.
-	// Migration still re-reads each candidate after writer admission below.
-	for (let index = 0; index < fingerprints.length; index += 900) {
-		const batch = fingerprints.slice(index, index + 900);
-		const placeholders = batch.map(() => "?").join(",");
-		const match = db
-			.prepare(
-				`SELECT 1 FROM tags WHERE session_id = ? AND type = 'message'
-             AND entry_fingerprint IN (${placeholders})
-             AND message_id LIKE 'pi-msg-%' LIMIT 1`,
-			)
-			.get(sessionId, ...batch);
-		if (match != null) return true;
-	}
-	return false;
-}
-
 function readAdoptablePiFallbackFingerprints(
 	db: ContextDatabase,
 	sessionId: string,
-	fingerprintById: ReadonlyMap<string, string>,
+	batches: readonly { values: string[]; placeholders: string }[],
 ): Set<string> {
-	const fingerprints = [
-		...new Set(
-			[...fingerprintById]
-				.filter(([id]) => !id.startsWith("pi-msg-"))
-				.map(([, fingerprint]) => fingerprint),
-		),
-	];
 	const found = new Set<string>();
-	for (let index = 0; index < fingerprints.length; index += 900) {
-		const batch = fingerprints.slice(index, index + 900);
-		const placeholders = batch.map(() => "?").join(",");
+	for (const { values, placeholders } of batches) {
 		const rows = db
 			.prepare(
 				`SELECT DISTINCT entry_fingerprint FROM tags WHERE session_id = ? AND type = 'message'
-             AND entry_fingerprint IN (${placeholders}) AND message_id LIKE 'pi-msg-%'`,
+			 AND entry_fingerprint IN (${placeholders}) AND message_id LIKE 'pi-msg-%'`,
 			)
-			.all(sessionId, ...batch) as { entry_fingerprint: string }[];
+			.all(sessionId, ...values) as { entry_fingerprint: string }[];
 		for (const row of rows) found.add(row.entry_fingerprint);
 	}
 	return found;
@@ -2221,35 +2195,71 @@ function adoptPiFallbackTags(
 	fingerprintById: ReadonlyMap<string, string>,
 	options: AdoptPiFallbackTagsOptions = {},
 ): void {
-	// A positive preflight remains a valid fast path, but a negative preflight is
-	// only advisory: a sibling connection can commit a fallback row after the
-	// fingerprint map is built. Re-probe negatives here so the decision to skip
-	// observes commits that happened before adoption starts.
-	const hasFallbackMessageTags =
-		options.hasFallbackMessageTags === true ||
-		hasPiFallbackMessageTags(db, sessionId);
-	const hasFallbackToolOwnerTags =
-		options.hasFallbackToolOwnerTags === true ||
-		hasPiFallbackToolOwnerTags(db, sessionId);
-	const shouldRunMessageMigration =
-		hasFallbackMessageTags &&
-		hasAdoptablePiFallbackMessageTags(db, sessionId, fingerprintById);
-	const shouldRunToolOwnerMigration = Boolean(
-		options.messages && options.resolveStableId && hasFallbackToolOwnerTags,
-	);
-	if (!shouldRunMessageMigration && !shouldRunToolOwnerMigration) return;
+	// Prepare message identities and SQL bind lists before taking the writer.
+	// Another connection can add a synthetic tag while this work runs, so validate
+	// the discovery revision after BEGIN; never trust an earlier negative read.
+	const realIdsByFingerprint = new Map<string, string[]>();
+	for (const [id, fingerprint] of fingerprintById) {
+		if (id.startsWith("pi-msg-")) continue;
+		const ids = realIdsByFingerprint.get(fingerprint) ?? [];
+		ids.push(id);
+		realIdsByFingerprint.set(fingerprint, ids);
+	}
+	const fingerprints = [...realIdsByFingerprint.keys()];
+	const batches: { values: string[]; placeholders: string }[] = [];
+	for (let i = 0; i < fingerprints.length; i += 900) {
+		const values = fingerprints.slice(i, i + 900);
+		batches.push({ values, placeholders: values.map(() => "?").join(",") });
+	}
+	const ownerMap =
+		options.messages && options.resolveStableId
+			? buildPiToolOwnerMap(options.messages, options.resolveStableId)
+			: null;
+	if (!batches.length && !ownerMap?.size) return;
+	const revision = () => ({
+		external: db.prepare("PRAGMA data_version").get() as {
+			data_version: number;
+		},
+		local: db.prepare("SELECT total_changes() AS changes").get() as {
+			changes: number;
+		},
+	});
+	const beforeDiscovery = revision();
+	// Discover candidates without blocking writers and prepare their target ids.
+	// The revision check below is authoritative: discovery may miss a sibling's
+	// newly committed row, or include one another connection already renamed.
+	const discovered = hasPersistedPiFallbackMessageTags(db, sessionId)
+		? readAdoptablePiFallbackFingerprints(db, sessionId, batches)
+		: new Set<string>();
+	const targetsFor = (fingerprints: Iterable<string>) =>
+		[...fingerprints].flatMap((fingerprint) =>
+			(realIdsByFingerprint.get(fingerprint) ?? []).map(
+				(id) => [id, fingerprint] as const,
+			),
+		);
+	const discoveredTargets = targetsFor(discovered);
 
 	runImmediateTransaction(db, () => {
-		if (shouldRunMessageMigration) {
+		if (batches.length && hasPersistedPiFallbackMessageTags(db, sessionId)) {
 			// After writer admission the candidate set cannot gain rows from a
 			// sibling connection. Missing fingerprints need no per-message read;
 			// present ones still use the sequential, authoritative migration path.
-			const adoptable = readAdoptablePiFallbackFingerprints(
-				db,
-				sessionId,
-				fingerprintById,
+			// data_version detects other connections' commits; total_changes catches
+			// this connection's own writes. With BEGIN held, an unchanged revision
+			// makes discovery authoritative without repeating the large IN queries.
+			const admitted = revision();
+			const unchanged =
+				beforeDiscovery.external.data_version ===
+					admitted.external.data_version &&
+				beforeDiscovery.local.changes === admitted.local.changes;
+			const adoptable = unchanged
+				? discovered
+				: readAdoptablePiFallbackFingerprints(db, sessionId, batches);
+			const targets = discoveredTargets.filter(([, fp]) => adoptable.has(fp));
+			targets.push(
+				...targetsFor([...adoptable].filter((fp) => !discovered.has(fp))),
 			);
-			for (const [realMessageId, fingerprint] of fingerprintById) {
+			for (const [realMessageId, fingerprint] of targets) {
 				// Only real ids can be adoption targets; a pi-msg-* id has no fallback
 				// predecessor to migrate from.
 				if (realMessageId.startsWith("pi-msg-")) continue;
@@ -2295,15 +2305,7 @@ function adoptPiFallbackTags(
 			}
 		}
 
-		if (
-			shouldRunToolOwnerMigration &&
-			options.messages &&
-			options.resolveStableId
-		) {
-			const ownerMap = buildPiToolOwnerMap(
-				options.messages,
-				options.resolveStableId,
-			);
+		if (ownerMap && hasPersistedPiFallbackToolOwnerTags(db, sessionId)) {
 			for (const row of findPiFallbackToolOwnerTags(db, sessionId)) {
 				const parsed = parsePiFallbackToolOwnerId(row.toolOwnerMessageId);
 				if (parsed?.role !== "assistant") continue;
@@ -2476,6 +2478,25 @@ export function registerPiContextHandler(
 	});
 
 	registerPiGuardedContext(pi, async (event, ctx) => {
+		const passSessionId = ctx.sessionManager
+			? resolveSessionId(ctx)
+			: undefined;
+		const generation = Symbol();
+		if (passSessionId) contextPassGeneration.set(passSessionId, generation);
+		const signal =
+			(event as { signal?: AbortSignal }).signal ??
+			(ctx as { signal?: AbortSignal }).signal;
+		const assertCurrentPass = () => {
+			signal?.throwIfAborted();
+			if (
+				passSessionId &&
+				contextPassGeneration.get(passSessionId) !== generation
+			)
+				throw new PiContextSupersededError(
+					"Pi context pass superseded before writer admission",
+				);
+		};
+		const toolWireSchema = await loadPiToolWireSchema();
 		if (processOptions.checkoutClaim) {
 			const claimSessionId = resolveSessionId(ctx);
 			if (claimSessionId) {
@@ -2538,7 +2559,6 @@ export function registerPiContextHandler(
 					projectDirectory,
 					options.allowHomeProject,
 				) ?? "";
-			updateSessionProjectTracking(sessionId, projectIdentity, options.db);
 			logTransformTiming(
 				sessionId,
 				"findSessionId",
@@ -2631,13 +2651,79 @@ export function registerPiContextHandler(
 				typeof lkgContextModel?.provider === "string"
 					? lkgContextModel.provider
 					: null;
-			lkgPassSnapshot = lkgCoordinator.beginPass({
+			const snapshot = lkgCoordinator.beginPass({
 				sessionId,
 				messages: event.messages,
 				entryIds: lkgEntryIds,
 				modelKey: lkgModelKey,
 				providerKey: lkgProviderKey,
 			});
+			lkgPassSnapshot = snapshot;
+			let checkedReplay = false;
+			const sessionMetaForUsage = await withAsyncPrivilegedWriter(
+				options.db,
+				() => {
+					assertCurrentPass();
+					// Keep BEGIN held through the session-meta read/create. Acquiring and
+					// releasing an empty transaction would let another writer win before
+					// this write. Subsequent tagging/materialization failures refuse the
+					// turn rather than rerunning already committed work.
+					return getOrCreateSessionMeta(options.db, sessionId);
+				},
+				{
+					signal,
+					jitter: true,
+					beforeRetry: (error) => {
+						assertCurrentPass();
+						if (checkedReplay) return;
+						checkedReplay = true;
+						const state = loadPiHistorianStateSnapshot(options.db, sessionId);
+						lkgEmergencyRecoveryArmed = state.needsEmergencyRecovery;
+						if (state.detectedContextLimit > 0)
+							rawFallbackLimit = resolvePiWindowGeometry({
+								model: ctx.model,
+								rawContextWindow: piUsage?.contextWindow,
+								detectedContextLimit: state.detectedContextLimit,
+							})?.usableHard;
+						if (
+							lkgCompactionOff ||
+							lkgEmergencyRecoveryArmed ||
+							isProviderOverflowFailClosedProven(sessionId)
+						)
+							return;
+						const replay = lkgCoordinator.replay(
+							snapshot,
+							(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
+						);
+						if (!replay.ok) return;
+						try {
+							assertPiRawFallbackFits(
+								replay.messages,
+								rawFallbackLimit,
+								(line) => logPiLkgRecovery(sessionId, line),
+								error,
+								readPiLkgFitEnvelope(
+									ctx,
+									pi,
+									lkgModelKey,
+									sessionDecisionCalibration(options.db, sessionId),
+									toolWireSchema,
+								),
+								replay.measuredPrefix,
+							);
+						} catch {
+							return;
+						}
+						logPiLkgRecovery(
+							sessionId,
+							`TRANSIENT STORAGE FAILURE ${piStorageErrorReason(error)}: LKG replay served ${replay.messages.length} messages instead of raw ${rawMessageCount}`,
+						);
+						throw new PiLkgAdmissionReplay(replay.messages);
+					},
+				},
+			);
+			assertCurrentPass();
+			updateSessionProjectTracking(sessionId, projectIdentity, options.db);
 			const lkgInputIdByRef = new Map<unknown, string>();
 			for (const input of lkgPassSnapshot.inputs)
 				lkgInputIdByRef.set(event.messages[input.messageIndex], input.id);
@@ -2674,7 +2760,6 @@ export function registerPiContextHandler(
 				}
 			}
 			const tMeta = performance.now();
-			const sessionMetaForUsage = getOrCreateSessionMeta(options.db, sessionId);
 			sessionMetaForPass = sessionMetaForUsage;
 			const historianStateForPass = options.compactionOff
 				? EMPTY_PI_HISTORIAN_STATE_SNAPSHOT
@@ -4058,6 +4143,7 @@ export function registerPiContextHandler(
 					pi,
 					resolvePiContextModelKey(ctx),
 					sessionDecisionCalibration(options.db, sessionId),
+					toolWireSchema,
 				);
 				const estimate = estimatePiOutgoingInputTokens(
 					outputMessages,
@@ -4091,6 +4177,7 @@ export function registerPiContextHandler(
 						pi,
 						resolvePiContextModelKey(ctx),
 						sessionDecisionCalibration(baseOptions.db, sessionId),
+						toolWireSchema,
 					)?.envelopeSignature;
 				} catch {
 					/* Missing optional attribution must not prevent capturing the good prefix. */
@@ -4130,6 +4217,13 @@ export function registerPiContextHandler(
 				messages: typeof event.messages;
 			};
 		} catch (err) {
+			assertCurrentPass();
+			if (err instanceof PiLkgAdmissionReplay && sessionIdForError) {
+				capturePiServedArray(sessionIdForError, err.messages);
+				return { messages: err.messages } as {
+					messages: typeof event.messages;
+				};
+			}
 			// Loud fail-closed / emergency aborts must reach the user — do not
 			// swallow into native-compaction fallthrough.
 			if (
@@ -4185,6 +4279,7 @@ export function registerPiContextHandler(
 								pi,
 								resolvePiContextModelKey(ctx),
 								sessionDecisionCalibration(baseOptions.db, sessionIdForError),
+								toolWireSchema,
 							),
 							replay.measuredPrefix,
 						);
@@ -8051,6 +8146,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	deferredHistoryRefreshSessions.delete(sessionId);
 	deferredMaterializationSessions.delete(sessionId);
 	firstContextPassSeenBySession.delete(sessionId);
+	contextPassGeneration.delete(sessionId);
 	commitSeenLastPass.delete(sessionId);
 	liveModelBySession.delete(sessionId);
 	latestAssistantModelTimestampBySession.delete(sessionId);

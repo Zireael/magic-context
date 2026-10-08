@@ -871,11 +871,21 @@ export async function beginSqliteWriterAsync(db: Database, site: string): Promis
 }
 
 /** Retry admission before any turn work, yielding between short lock attempts. */
-export async function withAsyncPrivilegedWriter<T>(db: Database, operation: () => T): Promise<T> {
+export async function withAsyncPrivilegedWriter<T>(
+    db: Database,
+    operation: () => T,
+    options: {
+        signal?: AbortSignal;
+        beforeRetry?: (error: SqliteAcquisitionBusyError) => void;
+        jitter?: boolean;
+    } = {},
+): Promise<T> {
     const started = performance.now();
     let attempts = 0;
     for (;;) {
+        options.signal?.throwIfAborted();
         attempts++;
+        let entered = false;
         try {
             const acquisition: WriterAcquisition = {
                 site: "privileged_writer",
@@ -889,13 +899,19 @@ export async function withAsyncPrivilegedWriter<T>(db: Database, operation: () =
             return admissionScope.run(true, () =>
                 withSqliteTransformPass(() =>
                     writerAcquisitionScope.run(acquisition, () =>
-                        withPrivilegedWriter(db, operation),
+                        withPrivilegedWriter(db, () => {
+                            entered = true;
+                            return operation();
+                        }),
                     ),
                 ),
             );
         } catch (error) {
             // A callback failure can occur after writes; only retry a failed BEGIN.
-            if (!(error instanceof SqliteAcquisitionBusyError)) throw error;
+            if (entered || !(error instanceof SqliteAcquisitionBusyError)) throw error;
+            // Adapters may serve a validated saved request instead of waiting.
+            // This runs only after a failed BEGIN, never after callback writes.
+            options.beforeRetry?.(error);
             const elapsed = performance.now() - started;
             if (elapsed >= FOREGROUND_ACQUISITION_BUDGET_MS) {
                 reportSqliteDiagnostic(
@@ -903,15 +919,24 @@ export async function withAsyncPrivilegedWriter<T>(db: Database, operation: () =
                 );
                 throw error;
             }
-            await new Promise<void>((resolve) =>
-                setTimeout(
-                    resolve,
-                    Math.min(
-                        attempts === 1 ? 500 : 1000,
-                        FOREGROUND_ACQUISITION_BUDGET_MS - elapsed,
-                    ),
-                ),
+            const backoff = attempts === 1 ? 500 : 1000;
+            const delay = Math.min(
+                options.jitter ? backoff * (0.8 + Math.random() * 0.4) : backoff,
+                FOREGROUND_ACQUISITION_BUDGET_MS - elapsed,
             );
+            await new Promise<void>((resolve, reject) => {
+                const abort = () => {
+                    clearTimeout(timer);
+                    options.signal?.removeEventListener("abort", abort);
+                    reject(options.signal?.reason ?? new Error("Writer wait aborted"));
+                };
+                const timer = setTimeout(() => {
+                    options.signal?.removeEventListener("abort", abort);
+                    resolve();
+                }, delay);
+                options.signal?.addEventListener("abort", abort, { once: true });
+                if (options.signal?.aborted) abort();
+            });
         }
     }
 }
