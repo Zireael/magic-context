@@ -274,11 +274,13 @@ describe("Pi status dialog", () => {
 					"80-100": 1,
 				},
 			});
-			// The distribution is data the status surfaces no longer draw: the
-			// single view dropped the Importance histogram row.
-			expect(
-				renderPiStatusOverlay(detail, plainTheme(), 74).join("\n"),
-			).not.toContain("Importance");
+			expect(detail.historianRuns).toBe(0);
+			const overlay = renderPiStatusOverlay(detail, plainTheme(), 74).join(
+				"\n",
+			);
+			expect(overlay).toContain("Historian runs");
+			expect(overlay).toMatch(/Historian runs\s+0/);
+			expect(overlay).not.toContain("Importance");
 		} finally {
 			closeQuietly(db);
 		}

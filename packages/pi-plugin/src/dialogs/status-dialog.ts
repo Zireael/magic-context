@@ -40,6 +40,7 @@ import {
 import { parseCacheTtl } from "@magic-context/core/features/magic-context/scheduler";
 import { readSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
+import { countHistorianRuns } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
 import {
 	getCompactionMarkerHealth,
@@ -162,7 +163,7 @@ export interface StatusDialogDetail {
 		pendingSinceMs: number | null;
 	};
 	historianRunning: boolean;
-	timesExecuteThresholdReached: number;
+	historianRuns: number;
 	historianFailureCount: number;
 	historianLastFailureAt: number | null;
 	historianLastError: string | null;
@@ -618,10 +619,23 @@ export function renderPiStatusOverlay(
 		lines.push(renderStatusRow(view.hygiene, 9, innerWidth, theme));
 	}
 
-	// Pi has no sidebar, so a detached recomp run and compartments still in the
-	// pre-v2 layout have nowhere else to surface. This is live run state
-	// rather than status content, which is why it is not one of the shared
-	// sections.
+	// Pi has no sidebar, so show the total number of recorded historian runs
+	// here beside the recomp state.
+	if (status.state === "ready") {
+		lines.push(
+			renderStatusRow(
+				{
+					label: "Historian runs",
+					value: s.historianRuns.toLocaleString(),
+					tone: "muted",
+				},
+				9,
+				innerWidth,
+				theme,
+			),
+		);
+	}
+
 	const upgrade: StatusRow | null =
 		status.state !== "ready"
 			? null
@@ -1218,7 +1232,7 @@ function buildStatusDetail(
 		pendingOpsCount: pendingOps,
 		compactionMarker: getCompactionMarkerHealth(deps.db, sessionId),
 		historianRunning: meta.compartmentInProgress,
-		timesExecuteThresholdReached: meta.timesExecuteThresholdReached,
+		historianRuns: countHistorianRuns(deps.db, sessionId),
 		historianFailureCount: Number(metaRow?.historian_failure_count ?? 0),
 		historianLastFailureAt:
 			typeof metaRow?.historian_last_failure_at === "number"
