@@ -7546,18 +7546,7 @@ function isAutoSearchHintDecision(
 	if (typeof row.messageId !== "string" || row.messageId.length === 0)
 		return false;
 	if (row.decision === "hint") {
-		const publication = row.publication as
-			| { state?: unknown; token?: unknown }
-			| undefined;
-		return (
-			typeof row.text === "string" &&
-			row.text.length > 0 &&
-			(publication === undefined ||
-				(publication !== null &&
-					publication.state === "accepted" &&
-					typeof publication.token === "string" &&
-					publication.token.length > 0))
-		);
+		return typeof row.text === "string" && row.text.length > 0;
 	}
 	return (
 		row.decision === "no-hint" &&
@@ -7603,14 +7592,6 @@ function loadPiPostTransformSnapshot(
 		autoSearchDecisions: parseStoredArray(
 			row?.auto_search_hint_decisions,
 			isAutoSearchHintDecision,
-		).map((entry) =>
-			entry.decision === "hint"
-				? {
-						messageId: entry.messageId,
-						decision: "hint" as const,
-						text: entry.text,
-					}
-				: entry,
 		),
 		noteTriggerPending: row?.note_nudge_trigger_pending === 1,
 	};

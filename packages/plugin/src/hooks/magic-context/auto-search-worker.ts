@@ -1,12 +1,9 @@
 import { parentPort, workerData } from "node:worker_threads";
+import { ensureMemoryEmbeddings } from "../../features/magic-context/memory/embedding-backfill";
+import { getProjectEmbeddings } from "../../features/magic-context/memory/embedding-cache";
+import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
 import { installProjectEmbeddingSearchBridge } from "../../features/magic-context/project-embedding-registry";
 import { unifiedSearch } from "../../features/magic-context/search";
-import {
-    type AutoSearchHintDecision,
-    acceptAutoSearchHintDecision,
-    appendAutoSearchHintDecision,
-    retireUnservedAutoSearchHintDecision,
-} from "../../features/magic-context/storage-meta-persisted";
 import { setEmbeddingSessionBusy } from "../../shared/embedding-activity";
 import { setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
@@ -18,40 +15,22 @@ import type {
 
 const port = parentPort;
 if (!port) throw new Error("auto-search worker requires a parent port");
-const input = workerData as AutoSearchWorkerInput & {
-    skipDecision?: AutoSearchHintDecision;
-    decision?: AutoSearchHintDecision;
-    acceptDecision?: AutoSearchHintDecision;
-    retireDecision?: AutoSearchHintDecision;
-    retireUntil?: number;
-    deadlineUnixMs?: number;
-    cancellation?: SharedArrayBuffer;
-    expectedRowid?: number | null;
-};
+const input = workerData as AutoSearchWorkerInput;
 // Workers have their own module globals; session rows must retain their owner's
 // harness identity, and Pi/OMP must never inherit OpenCode-store ownership.
 setHarness(input.harness);
 setEmbeddingSessionBusy(input.sessionId, input.embeddingHostBusy === true);
 let nextId = 0;
 const pending = new Map<number, (reply: AutoSearchEmbeddingReply) => void>();
-let publicationApproval: ((token: string) => void) | undefined;
 let queryDimensions: number | null = null;
 let db: Database;
-const deadline = input.deadlineUnixMs ?? input.retireUntil ?? Date.now() + 3000;
-const setBusyBudget = () =>
-    db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(deadline - Date.now()))}`);
-port.on("message", (reply: AutoSearchEmbeddingReply | { kind: "publish"; token: string }) => {
-    if ("kind" in reply) {
-        publicationApproval?.(reply.token);
-        return;
-    }
+port.on("message", (reply: AutoSearchEmbeddingReply) => {
     // Backfill's busy-host gate is owner state, not this worker's empty activity
     // tracker. Refresh it when an embedding continuation is about to resume SQL.
     if (reply.embeddingHostBusy !== undefined)
         setEmbeddingSessionBusy(input.sessionId, reply.embeddingHostBusy);
     const vector = reply.result instanceof Float32Array ? reply.result : reply.result?.vector;
     if (vector) queryDimensions = vector.length;
-    setBusyBudget();
     pending.get(reply.id)?.(reply);
     pending.delete(reply.id);
 });
@@ -99,106 +78,40 @@ if (input.snapshot) {
         },
     });
 }
-// No bootstrap or migration here. Backfill uses its ordinary guarded transaction;
-// terminating this owner rolls an in-flight transaction back through SQLite.
-db = new Database(input.path);
-setBusyBudget();
+// Search is enforced read-only by SQLite, not just by a caller convention.
+// Only the separate post-decision backfill job may open a writable connection.
+db = new Database(input.path, input.job === "backfill" ? undefined : { readonly: true });
+db.exec("PRAGMA busy_timeout = 250");
 try {
-    if (input.retireDecision) {
-        let retired = false;
-        do {
-            try {
-                retired = retireUnservedAutoSearchHintDecision(
+    if (input.job === "backfill") {
+        if (input.snapshot?.enabled && input.snapshot.features.memoryEnabled) {
+            // Capture query dimensions before the passage RPC so incompatible batches
+            // can never be stored under the captured model's namespace.
+            await request({ kind: "query", text: input.query });
+            if (queryDimensions) {
+                const existingEmbeddings = getProjectEmbeddings(
                     db,
-                    input.sessionId,
-                    input.retireDecision,
+                    input.projectPath,
+                    input.snapshot.modelId,
                 );
-            } catch {
-                /* Another writer may own the short metadata transaction. */
+                const memories = getMemoriesByProject(db, input.projectPath)
+                    .filter((memory) => !existingEmbeddings.has(memory.id))
+                    .slice(0, 50);
+                await ensureMemoryEmbeddings({
+                    db,
+                    projectIdentity: input.projectPath,
+                    memories,
+                    existingEmbeddings,
+                });
             }
-            if (retired || Date.now() >= (input.retireUntil ?? 0)) break;
-            await new Promise((resolve) => setTimeout(resolve, 50));
-        } while (Date.now() < (input.retireUntil ?? 0));
-        port.postMessage({ retired });
-    } else if (input.acceptDecision) {
-        const outcome = acceptAutoSearchHintDecision(
-            db,
-            input.sessionId,
-            input.acceptDecision,
-            deadline,
-        );
-        if (Date.now() >= deadline) {
-            retireUnservedAutoSearchHintDecision(db, input.sessionId, input.acceptDecision);
-            port.postMessage(null);
-        } else port.postMessage(outcome);
-    } else if (input.decision) {
-        const decision = input.decision;
-        if (Date.now() >= (input.deadlineUnixMs ?? 0)) {
-            port.postMessage(null);
-        } else {
-            const outcome = appendAutoSearchHintDecision(db, input.sessionId, decision);
-            if (Date.now() >= (input.deadlineUnixMs ?? 0)) {
-                if (outcome.ok && outcome.kind === "appended")
-                    retireUnservedAutoSearchHintDecision(db, input.sessionId, input.decision);
-                port.postMessage(null);
-            } else if (
-                outcome.ok &&
-                outcome.decision.decision === "hint" &&
-                decision.decision === "hint" &&
-                outcome.decision.publication?.state === "provisional" &&
-                outcome.decision.publication.token === decision.publication?.token
-            ) {
-                // Keep this connection: publication is a second IMMEDIATE transaction
-                // after the owner received the provisional acknowledgement on time.
-                const approved = await new Promise<boolean>((resolve) => {
-                    const timer = setTimeout(
-                        () => resolve(false),
-                        Math.max(0, deadline - Date.now()),
-                    );
-                    publicationApproval = (token) => {
-                        clearTimeout(timer);
-                        resolve(token === decision.publication?.token);
-                    };
-                    port.postMessage(outcome);
-                });
-                setBusyBudget();
-                if (!approved || Date.now() >= deadline) {
-                    retireUnservedAutoSearchHintDecision(db, input.sessionId, decision);
-                    port.postMessage(null);
-                } else {
-                    const published = acceptAutoSearchHintDecision(
-                        db,
-                        input.sessionId,
-                        decision,
-                        deadline,
-                    );
-                    if (Date.now() >= deadline) {
-                        retireUnservedAutoSearchHintDecision(db, input.sessionId, decision);
-                        port.postMessage(null);
-                    } else port.postMessage(published);
-                }
-            } else port.postMessage(outcome);
         }
-    } else if (input.skipDecision) {
-        const skippedDecision = input.skipDecision;
-        const outcome = db
-            .transaction(() => {
-                if (input.cancellation && Atomics.load(new Int32Array(input.cancellation), 0) !== 0)
-                    return { ok: false, kind: "cas-exhausted" };
-                const current = db
-                    .prepare("SELECT rowid AS id FROM session_meta WHERE session_id = ?")
-                    .get(input.sessionId) as { id: number } | undefined;
-                if (input.expectedRowid != null && current?.id !== input.expectedRowid)
-                    return { ok: false, kind: "cas-exhausted" };
-                return appendAutoSearchHintDecision(db, input.sessionId, skippedDecision, {
-                    ensureRow: input.expectedRowid == null,
-                });
-            })
-            .immediate();
-        port.postMessage(outcome);
+        port.postMessage({ kind: "result", results: [] } satisfies AutoSearchWorkerReply);
     } else {
         const results = await unifiedSearch(db, input.sessionId, input.projectPath, input.query, {
             ...input.options,
+            backfillMemoryEmbeddings: false,
+            countRetrievals: false,
+            measurementDisabled: true,
             embedQuery: async (text) => (await request({ kind: "query", text })).result ?? null,
             isEmbeddingRuntimeEnabled: () => input.embeddingRuntimeEnabled,
         });

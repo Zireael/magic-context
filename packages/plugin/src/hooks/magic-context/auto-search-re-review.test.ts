@@ -1,35 +1,27 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import ts from "typescript";
-import * as embedding from "../../features/magic-context/memory/embedding";
-import { invalidateProject } from "../../features/magic-context/memory/embedding-cache";
 import { insertMemory } from "../../features/magic-context/memory/storage-memory";
 import { runMigrations } from "../../features/magic-context/migrations";
-import { unifiedSearch } from "../../features/magic-context/search";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     type AutoSearchHintDecision,
     appendAutoSearchHintDecision,
     getAutoSearchHintDecisions,
 } from "../../features/magic-context/storage-meta-persisted";
-import {
-    clearSession,
-    getOrCreateSessionMeta,
-} from "../../features/magic-context/storage-meta-session";
+import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
-import { Database, withSqliteTransformPass } from "../../shared/sqlite";
+import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { createCtxSearchTools } from "../../tools/ctx-search/tools";
 import { clearAutoSearchTimeoutForSession } from "./auto-search-deadline";
-import { buildAutoSearchHint } from "./auto-search-hint";
-import { clearAutoSearchForSession, runAutoSearchHint } from "./auto-search-runner";
-import { autoSearchTestSnapshot } from "./auto-search-snapshot.fixture";
-import { persistAutoSearchDecision, searchAutoHint } from "./auto-search-worker-client";
+import { runAutoSearchHint } from "./auto-search-runner";
+import { persistAutoSearchDecision } from "./auto-search-worker-client";
 
 const root = join(tmpdir(), "magic-context", "bg_a0f7b373d3df719d");
 mkdirSync(root, { recursive: true });
@@ -100,136 +92,71 @@ function olderGetter() {
     ) => AutoSearchHintDecision[];
 }
 
-test("re-review: an older master reader must not expose a provisional publication", () => {
-    const { db } = fixture();
-    expect(
-        appendAutoSearchHintDecision(db, "mixed-version", {
-            messageId: "user",
-            decision: "hint",
-            text: "unserved",
-            publication: { token: "owner-token", state: "provisional" },
-        }).ok,
-    ).toBe(true);
-    expect(getAutoSearchHintDecisions(db, "mixed-version")).toEqual([]);
-    expect(olderGetter()(db, "mixed-version")).toEqual([]);
-});
-
-test("re-review: an accepted commit with a late final ack must remain invisible to a second owner", async () => {
-    const { db, path } = fixture();
-    const reader = new Database(path);
-    dbs.push(reader);
-    const sessionId = "late-publication-ack";
-    const pending = persistAutoSearchDecision(
-        db,
-        sessionId,
-        {
-            messageId: "user",
-            decision: "hint",
-            text: "\n\n<ctx-search-hint>unserved</ctx-search-hint>",
-        },
-        performance.now() - 2000,
-        new URL("./auto-search-publication-ack-review.fixture.ts", import.meta.url),
-    );
-    const until = performance.now() + 900;
-    while (!existsSync(`${path}.accepted`) && performance.now() < until)
-        await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(existsSync(`${path}.accepted`)).toBe(true);
-    // Hold retirement behind an ordinary independent writer while a WAL reader
-    // replays. The final ack, not the provisional ack, is the delayed one.
-    reader.exec("BEGIN IMMEDIATE");
-    try {
-        expect(await pending).toBeNull();
-        expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([]);
-        const output = messages();
-        const before = JSON.stringify(output);
-        await runAutoSearchHint({
-            db: reader,
-            sessionId,
-            messages: output,
-            options: {
-                enabled: true,
-                projectPath: "git:review",
-                scoreThreshold: 0,
-                minPromptChars: 1,
+// These five findings required the worker to write a decision or backfill while
+// ranking. Those operations are no longer part of the search protocol. Send the
+// former commands to the real reader to prove they cannot publish or recreate rows.
+for (const finding of [
+    "older-reader provisional",
+    "late accepted ack",
+    "pending hint cleanup",
+    "reused skip rowid",
+    "backfill writer lease",
+]) {
+    test(`re-review replacement: ${finding} worker writes no decision rows`, async () => {
+        const { db, path } = fixture();
+        const sessionId = `reader-${finding}`;
+        getOrCreateSessionMeta(db, sessionId);
+        insertMemory(db, {
+            projectPath: "git:reader",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "historian cache wiring details",
+        });
+        const worker = new Worker(new URL("./auto-search-worker.ts", import.meta.url), {
+            workerData: {
+                path,
+                sessionId,
+                harness: "pi",
+                projectPath: "git:reader",
+                query: "historian cache wiring",
+                options: { sources: ["memory"] },
+                embeddingRuntimeEnabled: false,
+                snapshot: null,
+                decision: {
+                    messageId: "user",
+                    decision: "hint",
+                    text: "unserved",
+                    publication: { token: "old-command", state: "provisional" },
+                },
+                skipDecision: { messageId: "old-user", decision: "no-hint", reason: "timeout" },
             },
         });
-        expect(JSON.stringify(output)).toBe(before);
-    } finally {
-        reader.exec("ROLLBACK");
-        await pending;
-    }
-}, 7000);
-
-test("re-review: pending hint publication must not recreate a cleared session", async () => {
-    const { db, path } = fixture();
-    const sessionId = "deleted-hint-owner";
-    getOrCreateSessionMeta(db, sessionId);
-    const writer = new Database(path);
-    dbs.push(writer);
-    writer.exec("BEGIN IMMEDIATE");
-    const pending = persistAutoSearchDecision(
-        db,
-        sessionId,
-        {
-            messageId: "user",
-            decision: "hint",
-            text: "orphan hint",
-        },
-        performance.now(),
-    );
-    try {
-        clearSession(writer, sessionId);
-        clearAutoSearchForSession(sessionId);
-        expect(
-            writer.prepare("SELECT 1 FROM session_meta WHERE session_id=?").get(sessionId),
-        ).toBeFalsy();
-    } finally {
-        writer.exec("COMMIT");
-    }
-    await pending;
-    expect(db.prepare("SELECT 1 FROM session_meta WHERE session_id=?").get(sessionId)).toBeFalsy();
-});
-
-test("re-review: another owner's old skip must not contaminate a recreated session with a reused rowid", async () => {
-    const { db, path } = fixture();
-    const sessionId = "reused-incarnation";
-    getOrCreateSessionMeta(db, sessionId);
-    const oldId = db.prepare("SELECT rowid FROM session_meta WHERE session_id=?").get(sessionId);
-    db.exec("BEGIN IMMEDIATE");
-    const owner = new Worker(
-        new URL("./auto-search-skip-owner-review.fixture.ts", import.meta.url),
-        {
-            workerData: { path, sessionId },
-        },
-    );
-    workers.push(owner);
-    const queued = new Promise<void>((resolve, reject) => {
-        owner.on("message", (reply) => {
-            if (reply.queued) resolve();
+        workers.push(worker);
+        const reply = await new Promise<{ kind: string; results: unknown[] }>((resolve, reject) => {
+            worker.once("message", resolve);
+            worker.once("error", reject);
         });
-        owner.on("error", reject);
-        owner.on("exit", () => reject(new Error("skip owner exited before reply")));
+        expect(reply.kind).toBe("result");
+        expect(reply.results.length).toBe(1);
+        expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([]);
+        expect(olderGetter()(db, sessionId)).toEqual([]);
+        expect(db.prepare("SELECT COUNT(*) AS n FROM memory_embeddings").get()).toEqual({ n: 0 });
     });
-    const finished = new Promise<boolean>((resolve, reject) => {
-        owner.on("message", (reply) => {
-            if (reply.finished) resolve(reply.ok);
-        });
-        owner.on("error", reject);
-        owner.on("exit", () => reject(new Error("skip owner exited before reply")));
-    });
-    try {
-        await queued;
-        clearSession(db, sessionId);
-        clearAutoSearchForSession(sessionId);
-        getOrCreateSessionMeta(db, sessionId);
-        expect(
-            db.prepare("SELECT rowid FROM session_meta WHERE session_id=?").get(sessionId),
-        ).toEqual(oldId);
-    } finally {
-        db.exec("COMMIT");
-    }
-    expect(await finished).toBe(true);
-    expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([]);
+}
+
+test("owner decisions retain master's exact JSON and older-reader replay", async () => {
+    const { db } = fixture();
+    const decision = { messageId: "user", decision: "hint" as const, text: "served" };
+    expect((await persistAutoSearchDecision(db, "owner", decision, performance.now()))?.ok).toBe(
+        true,
+    );
+    expect(olderGetter()(db, "owner")).toEqual([decision]);
+    expect(
+        db
+            .prepare(
+                "SELECT auto_search_hint_decisions AS decisions FROM session_meta WHERE session_id='owner'",
+            )
+            .get(),
+    ).toEqual({ decisions: '[{"decision":"hint","messageId":"user","text":"served"}]' });
 });
 
 test("re-review control: exhausted publication budget returns no hint without waiting for a writer", async () => {
@@ -256,60 +183,6 @@ test("re-review control: exhausted publication budget returns no hint without wa
     }
 });
 
-test("re-review control: publication contention cannot overrun the remaining stage budget", async () => {
-    const { db, path } = fixture();
-    const writer = new Database(path);
-    dbs.push(writer);
-    writer.exec("BEGIN IMMEDIATE");
-    try {
-        const start = performance.now();
-        const result = await persistAutoSearchDecision(
-            db,
-            "short-budget",
-            {
-                messageId: "user",
-                decision: "hint",
-                text: "never published",
-            },
-            start - 2750,
-        );
-        expect(result).toBeNull();
-        expect(performance.now() - start).toBeLessThan(600);
-        expect(getAutoSearchHintDecisions(db, "short-budget")).toEqual([]);
-    } finally {
-        writer.exec("ROLLBACK");
-    }
-});
-
-test("re-review control: an expired background skip budget still permits an uncontended freeze", async () => {
-    const { db, path } = fixture();
-    const sessionId = "expired-skip-budget";
-    getOrCreateSessionMeta(db, sessionId);
-    const row = db
-        .prepare("SELECT rowid AS id FROM session_meta WHERE session_id=?")
-        .get(sessionId) as { id: number };
-    const worker = new Worker(new URL("./auto-search-worker.ts", import.meta.url), {
-        workerData: {
-            path,
-            sessionId,
-            harness: "pi",
-            expectedRowid: row.id,
-            deadlineUnixMs: Date.now() - 1,
-            skipDecision: { messageId: "user", decision: "no-hint", reason: "timeout" },
-        },
-    });
-    workers.push(worker);
-    const outcome = await new Promise<{ ok?: boolean }>((resolve, reject) => {
-        worker.once("message", resolve);
-        worker.once("error", reject);
-        worker.once("exit", () => reject(new Error("skip worker exited before reply")));
-    });
-    expect(outcome.ok).toBe(true);
-    expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([
-        { messageId: "user", decision: "no-hint", reason: "timeout" },
-    ]);
-});
-
 test("re-review control: publication metadata is absent from public decisions, served bytes and ctx_search", async () => {
     const { db } = fixture();
     const sessionId = "metadata-public-surface";
@@ -324,10 +197,7 @@ test("re-review control: publication metadata is absent from public decisions, s
         decision: "hint" as const,
         text: "\n\n<ctx-search-hint>accepted</ctx-search-hint>",
     };
-    appendAutoSearchHintDecision(db, sessionId, {
-        ...decision,
-        publication: { token: "internal-marker-7e41", state: "accepted" },
-    });
+    appendAutoSearchHintDecision(db, sessionId, decision);
     expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([decision]);
     const output = messages();
     await runAutoSearchHint({
@@ -351,95 +221,4 @@ test("re-review control: publication metadata is absent from public decisions, s
     expect(result).toContain("historian cache wiring details");
     expect(result).not.toContain("internal-marker-7e41");
     expect(result).not.toContain("publication");
-});
-
-test("re-review: successful hint bytes must match master when a backfill lock exceeds the foreground lease", async () => {
-    const project = "git:review-long-backfill-lock";
-    const initial = autoSearchTestSnapshot(project);
-    const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(initial);
-    let lock: Worker | undefined;
-    const batch = spyOn(embedding, "embedBatchForProject").mockImplementation(
-        async (_project, texts) => {
-            lock?.postMessage("release");
-            return {
-                vectors: texts.map(
-                    (text) => new Float32Array(text.includes("details") ? [-1, 0] : [1, 0]),
-                ),
-                modelId: initial.modelId,
-                generation: 1,
-            };
-        },
-    );
-    const payloads: string[] = [];
-    try {
-        for (const offThread of [false, true]) {
-            const { db, path } = fixture();
-            db.exec("PRAGMA busy_timeout = 2000");
-            insertMemory(db, {
-                projectPath: project,
-                category: "ARCHITECTURE_DECISIONS",
-                content: "historian cache wiring details",
-            });
-            insertMemory(db, {
-                projectPath: project,
-                category: "ARCHITECTURE_DECISIONS",
-                content: "historian cache wiring retry correctness budgeting",
-            });
-            invalidateProject(project);
-            const lockWorker = new Worker(
-                new URL("./auto-search-long-lock-review.fixture.ts", import.meta.url),
-                { workerData: { path } },
-            );
-            lock = lockWorker;
-            workers.push(lockWorker);
-            const finished = new Promise<void>((resolve, reject) => {
-                lockWorker.on("exit", (code) =>
-                    code === 0 ? resolve() : reject(new Error(`lock worker exited ${code}`)),
-                );
-                lockWorker.on("error", reject);
-            });
-            await new Promise<void>((resolve, reject) => {
-                lockWorker.once("message", () => resolve());
-                lockWorker.once("error", reject);
-            });
-            const startedAt = performance.now();
-            const results = await withSqliteTransformPass(() =>
-                (offThread ? searchAutoHint : unifiedSearch)(
-                    db,
-                    "long-backfill-lock",
-                    project,
-                    "historian cache wiring",
-                    {
-                        sources: ["memory"],
-                        embeddingEnabled: true,
-                        countRetrievals: false,
-                        measurementDisabled: true,
-                        isEmbeddingRuntimeEnabled: () => true,
-                        embedQuery: async () => ({
-                            vector: new Float32Array([1, 0]),
-                            modelId: initial.modelId,
-                            chunkModelId: initial.chunkModelId,
-                            generation: 1,
-                        }),
-                    },
-                ),
-            );
-            await finished;
-            expect(results.length).toBeGreaterThan(0);
-            expect(results[0].score).toBeGreaterThan(0.6);
-            const text = `\n\n${buildAutoSearchHint(results)}`;
-            const decision = { messageId: "user", decision: "hint" as const, text };
-            const outcome = offThread
-                ? await persistAutoSearchDecision(db, "long-backfill-lock", decision, startedAt)
-                : appendAutoSearchHintDecision(db, "long-backfill-lock", decision);
-            expect(outcome?.ok).toBe(true);
-            expect(performance.now() - startedAt).toBeLessThan(3000);
-            payloads.push(text);
-        }
-        expect(batch).toHaveBeenCalledTimes(2);
-        expect(payloads[1]).toBe(payloads[0]);
-    } finally {
-        batch.mockRestore();
-        snapshot.mockRestore();
-    }
 });

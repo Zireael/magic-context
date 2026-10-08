@@ -31,7 +31,6 @@ import {
     type AutoSearchHintNoHintReason,
     getAutoSearchHintDecisions,
 } from "../../features/magic-context/storage-meta-persisted";
-import { isAutoSearchHintPending } from "../../shared/auto-search-hint-fence";
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
@@ -45,6 +44,7 @@ import { buildAutoSearchHint } from "./auto-search-hint";
 import {
     coalesceAutoSearchTurn,
     persistAutoSearchDecision,
+    queueAutoSearchBackfill,
     queueAutoSearchRegistration,
     searchAutoHint,
 } from "./auto-search-worker-client";
@@ -231,12 +231,9 @@ export async function runAutoSearchHint(args: {
         db,
         sessionId,
         userMsgId,
-        async (): Promise<AutoSearchOutcome> => {
-            if (
-                wasAutoSearchSkipped(db, sessionId, userMsgId) ||
-                isAutoSearchHintPending(db, sessionId, userMsgId)
-            )
-                return AUTO_SEARCH_OK;
+        async (lifecycleSignal): Promise<AutoSearchOutcome> => {
+            if (lifecycleSignal.aborted) return AUTO_SEARCH_OK;
+            if (wasAutoSearchSkipped(db, sessionId, userMsgId)) return AUTO_SEARCH_OK;
 
             const existing = getAutoSearchHintDecisions(db, sessionId);
             const existingForMessage = existing.find(
@@ -281,7 +278,7 @@ export async function runAutoSearchHint(args: {
             const writeNoHintAndReconcile = async (
                 reason: AutoSearchHintNoHintReason,
             ): Promise<AutoSearchOutcome> => {
-                const outcome = await persistAutoSearchDecision(
+                const outcome = persistAutoSearchDecision(
                     db,
                     sessionId,
                     {
@@ -370,76 +367,78 @@ export async function runAutoSearchHint(args: {
                 return { ok: false, kind: "search-failure" };
             }
 
-            if (results === null) {
-                // Freeze the served skip for this turn. Retrying could add a hint to a
-                // user message already sent to the provider, rewriting its cached bytes.
-                sessionLog(
-                    sessionId,
-                    `auto-search: timed out after ${AUTO_SEARCH_TIMEOUT_MS}ms, skipping hint for this turn`,
-                );
-                void persistAutoSearchSkip(db, sessionId, userMsgId);
-                sessionLog(
-                    sessionId,
-                    "auto-search: skip frozen; retries for this turn are replay-only",
-                );
-                return { ok: false, kind: "timeout" };
-            }
+            if (lifecycleSignal.aborted) return AUTO_SEARCH_OK;
+            try {
+                if (results === null) {
+                    // Freeze the served skip for this turn. Retrying could add a hint to a
+                    // user message already sent to the provider, rewriting its cached bytes.
+                    sessionLog(
+                        sessionId,
+                        `auto-search: timed out after ${AUTO_SEARCH_TIMEOUT_MS}ms, skipping hint for this turn`,
+                    );
+                    void persistAutoSearchSkip(db, sessionId, userMsgId);
+                    sessionLog(
+                        sessionId,
+                        "auto-search: skip frozen; retries for this turn are replay-only",
+                    );
+                    return { ok: false, kind: "timeout" };
+                }
 
-            if (results.length === 0) {
-                return writeNoHintAndReconcile("empty");
-            }
-            if (results[0].score < options.scoreThreshold) {
+                if (results.length === 0) {
+                    return writeNoHintAndReconcile("empty");
+                }
+                if (results[0].score < options.scoreThreshold) {
+                    sessionLog(
+                        sessionId,
+                        `auto-search: top score ${results[0].score.toFixed(3)} below threshold ${options.scoreThreshold}`,
+                    );
+                    return writeNoHintAndReconcile("below-threshold");
+                }
+
+                const hintText = buildAutoSearchHint(results, { wordRules: options.wordRules });
+                if (!hintText) {
+                    return writeNoHintAndReconcile("empty");
+                }
+
+                // Prefix with double newline so the hint is a separate block, not glued
+                // onto the last word of the user's prompt.
+                const payload = `\n\n${hintText}`;
+                const outcome = persistAutoSearchDecision(
+                    db,
+                    sessionId,
+                    {
+                        messageId: userMsgId,
+                        decision: "hint",
+                        text: payload,
+                    },
+                    startedAt,
+                );
+                if (outcome === null) {
+                    void persistAutoSearchSkip(db, sessionId, userMsgId);
+                    return { ok: false, kind: "timeout" };
+                }
+                if (!outcome.ok) {
+                    sessionLog(
+                        sessionId,
+                        `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`,
+                    );
+                    return { ok: false, kind: "cas-exhaustion" };
+                }
+                if (outcome.decision.decision === "hint") {
+                    appendReminderToUserMessageById(messages, userMsgId, outcome.decision.text);
+                }
                 sessionLog(
                     sessionId,
-                    `auto-search: top score ${results[0].score.toFixed(3)} below threshold ${options.scoreThreshold}`,
+                    `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,
                 );
-                return writeNoHintAndReconcile("below-threshold");
+                return AUTO_SEARCH_OK;
+            } finally {
+                if (!lifecycleSignal.aborted && results !== null)
+                    void queueAutoSearchBackfill(db, sessionId, options.projectPath, rawPrompt);
             }
-
-            const hintText = buildAutoSearchHint(results, { wordRules: options.wordRules });
-            if (!hintText) {
-                return writeNoHintAndReconcile("empty");
-            }
-
-            // Prefix with double newline so the hint is a separate block, not glued
-            // onto the last word of the user's prompt.
-            const payload = `\n\n${hintText}`;
-            const outcome = await persistAutoSearchDecision(
-                db,
-                sessionId,
-                {
-                    messageId: userMsgId,
-                    decision: "hint",
-                    text: payload,
-                },
-                startedAt,
-            );
-            if (outcome === null) {
-                void persistAutoSearchSkip(db, sessionId, userMsgId);
-                return { ok: false, kind: "timeout" };
-            }
-            if (!outcome.ok) {
-                sessionLog(
-                    sessionId,
-                    `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`,
-                );
-                return { ok: false, kind: "cas-exhaustion" };
-            }
-            if (outcome.decision.decision === "hint") {
-                appendReminderToUserMessageById(messages, userMsgId, outcome.decision.text);
-            }
-            sessionLog(
-                sessionId,
-                `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,
-            );
-            return AUTO_SEARCH_OK;
         },
         () => {
-            if (
-                wasAutoSearchSkipped(db, sessionId, userMsgId) ||
-                isAutoSearchHintPending(db, sessionId, userMsgId)
-            )
-                return;
+            if (wasAutoSearchSkipped(db, sessionId, userMsgId)) return;
             const decision = getAutoSearchHintDecisions(db, sessionId).find(
                 (entry) => entry.messageId === userMsgId,
             );

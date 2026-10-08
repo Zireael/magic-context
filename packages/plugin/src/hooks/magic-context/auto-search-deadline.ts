@@ -1,15 +1,9 @@
-import { Worker } from "node:worker_threads";
 import {
-    type AutoSearchHintDecision,
     type AutoSearchHintNoHintReason,
     appendAutoSearchHintDecision,
 } from "../../features/magic-context/storage-meta-persisted";
-import {
-    cancelAutoSearchSessionWrites,
-    registerAutoSearchWriter,
-} from "../../shared/auto-search-hint-fence";
-import { getHarness } from "../../shared/harness";
-import { type Database, getSqliteDatabasePath } from "../../shared/sqlite";
+import { cancelAutoSearchWork } from "../../shared/auto-search-lifecycle";
+import type { Database } from "../../shared/sqlite";
 
 export const AUTO_SEARCH_TIMEOUT_MS = 3_000;
 const operationDeadlines = new WeakMap<AbortSignal, number>();
@@ -31,7 +25,7 @@ export function wasAutoSearchSkipped(db: Database, sessionId: string, messageId:
 }
 
 export function clearAutoSearchTimeoutForSession(sessionId?: string): void {
-    cancelAutoSearchSessionWrites(sessionId);
+    cancelAutoSearchWork(sessionId);
     if (sessionId === undefined) skippedTurns.clear();
     else skippedTurns.delete(sessionId);
 }
@@ -55,56 +49,21 @@ export function persistAutoSearchSkip(
     }
     const prior = messages.get(messageId);
     if (prior) return prior;
-    const path = getSqliteDatabasePath(db);
-    const incarnation = db
-        .prepare("SELECT rowid AS id FROM session_meta WHERE session_id = ?")
-        .get(sessionId) as { id: number } | undefined;
-    // In-memory databases have neither file locks nor WAL checkpoint I/O. They
-    // are used by isolated tests; runtime stores use the off-thread path below.
-    const persistence = path
-        ? new Promise<boolean>((resolve) => {
-              const registration = registerAutoSearchWriter(sessionId);
-              const worker = new Worker(
-                  new URL(
-                      new URL(import.meta.url).pathname.endsWith(".ts")
-                          ? "./auto-search-worker.ts"
-                          : "./auto-search-worker.js",
-                      import.meta.url,
-                  ),
-                  {
-                      workerData: {
-                          path,
-                          sessionId,
-                          harness: getHarness(),
-                          skipDecision: { messageId, decision: "no-hint", reason },
-                          cancellation: registration.cancellation,
-                          expectedRowid: incarnation?.id ?? null,
-                          deadlineUnixMs: Date.now() + 250,
-                      },
-                  },
-              );
-              const finish = (ok: boolean) => {
-                  registration.done();
-                  resolve(ok);
-                  void worker.terminate();
-              };
-              worker.on("message", (reply: { ok?: boolean; decision?: AutoSearchHintDecision }) =>
-                  finish(reply.ok === true && reply.decision?.decision === "no-hint"),
-              );
-              worker.on("error", () => finish(false));
-              worker.on("exit", () => {
-                  registration.done();
-                  resolve(false);
-              });
-              worker.unref();
-          })
-        : Promise.resolve(
-              appendAutoSearchHintDecision(db, sessionId, {
-                  messageId,
-                  decision: "no-hint",
-                  reason,
-              }).ok,
-          );
+    // Persist on the owner, exactly like ordinary hint decisions. There is no
+    // queued writer that can recreate a deleted/replaced session later. A failed
+    // durable write must still leave this message frozen in the owner's cache.
+    let ok = false;
+    try {
+        const outcome = appendAutoSearchHintDecision(db, sessionId, {
+            messageId,
+            decision: "no-hint",
+            reason,
+        });
+        ok = outcome.ok && outcome.decision.decision === "no-hint";
+    } catch {
+        // A contended store must not erase the already-served no-hint decision.
+    }
+    const persistence = Promise.resolve(ok);
     messages.set(messageId, persistence);
     return persistence;
 }

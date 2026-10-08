@@ -177,49 +177,6 @@ test("late search results cannot mutate this turn or a later pass's bytes", asyn
     }
 }, 6000);
 
-test("a late decision commit is retired and never enters a replay's served bytes", async () => {
-    const realPersist = search.persistAutoSearchDecision;
-    const results = spyOn(search, "searchAutoHint").mockResolvedValue([
-        {
-            source: "memory",
-            content: "historian cache wiring details",
-            score: 1,
-            memoryId: 1,
-            category: "ARCHITECTURE_DECISIONS",
-            matchType: "fts",
-        },
-    ]);
-    const persist = spyOn(search, "persistAutoSearchDecision").mockImplementation(
-        (db, session, decision, startedAt) =>
-            realPersist(
-                db,
-                session,
-                decision,
-                startedAt,
-                new URL("./auto-search-decision-blocking.fixture.ts", import.meta.url),
-            ),
-    );
-    try {
-        const wire = messages();
-        const before = JSON.stringify(wire);
-        const start = performance.now();
-        await runAutoSearchHint({ db, sessionId: "late-commit", messages: wire, options });
-        expect(performance.now() - start).toBeLessThan(3150);
-        expect(JSON.stringify(wire)).toBe(before);
-        const replay = messages();
-        await runAutoSearchHint({ db, sessionId: "late-commit", messages: replay, options });
-        expect(JSON.stringify(replay)).toBe(before);
-        expect(results).toHaveBeenCalledTimes(1);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        expect(getAutoSearchHintDecisions(db, "late-commit")).toEqual([
-            { messageId: "user", decision: "no-hint", reason: "timeout" },
-        ]);
-    } finally {
-        persist.mockRestore();
-        results.mockRestore();
-    }
-}, 7000);
-
 test("cold synchronous preparation is deferred beyond the served stage", async () => {
     const snapshot = snapshotSpy.mockReturnValue(null);
     let prepared = false;
@@ -305,131 +262,91 @@ test("worker preserves the owner's busy-host backfill gate and hint bytes", asyn
     }
 });
 
-test("concurrent passes cannot replay a hint whose first decision is still unacknowledged", async () => {
-    const realPersist = search.persistAutoSearchDecision;
-    const results = spyOn(search, "searchAutoHint").mockResolvedValue([
-        {
-            source: "memory",
-            content: "historian cache wiring details",
-            score: 1,
-            memoryId: 1,
-            category: "ARCHITECTURE_DECISIONS",
-            matchType: "fts",
-        },
-    ]);
-    const persist = spyOn(search, "persistAutoSearchDecision").mockImplementation(
-        (db, session, decision, startedAt) =>
-            realPersist(
-                db,
-                session,
-                decision,
-                startedAt,
-                new URL("./auto-search-decision-blocking.fixture.ts", import.meta.url),
-            ),
+test("concurrent passes join one read and replay the owner's decision", async () => {
+    let release:
+        | ((results: import("../../features/magic-context/search").UnifiedSearchResult[]) => void)
+        | undefined;
+    const results = spyOn(search, "searchAutoHint").mockImplementation(
+        () =>
+            new Promise((resolve) => {
+                release = resolve;
+            }),
     );
     const firstWire = messages();
     const secondWire = messages();
-    const before = JSON.stringify(firstWire);
     const first = runAutoSearchHint({
         db,
-        sessionId: "concurrent-commit",
+        sessionId: "concurrent-read",
         messages: firstWire,
         options,
     });
+    const second = runAutoSearchHint({
+        db,
+        sessionId: "concurrent-read",
+        messages: secondWire,
+        options,
+    });
     try {
-        const rawDecision = () => {
-            const row = db
-                .prepare(
-                    "SELECT auto_search_hint_decisions AS decisions FROM session_meta WHERE session_id = ?",
-                )
-                .get("concurrent-commit") as { decisions: string } | undefined;
-            return JSON.parse(row?.decisions ?? "[]") as { decision: string }[];
-        };
-        const until = performance.now() + 2000;
-        while (rawDecision().length === 0 && performance.now() < until) {
-            await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-        expect(rawDecision()[0]?.decision).toBe("hint");
-        expect(getAutoSearchHintDecisions(db, "concurrent-commit")).toEqual([]);
-        const { loadPostprocessReplaySnapshot } = await import(
-            "../../features/magic-context/storage-meta-persisted"
-        );
-        expect(
-            loadPostprocessReplaySnapshot(db, "concurrent-commit").autoSearchHintDecisions,
-        ).toEqual([]);
-        const second = runAutoSearchHint({
-            db,
-            sessionId: "concurrent-commit",
-            messages: secondWire,
-            options,
-        });
-        const outcomes = await Promise.all([first, second]);
-        expect(outcomes).toEqual([
-            { ok: false, kind: "timeout" },
-            { ok: false, kind: "timeout" },
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(getAutoSearchHintDecisions(db, "concurrent-read")).toEqual([]);
+        release?.([
+            {
+                source: "memory",
+                content: "historian cache wiring details",
+                score: 1,
+                memoryId: 1,
+                category: "ARCHITECTURE_DECISIONS",
+                matchType: "fts",
+            },
         ]);
-        expect(JSON.stringify(firstWire)).toBe(before);
-        expect(JSON.stringify(secondWire)).toBe(before);
+        expect(await Promise.all([first, second])).toEqual([{ ok: true }, { ok: true }]);
+        expect(JSON.stringify(secondWire)).toBe(JSON.stringify(firstWire));
+        expect(firstWire[0].parts[0].text).toContain("ctx-search-hint");
         expect(results).toHaveBeenCalledTimes(1);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
     } finally {
-        await first;
-        persist.mockRestore();
         results.mockRestore();
     }
-}, 7000);
+});
 
-test("late acknowledgements remain invisible across cache cleanup and retire durably", async () => {
-    const realPersist = search.persistAutoSearchDecision;
-    const results = spyOn(search, "searchAutoHint").mockResolvedValue([
-        {
-            source: "memory",
-            content: "historian cache wiring details",
-            score: 1,
-            memoryId: 1,
-            category: "ARCHITECTURE_DECISIONS",
-            matchType: "fts",
-        },
-    ]);
-    const persist = spyOn(search, "persistAutoSearchDecision").mockImplementation(
-        (db, session, decision, startedAt) =>
-            realPersist(
-                db,
-                session,
-                decision,
-                startedAt,
-                new URL("./auto-search-decision-late-ack.fixture.ts", import.meta.url),
-            ),
+test("session cleanup discards a pending search result without recreating its decision row", async () => {
+    const { clearSession, getOrCreateSessionMeta } = await import(
+        "../../features/magic-context/storage-meta-session"
+    );
+    const { clearAutoSearchForSession } = await import("./auto-search-runner");
+    const sessionId = "cleanup-pending-read";
+    getOrCreateSessionMeta(db, sessionId);
+    let release!: (
+        results: import("../../features/magic-context/search").UnifiedSearchResult[],
+    ) => void;
+    const results = spyOn(search, "searchAutoHint").mockImplementation(
+        () =>
+            new Promise((resolve) => {
+                release = resolve;
+            }),
     );
     try {
         const wire = messages();
         const before = JSON.stringify(wire);
-        await runAutoSearchHint({ db, sessionId: "late-ack", messages: wire, options });
-        const { _resetAutoSearchCache } = await import("./auto-search-runner");
-        _resetAutoSearchCache();
-        const replay = messages();
-        await runAutoSearchHint({ db, sessionId: "late-ack", messages: replay, options });
+        const pending = runAutoSearchHint({ db, sessionId, messages: wire, options });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        clearSession(db, sessionId);
+        clearAutoSearchForSession(sessionId);
+        release([
+            {
+                source: "memory",
+                content: "late",
+                score: 1,
+                memoryId: 1,
+                category: "ARCHITECTURE_DECISIONS",
+                matchType: "fts",
+            },
+        ]);
+        await pending;
         expect(JSON.stringify(wire)).toBe(before);
-        expect(JSON.stringify(replay)).toBe(before);
-        const rawDecision = () => {
-            const row = db
-                .prepare(
-                    "SELECT auto_search_hint_decisions AS decisions FROM session_meta WHERE session_id = ?",
-                )
-                .get("late-ack") as { decisions: string } | undefined;
-            return JSON.parse(row?.decisions ?? "[]") as { decision: string }[];
-        };
-        const until = performance.now() + 2500;
-        while (rawDecision()[0]?.decision !== "no-hint" && performance.now() < until)
-            await new Promise((resolve) => setTimeout(resolve, 10));
-        expect(rawDecision()[0]?.decision).toBe("no-hint");
-        _resetAutoSearchCache();
-        const durable = messages();
-        await runAutoSearchHint({ db, sessionId: "late-ack", messages: durable, options });
-        expect(JSON.stringify(durable)).toBe(before);
-        expect(results).toHaveBeenCalledTimes(1);
+        expect(
+            db.prepare("SELECT 1 FROM session_meta WHERE session_id=?").get(sessionId),
+        ).toBeFalsy();
     } finally {
-        persist.mockRestore();
         results.mockRestore();
     }
-}, 8000);
+});

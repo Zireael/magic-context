@@ -9,10 +9,7 @@ import { loadAllEmbeddings } from "../../features/magic-context/memory/storage-m
 import { runMigrations } from "../../features/magic-context/migrations";
 import { unifiedSearch } from "../../features/magic-context/search";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
-import {
-    getAutoSearchHintDecisions,
-    loadPostprocessReplaySnapshot,
-} from "../../features/magic-context/storage-meta-persisted";
+import { loadPostprocessReplaySnapshot } from "../../features/magic-context/storage-meta-persisted";
 import {
     clearSession,
     getOrCreateSessionMeta,
@@ -63,7 +60,7 @@ test("review: background skip persistence must not resurrect a deleted session",
     ).toBeFalsy();
 });
 
-test("review: a successful worker hint must preserve legacy bytes across a short backfill writer lock", async () => {
+test("review: read-only worker bytes match the stored snapshot under a short writer lock", async () => {
     const project = "git:review-backfill-lock";
     const initial = autoSearchTestSnapshot(project);
     const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(initial);
@@ -122,6 +119,7 @@ test("review: a successful worker hint must preserve legacy bytes across a short
                         project,
                         "historian cache wiring",
                         {
+                            backfillMemoryEmbeddings: false,
                             sources: ["memory"],
                             embeddingEnabled: true,
                             countRetrievals: false,
@@ -163,7 +161,7 @@ test("review: a successful worker hint must preserve legacy bytes across a short
                 appendReminderToUserMessageById(messages, "user", outcome.decision.text);
             hints.push(JSON.stringify(messages));
         }
-        expect(batch).toHaveBeenCalledTimes(2);
+        expect(batch).toHaveBeenCalledTimes(0);
         expect(hints[1]).toBe(hints[0]);
     } finally {
         batch.mockRestore();
@@ -198,8 +196,24 @@ test("review: a provider generation change must not label new passage vectors wi
                 generation: 1,
             }),
         });
+        const query = spyOn(embedding, "embedTextForProject").mockResolvedValue({
+            vector: new Float32Array([1, 0]),
+            modelId: initial.modelId,
+            chunkModelId: initial.chunkModelId,
+            generation: 1,
+        });
+        try {
+            await search.queueAutoSearchBackfill(
+                db,
+                "generation",
+                project,
+                "historian cache wiring",
+            );
+        } finally {
+            query.mockRestore();
+        }
         expect(batch).toHaveBeenCalledTimes(1);
-        expect(result).toEqual([]);
+        expect(result.length).toBeGreaterThan(0);
         // Discarding the final hint is insufficient: the passage bridge must retain
         // the provider contract before a guarded embedding write can occur.
         expect(loadAllEmbeddings(db, project, initial.modelId).has(memory.id)).toBe(false);
@@ -209,70 +223,34 @@ test("review: a provider generation change must not label new passage vectors wi
     }
 });
 
-test("review: a second connection must not replay a committed but unacknowledged hint", async () => {
+test("review: search readers cannot publish an unacknowledged hint on another connection", async () => {
     const { db, path } = fixture();
     const reader = new Database(path);
     connections.push(reader);
-    const sessionId = "review-second-owner";
-    const decision = {
-        messageId: "user",
-        decision: "hint" as const,
-        text: "\n\n<ctx-search-hint>unserved</ctx-search-hint>",
-    };
-    const pending = persistAutoSearchDecision(
+    const result = await searchAutoHint(
         db,
-        sessionId,
-        decision,
-        performance.now(),
-        new URL("./auto-search-decision-late-ack.fixture.ts", import.meta.url),
+        "review-second-owner",
+        "git:reader",
+        "historian cache wiring",
+        { embeddingEnabled: false },
     );
-    try {
-        const until = performance.now() + 2000;
-        while (
-            !reader
-                .prepare(
-                    "SELECT 1 FROM session_meta WHERE session_id = ? AND auto_search_hint_decisions <> '[]'",
-                )
-                .get(sessionId) &&
-            performance.now() < until
-        )
-            await new Promise((resolve) => setTimeout(resolve, 10));
-        expect(await pending).toBeNull();
-        expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([]);
-        const messages = [
-            {
-                info: { id: "user", role: "user" },
-                parts: [{ type: "text", text: "historian cache wiring details" }],
-            },
-            {
-                info: { id: "assistant", role: "assistant" },
-                parts: [{ type: "text", text: "answer" }],
-            },
-        ];
-        const before = JSON.stringify(messages);
-        await runAutoSearchHint({
-            db: reader,
-            sessionId,
-            messages,
-            options: {
-                enabled: true,
-                projectPath: "git:review-second-owner",
-                scoreThreshold: 0,
-                minPromptChars: 1,
-            },
-        });
-        // This is a defer/tool continuation: the user message is no longer the
-        // tail. The late hint must be absent from both snapshots and served parts.
-        expect({
-            decisions: loadPostprocessReplaySnapshot(reader, sessionId).autoSearchHintDecisions,
-            bytes: JSON.stringify(messages),
-        }).toEqual({ decisions: [], bytes: before });
-    } finally {
-        await pending;
-        // Allow the delayed acknowledgement and exact-row retirement to finish.
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-}, 7000);
+    expect(result).toEqual([]);
+    expect(
+        loadPostprocessReplaySnapshot(reader, "review-second-owner").autoSearchHintDecisions,
+    ).toEqual([]);
+    const messages = [
+        { info: { id: "user", role: "user" }, parts: [{ type: "text", text: "question" }] },
+        { info: { id: "assistant", role: "assistant" }, parts: [{ type: "text", text: "answer" }] },
+    ];
+    const before = JSON.stringify(messages);
+    await runAutoSearchHint({
+        db: reader,
+        sessionId: "review-second-owner",
+        messages,
+        options: { enabled: true, projectPath: "git:reader", minPromptChars: 1, scoreThreshold: 0 },
+    });
+    expect(JSON.stringify(messages)).toBe(before);
+});
 
 test("review: a failed durable skip remains frozen after another turn skips", async () => {
     const { db, path } = fixture();

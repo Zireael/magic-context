@@ -7,15 +7,16 @@ import { insertMemory } from "../../features/magic-context/memory/storage-memory
 import { loadAllEmbeddings } from "../../features/magic-context/memory/storage-memory-embeddings";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
 import {
-    appendAutoSearchHintDecision,
-    getAutoSearchHintDecisions,
-} from "../../features/magic-context/storage-meta-persisted";
+    clearSession,
+    getOrCreateSessionMeta,
+} from "../../features/magic-context/storage-meta-session";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
-import { runAutoSearchHint } from "./auto-search-runner";
+import { clearAutoSearchForSession, runAutoSearchHint } from "./auto-search-runner";
 import { autoSearchTestSnapshot } from "./auto-search-snapshot.fixture";
-import { persistAutoSearchDecision, searchAutoHint } from "./auto-search-worker-client";
+import { persistAutoSearchDecision, queueAutoSearchBackfill } from "./auto-search-worker-client";
 
 const root = join(tmpdir(), "magic-context", "auto-search-followup");
 mkdirSync(root, { recursive: true });
@@ -53,17 +54,17 @@ for (const mismatch of ["provider", "dimensions"] as const) {
             };
         });
         try {
-            await searchAutoHint(db, "contract", project, "historian cache wiring", {
-                sources: ["memory"],
-                embeddingEnabled: true,
-                isEmbeddingRuntimeEnabled: () => true,
-                embedQuery: async () => ({
-                    vector: new Float32Array([1, 0]),
-                    modelId: initial.modelId,
-                    chunkModelId: initial.chunkModelId,
-                    generation: 1,
-                }),
+            const query = spyOn(embedding, "embedTextForProject").mockResolvedValue({
+                vector: new Float32Array([1, 0]),
+                modelId: initial.modelId,
+                chunkModelId: initial.chunkModelId,
+                generation: 1,
             });
+            try {
+                await queueAutoSearchBackfill(db, "contract", project, "historian cache wiring");
+            } finally {
+                query.mockRestore();
+            }
             expect(batch).toHaveBeenCalledTimes(1);
             expect(loadAllEmbeddings(db, project, initial.modelId).has(memory.id)).toBe(false);
         } finally {
@@ -73,7 +74,7 @@ for (const mismatch of ["provider", "dimensions"] as const) {
     });
 }
 
-test("durably accepted publication has identical SOFT replay on two connections", async () => {
+test("owner-persisted hint has identical SOFT replay on two connections", async () => {
     const { db, path } = fixture();
     const reader = new Database(path);
     dbs.push(reader);
@@ -92,7 +93,7 @@ test("durably accepted publication has identical SOFT replay on two connections"
             "SELECT auto_search_hint_decisions AS decisions FROM session_meta WHERE session_id=?",
         )
         .get(sessionId) as { decisions: string };
-    expect(JSON.parse(raw.decisions)[0].publication.state).toBe("accepted");
+    expect(JSON.parse(raw.decisions)).toEqual([decision]);
     const outputs: string[] = [];
     for (const connection of [db, reader]) {
         const messages = [
@@ -119,33 +120,220 @@ test("durably accepted publication has identical SOFT replay on two connections"
     expect(outputs[0]).toContain("accepted fragment");
 });
 
-test("a different process cannot see a provisional JSON decision", async () => {
-    const { db, path } = fixture();
-    expect(
-        appendAutoSearchHintDecision(db, "process-reader", {
-            messageId: "user",
-            decision: "hint",
-            text: "unserved",
-            publication: { token: "process-token", state: "provisional" },
-        }).ok,
-    ).toBe(true);
-    const storage = new URL(
-        "../../features/magic-context/storage-meta-persisted.ts",
-        import.meta.url,
-    ).href;
-    const sqlite = new URL("../../shared/sqlite.ts", import.meta.url).href;
-    const code = `import {Database} from ${JSON.stringify(sqlite)}; import {getAutoSearchHintDecisions} from ${JSON.stringify(storage)}; const db=new Database(${JSON.stringify(path)},{readonly:true}); console.log(JSON.stringify(getAutoSearchHintDecisions(db,"process-reader"))); db.close();`;
-    const child = Bun.spawn([process.execPath, "-e", code], {
-        windowsHide: true,
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...process.env, MAGIC_CONTEXT_LOG_PATH: join(root, "process-reader.log") },
+test("backfill starts after the served decision and cannot change its bytes", async () => {
+    const { db } = fixture();
+    const project = "git:separate-backfill";
+    const initial = autoSearchTestSnapshot(project);
+    const memory = insertMemory(db, {
+        projectPath: project,
+        category: "ARCHITECTURE_DECISIONS",
+        content: "historian cache wiring details",
     });
-    const [output, error, exit] = await Promise.all([
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
-        child.exited,
-    ]);
-    expect({ exit, error: exit === 0 ? "" : error }).toEqual({ exit: 0, error: "" });
-    expect(JSON.parse(output.trim())).toEqual([]);
+    const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(initial);
+    const query = spyOn(embedding, "embedTextForProject").mockResolvedValue({
+        vector: new Float32Array([1, 0]),
+        modelId: initial.modelId,
+        chunkModelId: initial.chunkModelId,
+        generation: 1,
+    });
+    const batch = spyOn(embedding, "embedBatchForProject").mockImplementation(async () => {
+        expect(getAutoSearchHintDecisions(db, "separate")[0]?.decision).toBe("hint");
+        return { vectors: [new Float32Array([1, 0])], modelId: initial.modelId, generation: 1 };
+    });
+    try {
+        const messages = [
+            {
+                info: { id: "user", role: "user" },
+                parts: [{ type: "text", text: "historian cache wiring" }],
+            },
+        ];
+        await runAutoSearchHint({
+            db,
+            sessionId: "separate",
+            messages,
+            options: { enabled: true, projectPath: project, minPromptChars: 1, scoreThreshold: 0 },
+        });
+        const served = JSON.stringify(messages);
+        expect(batch).toHaveBeenCalledTimes(0);
+        await queueAutoSearchBackfill(db, "separate", project, "historian cache wiring");
+        expect(batch).toHaveBeenCalled();
+        expect(loadAllEmbeddings(db, project, initial.modelId).has(memory.id)).toBe(true);
+        expect(JSON.stringify(messages)).toBe(served);
+    } finally {
+        snapshot.mockRestore();
+        query.mockRestore();
+        batch.mockRestore();
+    }
+});
+
+test("cleanup cancels queued backfill before it requests embeddings", async () => {
+    const { db } = fixture();
+    const batch = spyOn(embedding, "embedBatchForProject");
+    try {
+        const pending = queueAutoSearchBackfill(db, "queued-cleanup", "git:cleanup", "question");
+        clearAutoSearchForSession("queued-cleanup");
+        await pending;
+        expect(batch).toHaveBeenCalledTimes(0);
+        expect(getAutoSearchHintDecisions(db, "queued-cleanup")).toEqual([]);
+    } finally {
+        batch.mockRestore();
+    }
+});
+
+test("cleanup discards an active backfill's late passage result after session recreation", async () => {
+    const { db } = fixture();
+    const project = "git:active-cleanup";
+    const initial = autoSearchTestSnapshot(project);
+    const memory = insertMemory(db, {
+        projectPath: project,
+        category: "ARCHITECTURE_DECISIONS",
+        content: "historian cache wiring details",
+    });
+    getOrCreateSessionMeta(db, "active-cleanup");
+    const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(initial);
+    const query = spyOn(embedding, "embedTextForProject").mockResolvedValue({
+        vector: new Float32Array([1, 0]),
+        modelId: initial.modelId,
+        chunkModelId: initial.chunkModelId,
+        generation: 1,
+    });
+    let started!: () => void;
+    const reached = new Promise<void>((resolve) => {
+        started = resolve;
+    });
+    let release!: (value: { vectors: Float32Array[]; modelId: string; generation: number }) => void;
+    let signal: AbortSignal | undefined;
+    const batch = spyOn(embedding, "embedBatchForProject").mockImplementation(
+        async (_project, _texts, currentSignal) => {
+            signal = currentSignal;
+            started();
+            return new Promise((resolve) => {
+                release = resolve;
+            });
+        },
+    );
+    try {
+        const pending = queueAutoSearchBackfill(db, "active-cleanup", project, "question");
+        await reached;
+        clearSession(db, "active-cleanup");
+        getOrCreateSessionMeta(db, "active-cleanup");
+        await pending;
+        expect(signal?.aborted).toBe(true);
+        release({ vectors: [new Float32Array([1, 0])], modelId: initial.modelId, generation: 1 });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(loadAllEmbeddings(db, project, initial.modelId).has(memory.id)).toBe(false);
+        expect(getAutoSearchHintDecisions(db, "active-cleanup")).toEqual([]);
+    } finally {
+        snapshot.mockRestore();
+        query.mockRestore();
+        batch.mockRestore();
+    }
+});
+
+test("golden hybrid hint matches master's search for the same stored-vector snapshot", async () => {
+    const { db } = fixture();
+    const { unifiedSearch } = await import("../../features/magic-context/search");
+    const { saveEmbedding } = await import(
+        "../../features/magic-context/memory/storage-memory-embeddings"
+    );
+    const { buildAutoSearchHint } = await import("./auto-search-hint");
+    const { searchAutoHint } = await import("./auto-search-worker-client");
+    const project = "git:hybrid-golden";
+    const initial = autoSearchTestSnapshot(project);
+    const memory = insertMemory(db, {
+        projectPath: project,
+        category: "ARCHITECTURE_DECISIONS",
+        content: "historian cache wiring details",
+    });
+    saveEmbedding(db, memory.id, new Float32Array([1, 0]), initial.modelId);
+    const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(initial);
+    const batch = spyOn(embedding, "embedBatchForProject");
+    const options = {
+        sources: ["memory" as const],
+        countRetrievals: false,
+        measurementDisabled: true,
+        embeddingEnabled: true,
+        isEmbeddingRuntimeEnabled: () => true,
+        embedQuery: async () => ({
+            vector: new Float32Array([1, 0]),
+            modelId: initial.modelId,
+            chunkModelId: initial.chunkModelId,
+            generation: 1,
+        }),
+    };
+    try {
+        const master = await unifiedSearch(
+            db,
+            "golden",
+            project,
+            "historian cache wiring",
+            options,
+        );
+        const worker = await searchAutoHint(
+            db,
+            "golden",
+            project,
+            "historian cache wiring",
+            options,
+        );
+        expect(worker).toEqual(master);
+        expect(worker[0]?.source === "memory" && worker[0].matchType).toBe("hybrid");
+        const golden =
+            "<ctx-search-hint>\nYour memory may contain 1 related fragment:\n- historian cache wiring details\nIf the fragments above seem relevant to the current request, you may run ctx_search to retrieve full context. Otherwise ignore.\n</ctx-search-hint>";
+        expect(buildAutoSearchHint(master)).toBe(golden);
+        expect(buildAutoSearchHint(worker)).toBe(golden);
+        expect(batch).toHaveBeenCalledTimes(0);
+    } finally {
+        snapshot.mockRestore();
+        batch.mockRestore();
+    }
+});
+
+test("background backfill keeps a 250ms writer lease without touching hint decisions", async () => {
+    const { Worker } = await import("node:worker_threads");
+    const { db, path } = fixture();
+    const project = "git:bounded-backfill";
+    const initial = autoSearchTestSnapshot(project);
+    const memory = insertMemory(db, {
+        projectPath: project,
+        category: "ARCHITECTURE_DECISIONS",
+        content: "historian cache wiring details",
+    });
+    const lock = new Worker(new URL("./auto-search-long-lock-review.fixture.ts", import.meta.url), {
+        workerData: { path },
+    });
+    const unlocked = new Promise<void>((resolve, reject) => {
+        lock.once("exit", () => resolve());
+        lock.once("error", reject);
+    });
+    await new Promise<void>((resolve, reject) => {
+        lock.once("message", () => resolve());
+        lock.once("error", reject);
+    });
+    const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(initial);
+    const query = spyOn(embedding, "embedTextForProject").mockResolvedValue({
+        vector: new Float32Array([1, 0]),
+        modelId: initial.modelId,
+        chunkModelId: initial.chunkModelId,
+        generation: 1,
+    });
+    const batch = spyOn(embedding, "embedBatchForProject").mockImplementation(async () => {
+        lock.postMessage("release");
+        return { vectors: [new Float32Array([1, 0])], modelId: initial.modelId, generation: 1 };
+    });
+    try {
+        await queueAutoSearchBackfill(db, "bounded-backfill", project, "historian cache wiring");
+        expect(batch).toHaveBeenCalledTimes(1);
+        await unlocked;
+        expect(loadAllEmbeddings(db, project, initial.modelId).has(memory.id)).toBe(false);
+        expect(getAutoSearchHintDecisions(db, "bounded-backfill")).toEqual([]);
+        expect(
+            db.prepare("SELECT 1 FROM session_meta WHERE session_id='bounded-backfill'").get(),
+        ).toBeFalsy();
+    } finally {
+        await lock.terminate();
+        snapshot.mockRestore();
+        query.mockRestore();
+        batch.mockRestore();
+    }
 });

@@ -57,17 +57,17 @@ assert.equal(result.results[0].source, 'memory');
 await run({ path: root + '/missing-parent/no.db', ...search }, true);
 const restarted = await run(search);
 assert.deepEqual(restarted.results, result.results);
-const decision = { messageId: 'fresh', decision: 'hint', text: '\\n\\n<ctx-search-hint>bundle</ctx-search-hint>' };
 const sqlite = await import(process.versions.bun ? 'bun:sqlite' : 'node:sqlite');
 const owner = new (sqlite.Database ?? sqlite.DatabaseSync)(path);
 owner.exec('BEGIN IMMEDIATE');
 try {
-  const blocked = await run({ decision, deadlineUnixMs: Date.now() + 3000 }, true);
-  assert.equal(blocked.kind, 'error');
-  assert.match(blocked.error, /locked|busy/i);
-} finally { owner.exec('ROLLBACK'); owner.close(); }
-assert.equal((await run({ decision, deadlineUnixMs: Date.now() + 3000 })).ok, true);
-assert.equal((await run({ retireDecision: decision, retireUntil: Date.now() + 1000 })).retired, true);
+  const read = await run(search);
+  assert.deepEqual(read.results, result.results);
+} finally { owner.exec('ROLLBACK'); }
+await run({ ...search, decision: { messageId: 'fresh', decision: 'hint', text: 'unserved' } });
+assert.equal(owner.prepare('SELECT count(*) AS n FROM session_meta').get().n, 0, 'reader cannot create decision/session rows');
+await run(search);
+owner.close();
 // Each worker exits by closing its connection and port; repeated sessions must
 // not leave SQLite handles behind. This also tests shutdown without terminate().
 for (let i = 0; i < 12; i++) await run({ ...search, sessionId: 'many-' + i });
@@ -90,7 +90,7 @@ for (const [runtime, directory, harness, packed] of [
     ["omp", "packages/pi-plugin/dist", "omp", false],
 ] as const) {
     test.skipIf(!Bun.which(runtime))(
-        `review bundle: ${packed ? "packed " : ""}${harness} worker under ${runtime} loads, restarts, retires and shuts down`,
+        `review bundle: ${packed ? "packed " : ""}${harness} worker under ${runtime} loads, restarts, reads only and shuts down`,
         async () => {
             const fixtureRoot = realpathSync(createTestTempDirFromPath(join(root, "bundle-")));
             let workerEntry = join(repo, directory, "auto-search-worker.js");
@@ -236,16 +236,9 @@ for (const [runtime, directory, harness, packed] of [
             const reader = new Database(path);
             try {
                 const row = reader
-                    .prepare(
-                        "SELECT harness, auto_search_hint_decisions AS decisions FROM session_meta WHERE session_id = ?",
-                    )
-                    .get(`bundle-${harness}`) as { harness: string; decisions: string };
-                expect(row.harness).toBe(harness);
-                expect(JSON.parse(row.decisions)[0]).toEqual({
-                    messageId: "fresh",
-                    decision: "no-hint",
-                    reason: "timeout",
-                });
+                    .prepare("SELECT 1 FROM session_meta WHERE session_id = ?")
+                    .get(`bundle-${harness}`);
+                expect(row).toBeFalsy();
             } finally {
                 reader.close();
             }

@@ -75,11 +75,11 @@ import { buildAutoSearchHint } from "@magic-context/core/hooks/magic-context/aut
 import {
 	coalesceAutoSearchTurn,
 	persistAutoSearchDecision,
+	queueAutoSearchBackfill,
 	queueAutoSearchRegistration,
 	searchAutoHint,
 } from "@magic-context/core/hooks/magic-context/auto-search-worker-client";
 import type { CavemanWordRules } from "@magic-context/core/hooks/magic-context/caveman";
-import { isAutoSearchHintPending } from "@magic-context/core/shared/auto-search-hint-fence";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
@@ -302,12 +302,9 @@ export async function runAutoSearchHintForPi(args: {
 		db,
 		sessionId,
 		userMsgId,
-		async (): Promise<AgentMessage[]> => {
-			if (
-				wasAutoSearchSkipped(db, sessionId, userMsgId) ||
-				isAutoSearchHintPending(db, sessionId, userMsgId)
-			)
-				return messages;
+		async (lifecycleSignal): Promise<AgentMessage[]> => {
+			if (lifecycleSignal.aborted) return messages;
+			if (wasAutoSearchSkipped(db, sessionId, userMsgId)) return messages;
 
 			const existing =
 				args.decisions ?? getAutoSearchHintDecisions(db, sessionId);
@@ -356,7 +353,7 @@ export async function runAutoSearchHintForPi(args: {
 			const writeNoHintAndReconcile = async (
 				reason: AutoSearchHintNoHintReason,
 			): Promise<void> => {
-				const outcome = await persistAutoSearchDecision(
+				const outcome = persistAutoSearchDecision(
 					db,
 					sessionId,
 					{
@@ -452,73 +449,81 @@ export async function runAutoSearchHintForPi(args: {
 				return messages;
 			}
 
-			if (results === null) {
-				// Preserve the served skip: replay must never add a late hint to this turn.
+			if (lifecycleSignal.aborted) return messages;
+			try {
+				if (results === null) {
+					// Preserve the served skip: replay must never add a late hint to this turn.
+					sessionLog(
+						sessionId,
+						`auto-search: timed out after ${AUTO_SEARCH_TIMEOUT_MS}ms, skipping hint for this turn`,
+					);
+					void persistAutoSearchSkip(db, sessionId, userMsgId);
+					return messages;
+				}
+
+				if (results.length === 0) {
+					await writeNoHintAndReconcile("empty");
+					return messages;
+				}
+
+				const scoreThreshold =
+					options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD;
+				if (results[0].score < scoreThreshold) {
+					sessionLog(
+						sessionId,
+						`auto-search: top score ${results[0].score.toFixed(3)} below threshold ${scoreThreshold}`,
+					);
+					await writeNoHintAndReconcile("below-threshold");
+					return messages;
+				}
+
+				const hintText = buildAutoSearchHint(results, {
+					wordRules: options.wordRules,
+				});
+				if (!hintText) {
+					await writeNoHintAndReconcile("empty");
+					return messages;
+				}
+
+				// Prefix with double newline so the hint is a separate block, matching
+				// OpenCode lines 268-270.
+				const payload = `\n\n${hintText}`;
+				const outcome = persistAutoSearchDecision(
+					db,
+					sessionId,
+					{
+						messageId: userMsgId,
+						decision: "hint",
+						text: payload,
+					},
+					startedAt,
+				);
+				if (outcome === null) {
+					void persistAutoSearchSkip(db, sessionId, userMsgId);
+					return messages;
+				}
+				if (!outcome.ok) return messages;
+				if (outcome.decision.decision === "hint") {
+					appendHintToUserMessage(userMsg, outcome.decision.text);
+				}
 				sessionLog(
 					sessionId,
-					`auto-search: timed out after ${AUTO_SEARCH_TIMEOUT_MS}ms, skipping hint for this turn`,
+					`auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,
 				);
-				void persistAutoSearchSkip(db, sessionId, userMsgId);
-				return messages;
-			}
 
-			if (results.length === 0) {
-				await writeNoHintAndReconcile("empty");
 				return messages;
+			} finally {
+				if (!lifecycleSignal.aborted && results !== null)
+					void queueAutoSearchBackfill(
+						db,
+						sessionId,
+						options.projectPath,
+						rawPrompt,
+					);
 			}
-
-			const scoreThreshold = options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD;
-			if (results[0].score < scoreThreshold) {
-				sessionLog(
-					sessionId,
-					`auto-search: top score ${results[0].score.toFixed(3)} below threshold ${scoreThreshold}`,
-				);
-				await writeNoHintAndReconcile("below-threshold");
-				return messages;
-			}
-
-			const hintText = buildAutoSearchHint(results, {
-				wordRules: options.wordRules,
-			});
-			if (!hintText) {
-				await writeNoHintAndReconcile("empty");
-				return messages;
-			}
-
-			// Prefix with double newline so the hint is a separate block, matching
-			// OpenCode lines 268-270.
-			const payload = `\n\n${hintText}`;
-			const outcome = await persistAutoSearchDecision(
-				db,
-				sessionId,
-				{
-					messageId: userMsgId,
-					decision: "hint",
-					text: payload,
-				},
-				startedAt,
-			);
-			if (outcome === null) {
-				void persistAutoSearchSkip(db, sessionId, userMsgId);
-				return messages;
-			}
-			if (!outcome.ok) return messages;
-			if (outcome.decision.decision === "hint") {
-				appendHintToUserMessage(userMsg, outcome.decision.text);
-			}
-			sessionLog(
-				sessionId,
-				`auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,
-			);
-
-			return messages;
 		},
 		() => {
-			if (
-				wasAutoSearchSkipped(db, sessionId, userMsgId) ||
-				isAutoSearchHintPending(db, sessionId, userMsgId)
-			)
-				return;
+			if (wasAutoSearchSkipped(db, sessionId, userMsgId)) return;
 			const decision = getAutoSearchHintDecisions(db, sessionId).find(
 				(entry) => entry.messageId === userMsgId,
 			);

@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import {
     embedBatchForProject,
+    embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
 import type { EmbeddingPurpose } from "../../features/magic-context/memory/embedding-provider";
@@ -14,63 +14,25 @@ import {
     type AutoSearchHintDecision,
     appendAutoSearchHintDecision,
 } from "../../features/magic-context/storage-meta-persisted";
-import {
-    markAutoSearchHintPending,
-    settleAutoSearchHint,
-} from "../../shared/auto-search-hint-fence";
+import { registerAutoSearchWork } from "../../shared/auto-search-lifecycle";
 import { isEmbeddingHostBusy } from "../../shared/embedding-activity";
 import { getHarness, type HarnessId } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import { type Database, getSqliteDatabasePath } from "../../shared/sqlite";
-import {
-    AUTO_SEARCH_TIMEOUT_MS,
-    autoSearchDeadlineUnixMs,
-    withAutoSearchDeadline,
-} from "./auto-search-deadline";
+import { AUTO_SEARCH_TIMEOUT_MS, autoSearchDeadlineUnixMs } from "./auto-search-deadline";
 
 const pendingRegistrations = new WeakMap<Database, Set<string>>();
-const pendingTurns = new WeakMap<Database, Map<string, Map<string, Promise<unknown>>>>();
+const pendingTurns = new WeakMap<
+    Database,
+    Map<string, Map<string, { promise: Promise<unknown>; signal: AbortSignal }>>
+>();
 
-function retireRejectedHint(
-    db: Database,
-    path: string,
-    sessionId: string,
-    decision: AutoSearchHintDecision,
-): void {
-    const worker = new Worker(
-        new URL(
-            new URL(import.meta.url).pathname.endsWith(".ts")
-                ? "./auto-search-worker.ts"
-                : "./auto-search-worker.js",
-            import.meta.url,
-        ),
-        {
-            workerData: {
-                path,
-                sessionId,
-                harness: getHarness(),
-                retireDecision: decision,
-                retireUntil: Date.now() + 10_000,
-            },
-        },
-    );
-    const finish = (retired: boolean) => {
-        if (retired) settleAutoSearchHint(db, sessionId, decision.messageId);
-        void worker.terminate();
-    };
-    worker.on("message", (reply: { retired?: boolean }) => finish(reply.retired === true));
-    worker.on("error", () => finish(false));
-    worker.unref();
-}
-
-/** A committed row may still be awaiting its owner's deadline acknowledgement.
- * Other passes of that same turn must join the owner, not replay a provisional
- * hint directly from SQLite. Each caller replays into its own message array. */
+/** Same-turn passes join one search, then replay the owner's served decision. */
 export async function coalesceAutoSearchTurn<T>(
     db: Database,
     sessionId: string,
     messageId: string,
-    operation: () => Promise<T>,
+    operation: (signal: AbortSignal) => Promise<T>,
     replay: () => void,
 ): Promise<T> {
     let sessions = pendingTurns.get(db);
@@ -84,17 +46,20 @@ export async function coalesceAutoSearchTurn<T>(
         sessions.set(sessionId, turns);
     }
     const pending = turns.get(messageId);
-    if (pending) {
-        const result = await pending;
-        replay();
+    if (pending && !pending.signal.aborted) {
+        const result = await pending.promise;
+        if (!pending.signal.aborted) replay();
         return result as T;
     }
-    const work = Promise.resolve().then(operation);
-    turns.set(messageId, work);
+    const lifecycle = registerAutoSearchWork(sessionId);
+    const work = Promise.resolve().then(() => operation(lifecycle.signal));
+    const turn = { promise: work, signal: lifecycle.signal };
+    turns.set(messageId, turn);
     try {
         return await work;
     } finally {
-        turns.delete(messageId);
+        lifecycle.done();
+        if (turns.get(messageId) === turn) turns.delete(messageId);
         if (turns.size === 0) sessions.delete(sessionId);
     }
 }
@@ -132,126 +97,20 @@ export function queueAutoSearchRegistration(
     timer.unref?.();
 }
 
-/** Decision writes can checkpoint a large WAL. Give them the remaining search
- * budget too, without blocking the prompt thread on SQLite or filesystem I/O. */
-export async function persistAutoSearchDecision(
+/** Only the owner publishes a decision. Once master's synchronous append succeeds,
+ * serve it: never reject a committed hint because of a later IPC acknowledgement. */
+export function persistAutoSearchDecision(
     db: Database,
     sessionId: string,
     decision: AutoSearchHintDecision,
     startedAt: number,
-    entry = new URL(
-        new URL(import.meta.url).pathname.endsWith(".ts")
-            ? "./auto-search-worker.ts"
-            : "./auto-search-worker.js",
-        import.meta.url,
-    ),
-): Promise<ReturnType<typeof appendAutoSearchHintDecision> | null> {
-    const path = getSqliteDatabasePath(db);
-    const fenced = path !== null && decision.decision === "hint";
-    const reserved: AutoSearchHintDecision =
-        fenced && decision.decision === "hint"
-            ? { ...decision, publication: { token: randomUUID(), state: "provisional" } }
-            : decision;
-    let rejected = false;
-    let retirementQueued = false;
-    // A rejected publication can be retired immediately: its durable provisional
-    // state cannot be promoted without a timely owner command.
-    const retireIfReady = () => {
-        if (fenced && path && rejected && !retirementQueued) {
-            retirementQueued = true;
-            retireRejectedHint(db, path, sessionId, reserved);
-        }
-    };
-    const result = await withAutoSearchDeadline(
-        async (signal): Promise<ReturnType<typeof appendAutoSearchHintDecision> | null> => {
-            if (fenced) markAutoSearchHintPending(db, sessionId, decision.messageId);
-            if (!path) return appendAutoSearchHintDecision(db, sessionId, decision);
-            const write = (command: Record<string, AutoSearchHintDecision>, target = entry) =>
-                new Promise<ReturnType<typeof appendAutoSearchHintDecision> | null>((resolve) => {
-                    const worker = new Worker(target, {
-                        workerData: {
-                            path,
-                            sessionId,
-                            harness: getHarness(),
-                            ...command,
-                            deadlineUnixMs:
-                                Date.now() +
-                                Math.max(
-                                    0,
-                                    AUTO_SEARCH_TIMEOUT_MS - (performance.now() - startedAt),
-                                ),
-                        },
-                    });
-                    const abort = () => {
-                        // Do not kill a worker in COMMIT: it must be allowed to retire a
-                        // hint whose commit completed after the served-turn deadline.
-                        worker.unref();
-                        resolve(null);
-                    };
-                    let finished = false;
-                    const finish = (
-                        outcome: ReturnType<typeof appendAutoSearchHintDecision> | null,
-                    ) => {
-                        if (finished) return;
-                        finished = true;
-                        signal.removeEventListener("abort", abort);
-                        resolve(signal.aborted ? null : outcome);
-                        void worker.terminate();
-                        retireIfReady();
-                    };
-                    signal.addEventListener("abort", abort, { once: true });
-                    worker.on(
-                        "message",
-                        (
-                            reply:
-                                | ReturnType<typeof appendAutoSearchHintDecision>
-                                | { kind: "error"; error: string }
-                                | null,
-                        ) => {
-                            if (
-                                reply &&
-                                "ok" in reply &&
-                                reply.ok &&
-                                reply.decision.decision === "hint" &&
-                                reply.decision.publication?.state === "provisional" &&
-                                !signal.aborted
-                            ) {
-                                if (
-                                    reserved.decision !== "hint" ||
-                                    reply.decision.publication.token !== reserved.publication?.token
-                                ) {
-                                    finish({ ok: false, kind: "cas-exhausted" });
-                                } else
-                                    worker.postMessage({
-                                        kind: "publish",
-                                        token: reserved.publication.token,
-                                    });
-                                return;
-                            }
-                            finish(
-                                reply === null
-                                    ? null
-                                    : "ok" in reply
-                                      ? reply
-                                      : { ok: false, kind: "cas-exhausted" },
-                            );
-                        },
-                    );
-                    worker.on("error", () => finish({ ok: false, kind: "cas-exhausted" }));
-                    worker.on("exit", () => finish({ ok: false, kind: "cas-exhausted" }));
-                    if (signal.aborted) abort();
-                });
-            return write({ decision: reserved });
-        },
-        startedAt,
-    );
-    rejected = result === null || !result.ok;
-    if (rejected) retireIfReady();
-    else if (fenced) settleAutoSearchHint(db, sessionId, decision.messageId);
-    return result;
+): ReturnType<typeof appendAutoSearchHintDecision> | null {
+    if (performance.now() - startedAt >= AUTO_SEARCH_TIMEOUT_MS) return null;
+    return appendAutoSearchHintDecision(db, sessionId, decision);
 }
 
 export interface AutoSearchWorkerInput {
+    job?: "search" | "backfill";
     path: string;
     harness: HarnessId;
     sessionId: string;
@@ -287,7 +146,7 @@ export type AutoSearchEmbeddingReply = {
 };
 
 /**
- * Keep every search SELECT, vector scan and memory backfill off the prompt thread.
+ * Keep every search SELECT and vector scan off the prompt thread.
  * Termination is deliberately not awaited: a blocked SQLite worker must not hold
  * the served turn hostage. It owns its connection and cannot persist hint decisions.
  * All provider calls stay with the owner and share the caller's abort signal.
@@ -305,28 +164,110 @@ export async function searchAutoHint(
         import.meta.url,
     ),
 ): Promise<UnifiedSearchResult[]> {
+    return executeAutoSearchWorker(db, sessionId, projectPath, query, options, entry, "search");
+}
+
+const pendingBackfills = new WeakMap<Database, Map<string, Promise<void>>>();
+
+/** Called only after the owner has decided the hint. No background result can
+ * change that decision, and cleanup cancels both queued and active jobs. */
+export function queueAutoSearchBackfill(
+    db: Database,
+    sessionId: string,
+    projectPath: string,
+    query: string,
+): Promise<void> {
+    if (isEmbeddingHostBusy()) return Promise.resolve();
+    const key = `${sessionId}\0${projectPath}`;
+    const pending = pendingBackfills.get(db) ?? new Map<string, Promise<void>>();
+    pendingBackfills.set(db, pending);
+    const prior = pending.get(key);
+    if (prior) return prior;
+    const lifecycle = registerAutoSearchWork(sessionId);
+    const work = new Promise<void>((resolve) => {
+        const done = () => {
+            lifecycle.done();
+            pending.delete(key);
+            resolve();
+        };
+        const queued = setTimeout(() => {
+            lifecycle.signal.removeEventListener("abort", cancel);
+            if (lifecycle.signal.aborted) return done();
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 10_000);
+            timeout.unref?.();
+            void executeAutoSearchWorker(
+                db,
+                sessionId,
+                projectPath,
+                query,
+                { signal: AbortSignal.any([controller.signal, lifecycle.signal]) },
+                new URL(
+                    new URL(import.meta.url).pathname.endsWith(".ts")
+                        ? "./auto-search-worker.ts"
+                        : "./auto-search-worker.js",
+                    import.meta.url,
+                ),
+                "backfill",
+            )
+                .catch((error) => log("[auto-search] background backfill failed:", error))
+                .finally(() => {
+                    clearTimeout(timeout);
+                    done();
+                });
+        }, 0);
+        const cancel = () => {
+            clearTimeout(queued);
+            done();
+        };
+        lifecycle.signal.addEventListener("abort", cancel, { once: true });
+        queued.unref?.();
+    });
+    pending.set(key, work);
+    return work;
+}
+
+async function executeAutoSearchWorker(
+    db: Database,
+    sessionId: string,
+    projectPath: string,
+    query: string,
+    options: UnifiedSearchOptions,
+    entry: URL,
+    job: "search" | "backfill",
+): Promise<UnifiedSearchResult[]> {
     if (options.signal?.aborted) return [];
     const path = getSqliteDatabasePath(db);
     if (!path) throw new Error("auto-search requires a file-backed database for off-thread search");
     const {
         embedQuery,
         isEmbeddingRuntimeEnabled,
-        signal,
+        signal: deadlineSignal,
         readMessages: _readMessages,
         ...serializable
     } = options;
+    const lifecycle = registerAutoSearchWork(sessionId);
+    const signal = deadlineSignal
+        ? AbortSignal.any([deadlineSignal, lifecycle.signal])
+        : lifecycle.signal;
     const snapshot = getProjectEmbeddingSnapshot(projectPath);
     const input: AutoSearchWorkerInput = {
+        job,
         path,
         harness: getHarness(),
         sessionId,
         projectPath,
         query,
-        options: { ...serializable, countRetrievals: false, measurementDisabled: true },
+        options: {
+            ...serializable,
+            backfillMemoryEmbeddings: false,
+            countRetrievals: false,
+            measurementDisabled: true,
+        },
         embeddingRuntimeEnabled: isEmbeddingRuntimeEnabled?.() ?? false,
         embeddingHostBusy: isEmbeddingHostBusy(),
         snapshot,
-        deadlineUnixMs: autoSearchDeadlineUnixMs(signal),
+        deadlineUnixMs: autoSearchDeadlineUnixMs(deadlineSignal),
     };
     return new Promise((resolve, reject) => {
         const worker = new Worker(entry, { workerData: input });
@@ -335,6 +276,8 @@ export async function searchAutoHint(
             if (settled) return;
             settled = true;
             signal?.removeEventListener("abort", abort);
+            lifecycle.signal.removeEventListener("abort", abort);
+            lifecycle.done();
             void worker.terminate();
             worker.unref();
             if (error) reject(error);
@@ -342,6 +285,7 @@ export async function searchAutoHint(
         };
         const abort = () => finish([]);
         signal?.addEventListener("abort", abort, { once: true });
+        lifecycle.signal.addEventListener("abort", abort, { once: true });
         worker.on("error", (error) => finish([], error));
         worker.on("exit", (code) => finish([], new Error(`auto-search worker exited (${code})`)));
         worker.on("message", async (reply: AutoSearchWorkerReply) => {
@@ -364,7 +308,10 @@ export async function searchAutoHint(
             const response: AutoSearchEmbeddingReply = { id: reply.id };
             try {
                 if (reply.kind === "query")
-                    response.result = (await embedQuery?.(reply.text, signal)) ?? null;
+                    response.result =
+                        (await (job === "backfill"
+                            ? embedTextForProject(projectPath, reply.text, signal, "query")
+                            : embedQuery?.(reply.text, signal))) ?? null;
                 else {
                     const passage = await embedBatchForProject(
                         projectPath,
