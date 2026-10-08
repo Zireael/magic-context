@@ -105,6 +105,27 @@ try {
     );
     run("bun", ["install", "--production"], installRoot);
 
+    for (const dependency of ["@opentui/core", "@opentui/solid", "solid-js"]) {
+        check(
+            `standalone consumer does not install ${dependency}`,
+            !existsSync(join(installRoot, "node_modules", dependency)),
+        );
+    }
+
+    // These probes emulate a host and bare-Bun development, respectively. The
+    // published package must not install a second Solid/OpenTUI runtime; provide
+    // the development runtimes explicitly only after checking the consumer graph.
+    const manifest = JSON.parse(await readFile(join(pluginRoot, "package.json"), "utf8")) as {
+        devDependencies: Record<string, string>;
+    };
+    run(
+        "bun",
+        ["add", "--dev", ...["@opentui/core", "@opentui/solid", "solid-js"].map(
+            (name) => `${name}@${manifest.devDependencies[name]}`,
+        )],
+        installRoot,
+    );
+
     const installedPackageRoot = join(
         installRoot,
         "node_modules",

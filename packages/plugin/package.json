@@ -59,14 +59,11 @@
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
     "@opencode-ai/plugin": "^1.17.11",
     "@opencode-ai/sdk": "^1.17.11",
-    "@opentui/core": "^0.4.2",
-    "@opentui/solid": "^0.4.2",
     "ai-tokenizer": "^1.0.6",
     "comment-json": "^5.0.0",
     "jsonc-parser": "^3.3.1",
     "onnxruntime-web": "1.26.0-dev.20260416-b7804b056c",
     "quickjs-emscripten": "^0.32.0",
-    "solid-js": "1.9.12",
     "zod": "^4.1.8"
   },
   "optionalDependencies": {
@@ -74,6 +71,9 @@
     "sharp": "^0.35.0"
   },
   "devDependencies": {
+    "@opentui/core": "^0.4.2",
+    "@opentui/solid": "^0.4.2",
+    "solid-js": "1.9.12",
     "@opencode/plugin": "2.0.22",
     "@opencode/ai": "2.0.22",
     "@opencode/cli": "2.0.22",
@@ -104,6 +104,14 @@
     "tui"
   ],
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.15.0"
+    "@opencode-ai/plugin": ">=1.15.0",
+    "@opentui/core": ">=0.4.2",
+    "@opentui/solid": ">=0.4.2",
+    "solid-js": "^1.9.12"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": { "optional": true },
+    "@opentui/solid": { "optional": true },
+    "solid-js": { "optional": true }
   }
 }
