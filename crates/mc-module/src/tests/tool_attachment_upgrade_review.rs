@@ -400,3 +400,42 @@ fn attachment_repair_old_adapter_control_refreshes_hygiene_on_second_pass() {
         second.meta.tail_hygiene_baseline
     );
 }
+
+#[test]
+fn attachment_repair_ts_omitted_defaults_preserve_old_identity_on_defer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let (native, fixed) = attachment_review_fixture();
+    let ts_wire = |messages: Vec<CkIngressMessage>| {
+        let mut wire = serde_json::to_value(messages).unwrap();
+        for message in wire.as_array_mut().unwrap() {
+            for block in message["ck"]["content"].as_array_mut().unwrap() {
+                block["kind"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("provider_executed");
+            }
+        }
+        serde_json::from_value(wire).unwrap()
+    };
+    let session = "attachment-repair-ts-wire";
+    let old = attachment_review_request(
+        &native,
+        ts_wire(attachment_review_old_ingress(fixed.clone())),
+        session,
+    );
+    let before = run(&store, &old, &[]);
+    run(&store, &old, &[]);
+    let version = store.load(session).unwrap().row_version;
+    let upgraded = attachment_review_request(&native, ts_wire(fixed), session);
+    for _ in 0..3 {
+        let deferred = run(&store, &upgraded, &[]);
+        assert!(!deferred.prefix_bust_permitted);
+        assert_eq!(
+            attachment_review_native(&deferred, &native),
+            attachment_review_native(&before, &native),
+            "omitted TS defaults must not hide an already-served attachment upgrade"
+        );
+        assert_eq!(store.load(session).unwrap().row_version, version);
+    }
+}

@@ -7702,7 +7702,22 @@ fn attachment_projection_replay(
             } else {
                 ck_wire::CkOutputKind::Text { text: text.clone() }
             });
-            replacements.insert((message.mid.clone(), index), old);
+            // Keep the ingress shell byte-exact, including omitted defaults.
+            // Rebuilding the typed kind would add provider_executed=false to
+            // the TS adapter's old wire and fail the stored identity comparison.
+            let legacy_block = if let Some(original) = block.retained_original_json() {
+                let mut wire = original.clone();
+                wire["kind"]["output"] = serde_json::to_value(old).expect("CK output serializes");
+                serde_json::from_value(wire).expect("validated CK block with scalar output")
+            } else {
+                let mut wire = block.clone();
+                if let ck_wire::CkKind::ToolResult { output, .. } = &mut wire.kind {
+                    *output = old;
+                }
+                wire.mark_modified();
+                wire
+            };
+            replacements.insert((message.mid.clone(), index), legacy_block);
         }
     }
     if replacements.is_empty() {
@@ -7726,10 +7741,7 @@ fn attachment_projection_replay(
             let Some(old) = replacements.get(&(message.mid.clone(), index)) else {
                 continue;
             };
-            if let ck_wire::CkKind::ToolResult { output, .. } = &mut block.kind {
-                *output = old.clone();
-                block.mark_modified();
-            }
+            *block = old.clone();
         }
         message.ck.mark_modified();
     }
