@@ -5085,14 +5085,7 @@ fn apply_once(
                 .unwrap_or(200_000),
         );
     let reasoning_exemption_repair = !req.is_subagent
-        && (reasoning_clear_exemption_changed(&loaded.core, req, lineage_anchor_mid)
-            || legacy_reasoning_exemption_changed(
-                &loaded.core,
-                &loaded.meta,
-                req,
-                &projection,
-                lineage_anchor_mid,
-            ));
+        && reasoning_clear_exemption_changed(&loaded.core, req, lineage_anchor_mid);
     // Every trigger below asks for a HARD. Whether that HARD may also price automatic
     // reductions and the other bust-only lanes depends on whether it can re-render the
     // served prefix byte-identically:
@@ -6982,7 +6975,7 @@ fn apply_once(
         meta.reasoning_clear_initialized = true;
         meta.reasoning_replay_evidence = None;
     }
-    let cleared_mids = reasoning_clear_mids(&core.frozen_units)
+    let cleared_mids = reasoning_native_clear_mids(&core.frozen_units)
         .into_iter()
         .chain(core.frozen_units.iter().filter_map(|unit| {
             unit.key
@@ -14007,8 +14000,7 @@ fn remove_frozen_historical_reasoning(
     rebuilt: &mut CkWireMessage,
 ) -> usize {
     if message.ck.role != "assistant"
-        || (output_message_strip_unit(frozen_units, "reasoning_age", &message.mid).is_none()
-            && output_message_strip_unit(frozen_units, "merged_reasoning", &message.mid).is_none())
+        || output_message_strip_unit(frozen_units, "reasoning_age", &message.mid).is_none()
     {
         return 0;
     }

@@ -205,11 +205,13 @@ fn reasoning_clear_pre_fix_database_migrates_ck_and_incremental_wire_without_bus
     ctx.temporal_awareness = false;
     let loaded = db.load(&request.session_id).unwrap();
     assert!(loaded.meta.reasoning_replay_evidence.is_none());
-    assert!(!loaded
-        .core
-        .frozen_units
-        .iter()
-        .any(|unit| unit.key.starts_with("strip:reasoning_clear:")));
+    assert!(
+        !loaded
+            .core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key.starts_with("strip:reasoning_clear:"))
+    );
     let mut native = ReasoningNativeHarness::new();
     let mut first = transform_with_projection(&db, &request, &ctx).unwrap();
     assert_eq!(first.response.action, "SOFT+");
@@ -226,12 +228,13 @@ fn reasoning_clear_pre_fix_database_migrates_ck_and_incremental_wire_without_bus
         wire,
         include_bytes!("../../gen/reasoning-clear-legacy/pre-fix.native.json").as_slice()
     );
-    assert!(db
-        .load(&request.session_id)
-        .unwrap()
-        .meta
-        .reasoning_replay_evidence
-        .is_some());
+    assert!(
+        db.load(&request.session_id)
+            .unwrap()
+            .meta
+            .reasoning_replay_evidence
+            .is_some()
+    );
     let mut adopted = transform_with_projection(&db, &request, &ctx).unwrap();
     assert_eq!(adopted.response.action, "SOFT+");
     assert_eq!(
@@ -257,10 +260,12 @@ fn reasoning_clear_pre_fix_database_migrates_ck_and_incremental_wire_without_bus
     for _ in 0..3 {
         let mut deferred = transform_with_projection(&db, &request, &ctx).unwrap();
         assert_eq!(deferred.response.action, "SOFT+");
-        assert!(!deferred
-            .reasoning_clear_units
-            .iter()
-            .any(|unit| unit.key.starts_with(LEGACY_REASONING_CLEAR_PREFIX)));
+        assert!(
+            !deferred
+                .reasoning_clear_units
+                .iter()
+                .any(|unit| unit.key.starts_with(LEGACY_REASONING_CLEAR_PREFIX))
+        );
         assert_eq!(native.attach(&db, &mut deferred, &request), priced_wire);
     }
     assert!(
@@ -593,7 +598,7 @@ fn reasoning_clear_stale_generation_holds_legacy_wire_without_adopting() {
 }
 
 #[test]
-fn reasoning_clear_legacy_reexemption_prices_restoration_before_unit_adoption() {
+fn reasoning_clear_legacy_reexemption_preserves_absence_before_unit_adoption() {
     let dir = tempfile::tempdir().unwrap();
     let (db, mut request, _) = load_pre_fix_reasoning_fixture(dir.path());
     request.native_messages.as_mut().unwrap().retain(|message| {
@@ -605,16 +610,18 @@ fn reasoning_clear_legacy_reexemption_prices_restoration_before_unit_adoption() 
         crate::codec::decode_opencode(request.native_messages.as_ref().unwrap()).messages;
     let mut ctx = pctx("git:fixture", "/nonexistent-docs", 0);
     ctx.temporal_awareness = false;
+    // Contract change: preserved thinking forbids restoring an already removed
+    // signed block, even before a durable clear unit has been adopted.
     let mut restored = transform_with_projection(&db, &request, &ctx).unwrap();
-    assert_eq!(restored.response.action, "HARD");
-    assert_eq!(
+    assert_eq!(restored.response.action, "SOFT+");
+    assert_ne!(
         restored.response.materialize_reason.as_deref(),
         Some("reasoning_exemption_repair")
     );
     let mut native = ReasoningNativeHarness::new();
     native.attach(&db, &mut restored, &request);
     let bytes = native_mid_bytes(&native, "already");
-    assert!(String::from_utf8_lossy(&bytes).contains("thinking-already"));
+    assert!(!String::from_utf8_lossy(&bytes).contains("thinking-already"));
     for _ in 0..3 {
         let mut deferred = transform_with_projection(&db, &request, &ctx).unwrap();
         assert_eq!(deferred.response.action, "SOFT+");
@@ -663,7 +670,8 @@ fn reasoning_clear_subset_ingress_cannot_retire_an_omitted_legacy_clear() {
         .unwrap();
     served.content_hash = cleared_ck.block_fingerprints[0].0.clone();
     served.serialized_len = cleared_ck.block_fingerprints[0].1;
-    let tag_numbers = tag_number_by_message(&db.load_tags_for_session(&request.session_id).unwrap());
+    let tag_numbers =
+        tag_number_by_message(&db.load_tags_for_session(&request.session_id).unwrap());
     let old_tag = tag_numbers["old"];
     loaded.meta.reasoning_cleared_through_tag = old_tag;
     loaded.meta.reasoning_cleared_through_ordinal = old_tag;
@@ -688,17 +696,21 @@ fn reasoning_clear_subset_ingress_cannot_retire_an_omitted_legacy_clear() {
     let mut native = ReasoningNativeHarness::new();
     let mut first = transform_with_projection(&db, &request, &ctx).unwrap();
     assert_eq!(first.response.action, "SOFT+");
-    assert!(first
-        .reasoning_clear_units
-        .iter()
-        .any(|unit| unit.key == "strip:reasoning_clear_legacy:old"));
+    assert!(
+        first
+            .reasoning_clear_units
+            .iter()
+            .any(|unit| unit.key == "strip:reasoning_clear_legacy:old")
+    );
     native.attach(&db, &mut first, &request);
     let cleared_bytes = native_mid_bytes(&native, "old");
 
     let mut subset = request.clone();
-    subset.native_messages.as_mut().unwrap().retain(|message| {
-        !matches!(message["info"]["id"].as_str(), Some("old" | "already"))
-    });
+    subset
+        .native_messages
+        .as_mut()
+        .unwrap()
+        .retain(|message| !matches!(message["info"]["id"].as_str(), Some("old" | "already")));
     subset.messages =
         crate::codec::decode_opencode(subset.native_messages.as_ref().unwrap()).messages;
     let mut contracted = transform_with_projection(&db, &subset, &ctx).unwrap();
@@ -707,17 +719,20 @@ fn reasoning_clear_subset_ingress_cannot_retire_an_omitted_legacy_clear() {
 
     let mut expanded = transform_with_projection(&db, &request, &ctx).unwrap();
     assert_eq!(expanded.response.action, "SOFT+");
-    assert!(expanded
-        .reasoning_clear_units
-        .iter()
-        .any(|unit| unit.key == "strip:reasoning_clear_legacy:old"));
+    assert!(
+        expanded
+            .reasoning_clear_units
+            .iter()
+            .any(|unit| unit.key == "strip:reasoning_clear_legacy:old")
+    );
     native.attach(&db, &mut expanded, &request);
     assert_eq!(native_mid_bytes(&native, "old"), cleared_bytes);
-    assert!(!db
-        .load(&request.session_id)
-        .unwrap()
-        .meta
-        .reasoning_clear_initialized);
+    assert!(
+        !db.load(&request.session_id)
+            .unwrap()
+            .meta
+            .reasoning_clear_initialized
+    );
 }
 
 #[test]
@@ -730,12 +745,13 @@ fn reasoning_clear_legacy_arm_cannot_mint_for_just_demoted_exempt_assistant() {
 
     let mut held = transform_with_projection(&db, &request, &ctx).unwrap();
     assert_eq!(held.response.action, "SOFT+");
-    assert!(!held
-        .reasoning_clear_units
-        .iter()
-        .any(|unit| unit.key == "strip:reasoning_clear_legacy:old"));
+    assert!(
+        !held
+            .reasoning_clear_units
+            .iter()
+            .any(|unit| unit.key == "strip:reasoning_clear_legacy:old")
+    );
     let mut native = ReasoningNativeHarness::new();
     native.attach(&db, &mut held, &request);
-    assert!(String::from_utf8_lossy(&native_mid_bytes(&native, "old"))
-        .contains("thinking-old"));
+    assert!(String::from_utf8_lossy(&native_mid_bytes(&native, "old")).contains("thinking-old"));
 }

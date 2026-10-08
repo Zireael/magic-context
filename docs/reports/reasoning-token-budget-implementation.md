@@ -128,3 +128,62 @@ only budget first selection uses the new active-turn predicate. The two existing
 tests that asserted resurrection now assert absorbing frozen removals, as explicitly
 required. Budget prefix fixtures are historical context carriers rather than live
 requests, and preserve their cutoff/byte-identity assertions.
+
+## Second adversarial follow-up
+
+Imported `aad04f5253` and its witnesses without changing their expectations. The
+initial new TS/Pi run reproduced R2 and R4 (one control passed, two witnesses failed).
+
+- **R1 closed in code:** observed pre-unit legacy clears now bypass current newest,
+  active-turn and anchor eligibility because they are replay, not first selection.
+  Restoration pricing is removed. Legacy clear mids also suppress conflicting native
+  keep decisions. Witness: `re_review_legacy_reexemption_never_restores_an_already_served_signed_block`.
+  The old restoration-positive test is renamed to
+  `reasoning_clear_legacy_reexemption_preserves_absence_before_unit_adoption` and explicitly
+  documents the preserved-thinking contract change.
+- **R2 closed:** bare legacy merged ids replay the established partial-layout rule;
+  they no longer first-strip the retained first block on defer. Witness
+  `re-review: a legacy partial merged strip preserves its already-served first block on upgrade`
+  passes unchanged. The original pre-deploy partial-strip regression is restored.
+- **R3 closed in code:** `strip:merged_reasoning` is no longer treated as a whole-block
+  age removal. Serializer residual replay keeps the first block its planner retained;
+  budget costing applies that partial representation rather than treating the whole mid
+  as zero. Witness: `re_review_merged_strip_keeps_the_first_thinking_block_on_its_first_priced_pass`.
+  Fresh merged selection and proactive lanes remain unchanged; their broader turn policy
+  is still owned by the parallel branch.
+- **R4 closed:** Pi recognizes declared ordinary thinking even with empty unsigned
+  text and lets positive reported usage win before estimates. Witness
+  `re-review: Pi charges positive reported reasoning even when its ordinary summary is empty`
+  passes unchanged.
+
+Part-level absorption supersedes the earlier bare-id all-removal claim in this report:
+blocks explicitly removed stay absent; a previously retained sibling is not newly removed
+without budget bust permission. Bare ids lacking evidence replay the established layout.
+Both review rounds and exact-sibling/calibration controls pass together: 136 tests across
+seven files, 3,792 assertions. No live stores or local Rust binaries are used.
+
+Second-follow-up Rust ledger (Cargo 1.99.0): each of the five filters was attempted
+once, sequentially in a background task, with its own 900-second timeout. The original
+`review_reasoning_clear_never_restores_a_frozen_block_on_exemption_change` never reached
+its test while queued behind six occupied compile slots (exit 124, **not run**). Compilation
+completed during the second filter: `review_reasoning_budget_aliases_follow_the_shared_canonical_first_lookup`
+passed one test. `review_reasoning_budget_reported_count_survives_an_empty_summary`, R1's
+`re_review_legacy_reexemption_never_restores_an_already_served_signed_block`, and R3's
+`re_review_merged_strip_keeps_the_first_thinking_block_on_its_first_priced_pass` each passed
+one test, exit 0. Therefore R1 and R3 are closed with captured witness passes, not solely
+source evidence. The original absorption witness and full mc-module lib suite remain
+merge-time gates; no timeout retry was launched.
+
+Final second-follow-up TS gates: Pi full suite passed 1,626 tests (three skips); plugin
+full suite passed 7,327 with six skips and one unrelated 30-second visual-memory
+experiment timeout. Its full ten-test file passed with the repository runner in isolation.
+Both package typechecks pass (TypeScript 5.9.3); Biome checks pass with pre-existing
+warnings. Final TS/Pi/CLI bundles build successfully, including four v2 export-contract
+tests. No package manifest or lockfile changed. No host was launched for this follow-up;
+prior host evidence above is not claimed as a new second-review acceptance run.
+
+A final scoped run of the renamed contract regression,
+`reasoning_clear_legacy_reexemption_preserves_absence_before_unit_adoption`, also passed
+(one test, exit 0) on the final Rust sources. The final small parity edit restores the
+merged serializer's existing exemption input in both render and cost preview; it does
+not change fresh selection or broaden a bare merged flag into whole-block removal.

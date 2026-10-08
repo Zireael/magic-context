@@ -149,12 +149,17 @@ fn new_reasoning_clear_units(
     let mut units = Vec::new();
     for message in &req.messages {
         let tag = message_tag_number(message, tag_numbers);
+        // Legacy served evidence is replay, not new selection. Becoming newest
+        // or an anchor cannot restore thinking already absent from that wire.
+        let already_served_clear =
+            legacy_allowed && legacy_ck_clear_matches(&snapshot, &lookup, &previous, message);
         if message.ck.meta.synthetic
             || message.ck.role != "assistant"
             || message.mid.is_empty()
-            || newest == Some(message.mid.as_str())
-            || in_active_anthropic_turn(req, &message.mid)
-            || lineage_anchor_mid == Some(message.mid.as_str())
+            || (!already_served_clear
+                && (newest == Some(message.mid.as_str())
+                    || in_active_anthropic_turn(req, &message.mid)
+                    || lineage_anchor_mid == Some(message.mid.as_str())))
             || tag == 0
             || tag > cutoff
             || output_message_strip_unit(&lookup, "reasoning_clear", &message.mid).is_some()
@@ -168,8 +173,6 @@ fn new_reasoning_clear_units(
         }
         // Compare the pre-hydration snapshot, not identities re-adopted earlier in
         // this transform. A fingerprint from another source generation is not proof.
-        let already_served_clear =
-            legacy_allowed && legacy_ck_clear_matches(&snapshot, &lookup, &previous, message);
         if already_served_clear {
             let native_matches = native_proof.is_some_and(|proof| {
                 proof
@@ -265,40 +268,4 @@ fn legacy_reasoning_adoption_complete(meta: &ModuleMeta, units: &[FrozenUnit]) -
         }
     }
     any_known
-}
-
-/// Restoring a legacy cleared assistant that becomes exempt also needs a priced
-/// pass, even if deployment has not yet adopted its durable clear decision.
-fn legacy_reasoning_exemption_changed(
-    core: &CoreState,
-    meta: &ModuleMeta,
-    req: &TransformRequest,
-    projection: &FlatProjection,
-    anchor: Option<&str>,
-) -> bool {
-    if meta.reasoning_clear_initialized
-        || !req.serve_native
-        || SerializerProfile::parse(&req.serializer_profile)
-            != Some(SerializerProfile::OpencodeAiSdk)
-    {
-        return false;
-    }
-    let newest = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
-    let lookup = FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units));
-    let previous = meta
-        .served_output_fingerprint
-        .iter()
-        .map(|block| (block.block_id.as_str(), block.content_hash.as_str()))
-        .collect::<HashMap<_, _>>();
-    let snapshot = ReasoningClearSnapshot {
-        meta,
-        row_version: None,
-        projection,
-    };
-    req.messages
-        .iter()
-        .filter(|message| {
-            Some(message.mid.as_str()) == newest || Some(message.mid.as_str()) == anchor
-        })
-        .any(|message| legacy_ck_clear_matches(&snapshot, &lookup, &previous, message))
 }

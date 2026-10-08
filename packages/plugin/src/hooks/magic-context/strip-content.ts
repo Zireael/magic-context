@@ -935,28 +935,8 @@ export function stripReasoningFromMergedAssistants(
             stripped++;
         }
     }
-    // Legacy bare ids carry no exact part selection. Never rediscover a layout
-    // that could bring a previously removed signed block back on a host subset.
-    if (options?.frozenMessageIds) {
-        const legacyIds = new Set(
-            [...options.frozenMessageIds].filter(
-                (id) =>
-                    !frozenParts.has(id) &&
-                    !id.startsWith(MERGED_REASONING_PARTS_PREFIX) &&
-                    !id.startsWith("binding_mismatch:"),
-            ),
-        );
-        for (const message of messages) {
-            if (!legacyIds.has(message.info.id ?? "")) continue;
-            for (let index = 0; index < message.parts.length; index++) {
-                const part = message.parts[index];
-                if (!isRecord(part) || !REASONING_PART_TYPES.has(String(part.type))) continue;
-                message.parts[index] = makeSentinel(part);
-                stripped++;
-            }
-        }
-        return stripped;
-    }
+    // Bare legacy ids lack exact part evidence. Replay the established layout
+    // rule rather than first-stripping a previously kept sibling on a defer.
     for (const entry of planMergedAssistantReasoningStrip(
         messages,
         options?.mutationExemptMessage,

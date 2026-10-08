@@ -36,7 +36,6 @@ fn reasoning_budget_cutoff(
             unit.key
                 .strip_prefix("strip:reasoning_age:")
                 .or_else(|| unit.key.strip_prefix("strip:reasoning_clear:"))
-                .or_else(|| unit.key.strip_prefix("strip:merged_reasoning:"))
         })
         .collect();
     let assistants: Vec<_> = req
@@ -59,7 +58,30 @@ fn reasoning_budget_cutoff(
         let mut inline_text = String::new();
         let mut opaque = false;
         let mut has_reasoning = false;
-        for block in &message.ck.content {
+        let mut kept = message.ck.clone();
+        if core
+            .frozen_units
+            .iter()
+            .any(|unit| unit.key == format!("strip:merged_reasoning:{}", message.mid))
+        {
+            if let Some(profile) = SerializerProfile::parse(&req.serializer_profile) {
+                let index = req
+                    .messages
+                    .iter()
+                    .position(|entry| entry.mid == message.mid)
+                    .unwrap_or(0);
+                let first_in_run = index == 0 || req.messages[index - 1].ck.role != "assistant";
+                apply_serializer_residual_to_message(
+                    profile,
+                    req.provider_id.as_deref(),
+                    Some(message.mid.as_str()) == exempt
+                        || Some(message.mid.as_str()) == scope.anchor,
+                    first_in_run,
+                    &mut kept,
+                );
+            }
+        }
+        for block in &kept.content {
             match &block.kind {
                 ck_wire::CkKind::Reasoning {
                     text: visible,

@@ -226,6 +226,8 @@ export function piBudgetCutoff(args: {
 					let inlineText = "";
 					let opaque = false;
 					const typedGone = id !== undefined && args.alreadyGone?.(id) === true;
+					const hasTypedReasoning =
+						!typedGone && thinkingParts(entry.message).length > 0;
 					for (const part of typedGone
 						? []
 						: thinkingParts(entry.message).filter(isLiveThinking)) {
@@ -245,10 +247,10 @@ export function piBudgetCutoff(args: {
 						entry.message.providerPayload?.items?.some(
 							(item) => isRecord(item) && item.type === "reasoning",
 						) === true;
-					if (!text && !opaque && !inlineText) return 0;
+					if (!hasTypedReasoning && !text && !opaque && !inlineText) return 0;
 					const reported = entry.message.usage?.reasoning;
 					const typed =
-						text || opaque
+						hasTypedReasoning || text || opaque
 							? reported !== undefined && reported > 0
 								? reported
 								: reasoningStepCost(

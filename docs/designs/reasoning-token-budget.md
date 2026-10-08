@@ -339,7 +339,7 @@ caps by cost.
 
 ### Existing sessions on upgrade
 
-Persisted watermarks and frozen ids are unchanged and remain authoritative. The first riding
+Frozen reasoning decisions are absorbing at the **part** level. Exact merged-part decisions replay their selected blocks without reconsidering exemptions, while retained sibling blocks stay retained. Bare legacy merged ids lack exact evidence and continue the established partial-layout replay; they never become an all-block removal merely because of this upgrade. The first riding
 bust after upgrade computes a budget cutoff and advances by `max()`. It may remove more (Pi
 GPT, overthinkers) or nothing new (Opus at 1M). It never restores anything. No migration of
 stored state is needed.

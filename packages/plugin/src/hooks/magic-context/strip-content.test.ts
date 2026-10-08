@@ -1353,7 +1353,7 @@ describe("strip-content", () => {
 });
 
 describe("frozen merged reasoning parts", () => {
-    it("keeps legacy bare-id removals absorbing when no exact part selection exists", () => {
+    it("preserves the pre-deploy bare-id partial-strip bytes", () => {
         const build = () => [
             message("legacy", "assistant", [
                 { type: "reasoning", text: "kept first" },
@@ -1365,7 +1365,11 @@ describe("frozen merged reasoning parts", () => {
         stripReasoningFromMergedAssistants(legacy, "anthropic", {
             frozenMessageIds: new Set(["legacy"]),
         });
-        expect(legacy[0].parts).toEqual([SENTINEL, { type: "text", text: "between" }, SENTINEL]);
+        expect(legacy[0].parts).toEqual([
+            { type: "reasoning", text: "kept first" },
+            { type: "text", text: "between" },
+            SENTINEL,
+        ]);
         const fresh = build();
         stripReasoningFromMergedAssistants(fresh, "anthropic", {
             frozenMessageIds: new Set(["legacy"]),
