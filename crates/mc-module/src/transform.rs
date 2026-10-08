@@ -2092,6 +2092,7 @@ pub enum TransformError {
     CoverageGap(String),
     /// Internal retry: a priced pass must use the ingress synthetic classification.
     SyntheticTreatmentBust,
+    AttachmentProjectionBust,
     /// The lexical hint query failed before a durable decision could be written.
     Search(String),
     /// CK ingress rejected an unsupported or unpairable block before any partial projection.
@@ -2143,6 +2144,7 @@ impl std::fmt::Display for TransformError {
             ),
             TransformError::CoverageGap(m) => write!(f, "{m}"),
             TransformError::SyntheticTreatmentBust => write!(f, "synthetic treatment requires a priced retry"),
+            TransformError::AttachmentProjectionBust => write!(f, "attachment projection requires a priced retry"),
             TransformError::Search(m) => write!(f, "search: {m}"),
             TransformError::CkWire(e) => write!(f, "ck wire: {e}"),
             TransformError::DuplicateBlockId(id) => write!(f, "duplicate flattened block id: {id}"),
@@ -2959,6 +2961,7 @@ fn apply_once_with_estimator_and_projection(
         .map(|(_, ingress)| ingress.mid.clone())
         .collect();
     let mut replay_legacy_treatment = legacy_req.is_some();
+    let mut restore_attachments = false;
     profile_end!(perf_wrapper_prepare);
     loop {
         let mut boundary_divergence_detected = false;
@@ -2967,13 +2970,16 @@ fn apply_once_with_estimator_and_projection(
         } else {
             req
         };
+        let attachment_upgrade = attachment_projection_replay(store, pass_req)?;
+        let attachment_replay = attachment_upgrade.as_ref().filter(|_| !restore_attachments);
+        let effective_req = attachment_replay.map_or(pass_req, |upgrade| &upgrade.legacy);
         match apply_once(
             store,
-            pass_req,
+            effective_req,
             ctx,
             estimate_tokens,
             output_cache,
-            if replay_legacy_treatment {
+            if replay_legacy_treatment || attachment_upgrade.is_some() {
                 None
             } else {
                 projection_cache
@@ -2983,11 +2989,18 @@ fn apply_once_with_estimator_and_projection(
             incremental_history,
             replay_legacy_treatment,
             &reclassified_on_bust,
+            attachment_upgrade.as_ref(),
+            attachment_replay.is_some(),
         ) {
+            Err(TransformError::AttachmentProjectionBust) if attachment_replay.is_some() => {
+                restore_attachments = true;
+                continue;
+            }
             Err(TransformError::SyntheticTreatmentBust | TransformError::CoverageGap(_))
                 if replay_legacy_treatment =>
             {
                 replay_legacy_treatment = false;
+                restore_attachments = false;
                 continue;
             }
             Err(TransformError::Store(McStoreError::CasConflict { .. }))
@@ -2998,9 +3011,17 @@ fn apply_once_with_estimator_and_projection(
                 // cannot turn the already-proven inconsistency back into an ordinary defer.
                 boundary_divergence_retry |= boundary_divergence_detected;
                 attempt += 1;
+                restore_attachments = false;
                 continue;
             }
             Ok(mut output) => {
+                if attachment_replay.is_some() {
+                    // The facade's delta cache is an ingress cache, not a served
+                    // output cache. Keep the repaired media there while replaying
+                    // old provider bytes, so later tail deltas can still discover
+                    // the upgrade when independent bust permission arrives.
+                    output.projection = project_messages(&pass_req.messages)?;
+                }
                 output.response.cache_ttl =
                     response_marker_ttl(req, &ctx.cache_ttl, ctx.cache_ttl_provenance);
                 return Ok(output);
@@ -3468,6 +3489,8 @@ fn apply_additive_only(
     req: &TransformRequest,
     ctx: &ProducerContext<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
+    attachment_upgrade: Option<&AttachmentProjectionUpgrade>,
+    replay_attachments: bool,
 ) -> Result<TransformWithProjection, TransformError> {
     let total_started_at = Instant::now();
     let projection_started_at = Instant::now();
@@ -3672,6 +3695,16 @@ fn apply_additive_only(
     if let PassPlan::Reject(message) = plan {
         return Err(TransformError::UnknownShape(message));
     }
+    let prefix_rebuild_permitted = matches!(
+        plan,
+        PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
+    );
+    if replay_attachments && prefix_rebuild_permitted {
+        return Err(TransformError::AttachmentProjectionBust);
+    }
+    if attachment_upgrade.is_some() && !replay_attachments && !prefix_rebuild_permitted {
+        return Err(TransformError::AttachmentProjectionBust);
+    }
     let additive_shape_clean = loaded.core.boundary_id.is_empty()
         && loaded.core.pending_changes.is_empty()
         && loaded
@@ -3705,7 +3738,20 @@ fn apply_additive_only(
         meta.last_render_config = effective_render_config.clone();
     }
     let provisional_tail_mid = provisional_tail_mid(req);
-    apply_ingress_meta(&mut meta, req, &projection, provisional_tail_mid, None, &[]);
+    // Restored media and its recognized identity are one serving decision. Keeping
+    // the scalar identity here would make the next defer undo this permitted rebuild.
+    let attachment_re_adoptions = attachment_upgrade
+        .filter(|_| !replay_attachments && prefix_rebuild_permitted)
+        .map(|upgrade| attachment_identity_re_adoptions(&loaded.meta, &projection, upgrade))
+        .unwrap_or_default();
+    apply_ingress_meta(
+        &mut meta,
+        req,
+        &projection,
+        provisional_tail_mid,
+        None,
+        &attachment_re_adoptions,
+    );
     let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
     meta.cc_u1_active = cc_u1_active;
     meta.tagging_surface_active = tagging_surface_requested;
@@ -3910,6 +3956,15 @@ fn apply_additive_only(
     timings.tail_messages_emitted = req.messages.len();
     timings.frozen_units = core.frozen_units.len();
 
+    if prefix_rebuild_permitted && serializer_profile == Some(SerializerProfile::OpencodeAiSdk) {
+        // A provisional assistant deliberately has no identity pin. Record the
+        // admitted serving bytes with the rebuild so its next defer can prove
+        // media was already shown, without adding fingerprint writes on defers.
+        let mut frame_block_stems = vec![None; messages.len()];
+        frame_block_stems[leading_systems] = Some("mc_m0");
+        frame_block_stems[leading_systems + 1] = Some("mc_m1");
+        meta.served_output_fingerprint = served_output_fingerprints(&messages, &frame_block_stems);
+    }
     let state_changed = core != loaded.core || meta != loaded.meta;
     if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
@@ -4079,12 +4134,21 @@ fn apply_once(
     incremental_history: bool,
     replay_legacy_treatment: bool,
     reclassified_on_bust: &BTreeSet<String>,
+    attachment_upgrade: Option<&AttachmentProjectionUpgrade>,
+    replay_attachments: bool,
 ) -> Result<TransformWithProjection, TransformError> {
     // Keep this span alive through local destruction, which the wall `total` omits.
     profile_start!(_perf_apply, "apply_once");
     *boundary_divergence_detected = false;
     if !ctx.compaction_enabled {
-        return apply_additive_only(store, req, ctx, estimate_tokens);
+        return apply_additive_only(
+            store,
+            req,
+            ctx,
+            estimate_tokens,
+            attachment_upgrade,
+            replay_attachments,
+        );
     }
     let total_started_at = Instant::now();
     let mut timings = TransformTimings::default();
@@ -4729,7 +4793,36 @@ fn apply_once(
         &loaded.core,
         provisional_tail_mid,
         lineage_anchor_mid,
-    )?;
+    )
+    .or_else(|error| {
+        // This is not a general drift exemption. The legacy projection must match
+        // every stored block identity, including siblings and the tool envelope.
+        let Some(upgrade) = attachment_upgrade.filter(|_| !replay_attachments) else {
+            return Err(error);
+        };
+        let mut legacy_meta = loaded.meta.clone();
+        for mid in &upgrade.mids {
+            if let Some(vector) = projection.identity_by_mid.get(mid) {
+                legacy_meta
+                    .block_identity_by_mid
+                    .insert(mid.clone(), vector.clone());
+            }
+        }
+        let mut adoptions = enforce_block_identity(
+            &legacy_meta,
+            req,
+            &projection,
+            &loaded.core,
+            provisional_tail_mid,
+            lineage_anchor_mid,
+        )?;
+        adoptions.extend(attachment_identity_re_adoptions(
+            &loaded.meta,
+            &projection,
+            upgrade,
+        ));
+        Ok(adoptions)
+    })?;
     timings.identity_enforce = elapsed_ms(identity_enforce_started_at);
     profile_end!(perf_identity);
     let mut pending_overlays = PendingOverlayDecisions::default();
@@ -5472,7 +5565,11 @@ fn apply_once(
     );
     let reclaim_pending_now = reductions_pending_now
         || !planned_caveman_units.is_empty()
-        || !planned_strip_units.is_empty();
+        || !planned_strip_units.is_empty()
+        // Restoration is deferred prefix work, like a queued reduction. It can
+        // give an independently authorized flush/force/rebuild something to do,
+        // but never grants the shared permission itself.
+        || (attachment_upgrade.is_some() && independent_bust_opportunity);
     let mut plan = classify(&ClassifierInput {
         initialized: loaded.meta.initialized && !loaded.meta.bootstrap_seed_fold_pending,
         is_legacy_baseline: is_legacy_baseline(&loaded.core),
@@ -5490,11 +5587,13 @@ fn apply_once(
         // published prefix work, an explicit flush, force, or actual reductions.
         bust_opportunity,
     });
-    // Todo insertion and an expired retry's new tail reductions do not need a coverage
+    // Attachment restoration, todo insertion and an expired retry's new tail reductions do not need a coverage
     // anchor: neither moves the frozen m0/m1 boundary. The generic classifier requires
     // an anchor for history deltas, so promote only an ordinary defer here, after the
     // independent bust gate has priced the work. Reconcile defers remain untouched.
-    if (todo_injection_pending || (scheduler_outcome.idle_ttl_fired && reclaim_pending_now))
+    if (attachment_upgrade.is_some()
+        || todo_injection_pending
+        || (scheduler_outcome.idle_ttl_fired && reclaim_pending_now))
         && bust_opportunity
         && !loaded.core.reconcile_pending
         && matches!(plan, PassPlan::Defer)
@@ -5704,6 +5803,14 @@ fn apply_once(
     if replay_legacy_treatment && is_provider_prefix_mutation_pass {
         return Err(TransformError::SyntheticTreatmentBust);
     }
+    if replay_attachments && is_provider_prefix_mutation_pass {
+        // Retry before any CAS commit, with the repaired projection. Restoration
+        // rides this existing permission; discovering it never originates a bust.
+        return Err(TransformError::AttachmentProjectionBust);
+    }
+    if attachment_upgrade.is_some() && !replay_attachments && !is_provider_prefix_mutation_pass {
+        return Err(TransformError::AttachmentProjectionBust);
+    }
     if is_provider_prefix_mutation_pass {
         meta.reclassified_synthetic_mids
             .extend(reclassified_on_bust.iter().cloned());
@@ -5859,6 +5966,7 @@ fn apply_once(
             unit.key.starts_with(SYSTEM_STRIP_BLOCK_PREFIX) && !unit.reset_rule.is_empty()
         });
     let reasoning_trim_only_candidate = is_bust_pass
+        && attachment_upgrade.is_none()
         && serializer_profile == Some(SerializerProfile::OpencodeAiSdk)
         && is_prefix_bound_thinking_model(req.model_key.as_deref())
         && matches!(plan, PassPlan::Soft)
@@ -7588,6 +7696,239 @@ fn provisional_tail_mid(req: &TransformRequest) -> Option<&str> {
         .filter(|message| !message.ck.meta.synthetic && message.ck.role == "assistant")
         .max_by_key(|message| message.ordinal)
         .map(|message| message.mid.as_str())
+}
+
+struct AttachmentProjectionUpgrade {
+    legacy: TransformRequest,
+    mids: BTreeSet<String>,
+}
+
+// Recognize only the old OpenCode adapter's Text -> Content projection change.
+// Pinned message identities must match after removing attachments; arbitrary edits
+// to text, call inputs, polarity or siblings still go through the ordinary fence.
+// Provisional assistants have no pin, so their served fingerprints govern replay.
+fn attachment_projection_replay(
+    store: &McStore,
+    req: &TransformRequest,
+) -> Result<Option<AttachmentProjectionUpgrade>, TransformError> {
+    if SerializerProfile::parse(&req.serializer_profile) != Some(SerializerProfile::OpencodeAiSdk)
+        || req.lineage_switched
+    {
+        return Ok(None);
+    }
+    let mut replacements = BTreeMap::new();
+    for message in &req.messages {
+        for (index, block) in message.ck.content.iter().enumerate() {
+            let ck_wire::CkKind::ToolResult { output, .. } = &block.kind else {
+                continue;
+            };
+            let (blocks, error) = match &output.kind {
+                ck_wire::CkOutputKind::Content { blocks } => (blocks, false),
+                ck_wire::CkOutputKind::ErrorContent { blocks } => (blocks, true),
+                _ => continue,
+            };
+            if blocks.len() < 2 {
+                continue;
+            }
+            let ck_wire::ResultBlockKind::Text { text } = &blocks[0].kind else {
+                continue;
+            };
+            let old = ck_wire::CkToolOutput::bare(if error {
+                ck_wire::CkOutputKind::ErrorText { text: text.clone() }
+            } else {
+                ck_wire::CkOutputKind::Text { text: text.clone() }
+            });
+            // Keep the ingress shell byte-exact, including omitted defaults.
+            // Rebuilding the typed kind would add provider_executed=false to
+            // the TS adapter's old wire and fail the stored identity comparison.
+            let legacy_block = if let Some(original) = block.retained_original_json() {
+                let mut wire = original.clone();
+                wire["kind"]["output"] = serde_json::to_value(old).expect("CK output serializes");
+                serde_json::from_value(wire).expect("validated CK block with scalar output")
+            } else {
+                let mut wire = block.clone();
+                if let ck_wire::CkKind::ToolResult { output, .. } = &mut wire.kind {
+                    *output = old;
+                }
+                wire.mark_modified();
+                wire
+            };
+            replacements.insert((message.mid.clone(), index), legacy_block);
+        }
+    }
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+    // The old serving already froze raw block identities by message and part,
+    // alongside the served-output fingerprint. Use that state without writing
+    // on a defer; the repaired identities commit only with the restoring bust.
+    let loaded = store.load(&req.session_id)?;
+    let current = project_messages(&req.messages)?;
+    let served_with_media =
+        attachment_results_served_with_media(store, req, &current, &loaded.meta, &replacements)?;
+    let provisional_mid = provisional_tail_mid(req);
+    let previous_tail_mid = loaded
+        .meta
+        .newest_live_block_id
+        .as_deref()
+        .and_then(split_block_id)
+        .map(|(mid, _)| mid);
+    replacements.retain(|(mid, index), old| {
+        if let Some(stored) = loaded.meta.block_identity_by_mid.get(mid) {
+            // A formerly provisional message may have frozen a mix of already
+            // admitted media and lossy results. Replace only the scalar slots;
+            // the full reconstructed vector below must still match its pin.
+            let old_fingerprint = ck_wire::fingerprint(
+                &serde_json::to_string(old).expect("validated CK block serializes"),
+            );
+            return Some(stored) != current.identity_by_mid.get(mid)
+                && stored
+                    .get(*index)
+                    .is_some_and(|identity| identity.byte_fingerprint == old_fingerprint);
+        }
+        // A served result can outlive its provisional assistant without ever
+        // gaining a block-identity pin. Missing identity is not first-sight proof.
+        // If the served fingerprint cannot prove media was already shown, keep
+        // the lossy form. An unseen provisional result on an initialized session
+        // also waits for permission rather than risking a cached-prefix rewrite.
+        loaded.meta.initialized
+            && !served_with_media.contains(&(mid.clone(), *index))
+            && (overlay_target_was_served(
+                &loaded.meta.served_output_fingerprint,
+                &ck_wire::block_id(mid, *index),
+            ) || provisional_mid == Some(mid.as_str())
+                || previous_tail_mid == Some(mid.as_str()))
+    });
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+    let mut legacy = req.clone();
+    for message in &mut legacy.messages {
+        for (index, block) in message.ck.content.iter_mut().enumerate() {
+            let Some(old) = replacements.get(&(message.mid.clone(), index)) else {
+                continue;
+            };
+            *block = old.clone();
+        }
+        message.ck.mark_modified();
+    }
+    let projection = project_messages(&legacy.messages)?;
+    let mids: BTreeSet<String> = projection
+        .identity_by_mid
+        .iter()
+        .filter(|(mid, vector)| {
+            replacements.keys().any(|(candidate, _)| candidate == *mid)
+                && loaded
+                    .meta
+                    .block_identity_by_mid
+                    .get(*mid)
+                    .is_none_or(|stored| stored == *vector)
+                && current.identity_by_mid.get(*mid) != Some(*vector)
+        })
+        .map(|(mid, _)| mid.clone())
+        .collect();
+    if mids.is_empty() {
+        return Ok(None);
+    }
+    for (candidate, original) in legacy.messages.iter_mut().zip(&req.messages) {
+        if !mids.contains(&candidate.mid) {
+            *candidate = original.clone();
+            continue;
+        }
+    }
+    Ok(Some(AttachmentProjectionUpgrade { legacy, mids }))
+}
+
+// A matching served hash is positive evidence, even after restart, that the
+// identity-less result already included media. Reproduce only persisted overlays:
+// discovery must neither mint a new decision nor introduce a defer write.
+fn attachment_results_served_with_media(
+    store: &McStore,
+    req: &TransformRequest,
+    projection: &FlatProjection,
+    meta: &ModuleMeta,
+    replacements: &BTreeMap<(String, usize), CkWireBlock>,
+) -> Result<BTreeSet<(String, usize)>, TransformError> {
+    let unpinned_mids: BTreeSet<&str> = replacements
+        .keys()
+        .filter(|(mid, _)| !meta.block_identity_by_mid.contains_key(mid))
+        .map(|(mid, _)| mid.as_str())
+        .collect();
+    if unpinned_mids.is_empty() || meta.served_output_fingerprint.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let snapshot = store.load_transform_snapshot(&req.session_id)?;
+    let tags = load_cached_tags(store, &req.session_id)?;
+    let overlay = tag_overlay_state(
+        &tags,
+        &snapshot.temporal_marks,
+        &snapshot.user_hints,
+        &snapshot.channel1_appends,
+        &meta.pending_tag_block_ids,
+        &meta.pending_user_hint_block_ids,
+    );
+    let blocks_by_mid = projection_blocks_by_mid(projection);
+    let served_hashes: HashMap<&str, &str> = meta
+        .served_output_fingerprint
+        .iter()
+        .map(|block| (block.block_id.as_str(), block.content_hash.as_str()))
+        .collect();
+    let mut matches = BTreeSet::new();
+    for message in &req.messages {
+        if !unpinned_mids.contains(message.mid.as_str()) {
+            continue;
+        }
+        let mut rendered = message.ck.clone();
+        let blocks = blocks_by_mid
+            .get(message.mid.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        apply_tag_overlay_to_message(
+            &mut rendered,
+            message,
+            blocks,
+            Some(&overlay),
+            |_| false,
+            false,
+        );
+        for block in blocks {
+            if !replacements.contains_key(&(message.mid.clone(), block.block_index)) {
+                continue;
+            }
+            let Some(previous_hash) = served_hashes.get(block.id.as_str()) else {
+                continue;
+            };
+            let raw_hash = ck_wire::fingerprint_digest(&block.content_hash);
+            let overlaid_hash = ck_wire::fingerprint(
+                &serde_json::to_string(&rendered.content[block.block_index])
+                    .expect("validated CK block serializes"),
+            );
+            if *previous_hash == raw_hash || *previous_hash == overlaid_hash {
+                matches.insert((message.mid.clone(), block.block_index));
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn attachment_identity_re_adoptions(
+    meta: &ModuleMeta,
+    projection: &FlatProjection,
+    upgrade: &AttachmentProjectionUpgrade,
+) -> Vec<TailIdentityReAdoption> {
+    upgrade
+        .mids
+        .iter()
+        .map(|mid| TailIdentityReAdoption {
+            mid: mid.clone(),
+            old_hash_prefix: meta
+                .block_identity_by_mid
+                .get(mid)
+                .map(|vector| block_identity_hash_prefix(vector))
+                .unwrap_or_default(),
+            new_hash_prefix: block_identity_hash_prefix(&projection.identity_by_mid[mid]),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -17233,6 +17574,7 @@ pub(crate) mod tests {
     }
     use super::*;
     use crate::m1_compose::{m1_revision_signal, m1_revision_signal_parts_for_pass};
+    include!("tests/tool_attachment_upgrade_review.rs");
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
     use mc_store::{
