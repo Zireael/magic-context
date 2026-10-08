@@ -27,7 +27,11 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import { providerResponseFailed } from "@magic-context/core/shared/provider-response-completion";
-import { computePiPressure, extractAssistantUsage } from "./pi-pressure";
+import {
+	computePiPressure,
+	extractAssistantUsage,
+	MAX_UNKNOWN_PI_INPUT_TOKENS,
+} from "./pi-pressure";
 
 const FLOOR_STATE_KEY = "piProvenInputFloor";
 
@@ -44,6 +48,7 @@ export interface PiProvenFloorRecord {
 function largestAcceptedInput(
 	entries: readonly unknown[],
 	modelKey: string,
+	providerInputLimit: number,
 ): number {
 	let largest = 0;
 	for (const entry of entries) {
@@ -72,7 +77,11 @@ function largestAcceptedInput(
 			})
 		)
 			continue;
-		const pressure = computePiPressure(extractAssistantUsage(message), 0);
+		const pressure = computePiPressure(
+			extractAssistantUsage(message),
+			0,
+			providerInputLimit,
+		);
 		if (pressure) largest = Math.max(largest, pressure.inputTokens);
 	}
 	return largest;
@@ -196,6 +205,8 @@ export function resolvePiProvenInputFloor(args: {
 	db: ContextDatabase;
 	sessionId: string;
 	modelKey: string | undefined;
+	/** Authoritative raw request wall, before applying the persisted floor. */
+	providerInputLimit?: number;
 	/** Read lazily, only to re-derive a legacy floor on upgrade. */
 	readBranch?: () => readonly unknown[] | undefined;
 }): number {
@@ -225,7 +236,9 @@ export function resolvePiProvenInputFloor(args: {
 		}
 		return 0;
 	}
-	if (!hasMeasuredBasis(row.state)) {
+	const providerInputLimit =
+		args.providerInputLimit ?? MAX_UNKNOWN_PI_INPUT_TOKENS;
+	if (!hasMeasuredBasis(row.state) || observed > providerInputLimit) {
 		// Neither a legacy latch nor last_input_tokens proves a measured accepted
 		// request: the latter may hold a live estimate. Rebuild from the session's
 		// assistant usage, without applying decision/tokenizer calibration.
@@ -234,6 +247,7 @@ export function resolvePiProvenInputFloor(args: {
 			measured = largestAcceptedInput(
 				args.readBranch?.() ?? [],
 				record.modelKey,
+				providerInputLimit,
 			);
 		} catch {
 			// If the branch is unavailable, discard unverified capacity rather than

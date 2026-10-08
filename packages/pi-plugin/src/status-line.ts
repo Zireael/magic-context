@@ -4,7 +4,10 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { resolvePiWindowGeometry } from "./pi-context-limit";
-import { resolvePiStatusPressureSnapshot } from "./pi-pressure";
+import {
+	piPressureEvidenceLimit,
+	resolvePiStatusPressureSnapshot,
+} from "./pi-pressure";
 import {
 	piProvenFloorModelKey,
 	resolvePiProvenInputFloor,
@@ -90,13 +93,23 @@ export function renderStatusText(
 	sessionId: string,
 ): string {
 	const usage = ctx.getContextUsage?.();
+	const meta = readSessionMetaStatus(db, sessionId);
+	const providerInputLimit = piPressureEvidenceLimit(
+		resolvePiWindowGeometry({
+			rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
+			rawContextWindowSource: "catalog",
+			model: ctx.model,
+			detectedContextLimit: meta?.detected_context_limit ?? undefined,
+		}),
+	);
 	const provenInputTokens = resolvePiProvenInputFloor({
 		db,
 		sessionId,
 		modelKey: piProvenFloorModelKey(ctx.model),
 		readBranch: () => ctx.sessionManager.getBranch(),
+		providerInputLimit,
 	});
-	const meta = readSessionMetaStatus(db, sessionId);
+
 	const liveInputTokens =
 		typeof usage?.tokens === "number" && Number.isFinite(usage.tokens)
 			? usage.tokens
@@ -123,6 +136,7 @@ export function renderStatusText(
 	const pressure =
 		liveInputTokens !== undefined || persistedInputTokens !== undefined
 			? resolvePiStatusPressureSnapshot({
+					providerInputLimit,
 					sessionId,
 					persistedPercentage: meta?.last_context_percentage ?? 0,
 					persistedInputTokens: persistedInputTokens ?? 0,

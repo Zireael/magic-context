@@ -87,7 +87,10 @@ import { resolveSessionId } from "../commands/pi-command-utils";
 import { getPiChannel1Baseline } from "../ctx-reduce-nudge-pi";
 import { readHostSystemPrompt } from "../host-system-prompt";
 import { resolvePiWindowGeometry } from "../pi-context-limit";
-import { resolvePiStatusPressureSnapshot } from "../pi-pressure";
+import {
+	piPressureEvidenceLimit,
+	resolvePiStatusPressureSnapshot,
+} from "../pi-pressure";
 import {
 	piProvenFloorModelKey,
 	resolvePiProvenInputFloor,
@@ -703,12 +706,7 @@ export function buildPiStatusDetail(
 	sessionId: string,
 ): StatusDialogDetail {
 	const usage = ctx.getContextUsage?.();
-	const provenInputTokens = resolvePiProvenInputFloor({
-		db: deps.db,
-		sessionId,
-		modelKey: piProvenFloorModelKey(ctx.model),
-		readBranch: () => ctx.sessionManager.getBranch(),
-	});
+
 	const meta = getOrCreateSessionMeta(deps.db, sessionId);
 	let detectedContextLimit: number | undefined;
 	try {
@@ -717,6 +715,21 @@ export function buildPiStatusDetail(
 	} catch {
 		// Status remains available when overflow metadata cannot be read.
 	}
+	const providerInputLimit = piPressureEvidenceLimit(
+		resolvePiWindowGeometry({
+			rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
+			rawContextWindowSource: "catalog",
+			model: ctx.model,
+			detectedContextLimit,
+		}),
+	);
+	const provenInputTokens = resolvePiProvenInputFloor({
+		db: deps.db,
+		sessionId,
+		modelKey: piProvenFloorModelKey(ctx.model),
+		readBranch: () => ctx.sessionManager.getBranch(),
+		providerInputLimit,
+	});
 	const windowGeometry = resolvePiWindowGeometry({
 		rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
 		rawContextWindowSource: "catalog",
@@ -727,6 +740,7 @@ export function buildPiStatusDetail(
 		persistedPercentage: meta.lastContextPercentage,
 	});
 	const pressure = resolvePiStatusPressureSnapshot({
+		providerInputLimit,
 		sessionId,
 		persistedPercentage: meta.lastContextPercentage,
 		persistedInputTokens: meta.lastInputTokens,
