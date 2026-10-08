@@ -1,13 +1,113 @@
-# Opus 5.5 preserved-thinking matrix: not yet run (quota blocked)
+# Opus/Sonnet 5.5 preserved-thinking matrix: not reached (seed blocker)
+
+**Updated:** 2026-10-08. Route: Anthropic native Messages (`https://api.anthropic.com/v1/messages`), default vault credential `oauth:anthropic`, through the enrolled `mc-e2e` consumer. No account rotation was used. Two post-quota live attempts were made; both were seed-only and sent no matrix variants.
+
+## Seeding reruns
+
+### Attempt A: manual `enabled` thinking (unsupported mode)
+
+This attempt used `thinking: {type: "enabled", budget_tokens: 1024}` with a 1,152-token response cap. Current [Anthropic thinking-mode documentation](https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#migrating-to-adaptive-thinking) says `type: "enabled"` returns 400 for Claude Opus 5.5 and Sonnet 5.5; these models require adaptive thinking and effort control. The service accepted the requests with HTTP 200 but usage reported zero thinking tokens on every response. Each model completed eight tool rounds, accumulated zero signed blocks, and stopped before all matrix variants. Total: 32 model calls, all HTTP 200, no 429.
+
+### Attempt B: documented adaptive/high mode
+
+After switching seed requests to `thinking: {type: "adaptive"}` and `output_config: {effort: "high"}`, with short multi-step arithmetic prompts and a benign `record_note` tool, the runner used the eight-round cap. All 26 upstream requests returned HTTP 200; none returned 429. Opus accumulated one signed block in round 1, one in round 2, and none in completed round 3. Round 4's tool request and its one neutral-prompt retry both returned `stop_reason: refusal`, so Opus stopped with two signed blocks across three completed rounds. Sonnet completed all eight rounds with zero signed blocks. No control, trim, edit, restoration, or `[cleared]` variant was sent. The run exited 1 as designed for insufficient signed history.
+
+| Model | Per-round signed blocks (adaptive/high) | Result |
+| --- | --- | --- |
+| `claude-opus-5-5` | 1, 1, 0; round 4 incomplete after two refusals | 2 blocks / 3 completed rounds; seed aborted |
+| `claude-sonnet-5-5` | 0, 0, 0, 0, 0, 0, 0, 0 | 0 blocks / 8 completed rounds; seed aborted |
+
+### Requested claims, per model
+
+All claims remain **unverified**: the relevant variant calls were not reached, so there are no variant request IDs and the live provider neither confirms nor contradicts any signature rule. The revised harness now defines the same trim/edit cells for both models, but the seed guard prevents sending them without enough signed history.
+
+| Claim | Opus 5.5 | Sonnet 5.5 |
+| --- | --- | --- |
+| Removing a contiguous oldest prefix is accepted | Not tested; no variant request ID | Not tested; no variant request ID |
+| Removing from the end, or all thinking blocks, is accepted | Not tested; no variant request ID | Not tested; no variant request ID |
+| Removing one block from the middle invalidates later blocks (400) | Not tested; no variant request ID | Not tested; no variant request ID |
+| Restoring a removed block invalidates later blocks produced while it was absent | Not tested; no restore-check request ID | Not tested; no restore-check request ID |
+| Editing earlier tool inputs/results or re-rendering the first user message invalidates later signed blocks | Not tested; no edit request IDs | Not tested; no edit request IDs |
+| Replacing signed thinking text with `[cleared]` returns 400 | Not tested; no request ID | Not tested; no request ID |
+| `[cleared]` on Vertex, Bedrock, or Copilot | Not covered; Anthropic-only route | Not covered; Anthropic-only route |
+
+### Attempt A seed request IDs
+
+All 32 responses were HTTP 200 with `thinking_tokens: 0`. IDs are listed as tool/final pairs per round.
+
+| Model | Round | Tool request ID | Final request ID |
+| --- | --- | --- | --- |
+| `claude-opus-5-5` | 1 | `req_011Cfp2k3nYYNt4UyX7Uy6oF` | `req_011Cfp2kAj1JvUeTfys8oPPL` |
+| `claude-opus-5-5` | 2 | `req_011Cfp2kFqavogjsQ86SjZFZ` | `req_011Cfp2kNZtzRaTD6Td2W6vv` |
+| `claude-opus-5-5` | 3 | `req_011Cfp2kTBxeMvzQWLgAJTNK` | `req_011Cfp2kaCeGSxqJKQp1guSE` |
+| `claude-opus-5-5` | 4 | `req_011Cfp2kfGz7gumaEorV9egw` | `req_011Cfp2knEC54aQ1SDEtuJZ7` |
+| `claude-opus-5-5` | 5 | `req_011Cfp2ks9sBR1m2Pp1N6oj5` | `req_011Cfp2kz9449z2zC9z5NhXw` |
+| `claude-opus-5-5` | 6 | `req_011Cfp2m53iqYF6kF1e4xyLG` | `req_011Cfp2mCLGz61vRbyoixY5a` |
+| `claude-opus-5-5` | 7 | `req_011Cfp2mH53Fzg689VfFFzAt` | `req_011Cfp2mPvnFVjoNRnJXHxnx` |
+| `claude-opus-5-5` | 8 | `req_011Cfp2mULgzqFckyCPMiAab` | `req_011Cfp2mbckgxVe3mmwS5xsH` |
+| `claude-sonnet-5-5` | 1 | `req_011Cfp2mgRDm6TtGzAANqxE3` | `req_011Cfp2mnUN4a4CNanRew1EZ` |
+| `claude-sonnet-5-5` | 2 | `req_011Cfp2mqTC78DAMLCqApKTj` | `req_011Cfp2myeKEkZdAVAd3fyUp` |
+| `claude-sonnet-5-5` | 3 | `req_011Cfp2nN1UUdm4NaJQAptab` | `req_011Cfp2niwozkJt9prUiVeUh` |
+| `claude-sonnet-5-5` | 4 | `req_011Cfp2nw4Zi9TJX988zZ13E` | `req_011Cfp2o3tpy6Q2hkAWZKdME` |
+| `claude-sonnet-5-5` | 5 | `req_011Cfp2oEzpFttnpqk3kKWg8` | `req_011Cfp2oQquRuSMjaLP7RFcr` |
+| `claude-sonnet-5-5` | 6 | `req_011Cfp2oWt3d4cwsdao9vxAX` | `req_011Cfp2ofppLNUqjUb1EiP1S` |
+| `claude-sonnet-5-5` | 7 | `req_011Cfp2ok6Y2v3bY2oiJZQyE` | `req_011Cfp2os5iyJ2wV3e7f8bko` |
+| `claude-sonnet-5-5` | 8 | `req_011Cfp2oy8reYbTb9s588pqA` | `req_011Cfp2p5PQaHkgtdvSTcrGr` |
+
+### Attempt B seed request IDs
+
+All listed responses were HTTP 200. The request IDs below identify seed calls only; no variant request IDs exist.
+
+| Model | Seed phase | Request ID | Result |
+| --- | --- | --- | --- |
+| `claude-opus-5-5` | `seed-1-tool` | `req_011Cfp37oTh69aai8fgRLVVY` | `tool_use`, 25 thinking tokens |
+| `claude-opus-5-5` | `seed-1-final` | `req_011Cfp37xKkJgMnErnG1yqLe` | `end_turn`, 0 thinking tokens |
+| `claude-opus-5-5` | `seed-2-tool` | `req_011Cfp381LZw4xuGyZPrVE5D` | `tool_use`, 23 thinking tokens |
+| `claude-opus-5-5` | `seed-2-final` | `req_011Cfp389EarutqXqQKhyzVf` | `end_turn`, 0 thinking tokens |
+| `claude-opus-5-5` | `seed-3-tool` | `req_011Cfp38EKBEtwF9XDKuMLGf` | `refusal` |
+| `claude-opus-5-5` | `seed-3-tool-retry` | `req_011Cfp38Jq32T1r8ZvkznyvQ` | `tool_use`, 0 thinking tokens |
+| `claude-opus-5-5` | `seed-3-final` | `req_011Cfp38RJyDur88Wv5pYFrF` | `refusal` |
+| `claude-opus-5-5` | `seed-3-final-retry` | `req_011Cfp38VuHYeCEfux4MPBGc` | `end_turn`, 0 thinking tokens |
+| `claude-opus-5-5` | `seed-4-tool` | `req_011Cfp38Z1aKWG6w3DyDTtXD` | `refusal` |
+| `claude-opus-5-5` | `seed-4-tool-retry` | `req_011Cfp38cnH3g9ikeUY8UJMi` | `refusal`; stopped |
+| `claude-sonnet-5-5` | `seed-1-tool` | `req_011Cfp38gjQXSQnYzR2kYq89` | `tool_use`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-1-final` | `req_011Cfp38o5APq8JtaxFy7fjT` | `end_turn`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-2-tool` | `req_011Cfp38qraxTwp45YbMJh2o` | `tool_use`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-2-final` | `req_011Cfp38wpG4QkazcEFR46Ak` | `end_turn`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-3-tool` | `req_011Cfp391LrQm6UEMn7LSdbw` | `tool_use`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-3-final` | `req_011Cfp39DKRiDUo1PxbhXpLF` | `end_turn`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-4-tool` | `req_011Cfp39HKmbotoynUvgDWJv` | `tool_use`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-4-final` | `req_011Cfp39WAwDbctCABkqNwfK` | `end_turn`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-5-tool` | `req_011Cfp39a3MvY5vabSkyZQr5` | `tool_use`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-5-final` | `req_011Cfp39pC9e9DH5frhc8bfE` | `end_turn`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-6-tool` | `req_011Cfp39tB2DTPodK59vRYyq` | `tool_use`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-6-final` | `req_011Cfp3A1hwwgGfLrXQTejdp` | `end_turn`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-7-tool` | `req_011Cfp3A5TRYisD7Vo9tgMGS` | `tool_use`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-7-final` | `req_011Cfp3AD6oiXRKxBf4K3qYd` | `end_turn`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-8-tool` | `req_011Cfp3AHGL7rhQ7adwZ4EjS` | `tool_use`, 0 thinking tokens |
+| `claude-sonnet-5-5` | `seed-8-final` | `req_011Cfp3AQSvxQdVRKaN1xpfk` | `end_turn`, 0 thinking tokens |
+
+## Current harness and local verification
+
+The local harness now uses adaptive/high effort, the benign `record_note` tool, reasoning-inviting arithmetic seed prompts, up to eight completed rounds, and one alternate neutral prompt retry on a refusal. The common 13 one-shot mutation/control cells run for both models; a restoration check reuses the oldest-prefix response and issues one additional request only if that response produced a signed block. Any 429 stops both models immediately. The cap is 92 calls. The harness keeps signatures in memory and records statuses, request IDs, per-round signed-block counts, and hashed request shapes without raw thinking text or signatures.
+
+Offline verification, completed before the adaptive/high live run, used Bun 1.4.2 and TypeScript 5.9.3:
+
+- `timeout 90 bun test --timeout 30000 packages/e2e-tests/src/live-providers` — 31 passed, 1 optional smoke test skipped, 0 failed; 122 assertions across 32 tests in 5 files.
+- `timeout 180 bun packages/e2e-tests/node_modules/typescript/bin/tsc --noEmit -p packages/e2e-tests/tsconfig.live-providers.json` — passed (silent on success).
+
+The manual-enabled run started 2026-10-08 03:06:11 UTC and ended 03:07:07 UTC. The adaptive/high run started 03:11:06 UTC and ended 03:11:42 UTC. Neither run returned a 429, so no quota retry was made. After the adaptive/high run reached its seed limit/refusal blockers, no additional live run was performed.
+
+## Previous attempt (2026-10-07)
 
 **Attempt:** 2026-10-07, 09:56:28–09:56:30 UTC. Repository base:
 `392930c8c167e84d148290f464a28fe9269f26cc`. Route: Anthropic native Messages
 (`https://api.anthropic.com/v1/messages`), default vault credential
 `oauth:anthropic`, accessed only through the enrolled `mc-e2e` consumer.
 
-## Result
+### Result of the Oct 7 attempt
 
-**The requested signed-thinking matrix is not yet run live.** The first seed
+**That earlier attempt did not reach the signed-thinking matrix.** The first seed
 request for **both `claude-opus-5-5` and `claude-sonnet-5-5` returned HTTP 429**.
 Neither model generated any thinking, tool use, or completed conversation turn.
 Consequently, no unchanged next-request control or thinking mutation was reached.
@@ -83,91 +183,11 @@ read/write. No error body exists for an unsent request.
 
 ### Comparison with project memory
 
-**No reality-versus-memory difference was established.** #23609's oldest-prefix,
-suffix, middle-gap, earlier-edit and all-removal claims remain **unverified by
-this attempt**, as does the Anthropic analogue of #22050's literal `[cleared]`
-rejection. Restoring previously removed blocks, editing tool inputs, other
-models (including Fable 5.1), and Vertex/Bedrock/Copilot are outside this matrix
-and were not tested. No product behavior or memory claim should be changed on
-the strength of these two rate limits.
-
-## Harness and request configuration
-
-The existing MC `claude-oauth:trim-only` scenario exercises MC's real age/flush
-edits and does not permit arbitrary wire mutations. The added
-`packages/e2e-tests/src/live-providers/thinking-matrix-live.ts` is an independent
-native-wire experiment sharing the vault, installed-auth bootstrap, isolation,
-request-shape, usage and error readers with that harness. **It is not an
-end-to-end proof of MC's actual stripping or m0/m1 rendering.** No product code,
-`ARCHITECTURE.md`, or `STRUCTURE.md` was changed.
-
-- The installed Anthropic OpenCode auth dist shapes one **loopback-only** request.
-  The loopback rejects it locally; **zero** bootstrap requests reach Anthropic.
-  Bearer headers are captured in memory, never printed or persisted in evidence.
-  Only the auth plugin's first system block is retained in the native client;
-  host/MC tool definitions and subsequent system blocks are not replayed.
-- The client sends adaptive summarized thinking, low effort, **max output 512**,
-  `thinking.block_binding.prefix_mismatch_behavior: "error"`, and the
-  `thinking-binding-controls-2026-08-01` beta. These settings were sent on the
-  rejected seeds; successful signed generation at this budget is **not proven**.
-- A static system block contains 4,600 repetitions of ` anchor` and an explicit
-  five-minute ephemeral cache breakpoint, deliberately sized for the cache
-  minimum. The output cap is small; the cache anchor is input, not generation.
-  Its tokenizer size/cache eligibility and any cache hit still need live proof.
-  A positive read here would establish static-system caching, **not** survival of
-  cached conversation history across edits.
-- One conversation per model is allowed. Echo tool results return the model's
-  supplied string unchanged. Each tool round must finish with `end_turn` before
-  another user turn, avoiding the separate rule for thinking in an unfinished
-  tool continuation. Up to four rounds are permitted to obtain at least four
-  signed blocks across at least two completed turns; insufficient thinking aborts.
-- Each variant clones the same completed seed and identical next-user prompt.
-  Branch responses are discarded, never appended to a later branch. “Middle”
-  is the second signed block. Tool-result edits change only its text and preserve
-  IDs/inputs. The first-user re-render appends `Rendered context marker: m0 -> m1.`
-  to its original text, isolating a prefix-content change rather than invoking
-  MC's renderer. `[cleared]` changes text but preserves the signature.
-- Errors are recorded from the real upstream response, not the existing recorder's
-  synthetic host-facing 400. A rate limit stops that model without retries;
-  the other model receives at most its own initial seed probe before stopping
-  if also rate-limited. An authentication rejection stops both models.
-  The maximum complete matrix uses 30 calls; the hard budget is 32.
-
-The bootstrap host was **OpenCode 1.18.30**, PID **60427**. Before and after its
-loopback request, `lsof` showed only OpenCode and MC `.db`, `-wal`, and `-shm`
-handles under its throwaway root. The root was removed when the host stopped,
-including the mode-0600 bearer slot and auth state. HOME/XDG roots, OpenCode DB,
-MC storage/logs, and child TMPDIR were disposable. This is sampled host isolation,
-not a continuous descendant/network audit. No operator credential/config file was
-opened directly, and no account roster was used for fallback.
-
-## Verification and rerun
-
-Local checks use **Bun 1.4.2** and **TypeScript 5.9.3**:
-
-- `timeout 90 bun test --timeout 30000 packages/e2e-tests/src/live-providers`:
-  **26 passed, 1 optional installed-dist smoke skipped, 0 failed**; 92 assertions.
-  Five new tests cover the minimum signed-history guard, exact independent
-  variants, keep/strip edit pairs, and literal `[cleared]` with unchanged signature.
-- `timeout 90 bun packages/e2e-tests/node_modules/typescript/bin/tsc --noEmit -p packages/e2e-tests/tsconfig.live-providers.json`:
-  **passed**, scoped to the live-provider harness (silent on success).
-- Non-vacuity: disabling the minimum-four-signed-block guard reddened only
-  `signed-thinking request matrix > refuses insufficient or unsigned history before constructing variants`;
-  the other four matrix tests passed. The mutant was restored before delivery.
-
-The live command below ran once on the default credential, exited **1**, and
-produced the two 429 records above. When that account's quota resets, run the
-same harness with a **fresh output directory**, then inspect all statuses, usage,
-signed-history hashes and transformation diagnostics before drawing conclusions:
-
-```sh
-MC_LIVE_PROVIDERS=1 MC_LIVE_MAX_CALLS=32 timeout --kill-after=30s 600s \
-  bun packages/e2e-tests/src/live-providers/thinking-matrix-live.ts \
-  --opencode /Users/ufukaltinok/.opencode/bin/opencode \
-  --anthropic-auth /Users/ufukaltinok/Work/Projects/CortexKit/anthropic-auth/packages/opencode/dist/index.js \
-  --out "$TMPDIR/magic-context/live-providers/thinking-matrix-$(date -u +%Y%m%dT%H%M%SZ)"
-```
-
-The harness's `completed` outcome means every variant was reached, not that each
-expectation matched. Its generated-history paths and live cache behavior remain
-untested until a seed succeeds; offline fixture tests are not provider proofs.
+**No reality-versus-memory difference was established in the Oct 7 attempt.**
+#23609's oldest-prefix, suffix, middle-gap, earlier-edit and all-removal claims
+remain unverified, as does the Anthropic analogue of #22050's literal `[cleared]`
+rejection. Restoration and tool-input edits were outside the Oct 7 matrix; the
+updated harness now includes those cells, but neither 2026-10-08 seeding run
+reached them. Vertex, Bedrock and Copilot routes are not covered here. No product
+behavior or memory claim should be changed on the strength of the Oct 7 rate limits
+or the later incomplete seeds.
