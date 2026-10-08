@@ -90,12 +90,8 @@ async fn cereb_full_sync_through_real_daemon() {
     let fixture =
         fs::read(std::env::var("MC_SYNC_PROBE_FIXTURE").expect("fixture required")).unwrap();
     let workspace = workspace_root();
-    let daemon_bin = ensure_daemon_binary(&workspace, &["build", "-p", "subc-core", "--bins"]);
-    let module_bin = ensure_binary(
-        &workspace,
-        workspace.join("target/debug/ck-mc"),
-        &["build", "-p", "mc-module"],
-    );
+    let daemon_bin = ensure_daemon_binary(&workspace);
+    let module_bin = ensure_module_binary();
     let temp_root = TempRoot(unique_temp_dir("mc-full-sync-probe"));
     let runtime = temp_root.0.join("runtime");
     let config = temp_root.0.join("config");
@@ -165,13 +161,9 @@ async fn mc_transform_spine_through_real_daemon() {
     std::env::remove_var(subc_os::LAUNCH_NONCE_FD_ENV);
 
     let workspace = workspace_root();
-    // Build the daemon (from the sibling subconscious workspace) and our module.
-    let daemon_bin = ensure_daemon_binary(&workspace, &["build", "-p", "subc-core", "--bins"]);
-    let module_bin = ensure_binary(
-        &workspace,
-        workspace.join("target/debug/ck-mc"),
-        &["build", "-p", "mc-module"],
-    );
+    // Reuse the lock-pinned daemon and the module Cargo built for this test target.
+    let daemon_bin = ensure_daemon_binary(&workspace);
+    let module_bin = ensure_module_binary();
 
     // Declared before the daemon and modules so it drops after them.
     let temp_root = TempRoot(unique_temp_dir("mc-module-real-daemon"));
@@ -807,44 +799,159 @@ async fn wait_for_connection_file(path: &Path, wait: Duration) {
     }
 }
 
-fn ensure_binary(manifest_dir: &Path, path: PathBuf, cargo_args: &[&str]) -> PathBuf {
-    static BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = BUILD_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+fn ensure_module_binary() -> PathBuf {
+    static MODULE: OnceLock<PathBuf> = OnceLock::new();
+    MODULE
+        .get_or_init(|| dev_named_binary(Path::new(env!("CARGO_BIN_EXE_ck-mc"))))
+        .clone()
+}
+
+struct DaemonBinaries {
+    daemon: PathBuf,
+    cli: PathBuf,
+}
+
+static DAEMON_BUILD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn ensure_daemon_build(workspace: &Path) -> &'static DaemonBinaries {
+    static BINARIES: OnceLock<DaemonBinaries> = OnceLock::new();
+    BINARIES.get_or_init(|| build_daemon_binaries(workspace))
+}
+
+fn build_daemon_binaries(workspace: &Path) -> DaemonBinaries {
+    let source = locked_daemon_source(workspace);
+    // One target for every scenario, durable across test processes. Runtime/config/data
+    // directories remain private to each test; sharing immutable executables is safe.
+    let target = workspace.join("target/real-daemon-subc");
+    let cargo_args = [
+        "build",
+        "--locked",
+        "-p",
+        "subc-core",
+        "--bins",
+        "--target-dir",
+        target.to_str().unwrap(),
+    ];
+    DAEMON_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
     let output = Command::new("cargo")
         .env("CARGO_BUILD_JOBS", "2")
         .args(cargo_args)
-        .current_dir(manifest_dir)
+        .current_dir(&source)
         .output()
         .unwrap_or_else(|e| panic!("failed to run cargo {cargo_args:?}: {e}"));
+    // Show even successful nested builds so repeated test runs expose recompilation.
+    eprintln!(
+        "real-daemon nested cargo {cargo_args:?} in {}\n{}",
+        source.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         output.status.success(),
         "cargo {cargo_args:?} failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(path.exists(), "expected binary at {}", path.display());
-    dev_named_binary(&path)
+    DaemonBinaries {
+        daemon: dev_named_binary(&daemon_binary_path(&source, &cargo_args)),
+        cli: dev_named_binary(&target.join("debug/ck")),
+    }
 }
 
-fn ensure_daemon_binary(workspace: &Path, cargo_args: &[&str]) -> PathBuf {
-    if let Some(binary) = std::env::var_os("MC_TEST_CK_SUBC_BIN") {
-        let path = PathBuf::from(binary);
-        assert!(
-            path.is_file(),
-            "test daemon binary is missing: {}",
-            path.display()
-        );
-        return dev_named_binary(&path);
-    }
+fn ensure_daemon_binary(workspace: &Path) -> PathBuf {
+    static DAEMON: OnceLock<PathBuf> = OnceLock::new();
+    DAEMON
+        .get_or_init(|| {
+            if let Some(binary) = std::env::var_os("MC_TEST_CK_SUBC_BIN") {
+                let path = PathBuf::from(binary);
+                assert!(
+                    path.is_file(),
+                    "test daemon binary is missing: {}",
+                    path.display()
+                );
+                dev_named_binary_as(&path, "subc-prebuilt")
+            } else {
+                ensure_daemon_build(workspace).daemon.clone()
+            }
+        })
+        .clone()
+}
+
+fn locked_subc_revision(lock: &str) -> String {
+    let sources: Vec<_> = lock
+        .split("[[package]]")
+        .filter(|section| section.lines().any(|line| line == "name = \"subc-core\""))
+        .flat_map(|section| {
+            section
+                .lines()
+                .filter_map(|line| line.strip_prefix("source = \""))
+        })
+        .collect();
+    assert_eq!(
+        sources.len(),
+        1,
+        "expected one lock-pinned subc-core source"
+    );
+    let source = sources[0]
+        .strip_prefix("git+https://github.com/cortexkit/subconscious?rev=")
+        .and_then(|source| source.strip_suffix('"'))
+        .expect("subc-core must be pinned to the subconscious Git source");
+    let (revision, fragment) = source
+        .split_once('#')
+        .expect("Git source needs a revision fragment");
+    assert_eq!(
+        revision, fragment,
+        "subc-core revision must match its source fragment"
+    );
+    assert!(revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit()));
+    revision.to_owned()
+}
+
+fn locked_daemon_source(workspace: &Path) -> PathBuf {
+    let revision = locked_subc_revision(&fs::read_to_string(workspace.join("Cargo.lock")).unwrap());
     let subconscious = subconscious_root(workspace);
-    ensure_binary(
-        &subconscious,
-        daemon_binary_path(&subconscious, cargo_args),
-        cargo_args,
-    )
+    let compatible = Command::new("git")
+        .current_dir(&subconscious)
+        .args(["merge-base", "--is-ancestor", "2b0914f0", &revision])
+        .status()
+        .unwrap();
+    assert!(compatible.success(), "Cargo.lock's subconscious revision {revision} must include 2b0914f0 (per-module launch_nonce_env); refusing to pull or modify the sibling checkout");
+
+    // Export the committed tree, not the sibling's possibly newer or dirty worktree.
+    // Reuse it on subsequent runs to avoid changing Cargo's source mtimes.
+    let parent = workspace.join("target/real-daemon-subc-source");
+    let source = parent.join(&revision);
+    if source.join("Cargo.toml").is_file() && source.join("Cargo.lock").is_file() {
+        return source;
+    }
+    fs::create_dir_all(&parent).unwrap();
+    let scratch = parent.join(format!("{revision}-{}", std::process::id()));
+    fs::create_dir_all(&scratch).unwrap();
+    let archive = scratch.join("source.tar");
+    let exported = Command::new("git")
+        .current_dir(&subconscious)
+        .args(["archive", "--format=tar", "--output"])
+        .arg(&archive)
+        .arg(&revision)
+        .status()
+        .unwrap();
+    assert!(
+        exported.success(),
+        "failed to export locked subconscious revision {revision}"
+    );
+    let extracted = Command::new("tar")
+        .arg("-xf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&scratch)
+        .status()
+        .unwrap();
+    assert!(
+        extracted.success(),
+        "failed to extract locked subconscious source"
+    );
+    fs::remove_file(archive).unwrap();
+    fs::rename(&scratch, &source).unwrap();
+    source
 }
 
 // A caller can isolate its daemon build with --target-dir. Resolve the output
@@ -867,6 +974,48 @@ fn daemon_binary_path(subconscious: &Path, cargo_args: &[&str]) -> PathBuf {
         .map(|target| subconscious.join(target))
         .unwrap_or_else(|| subconscious.join("target"));
     target.join("debug/ck-subc")
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_artifacts_are_built_and_copied_once() {
+    use std::os::unix::fs::MetadataExt;
+
+    let workspace = workspace_root();
+    let first = ensure_daemon_build(&workspace);
+    let daemon_inode = fs::metadata(&first.daemon).unwrap().ino();
+    let cli_inode = fs::metadata(&first.cli).unwrap().ino();
+    let second = ensure_daemon_build(&workspace);
+    assert_eq!(first.daemon, second.daemon);
+    assert_eq!(first.cli, second.cli);
+    assert_eq!(
+        DAEMON_BUILD_COUNT.load(Ordering::Relaxed),
+        1,
+        "daemon build must be memoized, not merely serialized"
+    );
+    assert_eq!(fs::metadata(&second.daemon).unwrap().ino(), daemon_inode);
+    assert_eq!(fs::metadata(&second.cli).unwrap().ino(), cli_inode);
+    let target = workspace.join("target/real-daemon-subc/debug");
+    assert_ne!(
+        daemon_inode,
+        fs::metadata(target.join("ck-subc")).unwrap().ino(),
+        "daemon must be copied, never hard-linked"
+    );
+    assert_ne!(
+        cli_inode,
+        fs::metadata(target.join("ck")).unwrap().ino(),
+        "CLI must be copied, never hard-linked"
+    );
+
+    let module = ensure_module_binary();
+    let module_inode = fs::metadata(&module).unwrap().ino();
+    assert_eq!(ensure_module_binary(), module);
+    assert_eq!(fs::metadata(&module).unwrap().ino(), module_inode);
+    assert_ne!(
+        module_inode,
+        fs::metadata(env!("CARGO_BIN_EXE_ck-mc")).unwrap().ino(),
+        "module must be copied, never hard-linked"
+    );
 }
 
 #[test]
@@ -904,6 +1053,11 @@ fn dev_named_binary(path: &Path) -> PathBuf {
             .or_else(|| filename.strip_prefix("ck-"))
             .unwrap_or_else(|| panic!("expected a ck, ck-* or ckdev-* test binary, got {filename}"))
     };
+    dev_named_binary_as(path, suffix)
+}
+
+fn dev_named_binary_as(path: &Path, suffix: &str) -> PathBuf {
+    assert!(path.is_file(), "expected binary at {}", path.display());
     let dev_dir = std::env::temp_dir()
         .join("magic-context/mc-module-test-binaries")
         .join(std::process::id().to_string());
@@ -924,6 +1078,11 @@ fn dev_named_binary(path: &Path) -> PathBuf {
                 dev_path.display()
             )
         });
+    assert!(
+        fs::read(path).unwrap() == fs::read(&dev_path).unwrap(),
+        "staged binary must be byte-identical to {}",
+        path.display()
+    );
     dev_path
 }
 
@@ -958,33 +1117,9 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
     };
 
     let workspace = workspace_root();
-    let subconscious = subconscious_root(&workspace);
-    let revision = Command::new("git")
-        .current_dir(&subconscious)
-        .args(["merge-base", "--is-ancestor", "2b0914f0", "HEAD"])
-        .status()
-        .unwrap();
-    assert!(revision.success(), "local subconscious must include 2b0914f0 (per-module launch_nonce_env); refusing to pull or modify it");
-    // Build artifacts stay under this worktree, even for the subconscious source.
-    let target = workspace.join("target/pipe-only-subc");
-    let daemon_bin = ensure_binary(
-        &subconscious,
-        target.join("debug/ck-subc"),
-        &[
-            "build",
-            "--locked",
-            "-p",
-            "subc-core",
-            "--bins",
-            "--target-dir",
-            target.to_str().unwrap(),
-        ],
-    );
-    let module_bin = ensure_binary(
-        &workspace,
-        workspace.join("target/debug/ck-mc"),
-        &["build", "--locked", "-p", "mc-module"],
-    );
+    let daemon_bin = ensure_daemon_binary(&workspace);
+    let module_bin = ensure_module_binary();
+    let ck_bin = ensure_daemon_build(&workspace).cli.clone();
     let temp = TempRoot(unique_temp_dir("mc-pipe-only-daemon"));
     let runtime = temp.0.join("runtime");
     let config = temp.0.join("config");
@@ -1017,7 +1152,7 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
     let daemon = spawn_daemon(&daemon_bin, &runtime, &config, &data);
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
     let stop_module = StopSupervisedModule {
-        ck_bin: dev_named_binary(&target.join("debug/ck")),
+        ck_bin: ck_bin.clone(),
         daemon: &daemon,
         data_home: data.clone(),
     };
@@ -1056,7 +1191,6 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
         fs::read_to_string(&environment).unwrap(),
         "env_absent\nfd_present\n"
     );
-    let ck_bin = dev_named_binary(&target.join("debug/ck"));
     let provenance = Command::new(&ck_bin)
         .args([
             "--subc",
@@ -1230,23 +1364,8 @@ impl Drop for StopSupervisedModule<'_> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hostless_store_init_first_transform_through_real_daemon() {
     let workspace = workspace_root();
-    let target = workspace.join("target/store-init-subc");
-    let daemon_bin = ensure_daemon_binary(
-        &workspace,
-        &[
-            "build",
-            "--locked",
-            "-j",
-            "2",
-            "-p",
-            "subc-core",
-            "--bin",
-            "ck-subc",
-            "--target-dir",
-            target.to_str().unwrap(),
-        ],
-    );
-    let module_bin = dev_named_binary(Path::new(env!("CARGO_BIN_EXE_ck-mc")));
+    let daemon_bin = ensure_daemon_binary(&workspace);
+    let module_bin = ensure_module_binary();
     let parent = std::env::temp_dir().join("magic-context/store-init");
     fs::create_dir_all(&parent).unwrap();
     let temp = TempRoot(parent.join(format!(

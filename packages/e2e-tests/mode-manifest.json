@@ -1250,6 +1250,22 @@
             ]
         },
         {
+            "path": "tests/opencode2/hidden-child-foreign-location.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 639: two directories of one real OpenCode 2 host run Magic Context with a user config allowing edit and shell; a turn ending in the other directory starts no hidden run there and no tool touches either tree (file hashes unchanged), a run in its own directory still reads with its read-only allowlist and maps, and dreamer.disable applies without a restart in both directions. Throwaway roots proven by host PID lsof",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/hidden-agent-user-permissions.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 639 parity check: real OpenCode 1.18.x resolves every hidden Magic Context agent's ruleset with the agent's own rules after a user config that allows everything, so edit, write, bash, task and webfetch evaluate to deny and only each allowlist to allow; host PID lsof proves throwaway-store containment",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
+        },
+        {
             "path": "tests/opencode2/hidden-child-two-directories.test.ts",
             "tier": "excluded",
             "invocation": { "ts": false, "rust": false },
