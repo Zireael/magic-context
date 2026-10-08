@@ -78,7 +78,9 @@ const tempRoot = await mkdtemp(join(tmpdir(), "magic-context-tui-pack-"));
 const installRoot = join(tempRoot, "install");
 
 try {
-    run("bun", ["run", "build:tui"], pluginRoot);
+    // CI already built and checked drift; pack exactly that output. Standalone
+    // smoke runs still generate their own compiled TUI before packing.
+    if (!process.argv.includes("--skip-build")) run("bun", ["run", "build:tui"], pluginRoot);
 
     const packStdout = run("npm", ["pack", "--json", "--pack-destination", tempRoot], pluginRoot);
     const tarball = join(tempRoot, parsePackedFilename(packStdout));
