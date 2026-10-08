@@ -13680,6 +13680,7 @@ fn tag_age_cutoff(req: &TransformRequest, tag_numbers: &BTreeMap<String, u64>) -
 }
 
 include!("transform/reasoning_clear.rs");
+include!("transform/active_anthropic_turn.rs");
 
 fn new_frozen_strip_units(
     core: &CoreState,
@@ -16328,29 +16329,14 @@ fn is_mutable_merged_reasoning_block(block: &CkWireBlock) -> bool {
             .is_some_and(|extras| extras.contains_key("cache_control"))
 }
 
-fn latest_assistant_turn_start(messages: &[CkIngressMessage]) -> usize {
-    messages
-        .iter()
-        .rposition(|message| {
-            !message.ck.meta.synthetic
-                && message.ck.role == "user"
-                && message.ck.content.iter().any(|block| {
-                    !matches!(block.kind, ck_wire::CkKind::ToolResult { .. })
-                        && !is_reasoning_ignored_block(block)
-                })
-        })
-        .map_or(0, |index| index + 1)
-}
-
+/// Thinking-bearing assistants inside the active Anthropic turn. Membership comes from
+/// `in_active_anthropic_turn`, the one turn boundary shared with reasoning retention, so
+/// every lane agrees on which signed blocks are immutable this turn.
 fn protected_thinking_turn_mids(req: &TransformRequest) -> HashSet<&str> {
-    let route = req.provider_id.as_deref().unwrap_or("").to_lowercase();
-    let model = req.model_key.as_deref().unwrap_or("").to_lowercase();
-    if !route.contains("anthropic") && !model.contains("claude") && !model.contains("anthropic") {
-        return HashSet::new();
-    }
-    req.messages[latest_assistant_turn_start(&req.messages)..]
+    req.messages
         .iter()
         .filter(|m| m.ck.role == "assistant" && m.ck.content.iter().any(is_reasoning_block))
+        .filter(|m| in_active_anthropic_turn(req, &m.mid))
         .map(|m| m.mid.as_str())
         .collect()
 }

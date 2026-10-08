@@ -1,4 +1,5 @@
 import { isRecord } from "../../shared/record-type-guard";
+import { isInActiveAnthropicTurn } from "./active-anthropic-turn";
 import { removeReasoningParts } from "./reasoning-removal";
 import { isAnthropicFamilyRoute } from "./sentinel";
 import {
@@ -9,7 +10,6 @@ import {
 import type { MessageLike, TagTarget } from "./tag-messages";
 
 const THINKING_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
-const METADATA_TYPES = new Set(["step-start", "step-finish", "snapshot", "patch"]);
 
 function role(message: unknown): unknown {
     if (!isRecord(message)) return undefined;
@@ -21,28 +21,25 @@ function content(message: unknown): unknown {
     return Array.isArray(message.parts) ? message.parts : message.content;
 }
 
-/** A tool-result-only user entry continues the assistant turn, on both hosts. */
+/**
+ * First index of the active Anthropic turn: everything after the last real user
+ * request. Tool-result carriers and synthesized context messages do not end the
+ * turn. The boundary itself comes from `isInActiveAnthropicTurn`, the single
+ * definition shared with reasoning retention, so both lanes always agree on
+ * which messages belong to the current turn. With no real user request the
+ * active turn is empty.
+ */
 export function latestAssistantTurnStart(messages: readonly unknown[]): number {
-    for (let i = messages.length - 1; i >= 0; i--) {
-        const message = messages[i];
-        if (role(message) !== "user") continue;
-        const parts = content(message);
-        if (typeof parts === "string") return i + 1;
-        if (
-            Array.isArray(parts) &&
-            parts.some(
-                (part) =>
-                    isRecord(part) &&
-                    part.type !== "tool_result" &&
-                    part.type !== "tool-result" &&
-                    part.type !== "tool" &&
-                    part.kind !== "tool_result" &&
-                    !METADATA_TYPES.has(String(part.type ?? part.kind)),
-            )
-        )
-            return i + 1;
+    // Membership is monotonic (index > last real user), so binary search finds
+    // the first member without a quadratic scan over long tool loops.
+    let lo = 0;
+    let hi = messages.length;
+    while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (isInActiveAnthropicTurn(messages, mid, true)) hi = mid;
+        else lo = mid + 1;
     }
-    return 0;
+    return lo;
 }
 
 /** Signed blocks are frozen for the whole tool loop, not just its newest step. */
