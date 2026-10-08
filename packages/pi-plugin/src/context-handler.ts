@@ -2487,7 +2487,8 @@ export function registerPiContextHandler(
 			(event as { signal?: AbortSignal }).signal ??
 			(ctx as { signal?: AbortSignal }).signal;
 		const assertCurrentPass = () => {
-			signal?.throwIfAborted();
+			// Supersession takes precedence over cancellation: the old context's
+			// abort API belongs to the session and could cancel its replacement.
 			if (
 				passSessionId &&
 				contextPassGeneration.get(passSessionId) !== generation
@@ -2495,6 +2496,7 @@ export function registerPiContextHandler(
 				throw new PiContextSupersededError(
 					"Pi context pass superseded before writer admission",
 				);
+			signal?.throwIfAborted();
 		};
 		const toolWireSchema = await loadPiToolWireSchema();
 		if (processOptions.checkoutClaim) {
