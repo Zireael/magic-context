@@ -3015,6 +3015,13 @@ fn apply_once_with_estimator_and_projection(
                 continue;
             }
             Ok(mut output) => {
+                if attachment_replay.is_some() {
+                    // The facade's delta cache is an ingress cache, not a served
+                    // output cache. Keep the repaired media there while replaying
+                    // old provider bytes, so later tail deltas can still discover
+                    // the upgrade when independent bust permission arrives.
+                    output.projection = project_messages(&pass_req.messages)?;
+                }
                 output.response.cache_ttl =
                     response_marker_ttl(req, &ctx.cache_ttl, ctx.cache_ttl_provenance);
                 return Ok(output);
