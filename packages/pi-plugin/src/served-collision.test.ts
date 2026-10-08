@@ -11,6 +11,56 @@ import {
 import { createTestDb } from "./test-utils.test";
 
 for (const type of ["message", "tool"] as const) {
+	test(`conflicting served ${type} numbers refuse adoption without changing either row`, () => {
+		const db = createTestDb();
+		try {
+			for (const number of [1, 9]) {
+				db.prepare(
+					"INSERT INTO tags(message_id,type,status,session_id,tag_number,byte_size,tool_owner_message_id) VALUES (?,?,'active','conflicting',?,0,?)",
+				).run(
+					type === "message"
+						? number === 1
+							? "pi-msg-0-1-user:p0"
+							: "real:p0"
+						: "call",
+					type,
+					number,
+					type === "tool"
+						? number === 1
+							? "pi-msg-0-1-assistant"
+							: "real"
+						: null,
+				);
+			}
+			const before = db.prepare("SELECT * FROM tags ORDER BY tag_number").all();
+			const evidence = new Set([1, 9]);
+			expect(() =>
+				type === "message"
+					? adoptPiFallbackMessageTag(
+							db,
+							"conflicting",
+							1,
+							"pi-msg-0-1-user:p0",
+							"real:p0",
+							evidence,
+						)
+					: adoptPiFallbackToolOwnerTag(
+							db,
+							"conflicting",
+							1,
+							"call",
+							"pi-msg-0-1-assistant",
+							"real",
+							evidence,
+						),
+			).toThrow("Conflicting served Pi");
+			expect(
+				db.prepare("SELECT * FROM tags ORDER BY tag_number").all(),
+			).toEqual(before);
+		} finally {
+			db.close();
+		}
+	});
 	for (const served of [1, 9]) {
 		test(`served ${type} collision preserves ${served === 1 ? "fallback" : "real"} number regardless of allocation order`, () => {
 			const db = createTestDb();

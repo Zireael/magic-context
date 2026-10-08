@@ -435,7 +435,9 @@ function snapshotInputs(
 	const inputs: PiLkgInputSnapshot[] = [];
 	const seen = new Set<string>();
 	for (let index = 0; index < entryIds.length; index += 1) {
-		const fields = lkgContentFields(omitsBookkeeping ? piProviderInput(messages[index]) : messages[index]);
+		const fields = lkgContentFields(
+			omitsBookkeeping ? piProviderInput(messages[index]) : messages[index],
+		);
 		if (!fields) return { inputs: [], failure: "lkg_content_snapshot_failed" };
 		// Host extensions can inject entries absent from JSONL. A detached full-
 		// content digest gives those entries a stable identity without guessing a
@@ -471,7 +473,9 @@ const bookkeepingOmittingApis = new Set([
 	"openai-codex-responses",
 ]);
 
-function omitsRootBookkeeping(args: Parameters<PiLkgCoordinator["beginPass"]>[0]): boolean {
+function omitsRootBookkeeping(
+	args: Parameters<PiLkgCoordinator["beginPass"]>[0],
+): boolean {
 	// OMP pi-native-client.ts:184 and Pi pi-messages.js:248 serialize the entire
 	// context. Any transport override or unproved API therefore keeps all fields.
 	if (args.transport != null) return false;
@@ -479,10 +483,14 @@ function omitsRootBookkeeping(args: Parameters<PiLkgCoordinator["beginPass"]>[0]
 	if (api === undefined) {
 		// Standalone coordinators may have only native assistant records. Require
 		// one unambiguous API; production always supplies the current model's API.
-		const apis = new Set(args.messages.flatMap((message) => {
-			const value = message as { role?: unknown; api?: unknown } | null;
-			return value?.role === "assistant" && typeof value.api === "string" ? [value.api] : [];
-		}));
+		const apis = new Set(
+			args.messages.flatMap((message) => {
+				const value = message as { role?: unknown; api?: unknown } | null;
+				return value?.role === "assistant" && typeof value.api === "string"
+					? [value.api]
+					: [];
+			}),
+		);
 		if (apis.size === 1) api = [...apis][0];
 	}
 	return typeof api === "string" && bookkeepingOmittingApis.has(api);
@@ -542,7 +550,11 @@ export function createPiLkgCoordinator(
 	};
 
 	const beginPass: PiLkgCoordinator["beginPass"] = (args) => {
-		const snapped = snapshotInputs(args.messages, args.entryIds, omitsRootBookkeeping(args));
+		const snapped = snapshotInputs(
+			args.messages,
+			args.entryIds,
+			omitsRootBookkeeping(args),
+		);
 		const slot = getSlot(args.sessionId);
 		if (snapped.failure || !slot) {
 			return {
@@ -900,7 +912,11 @@ export function createPiLkgCoordinator(
 		const commit = (): void => {
 			// A queued capture must not overwrite replay state after this turn has
 			// been cancelled or replaced, even if its synchronous transform finished.
-			try { args.assertCurrentPass?.(); } catch { return; }
+			try {
+				args.assertCurrentPass?.();
+			} catch {
+				return;
+			}
 			if (plan.captureSequence !== state.captureSequence) return;
 			const startedAt = performance.now();
 			let reusedPrefix = 0;

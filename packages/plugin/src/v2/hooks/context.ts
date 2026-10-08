@@ -154,8 +154,6 @@ import { modelLimitCacheWarm, warmModelLimitCacheFromCatalog } from "./model-lim
 import { adaptPayload, HEAD_IDS } from "./payload";
 import { interruptBeforeProvider, V2ContextRefusal } from "./refusal";
 
-class V2LkgAdmissionReplay extends Error {}
-
 import { RestoredRowCache } from "./restore-rows";
 import { createV2RpcLiveSessionState } from "./rpc-live-state";
 import { createV2RustRefusalRecovery, resolveV2RustModeModuleClient } from "./rust-mode";
@@ -181,6 +179,8 @@ import { registerTools } from "./tools";
 import type { SessionContext, V2Context } from "./types";
 import { persistV2UsageReading } from "./usage-persist";
 import { resolveUsageReading } from "./usage-reading";
+
+class V2LkgAdmissionReplay extends Error {}
 
 // The event stream can trail the terminal store row by a scheduler tick; keep failure surfacing fast.
 const HIDDEN_SESSION_ERROR_GRACE_MS = 50;

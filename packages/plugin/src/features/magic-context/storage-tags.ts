@@ -1771,7 +1771,9 @@ export function adoptPiFallbackToolOwnerTag(
     }
 
     if (servedTagNumbers.has(survivor.tagNumber)) {
-        if (servedTagNumbers.has(existing.tagNumber)) return { action: "skipped" };
+        if (servedTagNumbers.has(existing.tagNumber)) {
+            throw new Error("Conflicting served Pi tool tag numbers; refusing identity adoption");
+        }
         foldDuplicateIntoSurvivor(db, sessionId, survivor, existing);
         db.prepare(
             "UPDATE tags SET tool_owner_message_id = ? WHERE session_id = ? AND tag_number = ?",
@@ -1833,7 +1835,9 @@ export function adoptPiFallbackMessageTag(
     const servedRows = [survivor, ...duplicates].filter((row) =>
         servedTagNumbers.has(row.tagNumber),
     );
-    if (servedRows.length > 1) return { action: "skipped" };
+    if (servedRows.length > 1) {
+        throw new Error("Conflicting served Pi message tag numbers; refusing identity adoption");
+    }
     const realSurvivor = servedRows[0] ?? duplicates[0];
     if (!realSurvivor) return { action: "skipped" };
     const deletedTagNumbers: number[] = [];

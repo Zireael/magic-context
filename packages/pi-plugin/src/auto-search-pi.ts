@@ -360,45 +360,46 @@ export async function runAutoSearchHintForPi(args: {
 
 	let results: UnifiedSearchResult[] | null;
 	try {
-		results = await wait(withAutoSearchDeadline(async (signal, checkDeadline) => {
-			args.passGuard?.assert();
-			await wait(args.ensureProjectRegistered?.() ?? Promise.resolve());
-			args.passGuard?.assert();
-			if (checkDeadline()) return null;
-			const snapshot = getProjectEmbeddingSnapshot(options.projectPath);
-			const memoryEnabled = snapshot?.features.memoryEnabled ?? true;
-			// Use the snapshot's history setting for query embedding, independently
-			// of memory.enabled. Memory and git-commit retrieval have separate gates.
-			const embeddingEnabled = snapshot ? snapshot.historyEnabled : true;
-			const gitCommitsEnabled = snapshot?.gitCommitEnabled ?? false;
-			const searchOptions: UnifiedSearchOptions = {
-				limit: 10,
-				memoryEnabled,
-				embeddingEnabled,
-				gitCommitsEnabled,
-				embedQuery: async (text, signal) => {
-					const result = await wait(embedTextForProject(
-						options.projectPath,
-						text,
+		results = await wait(
+			withAutoSearchDeadline(async (signal, checkDeadline) => {
+				args.passGuard?.assert();
+				await wait(args.ensureProjectRegistered?.() ?? Promise.resolve());
+				args.passGuard?.assert();
+				if (checkDeadline()) return null;
+				const snapshot = getProjectEmbeddingSnapshot(options.projectPath);
+				const memoryEnabled = snapshot?.features.memoryEnabled ?? true;
+				// Use the snapshot's history setting for query embedding, independently
+				// of memory.enabled. Memory and git-commit retrieval have separate gates.
+				const embeddingEnabled = snapshot ? snapshot.historyEnabled : true;
+				const gitCommitsEnabled = snapshot?.gitCommitEnabled ?? false;
+				const searchOptions: UnifiedSearchOptions = {
+					limit: 10,
+					memoryEnabled,
+					embeddingEnabled,
+					gitCommitsEnabled,
+					embedQuery: async (text, signal) => {
+						const result = await wait(
+							embedTextForProject(options.projectPath, text, signal, "query"),
+						);
+						args.passGuard?.assert();
+						checkDeadline();
+						return result?.vector ?? null;
+					},
+					isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
+					visibleMemoryIds: options.visibleMemoryIds ?? null,
+					// Leave primers out of automatic hints so primer updates cannot rewrite
+					// cached request prefixes. Explicit ctx_search and the dashboard expose them.
+					sources: ["memory", "message", "git_commit"],
+				};
+				return wait(
+					unifiedSearch(db, sessionId, options.projectPath, rawPrompt, {
+						...searchOptions,
 						signal,
-						"query",
-					));
-					args.passGuard?.assert();
-					checkDeadline();
-					return result?.vector ?? null;
-				},
-				isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
-				visibleMemoryIds: options.visibleMemoryIds ?? null,
-				// Leave primers out of automatic hints so primer updates cannot rewrite
-				// cached request prefixes. Explicit ctx_search and the dashboard expose them.
-				sources: ["memory", "message", "git_commit"],
-			};
-			return wait(unifiedSearch(db, sessionId, options.projectPath, rawPrompt, {
-				...searchOptions,
-				signal,
-				countRetrievals: false,
-			}));
-		}, startedAt));
+						countRetrievals: false,
+					}),
+				);
+			}, startedAt),
+		);
 	} catch (error) {
 		args.passGuard?.assert();
 		// Retryable failure — do not persist a permanent no-hint decision, or the
