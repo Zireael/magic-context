@@ -17233,6 +17233,7 @@ pub(crate) mod tests {
     }
     use super::*;
     use crate::m1_compose::{m1_revision_signal, m1_revision_signal_parts_for_pass};
+    include!("tests/tool_attachment_upgrade_review.rs");
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 
     use mc_store::{

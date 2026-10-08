@@ -19063,6 +19063,7 @@ pub fn manifest_with_route_targets(
 
 #[cfg(test)]
 mod tests {
+    include!("tests/tool_attachment_memory_review.rs");
     use super::*;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{

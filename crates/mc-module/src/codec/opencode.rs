@@ -1625,6 +1625,7 @@ fn set_nested_value(value: &mut Value, object_key: &str, key: &str, next: Value)
 
 #[cfg(test)]
 mod tests {
+    include!("../tests/tool_attachment_notice_review.rs");
     use super::*;
 
     fn fresh_tool_transform_fixture() -> Vec<CkWireMessage> {
