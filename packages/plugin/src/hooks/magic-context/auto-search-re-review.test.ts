@@ -1,6 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,17 +51,13 @@ function messages() {
 // Execute the actual old getter/validator, not a reimplementation of its semantics.
 // Pin the comparison master so a subsequent fix cannot silently change this reader.
 function olderGetter() {
-    const source = execFileSync(
-        "git",
-        [
-            "show",
-            "41eedb38821dba886ce8ea1c65963eab54bf52f3:packages/plugin/src/features/magic-context/storage-meta-persisted.ts",
-        ],
-        {
-            cwd: fileURLToPath(new URL("../../../../../", import.meta.url)),
-            encoding: "utf8",
-            windowsHide: true,
-        },
+    // The getter as it stood at master 41eedb38, kept as a fixture because CI's
+    // shallow clone has no history to read it from.
+    const source = readFileSync(
+        fileURLToPath(
+            new URL("./__fixtures__/storage-meta-persisted.41eedb38.ts.txt", import.meta.url),
+        ),
+        "utf8",
     );
     const parsed = ts.createSourceFile("old.ts", source, ts.ScriptTarget.Latest, true);
     const names = new Set([
