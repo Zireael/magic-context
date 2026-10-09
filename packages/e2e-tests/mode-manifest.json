@@ -148,6 +148,14 @@
             "hosts": ["opencode2"]
         },
         {
+            "path": "tests/opencode2/dreamer-task-context.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "native OpenCode 2 runs all six dreamer tasks (manual, timer, two locations, tool-using retrospective and curate) and asserts every hidden child receives its task context; throwaway roots with host PID lsof containment",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/opencode2/retrospective.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
