@@ -131,12 +131,36 @@ export class NativeFoldReplay {
         }
         const byID = new Map(metadata.map((row) => [row.id, row]));
         const grouped = new Map<V2RowStamp, V2Message[]>();
+        const anchorIndex = native.findIndex((message) => {
+            const id = nativeRowID(message);
+            return id !== undefined && byID.has(id);
+        });
+        const leading = native
+            .slice(0, anchorIndex < 0 ? native.length : anchorIndex)
+            .filter((message) => !nativeRowID(message) && message.role === "system");
+        const anchorMessage = native[anchorIndex];
+        const anchorID = anchorMessage && nativeRowID(anchorMessage);
+        const anchor = anchorID ? byID.get(anchorID) : undefined;
+        // A visible window may start after a checkpoint. Its leading systems belong
+        // immediately before the nearest anchored row, not the oldest stored system.
+        const leadingRows = anchor
+            ? metadata
+                  .filter((row) => row.type === "system" && row.seq < anchor.seq)
+                  .slice(-leading.length)
+            : [];
+        const leadingIDs = new Map(leading.map((message, i) => [message, leadingRows[i]?.id]));
         let cursor = -1;
         let owner: string | undefined;
         for (const message of native) {
             let id = nativeRowID(message);
-            if (!id && message.role === "system")
-                id = metadata.find((row) => row.type === "system" && row.seq > cursor)?.id;
+            if (!id && message.role === "system") {
+                if (leadingIDs.has(message)) {
+                    id = leadingIDs.get(message);
+                    // Without an anchor, a leading system cannot be matched safely to
+                    // a stored row. Do not cache it; missing hidden rows are read on restore.
+                    if (!id) continue;
+                } else id = metadata.find((row) => row.type === "system" && row.seq > cursor)?.id;
+            }
             if (!id && message.role === "tool") id = owner;
             const row = id ? byID.get(id) : undefined;
             if (!row)
