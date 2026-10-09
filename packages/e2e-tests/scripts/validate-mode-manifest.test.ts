@@ -71,7 +71,8 @@ describe("mode manifest validator", () => {
         }
         // OMP hashes each request into its system header, breaking within-session byte identity
         // in cache-stability and long-running-session; their manifest entries declare the omission.
-        expect(filesForMode(validation, "ts", "omp")).toHaveLength(21);
+        expect(filesForMode(validation, "ts", "omp")).toHaveLength(22);
+        expect(filesForMode(validation, "ts", "omp")).toContain("tests/checkout-claim.test.ts");
         const excluded = validation.manifest.entries
             .filter((entry) => entry.tier === "excluded")
             .map((entry) => entry.path);

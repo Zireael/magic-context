@@ -106,8 +106,10 @@ export function registerPiGuardedContext(
 		} finally {
 			if (!budget.sideTurn) ctx.abort();
 		}
-		// This callback only queues a diagnostic; it must never do storage work on
-		// the payload hook's synchronous dispatch stack.
+		// Queue ordinary error diagnostics without blocking a provider request.
+		// A checkout held elsewhere forbids even deferred writes to its Magic Context
+		// store; the magic-context-turn-refused entry already displays the reason.
+		if (isCheckoutClaimRefusalError(reason)) return;
 		try {
 			options.onRefusal?.(ctx, budget, message, isCurrent);
 		} catch (error) {
@@ -236,12 +238,13 @@ export function registerPiGuardedContext(
 			// exception contract. Real Pi contexts always supply abort().
 			if (typeof ctx.abort !== "function") {
 				budget.abandoned = true;
-				options.onRefusal?.(
-					ctx,
-					budget,
-					error instanceof Error ? error.message : String(error),
-					isOwned,
-				);
+				if (!isCheckoutClaimRefusalError(error))
+					options.onRefusal?.(
+						ctx,
+						budget,
+						error instanceof Error ? error.message : String(error),
+						isOwned,
+					);
 				throw error;
 			}
 			active.refused = true;

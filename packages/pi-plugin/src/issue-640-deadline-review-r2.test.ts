@@ -107,15 +107,27 @@ test.skipIf(
 				) => Promise<{ messages: PiMessage[] }>;
 				const ctx = {
 					...fakeContext(sessionId, process.cwd(), ids, raw),
+					abort: () => {
+						refused = true;
+					},
 					getContextUsage: () => ({
 						tokens: 960000,
 						percent: 96,
 						contextWindow: 1000000,
 					}),
 				};
+				let refused = false;
 				const start = performance.now();
 				const result = await handler({ messages: raw }, ctx);
-				expect(textOf(result.messages[0])).toContain("§");
+				if (hold) {
+					// Waiting for the database writer plus the history summary exceeds
+					// 21s. Refuse while there is still time to complete the 25s outcome.
+					expect(refused).toBe(true);
+					expect(textOf(result.messages[0])).not.toContain("§");
+				} else {
+					expect(refused).toBe(false);
+					expect(textOf(result.messages[0])).toContain("§");
+				}
 				timings.push({
 					hold,
 					admissionMs: admission - start,
