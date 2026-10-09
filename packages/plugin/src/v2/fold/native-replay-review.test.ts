@@ -277,11 +277,14 @@ test("review control: the seventeenth session recovers an evicted snapshot from 
         const native = [user("u", `session ${i}`)];
         const f = fixture(storage);
         f.rows[0]!.session_id = sid;
+        // Eviction reloads the host source, so its bytes must match the captured fixture.
+        f.rows[0]!.data = { text: `session ${i}` };
         readers.set(sid, f.reader);
         await replay.capture(draft([user(HEAD_IDS[0], SUMMARY), ...native], sid), native);
         await replay.supply({ draft: draft([], sid), reader: f.reader, summary: SUMMARY });
         await replay.restore(sid, completed("cut", 10, sid), "p/m");
     }
+    expect(storage.tail("s0")).toBeUndefined();
     expect(JSON.stringify(await replay.restore("s0", completed("cut", 10, "s0"), "p/m"))).toBe(
         JSON.stringify([user("u", "session 0")]),
     );

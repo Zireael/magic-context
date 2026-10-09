@@ -62,13 +62,23 @@ export class NativeFoldReplay {
     constructor(
         readonly storage: NativeFoldCache,
         private readonly openReader: (sessionID: string) => V2StoreReader,
-    ) {}
+    ) {
+        storage.onEvict((sessionID) => this.clear(sessionID));
+    }
+    private account(sessionID: string): void {
+        const source = this.sources.get(sessionID);
+        let bytes = 256 + (source?.length ?? 0) * 2;
+        for (const row of this.metadata.get(sessionID) ?? [])
+            bytes += 128 + (row.id.length + row.type.length) * 2;
+        this.storage.accountReplay(sessionID, bytes);
+    }
 
     async observeSource(sessionID: string, reader: V2StoreReader): Promise<void> {
         const source = reader.hostIdentity();
         const prior = this.sources.get(sessionID);
         if (prior && prior !== source) await this.forget(sessionID);
         this.sources.set(sessionID, source);
+        this.account(sessionID);
     }
     onEvent(event: { type?: string; data?: { sessionID?: string; to?: string } }): void {
         const sessionID = event.data?.sessionID;
@@ -85,6 +95,7 @@ export class NativeFoldReplay {
         this.changed.add(sessionID);
         this.metadata.delete(sessionID);
         this.metadataThrough.delete(sessionID);
+        this.account(sessionID);
     }
     private tail(sessionID: string): NativeTail | undefined {
         const record = this.storage.tail(sessionID);
@@ -177,6 +188,7 @@ export class NativeFoldReplay {
     async capture(draft: SessionContext, native: readonly V2Message[]): Promise<void> {
         // Capture is optional and runs after a servable transform. Cache trouble
         // cannot undo that transform or turn a usable request into an interruption.
+        const release = this.storage.hold(draft.sessionID);
         try {
             rememberHostMedia(native);
             const reader = this.openReader(draft.sessionID);
@@ -205,6 +217,9 @@ export class NativeFoldReplay {
         } catch {
             this.unavailable.add(draft.sessionID);
             this.invalidate(draft.sessionID);
+        } finally {
+            this.account(draft.sessionID);
+            release();
         }
     }
     async canReplay(sessionID: string, _reader: V2StoreReader): Promise<boolean> {
@@ -213,6 +228,20 @@ export class NativeFoldReplay {
         );
     }
     async supply(args: {
+        draft: SessionContext;
+        reader: V2StoreReader;
+        summary: string;
+        previousCut?: StoreRow<"compaction">;
+    }): Promise<boolean> {
+        const release = this.storage.hold(args.draft.sessionID);
+        try {
+            return await this.supplyHeld(args);
+        } finally {
+            this.account(args.draft.sessionID);
+            release();
+        }
+    }
+    private async supplyHeld(args: {
         draft: SessionContext;
         reader: V2StoreReader;
         summary: string;
@@ -255,6 +284,20 @@ export class NativeFoldReplay {
         cut: StoreRow<"compaction">,
         model: string,
         options: { bounded?: boolean; after?: number } = {},
+    ): Promise<V2Message[] | undefined> {
+        const release = this.storage.hold(sessionID);
+        try {
+            return await this.restoreHeld(sessionID, cut, model, options);
+        } finally {
+            this.account(sessionID);
+            release();
+        }
+    }
+    private async restoreHeld(
+        sessionID: string,
+        cut: StoreRow<"compaction">,
+        model: string,
+        options: { bounded?: boolean; after?: number },
     ): Promise<V2Message[] | undefined> {
         if (!isLocalCheckpoint(cut)) return undefined;
         const resolvedModel = {
@@ -356,7 +399,7 @@ export class NativeFoldReplay {
     sourceChanged(sessionID: string): boolean {
         return this.changed.has(sessionID);
     }
-    async forget(sessionID: string): Promise<void> {
+    private clear(sessionID: string): void {
         this.sources.delete(sessionID);
         this.metadata.delete(sessionID);
         this.metadataThrough.delete(sessionID);
@@ -364,6 +407,8 @@ export class NativeFoldReplay {
         this.unavailable.delete(sessionID);
         this.dirty.delete(sessionID);
         this.changed.delete(sessionID);
+    }
+    async forget(sessionID: string): Promise<void> {
         await this.storage.forget(sessionID);
     }
 }
