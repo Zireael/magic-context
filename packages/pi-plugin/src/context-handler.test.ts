@@ -1461,7 +1461,9 @@ describe("Pi fallback tag adoption", () => {
 			queuePendingOp(db, sessionId, 71, "drop", 200);
 			tagger.bindTag(sessionId, `${fallbackId}:p0`, 70);
 			tagger.bindTag(sessionId, `${realId}:p0`, 71);
-			capturePiServedArray(sessionId, [userMessage("§71§ hello", 70)]);
+			capturePiServedArray(sessionId, [userMessage("§71§ hello", 70)], {
+				servedTagNumbers: [71],
+			});
 
 			contextHandlerInternals.adoptPiFallbackTags(
 				db,

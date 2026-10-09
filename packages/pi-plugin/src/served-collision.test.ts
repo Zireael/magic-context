@@ -86,7 +86,9 @@ for (const type of ["message", "tool"] as const) {
 							: null,
 					);
 				}
-				capturePiServedArray(sessionId, [`§${served}§ actually returned`]);
+				capturePiServedArray(sessionId, [`§${served}§ actually returned`], {
+					servedTagNumbers: [served],
+				});
 				const evidence = getPiServedTagNumbers(sessionId);
 				const result =
 					type === "message"

@@ -36,6 +36,8 @@ interface PreviousPass {
 }
 
 interface CaptureOptions {
+	/** Numbers assigned to identities represented by this managed result, not parsed from text. */
+	servedTagNumbers?: Iterable<number>;
 	assertCurrentPass?: () => void;
 	storageDir?: string;
 	now?: Date;
@@ -232,8 +234,8 @@ export function capturePiServedArray(
 			options.serializedOutput?.json ?? `[${serializedMessages.join(",")}]`;
 		const digest = sha256(serializedArray);
 		const served = new Set(servedTagNumbersBySession.get(sessionId));
-		for (const match of serializedArray.matchAll(/§(\d+)§/g)) {
-			served.add(Number(match[1]));
+		for (const number of options.servedTagNumbers ?? []) {
+			if (Number.isSafeInteger(number) && number > 0) served.add(number);
 		}
 		const previous = previousBySession.get(sessionId);
 		const divergence = previous

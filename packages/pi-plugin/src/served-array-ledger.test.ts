@@ -41,12 +41,26 @@ function message(index: number): Record<string, unknown> {
 }
 
 describe("Pi served-array digest ledger", () => {
+	test("literal markers do not create served identities", () => {
+		const storageDir = temporaryDirectory();
+		capturePiServedArray("literal", ["quoted §9§"], { storageDir });
+		expect([...getPiServedTagNumbers("literal")]).toEqual([]);
+		capturePiServedArray("literal", ["§1§ quoted §9§"], {
+			storageDir,
+			servedTagNumbers: [1],
+		});
+		expect([...getPiServedTagNumbers("literal")]).toEqual([1]);
+	});
 	test("records served numbers across normal and detached LKG arrays until cleanup", () => {
 		const storageDir = temporaryDirectory();
 		expect(getPiServedTagNumbers("numbers").size).toBe(0);
-		capturePiServedArray("numbers", ["§3§ served"], { storageDir });
+		capturePiServedArray("numbers", ["§3§ served"], {
+			storageDir,
+			servedTagNumbers: [3],
+		});
 		capturePiServedArray("numbers", [], {
 			storageDir,
+			servedTagNumbers: [8],
 			serializedOutput: {
 				jsonMessages: ['"[dropped §8§]"'],
 				json: '["[dropped §8§]"]',

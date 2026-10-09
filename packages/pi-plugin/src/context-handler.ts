@@ -4300,6 +4300,7 @@ export function registerPiContextHandler(
 			budget.assertOutcome();
 			if (!budget.sideTurn)
 				capturePiServedArray(sessionId, outputMessages, {
+					servedTagNumbers: result.servedTagNumbers,
 					serializedOutput,
 					assertCurrentPass: budget.assertOutcome,
 				});
@@ -5525,6 +5526,7 @@ interface PiChannelBaselineSnapshot {
 
 interface RunPipelineResult {
 	messages: unknown[];
+	servedTagNumbers?: ReadonlySet<number>;
 	/** Whether heuristic cleanup actually ran on this pass. */
 	heuristicsExecuted: boolean;
 	/** Whether any execute-only state mutation ran on this pass. */
@@ -7728,8 +7730,34 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 
+	// A removed tool call/result pair never served its allocated number. Use
+	// surviving structured call IDs and this pass's tagged targets as evidence,
+	// not marker-like strings quoted in user content.
+	const visibleCallIds = new Set<string>();
+	for (const message of outputMessages as PiAgentMessage[]) {
+		if (message.role === "toolResult") visibleCallIds.add(message.toolCallId);
+		if (message.role === "assistant" && Array.isArray(message.content)) {
+			for (const part of message.content) {
+				if (part.type === "toolCall") visibleCallIds.add(part.id);
+			}
+		}
+	}
+	const servedTagNumbers = new Set(
+		allTagsForPass
+			.filter(
+				(tag) =>
+					targets.has(tag.tagNumber) &&
+					(tag.type === "message"
+						? ctxReduceCallable || tag.status !== "active"
+						: tag.type === "tool" &&
+							visibleCallIds.has(tag.messageId) &&
+							(ctxReduceCallable || tag.status !== "active")),
+			)
+			.map((tag) => tag.tagNumber),
+	);
 	return {
 		messages: outputMessages,
+		servedTagNumbers,
 		heuristicsExecuted,
 		executedWorkThisPass,
 		historyInjected: injectionResult?.injected ?? false,
