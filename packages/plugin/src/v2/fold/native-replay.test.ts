@@ -202,7 +202,7 @@ test("a failed second host cut preserves the previous snapshot even before its f
         user("u", "original native bytes"),
     ]);
     await replay.supply({ draft: context([]), reader: f.reader, summary: f.cut.data.summary! });
-    // The first checkpoint completed before any model-context callback restored it.
+    // The first checkpoint completed before any model-context callback restored its history.
     Object.assign(f.reader, { latestRunningCompaction: () => ({ id: "failed-cut" }) });
     await replay.supply({
         draft: context([]),

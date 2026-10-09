@@ -395,8 +395,14 @@ export class V2StoreReader {
         this.db = this.connection.db;
     }
 
-    /** Identify the acquired read connection, so a displaced old handle cannot
-     * advertise the replacement file's identity and reuse its cached history. */
+    /** Identifies the database file this reader's connection actually opened: the
+     * machine's host name, the resolved path, and the file's device, inode and
+     * creation time recorded when the connection was opened.
+     * If OpenCode's database file is later replaced (for example a new file moved
+     * over the same path), a connection opened earlier keeps reading the old file.
+     * Recording identity at open time, rather than checking the path again, stops
+     * that old connection from reporting the new file's identity, so the fold cache
+     * cannot pair rows read from one file with history cached for the other. */
     hostIdentity(): string {
         return createHash("sha256")
             .update(JSON.stringify([hostname(), resolve(this.path), this.connection.identity]))
@@ -677,8 +683,11 @@ export class V2StoreReader {
         }>;
     }
 
-    /** Count session_message rows after a sequence, including idle and compaction
-     * rows. One stored assistant may render several model messages or tags. */
+    /** Count session_message rows after a sequence. This counts stored rows, not
+     * model messages: it includes idle rows (OpenCode's marker that a run finished)
+     * and compaction rows (checkpoints), and one stored assistant row can render as
+     * several model messages, such as the assistant message plus a tool message for
+     * each tool result. */
     storedRowsAfter(sessionID: string, after: number): number {
         const row = this.prepare(
             "SELECT COUNT(*) AS count FROM session_message WHERE session_id = ? AND seq > ?",

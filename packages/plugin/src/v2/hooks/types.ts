@@ -174,7 +174,7 @@ export interface V2Context {
             model: { providerID: string; id: string; variant?: string };
         }): Promise<void>;
         prompt(input: { sessionID: string; text: string }): Promise<unknown>;
-        /** Present on 2.0.22+; automatic folding first checks that compact is a function. */
+        /** Present on OpenCode 2.0.22+; automatic folding first checks that compact is a function. */
         compact?(input: {
             sessionID: string;
             id?: string;

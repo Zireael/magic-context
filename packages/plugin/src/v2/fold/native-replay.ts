@@ -47,9 +47,11 @@ export function isLocalCheckpoint(row: StoreRow): row is StoreRow<"compaction"> 
 const conversational = (row: { type: string }) =>
     (RAW_MESSAGE_TYPES as readonly string[]).includes(row.type) || row.type === "location-switched";
 
-/** A disposable per-session row cache, never a second history authority. The host
- * owns edits and reverts; its events invalidate hidden rows, and visible rows are
- * replaced from each incoming draft. Cold or invalidated spans use restoreRow once.
+/** A disposable per-session row cache. The host owns the session history and
+ * every edit and revert to it; this cache only holds copies. Host events
+ * invalidate the copies of hidden rows, and visible rows are replaced from each
+ * incoming draft. Rows missing from the cache or invalidated are rebuilt once
+ * from the host store with restoreRow.
  */
 export class NativeFoldReplay {
     private readonly changed = new Set<string>();

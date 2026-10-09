@@ -110,7 +110,8 @@ test("re-review: reverting a hidden row stays reverted on the second replay", as
     const cut = await f.supply();
     await f.replay.restore("s", cut, "p/m");
     f.source.prepare("DELETE FROM session_message WHERE id='u1'").run();
-    // The host signals the committed tail revert; direct SQL edits alone are unsupported.
+    // OpenCode announces a revert with its session.revert.committed event, which
+    // invalidates the cached rows. Deleting the row with SQL alone sends no event.
     f.replay.onEvent({ type: "session.revert.committed", data: { sessionID: "s", to: "u1" } });
     const expected = [user("u2", "second user")];
     expect(await f.replay.restore("s", cut, "p/m")).toEqual(expected);
@@ -203,7 +204,9 @@ test("re-review: an open reader's identity cannot switch to a replacement file",
     }
 });
 
-// Unsupported: out-of-band direct database edits to hidden user rows have no public host update signal.
+// Skipped as unsupported: hidden rows (those behind the latest checkpoint, served
+// from this cache) are refreshed only when OpenCode sends an event. Editing one
+// directly in OpenCode's database sends no event, so the cache cannot detect it.
 test.skip("re-review control: equal-time equal-size hidden edits are fenced by raw JSON", () => {});
 
 test("re-review control: a cold copied host store has no owned admission", async () => {
@@ -244,5 +247,7 @@ test("re-review control: VACUUM retains raw rows and only replays the same autho
     }
 });
 
-// Inapplicable: there is no persisted cross-process cache owner or lease.
+// Not applicable: the cache lives only in its own process's memory, so no owner
+// or lease is ever written where another process could see it. When a process
+// dies its cache goes with it, leaving nothing for another process to reclaim.
 test.skip("re-review control: a dead owner is reclaimed only after its lease, never a live owner", () => {});

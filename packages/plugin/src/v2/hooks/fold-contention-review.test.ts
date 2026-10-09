@@ -63,8 +63,11 @@ test("re-review: a busy fold capture after successful transform never interrupts
         async function (this: NativeFoldReplay, draft, native) {
             captureReached = true;
             servedBeforeCapture = draft.messages.some((message) => message.id === HEAD_IDS[0]);
-            // No writer blocks the admission, transform or LKG capture. Only the
-            // optional native cache write has to contend with this separate handle.
+            // `blocker` is a second SQLite connection to context.db. It takes the
+            // write lock only once capture is reached, after the synthetic-message
+            // admission check and the context transform (with its last-known-good
+            // request snapshot) have run unblocked. Only the optional fold-cache
+            // capture and the steps after it run while that lock is held.
             blocker.exec("BEGIN IMMEDIATE");
             return capture.call(this, draft, native);
         },

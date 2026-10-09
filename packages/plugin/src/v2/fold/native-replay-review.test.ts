@@ -14,8 +14,8 @@ import { type NativeFoldCache, nativeFoldCache } from "./memory-cache";
 import { NativeFoldReplay } from "./native-replay";
 import { foldDigest } from "./owner";
 
-// Expected transcripts describe the host history without compaction, independently
-// of restoreRow. These regressions originally exposed failures in the prototype.
+// Expected transcripts describe the host history without compaction, written out
+// by hand rather than produced by restoreRow.
 const MODEL = { providerID: "p", id: "m" };
 const SUMMARY = "frozen served m0";
 const PNG =
@@ -230,8 +230,11 @@ test("review: the same session id in a different host store cannot inherit anoth
     await hostA.capture([user("u", "private host A conversation")]);
     await hostA.supply();
     await hostA.replay.restore("s", completed(), "p/m");
-    // Hosts using cloned/imported session ids share the default Magic Context
-    // storage directory, but may have different OpenCode DBs and histories.
+    // Two OpenCode installs can share the default Magic Context storage directory
+    // while each has its own OpenCode database, and a cloned or imported session
+    // keeps the same id in both. Host B gets its own cache over the same Magic
+    // Context database. Its host-store rows never contain host A's captured text,
+    // so seeing that text would mean host B replayed host A's conversation.
     const hostB = new NativeFoldReplay(nativeFoldCache(storage.db), () => hostA.reader);
     const replayed = await hostB.restore("s", completed(), "p/m");
     expect(JSON.stringify(replayed ?? [])).not.toContain("private host A conversation");
@@ -243,7 +246,7 @@ test("review: session deletion forgets durable native conversation bytes", async
     await f.capture();
     await f.supply();
     await f.replay.restore("s", completed(), "p/m");
-    await f.replay.forget("s"); // The deletion event invokes this method.
+    await f.replay.forget("s"); // The host's session.deleted event calls forget.
     const restarted = f.replay;
     expect({
         baseline: await restarted.baseline("s"),
@@ -265,7 +268,9 @@ test("review: capture freezes message-level metadata as well as content", async 
     expect(replayed?.[0]?.metadata).toEqual({ providerBinding: "original" });
 });
 
-// Unsupported: out-of-band direct database edits to hidden user rows have no public host update signal.
+// Skipped as unsupported: hidden rows (those behind the latest checkpoint, served
+// from this cache) are refreshed only when OpenCode sends an event. Editing one
+// directly in OpenCode's database sends no event, so the cache cannot detect it.
 test.skip("review: a hidden row edit is not silently replayed from obsolete bytes", () => {});
 
 test("review control: the seventeenth session recovers an evicted snapshot from files", async () => {
@@ -277,7 +282,9 @@ test("review control: the seventeenth session recovers an evicted snapshot from 
         const native = [user("u", `session ${i}`)];
         const f = fixture(storage);
         f.rows[0]!.session_id = sid;
-        // Eviction reloads the host source, so its bytes must match the captured fixture.
+        // The cache holds at most 16 sessions, so the 17th capture evicts the
+        // oldest session's cached rows. Restoring that session then reloads its
+        // rows through the host reader, so the host row must hold the captured text.
         f.rows[0]!.data = { text: `session ${i}` };
         readers.set(sid, f.reader);
         await replay.capture(draft([user(HEAD_IDS[0], SUMMARY), ...native], sid), native);
@@ -291,8 +298,14 @@ test("review control: the seventeenth session recovers an evicted snapshot from 
     expect(await replay.baseline("unrelated-session")).toBeUndefined();
 });
 
-// Inapplicable: completing a checkpoint neither publishes nor deletes a saved-message file. Restart recovery reads the host store instead.
+// Not applicable: captured messages are kept only in memory, never in a file, so
+// completing a checkpoint has no saved copy to publish or delete and there is no
+// crash window between those steps. After a restart, replay reads the host store.
 test.skip("review control: a crash after promotion but before tombstoning retains recovery bytes", () => {});
 
-// Inapplicable: no file or table stores captured messages to corrupt. Checkpoints with provider-owned context are excluded by the structural recognition test.
+// Not applicable: no file or table stores captured messages, so there is no saved
+// copy whose ids or bytes could be corrupted. A checkpoint whose context the
+// provider holds (a compaction row with providerContext) is never treated as a
+// local checkpoint; native-replay.test.ts covers that in "native checkpoint
+// recognition is structural and leaves literal user delimiters alone".
 test.skip("review control: draft id mismatch, provider cuts and active snapshot corruption refuse adoption", () => {});

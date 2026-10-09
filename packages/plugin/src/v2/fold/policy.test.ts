@@ -119,7 +119,10 @@ test("a failed host fold retains its in-process attempt and retries with a new i
     expect(f.logs[1]).toContain("status=completed");
 });
 
-// Inapplicable: no durable admission survives a restart; the host owns queue coalescing.
+// Not applicable: fold attempts and their ids live only in this process's memory,
+// and each new cache derives ids from its own random source id, so a restarted
+// host has no earlier id to reuse. Merging a request still queued from before the
+// restart is left to OpenCode's own compaction queue.
 test.skip("a pending fold reuses its durable id across a host restart", () => {});
 
 test("automatic admission reports cache callback failures without an unhandled rejection", async () => {

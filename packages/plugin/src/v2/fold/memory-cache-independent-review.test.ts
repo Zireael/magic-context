@@ -107,8 +107,12 @@ test("review632: post-checkpoint id-less system stays at its current source row"
     expect(restored).toEqual(visible);
 });
 
-// Rust-mode capture happens after the module's recorded boundary trim. A loaded
-// high-water mark does not prove that every earlier raw row is cached.
+// In Rust mode the context hook first trims the draft to the history boundary
+// recorded by the Rust module (trimToRecordedBoundary), then captures it, so the
+// cache can start at a later row than the conversation does. The cache's
+// "loaded through seq N" mark only records the highest row it holds, not that
+// every row below N was captured; restore must read the missing earlier rows
+// from the host store.
 test("review632: widening a partially captured range restores missing raw rows", async () => {
     const rows: StoreRow[] = [
         {

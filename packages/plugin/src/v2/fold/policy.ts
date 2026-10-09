@@ -73,8 +73,12 @@ export class HostFoldPolicy {
                 const cut = reader.latestCompaction(sessionID);
                 const previous = storage.latestAttempt(sessionID);
                 const old = previous ? (JSON.parse(previous.data) as Attempt) : undefined;
-                // Reconcile before the row-threshold test: a completed cut normally
-                // leaves too few rows to nominate again after a process restart.
+                // A cut is the session's latest completed compaction checkpoint in
+                // the host store. If it is the one a still-pending attempt asked for,
+                // settle that attempt here, before the row-threshold test: a
+                // completed cut leaves too few rows after it to nominate again
+                // (request another fold with session.compact), so the threshold
+                // test would return early and the attempt would never be settled.
                 if (
                     cut &&
                     previous?.status === "pending" &&

@@ -615,8 +615,11 @@ export async function registerContext(context: V2Context) {
         return;
     }
     const folds = new FoldOwner(context.storage);
-    // Experimental opt-in: byte preservation across providers and restarts must
-    // remain verified before automatic host folding can become the default.
+    // Experimental and opt-in (MC_OC2_INVISIBLE_FOLD=1). After OpenCode folds the
+    // history, the provider request bytes must stay identical to the ones sent
+    // before the fold, so the provider's prompt cache still matches. That has not
+    // yet been verified across providers and plugin restarts, so automatic host
+    // folding stays off by default.
     const nativeFoldMemory =
         !compactionOff && process.env.MC_OC2_INVISIBLE_FOLD === "1"
             ? nativeFoldCache(() => storage.require())
@@ -1272,7 +1275,8 @@ export async function registerContext(context: V2Context) {
                         sessionID,
                         model: { providerID: model.providerID, id: model.modelID },
                     });
-                    // Never hold the event subscriber while native queue admission settles.
+                    // Do not block event handling while the automatic fold runs: idle()
+                    // queues a compaction and then waits for OpenCode to settle it.
                     if (
                         !compactionOff &&
                         typeof (await nativeFoldReplay?.baseline(sessionID)) === "string"
@@ -1832,9 +1836,13 @@ export async function registerContext(context: V2Context) {
                     }
                 }
                 if (nativeRestored && nativeFoldReplay?.sourceChanged(draft.sessionID)) {
-                    // A host edit/revert changes the history actually served. The
-                    // ordinary transform may rebuild its summary on that change;
-                    // pending operations must use that same rebuild, not cause a second one.
+                    // A host edit or revert changed the restored history, so the
+                    // ordinary transform may rebuild the history head (the
+                    // <session-history> block in the first head message). Each rebuild
+                    // changes the request prefix and invalidates the provider's prompt
+                    // cache, so pending operations (queued drops and heuristic
+                    // cleanup) are flagged to apply in that same pass rather than
+                    // causing a second cache rebuild later.
                     historyRefreshSessions.add(draft.sessionID);
                     pendingMaterializationSessions.add(draft.sessionID);
                 }
