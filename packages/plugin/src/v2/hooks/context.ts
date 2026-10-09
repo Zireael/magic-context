@@ -1432,7 +1432,7 @@ export async function registerContext(context: V2Context) {
                                         !lkgSystems.restore(
                                             draft.sessionID,
                                             getSlot(draft.sessionID),
-                                            systemAtEntry,
+                                            draft.system,
                                             system,
                                         )
                                     )
