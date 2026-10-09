@@ -2623,6 +2623,7 @@ export function registerPiContextHandler(
 				`messages=${event.messages.length}`,
 			);
 
+			budget.stage = "branch projection";
 			const tEntryBranch = performance.now();
 			const branchEntries = readPiBranchEntriesForContext(ctx, sessionId);
 			assertCurrentPass();

@@ -1,6 +1,6 @@
 /**
  * Oh My Pi (OMP) 18.8.6 stops waiting after 30s without cancelling the context handler.
- * Finish mandatory work by 25s (5s host margin); stop optional work at 21s.
+ * Cooperatively finish mandatory work by 25s (5s host margin); stop optional work at 21s.
  * Mandatory tagging/reclaim and final publication share the 25s outcome clock.
  * At expiry the fallback is a synchronous, storage-independent visible refusal.
  * The real OMP held-writer edge probe measured 4ms for that fallback and 25.745s
@@ -8,7 +8,9 @@
  * OMP's 30s deadline. This is one Mac observation, not a Windows upper bound.
  * Writer admission retains the shared helper's 16.5s ceiling but reserves 2s of mandatory work:
  * the measured non-wait maximum was 0.822s, so this reserve is over twice that.
- * Plain Pi has no handler deadline; these internal deadlines bound our work there too.
+ * Synchronous host/native calls cannot be preempted by these checkpoints or timers.
+ * The independent dispatch receipt fence is the backstop after synchronous stalls.
+ * Plain Pi has no handler deadline; these cooperative budgets apply there too.
  * These are initial engineering budgets, not Windows latency percentiles.
  */
 export const PI_CONTEXT_BUDGET = {
@@ -25,7 +27,7 @@ export const PI_CONTEXT_BUDGET = {
 
 export class PiContextDeadlineError extends Error {}
 
-/** One clock shared by preparation, admission, normal work and recovery. */
+/** One cooperative clock shared by preparation, admission, normal work and recovery. */
 export class PiContextBudget {
 	sideTurn = false;
 	stage = "entry";
