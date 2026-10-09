@@ -856,7 +856,7 @@ function drainFailureBackoffActive(meta: ProtectedTailMeta, now: number): boolea
     );
 }
 
-/** Read-only admission check; the runner still reserves atomically before invoking a model. */
+/** Cheap admission check; the runner still reserves atomically before invoking a model. */
 export function getProtectedTailDrainBudgetSkip(args: {
     db: Database;
     sessionId: string;
@@ -868,6 +868,21 @@ export function getProtectedTailDrainBudgetSkip(args: {
 }): (ProtectedTailDrainBudgetState & { nextEligibleAt: number }) | null {
     const now = args.now ?? Date.now();
     const meta = loadProtectedTailMeta(args.db, args.sessionId);
+    const latch = resolvedEmergencyDrainLatch(
+        meta,
+        args.usagePercentage,
+        args.executeThresholdPercentage,
+        now,
+    );
+    // Usage-driven catch-up transitions must survive even when admission skips the runner.
+    // Only write a changed latch; admission must not charge tokens or reset the window.
+    if (latch !== meta.emergencyDrainActive) {
+        args.db
+            .prepare(
+                "UPDATE session_meta SET emergency_drain_active = ? WHERE session_id = ? AND emergency_drain_active = ?",
+            )
+            .run(latch, args.sessionId, meta.emergencyDrainActive);
+    }
     const startedAt = meta.protectedTailDrainWindowStartedAt;
     if (startedAt <= 0 || startedAt > now || now - startedAt >= DRAIN_WINDOW_MS) return null;
     const limitTokens = protectedTailWindowBudget(
@@ -876,12 +891,6 @@ export function getProtectedTailDrainBudgetSkip(args: {
         args.perRunCap,
     );
     if (meta.protectedTailDrainTokens < limitTokens) return null;
-    const latch = resolvedEmergencyDrainLatch(
-        meta,
-        args.usagePercentage,
-        args.executeThresholdPercentage,
-        now,
-    );
     if (latch > 0 && !drainFailureBackoffActive(meta, now)) return null;
     return {
         windowStartedAt: startedAt,

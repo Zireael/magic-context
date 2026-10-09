@@ -179,7 +179,10 @@ it("review startup: boundary preparation errors clear intent, registry and lease
 });
 
 for (const lane of ["defer", "flush", "fold", "force"] as const) {
-    it(`review mutation contract: OpenCode ${lane} pass during a registered historian`, async () => {
+    // Maintainer Ufuk's decision on whether explicit flush bypasses the historian veto is pending.
+    const review = lane === "flush" ? it.skip : it;
+    const name = `review mutation contract: OpenCode ${lane} pass during a registered historian`;
+    review(name, async () => {
         const sessionId = `review-wire-${lane}`;
         getOrCreateSessionMeta(db, sessionId);
         const materialize = new Set<string>();

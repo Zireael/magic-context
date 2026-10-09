@@ -195,3 +195,30 @@ An exact comparison of the 42 failing test-name sets found **no current-only or 
 - Frozen-lockfile installs performed by the package test scripts reported no dependency changes. No manifests or lockfiles changed.
 
 The retained failing tests are review artifacts, not a product repair. Applying this review commit will deliberately keep these contract claims red until the latch lifecycle is repaired and the flush/veto contract is resolved.
+
+## Emergency-latch repair verification
+
+The admission check now persists the usage-resolved emergency-drain latch before returning, including when a spent quota prevents historian startup. It only writes a changed latch, using the previously observed latch value as a compare-and-set guard; it does not reserve tokens or reset the drain window. The shared helper covers OpenCode and Pi, including their persisted-startup-intent and restart-recovery gates. The runner retains the final atomic reservation.
+
+The admission test in `packages/plugin/src/features/magic-context/protected-tail-drain-budget.test.ts` originally asserted that *all* metadata remained unchanged. That assertion is intentionally narrowed to allow only the latch transition, while preserving the token, window, and other metadata invariants. Its table also covers low-pressure exits at expired and future-dated windows. A Pi context-handler regression complements the original OpenCode regression: 69% must end catch-up without starting a historian, and the subsequent 78% reservation must be refused.
+
+Only the two explicit-flush veto tests are skipped, with their existing expectations preserved, pending maintainer Ufuk's decision on whether flush is another historian-veto exception. No flush behavior was changed.
+
+Repair gates ran on Linux with the `uname` guard, `OPENCODE_DB` unset, and a separate throwaway `HOME`. Versions: Bun 1.4.2, TypeScript 5.9.3, Biome 2.5.1. Frozen-lockfile test installs reported no changes.
+
+- Root `bun run build` passed before the test runs; nine compiled TUI files were unchanged.
+- OpenCode and Pi package typechecks passed (three and two TypeScript project invocations respectively).
+- OpenCode lint passed: 1307 files, ten existing warnings, six informational diagnostics. Pi lint passed: 257 files, ten existing warnings.
+- The OpenCode review plus bounded-auto-search run passed 18 tests, skipped only the flush test, and failed none (19 tests in two files, including the eight bounded-auto-search controls). The final budget-unit plus OpenCode review run passed 19 tests, skipped only the flush test, and failed none (20 tests in two files). The Pi review run passed six tests, skipped only the flush test, and failed none (seven tests).
+- Neutralizing only the admission check's persisted exits made exactly the latch regression fail in each review file: OpenCode nine pass / one skip / one fail; Pi five pass / one skip / one fail. Emergency entry, reset/backoff, deferred-start, served-byte, and startup-error controls remained green. The mutation was restored before final verification.
+
+Both complete package suites were also compared against `30a84ed473bf21284dc828c825177e1760b681c5`, temporarily restoring the 14 source/test files changed by gate commit `5eb72485826ecc6a724e35dacbf0e97b886fbc89` and omitting the subsequently added review files, then restoring the fixed index state. Each revision was built before testing:
+
+| Package | Parent baseline | Repaired revision |
+|---|---|---|
+| OpenCode | 7405 pass, 9 skip, 37 fail; 7451 tests | 7419 pass, 10 skip, 37 fail; 7466 tests |
+| Pi | 1531 pass, 3 skip, 144 fail; 1678 tests | 1538 pass, 4 skip, 144 fail; 1686 tests |
+
+The final failure-name sets match exactly within each package: no current-only or parent-only failures. These are not green full-suite claims. The earlier review's 42 OpenCode failures were captured **before** generating Linux distribution artifacts; this build-first comparison reproduced 37, not 42. All five of the separately reported WASM/packed-worker failures remain in that baseline set. Pi's full suite was not reached by the earlier review's root test command; the repair comparison therefore establishes its own 144-failure baseline.
+
+One intervening full OpenCode run also failed `slow embedding aborts at the deadline, freezes skip bytes, and cannot land late`. That unchanged timing test passed in the focused eight-test file run and in the final full-package recheck; the final comparison above uses the latter. A reporting attempt had to be repeated because remote jobs do not retain `/tmp` logs across invocations; the retained evidence copies are outside regenerable build directories. AFT inspection remained partial (unavailable checkout call graph/Biome and no timely TypeScript diagnostic snapshot), so the package typechecks and lint are the authoritative checks.

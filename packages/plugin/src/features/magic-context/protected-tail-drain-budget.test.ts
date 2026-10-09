@@ -43,32 +43,85 @@ describe("protected-tail drain budget window", () => {
     });
     afterEach(() => db.close());
 
-    it("read-only admission matches reservation expiry, force-band, latch and failure-backoff decisions", () => {
+    it("admission persists latch transitions without changing the budget and matches reservation decisions", () => {
         const now = 10_000_000;
         const cases = [
-            { usage: 20, start: now - 1, latch: 0, failure: 0, blocked: true },
-            { usage: 20, start: now - DRAIN_WINDOW_MS, latch: 0, failure: 0, blocked: false },
-            { usage: 20, start: now + 1, latch: 0, failure: 0, blocked: false },
-            { usage: 85, start: now - 1, latch: 0, failure: 0, blocked: false },
-            { usage: 95, start: now - 1, latch: 0, failure: 0, blocked: false },
-            { usage: 70, start: now - 1, latch: now - 1000, failure: 0, blocked: false },
-            { usage: 69, start: now - 1, latch: now - 1000, failure: 0, blocked: true },
+            { usage: 20, start: now - 1, latch: 0, failure: 0, blocked: true, afterLatch: 0 },
+            {
+                usage: 20,
+                start: now - DRAIN_WINDOW_MS,
+                latch: 0,
+                failure: 0,
+                blocked: false,
+                afterLatch: 0,
+            },
+            { usage: 20, start: now + 1, latch: 0, failure: 0, blocked: false, afterLatch: 0 },
+            { usage: 85, start: now - 1, latch: 0, failure: 0, blocked: false, afterLatch: now },
+            { usage: 95, start: now - 1, latch: 0, failure: 0, blocked: false, afterLatch: now },
+            {
+                usage: 70,
+                start: now - 1,
+                latch: now - 1000,
+                failure: 0,
+                blocked: false,
+                afterLatch: now - 1000,
+            },
+            {
+                usage: 69,
+                start: now - 1,
+                latch: now - 1000,
+                failure: 0,
+                blocked: true,
+                afterLatch: 0,
+            },
+            {
+                usage: 69,
+                start: now - DRAIN_WINDOW_MS,
+                latch: now - 1000,
+                failure: 0,
+                blocked: false,
+                afterLatch: 0,
+            },
+            {
+                usage: 69,
+                start: now + 1,
+                latch: now - 1000,
+                failure: 0,
+                blocked: false,
+                afterLatch: 0,
+            },
             {
                 usage: 70,
                 start: now - 1,
                 latch: now - EMERGENCY_DRAIN_MAX_LATCH_MS - 1,
                 failure: 0,
                 blocked: true,
+                afterLatch: 0,
             },
-            { usage: 95, start: now - 1, latch: 0, failure: now - 1, blocked: true },
+            {
+                usage: 95,
+                start: now - 1,
+                latch: 0,
+                failure: now - 1,
+                blocked: true,
+                afterLatch: now,
+            },
             {
                 usage: 95,
                 start: now - 1,
                 latch: 0,
                 failure: now - EMERGENCY_DRAIN_FAILURE_BACKOFF_MS,
                 blocked: false,
+                afterLatch: now,
             },
-            { usage: 95, start: now - 1, latch: 0, failure: now + 1, blocked: false },
+            {
+                usage: 95,
+                start: now - 1,
+                latch: 0,
+                failure: now + 1,
+                blocked: false,
+                afterLatch: now,
+            },
         ];
         cases.forEach((c, i) => {
             const sessionId = `admission-${i}`;
@@ -97,7 +150,10 @@ describe("protected-tail drain budget window", () => {
                           )
                         : c.start + DRAIN_WINDOW_MS,
                 );
-            expect(loadProtectedTailMeta(db, sessionId)).toEqual(before);
+            expect(loadProtectedTailMeta(db, sessionId)).toEqual({
+                ...before,
+                emergencyDrainActive: c.afterLatch,
+            });
             expect(
                 reserveProtectedTailDrainTokens({ ...args, runId: sessionId, trueRawTokens: 100 })
                     .ok,
