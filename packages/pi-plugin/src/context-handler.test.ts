@@ -17,6 +17,7 @@ import {
 	isSessionReconciled,
 } from "@magic-context/core/features/magic-context/message-index-async";
 import { readEpochFloorSnapshot } from "@magic-context/core/features/magic-context/protection-window";
+import { recordSessionProjectIdentity } from "@magic-context/core/features/magic-context/session-project-storage";
 import {
 	acquireWrapupInProgress,
 	addNote,
@@ -358,6 +359,117 @@ for (const configured of [true, false]) {
 }
 
 describe("Pi project binding retry", () => {
+	it("logs an actual binding change once and stays quiet for an unchanged pass", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-binding-change-log";
+		const logger = await import("@magic-context/core/shared/logger");
+		const log = spyOn(logger, "sessionLog");
+		try {
+			recordSessionProjectIdentity(db, sessionId, "git:old");
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:new",
+				db,
+				"/workspace/new",
+			);
+
+			const changeLogs = () =>
+				log.mock.calls.filter(([, message]) =>
+					String(message).startsWith("project binding changed"),
+				);
+			expect(changeLogs()).toHaveLength(1);
+			expect(changeLogs()[0]).toEqual([
+				sessionId,
+				"project binding changed harness=pi cwd=/workspace/new old=git:old new=git:new",
+			]);
+
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:new",
+				db,
+				"/workspace/new",
+			);
+			expect(changeLogs()).toHaveLength(1);
+		} finally {
+			log.mockRestore();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("rate-limits failed writes and logs one recovery", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-binding-write-log";
+		const logger = await import("@magic-context/core/shared/logger");
+		const log = spyOn(logger, "sessionLog");
+		const clock = spyOn(Date, "now").mockReturnValue(1_000);
+		const schema = (
+			db
+				.prepare(
+					"SELECT sql FROM sqlite_master WHERE name = 'session_projects'",
+				)
+				.get() as { sql: string }
+		).sql;
+		try {
+			db.exec("DROP TABLE session_projects");
+			const observe = () =>
+				contextHandlerInternals.updateSessionProjectTracking(
+					sessionId,
+					"git:retry",
+					db,
+					"/workspace/retry",
+				);
+			observe();
+			const failureLogs = () =>
+				log.mock.calls.filter(([, message]) =>
+					String(message).startsWith("project binding write failed"),
+				);
+			expect(failureLogs()).toHaveLength(1);
+			expect(failureLogs()[0][1]).toContain(
+				"project binding write failed harness=pi cwd=/workspace/retry attempted=git:retry:",
+			);
+			expect(failureLogs()[0][1]).toContain("no such table: session_projects");
+
+			clock.mockReturnValue(1_000 + 599_999);
+			observe();
+			expect(failureLogs()).toHaveLength(1);
+
+			clock.mockReturnValue(1_000 + 600_000);
+			observe();
+			expect(failureLogs()).toHaveLength(2);
+
+			db.exec(schema);
+			clock.mockReturnValue(1_000 + 600_001);
+			observe();
+			const recoveryLogs = log.mock.calls.filter(([, message]) =>
+				String(message).startsWith("project binding write recovered"),
+			);
+			expect(recoveryLogs).toHaveLength(1);
+			expect(recoveryLogs[0]).toEqual([
+				sessionId,
+				"project binding write recovered harness=pi cwd=/workspace/retry identity=git:retry",
+			]);
+			const changeLogs = log.mock.calls.filter(([, message]) =>
+				String(message).startsWith("project binding changed"),
+			);
+			expect(changeLogs).toHaveLength(1);
+			// Recovery is also the first successful binding write, so it reports the
+			// actual no-binding → project transition.
+			expect(changeLogs[0][1]).toContain("old=none new=git:retry");
+			const persisted = db
+				.prepare(
+					"SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'pi'",
+				)
+				.get(sessionId) as { project_path: string };
+			expect(persisted.project_path).toBe("git:retry");
+		} finally {
+			clock.mockRestore();
+			log.mockRestore();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("retries a failed first write without adding steady-state writes", () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-retry-binding";
