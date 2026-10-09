@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { log } from "@magic-context/core/shared/logger";
@@ -13,6 +14,7 @@ export const PI_SERVED_ARRAY_BODY_CAPTURE_ENV =
 	"MAGIC_CONTEXT_PI_SERVED_BODY_CAPTURE";
 const LEDGER_DIRECTORY = "pi-served-array-digests";
 const BODY_DIRECTORY = "pi-served-array-bodies";
+const IDENTITY_DIRECTORY = "pi-served-tag-numbers";
 const FLUSH_DELAY_MS = 25;
 
 type JsonMessage = Record<string, unknown>;
@@ -47,7 +49,10 @@ interface CaptureOptions {
 }
 
 const previousBySession = new Map<string, PreviousPass>();
-const servedTagNumbersBySession = new Map<string, Set<number>>();
+const servedTagNumbersBySession = new Map<
+	string,
+	{ path: string; numbers: Set<number> }
+>();
 const sequenceBySession = new Map<string, number>();
 const pendingLinesByPath = new Map<
 	string,
@@ -64,9 +69,45 @@ export function clearPiServedArraySession(sessionId: string): void {
 	sequenceBySession.delete(sessionId);
 }
 
-/** Numbers observed in returned arrays, not merely allocated by a writer. */
-export function getPiServedTagNumbers(sessionId: string): ReadonlySet<number> {
-	return servedTagNumbersBySession.get(sessionId) ?? new Set<number>();
+/** Assigned numbers in served records, including earlier process lifetimes. */
+export function getPiServedTagNumbers(
+	sessionId: string,
+	storageDir = getMagicContextStorageDir(),
+): ReadonlySet<number> {
+	const filePath = getPiServedTagNumbersPath(sessionId, storageDir);
+	const cached = servedTagNumbersBySession.get(sessionId);
+	if (cached?.path === filePath) return cached.numbers;
+	let text: string;
+	try {
+		text = readFileSync(filePath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		text = "";
+	}
+	const numbers = new Set<number>();
+	for (const line of text.split("\n")) {
+		if (!line.trim()) continue;
+		const row = JSON.parse(line) as {
+			version?: unknown;
+			session_id?: unknown;
+			tag_numbers?: unknown;
+		};
+		if (
+			row.version !== 1 ||
+			row.session_id !== sessionId ||
+			!Array.isArray(row.tag_numbers) ||
+			!row.tag_numbers.every(
+				(number) => Number.isSafeInteger(number) && number > 0,
+			)
+		) {
+			throw new Error(
+				"Invalid durable Pi served-number record; refusing identity adoption",
+			);
+		}
+		for (const number of row.tag_numbers) numbers.add(number);
+	}
+	servedTagNumbersBySession.set(sessionId, { path: filePath, numbers });
+	return numbers;
 }
 
 function sha256(value: string): string {
@@ -96,6 +137,17 @@ export function getPiServedArrayBodyPath(
 	return path.join(
 		storageDir,
 		BODY_DIRECTORY,
+		`${safeSessionFileStem(sessionId)}.jsonl`,
+	);
+}
+
+export function getPiServedTagNumbersPath(
+	sessionId: string,
+	storageDir = getMagicContextStorageDir(),
+): string {
+	return path.join(
+		storageDir,
+		IDENTITY_DIRECTORY,
 		`${safeSessionFileStem(sessionId)}.jsonl`,
 	);
 }
@@ -227,13 +279,18 @@ export function capturePiServedArray(
 	options: CaptureOptions = {},
 ): PiServedArrayDigestRecord | undefined {
 	options.assertCurrentPass?.();
+	let identityPersistenceFailed = false;
 	try {
 		const serializedMessages =
 			options.serializedOutput?.jsonMessages ?? messages.map(serializeMessage);
 		const serializedArray =
 			options.serializedOutput?.json ?? `[${serializedMessages.join(",")}]`;
 		const digest = sha256(serializedArray);
-		const served = new Set(servedTagNumbersBySession.get(sessionId));
+		const storageDir = options.storageDir ?? getMagicContextStorageDir();
+		identityPersistenceFailed = true;
+		const previousNumbers = getPiServedTagNumbers(sessionId, storageDir);
+		identityPersistenceFailed = false;
+		const served = new Set(previousNumbers);
 		for (const number of options.servedTagNumbers ?? []) {
 			if (Number.isSafeInteger(number) && number > 0) served.add(number);
 		}
@@ -258,9 +315,32 @@ export function capturePiServedArray(
 			block_vector_start: tailStart,
 			block_vectors: messages.slice(tailStart).map(blockVector),
 		};
-		const storageDir = options.storageDir ?? getMagicContextStorageDir();
 		options.assertCurrentPass?.();
-		servedTagNumbersBySession.set(sessionId, served);
+		const newNumbers = [...served].filter(
+			(number) => !previousNumbers.has(number),
+		);
+		const identityPath = getPiServedTagNumbersPath(sessionId, storageDir);
+		if (newNumbers.length) {
+			// Number identity is safety state, not optional telemetry. Persist it
+			// before returning; an unload or crash must not authorize renumbering.
+			identityPersistenceFailed = true;
+			ensureStorageDirectorySync(path.dirname(identityPath));
+			options.assertCurrentPass?.();
+			writeStorageFileSync(
+				identityPath,
+				`${JSON.stringify({ version: 1, session_id: sessionId, tag_numbers: newNumbers })}\n`,
+				{
+					encoding: "utf8",
+					flag: "a",
+				},
+			);
+			identityPersistenceFailed = false;
+		}
+		options.assertCurrentPass?.();
+		servedTagNumbersBySession.set(sessionId, {
+			path: identityPath,
+			numbers: served,
+		});
 		enqueue(
 			getPiServedArrayLedgerPath(sessionId, storageDir),
 			`${JSON.stringify(record)}\n`,
@@ -285,6 +365,7 @@ export function capturePiServedArray(
 		return record;
 	} catch (error) {
 		options.assertCurrentPass?.();
+		if (identityPersistenceFailed) throw error;
 		recordWriteFailure(error);
 		return undefined;
 	}
