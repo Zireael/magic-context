@@ -1,0 +1,23 @@
+bun test v1.4.2 (744846f84)
+r2 deadline timings [{"hold":0,"admissionMs":55.91912500000001,"totalMs":15702.543333000001,"root":"/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/base-acceptance/magic-context/bg_a1704ae3546049d5/mc-test-owned-deadline-itdkqQ"},{"hold":15500,"admissionMs":15469.101582999998,"totalMs":31088.827875000003,"root":"/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/base-acceptance/magic-context/bg_a1704ae3546049d5/mc-test-owned-deadline-vdlRuv"}]
+
+src/issue-640-deadline-review-r2.test.ts:
+142 | 				db.close();
+143 | 			}
+144 | 		}
+145 | 		console.log("r2 deadline timings", JSON.stringify(timings));
+146 | 		expect(timings[0].totalMs).toBeLessThan(30000);
+147 | 		expect(timings[1].totalMs).toBeLessThan(30000);
+                                   ^
+error: expect(received).toBeLessThan(expected)
+
+Expected: < 30000
+Received: 31088.827875000003
+
+      at <anonymous> (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_630d1ecbfc2147b0/.cache/issue-641/ff8d438a16ebbc3eae82acd29ea572731b086971/packages/pi-plugin/src/issue-640-deadline-review-r2.test.ts:147:30)
+(fail) r2: writer wait plus in-flight historian must fit OMP's 30-second deadline [47091.42ms]
+
+ 0 pass
+ 1 fail
+ 9 expect() calls
+Ran 1 test across 1 file. [47.17s]

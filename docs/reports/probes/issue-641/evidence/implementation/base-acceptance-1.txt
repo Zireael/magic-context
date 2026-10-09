@@ -1,0 +1,9 @@
+bun test v1.4.2 (744846f84)
+
+src/issue-641-deadline.test.ts:
+(fail) emergency foreground never joins a still-running historian [5000.02ms]
+  ^ this test timed out after 5000ms.
+
+ 0 pass
+ 1 fail
+Ran 1 test across 1 file. [5.10s]

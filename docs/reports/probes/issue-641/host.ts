@@ -16,12 +16,13 @@ const { MockProvider } = await import("../../../../packages/e2e-tests/src/mock-p
 const mode = process.argv[2] ?? "slow";
 const fixed = process.argv.includes("--fixed");
 const holdArg = process.argv.find(arg => arg.startsWith("--hold="));
-const hold = holdArg ? Number(holdArg.slice(7)) : mode === "refuse" && fixed ? 60 : 0;
+const hold = holdArg ? Number(holdArg.slice(7)) : ["refuse","outcome"].includes(mode) && fixed ? 60 : 0;
 if (!Number.isFinite(hold) || hold < 0) throw new Error("invalid writer hold");
-if (!["fast", "slow", "refuse", "late-mc", "fenced", "ephemeral"].includes(mode)) throw new Error("invalid mode");
+if (!["fast", "slow", "refuse", "late-mc", "fenced", "ephemeral", "outcome"].includes(mode)) throw new Error("invalid mode");
 const mock = new MockProvider();
 const { baseURL } = await mock.start();
 mock.setDefault({ text: "mock reply", usage: { input_tokens: 1000, output_tokens: 10 } });
+if (mode === "ephemeral") mock.addMatcher(body => JSON.stringify(body.messages).includes("MC641_SIDE") ? {text:"side reply",usage:{input_tokens:1000,output_tokens:10},delayMs:2000} : null);
 const iso = createPiIsolatedEnv(undefined, "omp");
 prepareContextDatabase(iso.dataDir);
 writeConfigs(iso, { host: "omp", mockProviderURL: baseURL, modelContextLimit: 256000,
@@ -39,7 +40,7 @@ const audit = value => appendFileSync(process.env.MC641_ROOT + '/audit.jsonl', J
 export default async function(pi) {
   const mode = process.env.MC641_MODE;
   let managed = false;
-  if (mode === 'fenced') pi.on('before_provider_request',(_event,ctx)=> {
+  if (mode === 'fenced' && !${JSON.stringify(fixed)}) pi.on('before_provider_request',(_event,ctx)=> {
     audit({phase:'provider-fence',managed});
     if (!managed) { pi.appendEntry('deadline-probe-refusal',{message:'No managed context receipt; refusing provider dispatch'}); ctx.abort(); }
   });
@@ -52,7 +53,7 @@ export default async function(pi) {
   };
   const fixed = ${JSON.stringify(fixed)};
   const sideReminder = 'Ephemeral side-channel turn; reuses current conversation context.';
-  const sideContext = event => event.messages.some(m => m.role === 'developer' && m.attribution === 'agent' && JSON.stringify(m.content).includes(sideReminder));
+   const sideContext = event => event.messages.at(-1)?.role === 'user' && event.messages.at(-1)?.attribution === 'agent' && event.messages.some(m => m.role === 'developer' && m.attribution === 'agent' && JSON.stringify(m.content).includes(sideReminder));
   const sidePayload = event => JSON.stringify(event.payload).includes(sideReminder);
   if (fixed) {
     const {default:magicContext} = await import(${JSON.stringify(join(repo, "packages/pi-plugin/dist/index.js"))});
@@ -60,15 +61,16 @@ export default async function(pi) {
     const proxied = new Proxy(pi,{get(target,key){
       if (key === 'on') return (name,handler) => target.on(name,
         name === 'context' ? async (event,ctx) => {
-          const side = sideContext(event);
-          inspect(event,ctx); audit({phase:'context-enter',side});
-          if (['slow','fenced','ephemeral'].includes(mode)) await Bun.sleep(32000);
-          if (mode === 'fast') await Bun.sleep(10);
-          if (mode === 'late-mc') {
-            const original = ctx.sessionManager.getBranch.bind(ctx.sessionManager);
+           const side = sideContext(event);
+           audit({phase:'hook-enter',side});
+           inspect(event,ctx); audit({phase:'context-enter',side,sideSignature:side?event.messages.slice(-2):undefined});
+           if (['slow','fenced'].includes(mode)) await Bun.sleep(32000);
+           if (['fast','ephemeral'].includes(mode)) await Bun.sleep(10);
+           if (['late-mc','outcome'].includes(mode)) {
+             const original = ctx.sessionManager.getLeafId.bind(ctx.sessionManager);
             let stalled = false;
             ctx = Object.assign(Object.create(ctx),{sessionManager:new Proxy(ctx.sessionManager,{get(sm,k){
-              if(k === 'getBranch') return () => { if(!stalled){stalled=true;const end=performance.now()+32000;while(performance.now()<end){} } return original();};
+               if(k === 'getLeafId') return () => { if(!stalled){stalled=true;audit({phase:'stall-start'});const end=performance.now()+(mode==='outcome'?25100:32000);while(performance.now()<end){} audit({phase:'stall-end'});} return original();};
               const v=sm[k];return typeof v==='function'?v.bind(sm):v;
             }})});
           }
@@ -81,11 +83,14 @@ export default async function(pi) {
           const abort=ctx.abort;
           return handler(event,Object.assign(Object.create(ctx),{abort:()=>{audit({phase:'payload-abort',side});return abort();}}));
         } : handler);
-      const value=target[key];return typeof value==='function'?value.bind(target):value;
+       if (key === 'appendEntry') return (type,data)=>{audit({phase:'entry',type,data});return target.appendEntry(type,data);};
+       const value=target[key];return typeof value==='function'?value.bind(target):value;
     }});
     await magicContext(proxied);
-    if(mode==='ephemeral') pi.on('agent_start',(_event,ctx)=>{
-      void ctx.runEphemeralTurn({promptText:'MC641_SIDE',tools:false}).then(result=>audit({phase:'side-done',reply:result.replyText}),error=>audit({phase:'side-error',error:String(error)}));
+     if(mode==='ephemeral') pi.on('agent_start',async (_event,ctx)=>{
+       void ctx.runEphemeralTurn({promptText:'MC641_SIDE',tools:false}).then(result=>audit({phase:'side-done',reply:result.replyText}),error=>audit({phase:'side-error',error:String(error)}));
+       // Start the main context after the side callback has entered, not after it finishes.
+       await Bun.sleep(20);
     });
     return;
   }
@@ -152,10 +157,24 @@ try {
     const audit=readFileSync(join(iso.baseDir,'audit.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line));
     const notices=readFileSync(join(iso.baseDir,'events.jsonl'),'utf8');
     if(mode==='fast' && hold < 16.5 && requests.length!==1) throw new Error('managed fast pass missing');
-    if(['slow','refuse','late-mc','fenced'].includes(mode) && requests.length) throw new Error('unmanaged provider dispatch');
-    if(mode==='ephemeral' && (requests.length!==1 || !body.includes('MC641_SIDE') || audit.some(row=>row.phase==='payload-abort'&&row.side))) throw new Error('ephemeral attribution unsafe');
-    if(mode!=='fast' && !notices.includes('Magic Context could not safely prepare')) throw new Error('visible refusal missing');
-    if(hold>16.5 && requests.length) throw new Error('held-writer refusal dispatched');
+     if(['slow','refuse','late-mc','fenced','outcome'].includes(mode) && requests.length) throw new Error('unmanaged provider dispatch');
+     if(mode==='ephemeral' && (requests.length!==2 || !body.includes('MC641_SIDE') || !body.includes('MC641_ORIGINAL') || audit.some(row=>row.phase==='payload-abort'))) throw new Error('concurrent ephemeral/main operation unsafe');
+     if(mode==='ephemeral') {
+       const side=requests.find(request=>JSON.stringify(request.body.messages).includes('MC641_SIDE'));
+       const main=requests.find(request=>JSON.stringify(request.body.messages).includes('MC641_ORIGINAL'));
+       if(!side?.responseCompletedAt || !main || side.receivedAt>main.receivedAt || side.responseCompletedAt<=main.receivedAt) throw new Error('side/main requests did not overlap');
+     }
+     if(!['fast','ephemeral'].includes(mode) && (!notices.includes('Magic Context could not safely prepare') || !audit.some(row=>row.phase==='entry' && row.type==='magic-context-turn-refused' && /stage=.*elapsed=.*recovery=/.test(row.data.message)))) throw new Error('visible refusal missing');
+     if(hold>16.5 && requests.length) throw new Error('held-writer refusal dispatched');
+     if(mode==='outcome') {
+       const stalled=audit.find(row=>row.phase==='stall-end');
+       const returned=audit.find(row=>row.phase==='context-end');
+       const entered=audit.find(row=>row.phase==='hook-enter');
+       if(!stalled || !returned || !entered || returned.at-stalled.at>=1000 || returned.at-entered.at>=28000) throw new Error('outcome-edge fallback waited');
+       const fallback={fallbackMs:returned.at-stalled.at,handlerElapsedMs:returned.at-entered.at,promptElapsedMs:returned.at-start,hold};
+       writeFileSync(join(iso.baseDir,'fallback.json'),JSON.stringify(fallback,null,2));
+       console.log(JSON.stringify(fallback));
+     }
     if(locker) locker.kill('SIGTERM');
   } else {
   if (mode === "fast" && (!summary.transformedOnWire || summary.originalOnWire)) throw new Error("fast transform not observed");

@@ -1,0 +1,17 @@
+COMMAND   PID        USER   FD   TYPE             DEVICE SIZE/OFF                NODE NAME
+Python  33157 ufukaltinok  cwd    DIR               1,17       64          2651645585 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-3vNy7g/work
+Python  33157 ufukaltinok  txt    REG               1,17    52128          1273198841 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
+Python  33157 ufukaltinok  txt    REG               1,17    77368          2648572740 /private/var/db/diagnostics/logd/.plist-cache.suDbE15I
+Python  33157 ufukaltinok  txt    REG               1,17    32768          2651645666 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-3vNy7g/data/cortexkit/magic-context/context.db-shm
+Python  33157 ufukaltinok  txt    REG               1,17  4129840 1152921500312609216 /usr/lib/dyld
+Python  33157 ufukaltinok  txt    REG               1,17  2949168          1273198831 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Python3
+Python  33157 ufukaltinok  txt    REG               1,17   107312          1273199533 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/math.cpython-39-darwin.so
+Python  33157 ufukaltinok  txt    REG               1,17    85488          1273199455 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_heapq.cpython-39-darwin.so
+Python  33157 ufukaltinok  txt    REG               1,17   141520          1273199445 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_datetime.cpython-39-darwin.so
+Python  33157 ufukaltinok  txt    REG               1,17   115056          1273199493 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_sqlite3.cpython-39-darwin.so
+Python  33157 ufukaltinok    0r   CHR                3,2      0t0                 336 /dev/null
+Python  33157 ufukaltinok    1u  unix 0x596ff000e413c18d      0t0                     ->0x6760f2b8e64d0bb
+Python  33157 ufukaltinok    2u  unix 0xb630fae8f24f8943      0t0                     ->0x8cde7ffce12a557d
+Python  33157 ufukaltinok    3u   REG               1,17     4096          2651645591 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-3vNy7g/data/cortexkit/magic-context/context.db
+Python  33157 ufukaltinok    4u   REG               1,17  3580312          2651645665 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-3vNy7g/data/cortexkit/magic-context/context.db-wal
+Python  33157 ufukaltinok    5u   REG               1,17    32768          2651645666 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-3vNy7g/data/cortexkit/magic-context/context.db-shm

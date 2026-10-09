@@ -1,0 +1,61 @@
+[
+  {
+    "mode": "fast",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-IOMrUh",
+    "requestBodySha256": [
+      "6ad5ce328e528b8578f437331fa7b38dd90f71c657be146628f6fbf7a3c74a36"
+    ]
+  },
+  {
+    "mode": "slow",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj",
+    "requestBodySha256": []
+  },
+  {
+    "mode": "refuse",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-zz39B9",
+    "requestBodySha256": []
+  },
+  {
+    "mode": "late-mc",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-mc9pOv",
+    "requestBodySha256": []
+  },
+  {
+    "mode": "fenced",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-jqDNuA",
+    "requestBodySha256": []
+  },
+  {
+    "mode": "ephemeral",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-cCzsy8",
+    "requestBodySha256": [
+      "22852c488c6f8bef6a26d4839803d509e60fcc926b4442132f1533e0bfbbf2b4",
+      "85a8c3137eae9491cd92cfd15927b515bf878b529fdc03fabd34b234aa9ecc56"
+    ]
+  },
+  {
+    "mode": "outcome",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-03v5Sp",
+    "requestBodySha256": []
+  },
+  {
+    "mode": "fast",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-jwqIDz",
+    "requestBodySha256": [
+      "a1366cae4acf9acbfe838e99e59e6fe97b418fb9eb241e8a4fe9c483c9993579"
+    ]
+  },
+  {
+    "mode": "fast",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-3vNy7g",
+    "requestBodySha256": [
+      "9fe348e8433e7e27aab801face7d5b5ba6e2669cfd04c9251d8e4a9f2234c1ca"
+    ]
+  },
+  {
+    "mode": "fast",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-cBZJlD",
+    "requestBodySha256": []
+  }
+]

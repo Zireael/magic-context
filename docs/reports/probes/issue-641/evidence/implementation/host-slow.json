@@ -1,0 +1,285 @@
+{
+  "summary": {
+    "mode": "slow",
+    "fixed": true,
+    "hold": 0,
+    "version": "omp/18.8.6",
+    "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj",
+    "pid": 48874,
+    "requests": 0,
+    "firstRequestMs": null,
+    "originalOnWire": false,
+    "transformedOnWire": false,
+    "dbLines": [
+      "bun     48874 ufukaltinok  txt      REG               1,17     32768          2654230046 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db-shm",
+      "bun     48874 ufukaltinok  txt      REG               1,17     32768          2654230053 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/models.db-shm",
+      "bun     48874 ufukaltinok  txt      REG               1,17     32768          2654230079 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/cache/legacy-pi-extension-cache.db-shm",
+      "bun     48874 ufukaltinok  txt      REG               1,17     32768          2654229956 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db-shm",
+      "bun     48874 ufukaltinok  txt      REG               1,17     32768          2654230437 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/skill-descriptions.db-shm",
+      "bun     48874 ufukaltinok   12u     REG               1,17      4096          2654230043 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db",
+      "bun     48874 ufukaltinok   13u     REG               1,17    486192          2654230045 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db-wal",
+      "bun     48874 ufukaltinok   14u     REG               1,17     32768          2654230046 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db-shm",
+      "bun     48874 ufukaltinok   15u     REG               1,17      4096          2654230043 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db",
+      "bun     48874 ufukaltinok   16u     REG               1,17    486192          2654230045 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db-wal",
+      "bun     48874 ufukaltinok   17u     REG               1,17   4071424          2654230050 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/models.db",
+      "bun     48874 ufukaltinok   18u     REG               1,17   3675072          2654230052 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/models.db-wal",
+      "bun     48874 ufukaltinok   19u     REG               1,17     32768          2654230053 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/models.db-shm",
+      "bun     48874 ufukaltinok   20u     REG               1,17      4096          2654230075 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/cache/legacy-pi-extension-cache.db",
+      "bun     48874 ufukaltinok   21u     REG               1,17     20632          2654230077 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/cache/legacy-pi-extension-cache.db-wal",
+      "bun     48874 ufukaltinok   22u     REG               1,17     32768          2654230079 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/cache/legacy-pi-extension-cache.db-shm",
+      "bun     48874 ufukaltinok   23u     REG               1,17      4096          2654229920 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db",
+      "bun     48874 ufukaltinok   24u     REG               1,17      4096          2654229920 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db",
+      "bun     48874 ufukaltinok   25u     REG               1,17   3613272          2654229955 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db-wal",
+      "bun     48874 ufukaltinok   26u     REG               1,17     32768          2654229956 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db-shm",
+      "bun     48874 ufukaltinok   29u     REG               1,17      4096          2654230430 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/skill-descriptions.db",
+      "bun     48874 ufukaltinok   30u     REG               1,17     12392          2654230435 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/skill-descriptions.db-wal",
+      "bun     48874 ufukaltinok   31u     REG               1,17     32768          2654230437 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/skill-descriptions.db-shm",
+      "bun     48874 ufukaltinok   36u     REG               1,17   3613272          2654229955 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db-wal"
+    ]
+  },
+  "audit": [
+    {
+      "at": 1791537654746,
+      "phase": "start",
+      "pid": 48874,
+      "eventKeys": [
+        "type",
+        "messages"
+      ],
+      "ctxKeys": [
+        "ui"
+      ],
+      "eventSignal": false,
+      "ctxSignal": false,
+      "dbLines": [
+        "bun     48874 ufukaltinok  txt      REG               1,17     32768          2654230046 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db-shm",
+        "bun     48874 ufukaltinok  txt      REG               1,17     32768          2654230053 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/models.db-shm",
+        "bun     48874 ufukaltinok  txt      REG               1,17     32768          2654230079 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/cache/legacy-pi-extension-cache.db-shm",
+        "bun     48874 ufukaltinok  txt      REG               1,17     32768          2654229956 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db-shm",
+        "bun     48874 ufukaltinok  txt      REG               1,17     32768          2654230437 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/skill-descriptions.db-shm",
+        "bun     48874 ufukaltinok   12u     REG               1,17      4096          2654230043 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db",
+        "bun     48874 ufukaltinok   13u     REG               1,17    486192          2654230045 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db-wal",
+        "bun     48874 ufukaltinok   14u     REG               1,17     32768          2654230046 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db-shm",
+        "bun     48874 ufukaltinok   15u     REG               1,17      4096          2654230043 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db",
+        "bun     48874 ufukaltinok   16u     REG               1,17    486192          2654230045 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/agent.db-wal",
+        "bun     48874 ufukaltinok   17u     REG               1,17   4071424          2654230050 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/models.db",
+        "bun     48874 ufukaltinok   18u     REG               1,17   2500872          2654230052 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/models.db-wal",
+        "bun     48874 ufukaltinok   19u     REG               1,17     32768          2654230053 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/models.db-shm",
+        "bun     48874 ufukaltinok   20u     REG               1,17      4096          2654230075 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/cache/legacy-pi-extension-cache.db",
+        "bun     48874 ufukaltinok   21u     REG               1,17     20632          2654230077 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/cache/legacy-pi-extension-cache.db-wal",
+        "bun     48874 ufukaltinok   22u     REG               1,17     32768          2654230079 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/cache/legacy-pi-extension-cache.db-shm",
+        "bun     48874 ufukaltinok   23u     REG               1,17      4096          2654229920 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db",
+        "bun     48874 ufukaltinok   24u     REG               1,17      4096          2654229920 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db",
+        "bun     48874 ufukaltinok   25u     REG               1,17   3584432          2654229955 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db-wal",
+        "bun     48874 ufukaltinok   26u     REG               1,17     32768          2654229956 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db-shm",
+        "bun     48874 ufukaltinok   29u     REG               1,17      4096          2654230430 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/skill-descriptions.db",
+        "bun     48874 ufukaltinok   30u     REG               1,17     12392          2654230435 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/skill-descriptions.db-wal",
+        "bun     48874 ufukaltinok   31u     REG               1,17     32768          2654230437 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/.omp/agent/skill-descriptions.db-shm",
+        "bun     48874 ufukaltinok   36u     REG               1,17   3584432          2654229955 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/data/cortexkit/magic-context/context.db-wal"
+      ]
+    },
+    {
+      "at": 1791537654749,
+      "phase": "context-enter",
+      "side": false
+    },
+    {
+      "at": 1791537684538,
+      "phase": "provider-fence",
+      "side": false,
+      "payloadKeys": [
+        "model",
+        "messages",
+        "system",
+        "tools",
+        "metadata",
+        "max_tokens",
+        "stream"
+      ]
+    },
+    {
+      "at": 1791537684539,
+      "phase": "entry",
+      "type": "magic-context-turn-refused",
+      "data": {
+        "message": "Magic Context could not safely prepare this turn; send your message again. stage=provider dispatch elapsed=0ms recovery=no managed result; refused (missing managed context receipt)"
+      }
+    },
+    {
+      "at": 1791537684539,
+      "phase": "payload-abort",
+      "side": false
+    },
+    {
+      "at": 1791537686763,
+      "phase": "context-error",
+      "side": false,
+      "error": "Error: Pi context pass superseded before writer admission"
+    }
+  ],
+  "state": {
+    "tags": [],
+    "meta": [
+      {
+        "session_id": "01a11ff7-28d5-718f-ae95-e4f5fece7d50",
+        "last_transform_error": "Magic Context could not safely prepare this turn; send your message again. stage=provider dispatch elapsed=0ms recovery=no managed result; refused (missing managed context receipt)",
+        "last_input_tokens": 11989,
+        "last_context_percentage": 4.838019757231405
+      }
+    ],
+    "lkg": [],
+    "decisions": []
+  },
+  "ledger": [],
+  "servedBodies": [],
+  "servedOnWire": [],
+  "diagnostics": [
+    "[2026-10-09T09:21:26.758Z] [magic-context][pi] DISCARDED CONTEXT RESULT stage=schema/claim elapsed=6ms recovery=not attempted Pi context pass superseded before writer admission"
+  ],
+  "events": [
+    {
+      "at": 1791537654082,
+      "type": "extension_ui_request",
+      "id": "159f4b1e50830958",
+      "method": "notify",
+      "message": "⚠️ Magic Context: The \"protected_tags\" setting is deprecated and ignored. Use \"protected_tokens\" instead.",
+      "notifyType": "warning"
+    },
+    {
+      "at": 1791537654110,
+      "type": "extension_ui_request",
+      "id": "159f4b1e57430959",
+      "method": "setStatus",
+      "statusKey": "magic-context",
+      "statusText": "mc: 11.2K (4%) · idle"
+    },
+    {
+      "at": 1791537654110,
+      "type": "extension_ui_request",
+      "id": "159f4b1e5783095a",
+      "method": "setWidget",
+      "widgetKey": "autoresearch"
+    },
+    {
+      "at": 1791537684521,
+      "type": "extension_error",
+      "extensionPath": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-JK6nbj/probe.mjs",
+      "event": "context",
+      "error": "handler timed out after 30000ms"
+    },
+    {
+      "at": 1791537684529,
+      "type": "message_end",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "MC641_ORIGINAL"
+          }
+        ],
+        "attribution": "user",
+        "timestamp": 1791537654132
+      },
+      "messageId": "msg-1"
+    },
+    {
+      "at": 1791537684539,
+      "type": "extension_ui_request",
+      "id": "159f4b3c0ec3095b",
+      "method": "notify",
+      "message": "Magic Context could not safely prepare this turn; send your message again. stage=provider dispatch elapsed=0ms recovery=no managed result; refused (missing managed context receipt)",
+      "notifyType": "error"
+    },
+    {
+      "at": 1791537684545,
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "content": [],
+        "api": "anthropic-messages",
+        "provider": "mock",
+        "model": "mock-model",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "aborted",
+        "errorMessage": "Interrupted by user",
+        "errorId": 67112960,
+        "timestamp": 1791537684541,
+        "completedAt": 1791537684545
+      },
+      "messageId": "msg-2"
+    },
+    {
+      "at": 1791537684550,
+      "type": "extension_ui_request",
+      "id": "159f4b3c1183095d",
+      "method": "setStatus",
+      "statusKey": "magic-context",
+      "statusText": "mc: 12K (5%) · idle"
+    },
+    {
+      "at": 1791537684554,
+      "type": "agent_end",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "MC641_ORIGINAL"
+            }
+          ],
+          "attribution": "user",
+          "timestamp": 1791537654132
+        },
+        {
+          "role": "assistant",
+          "content": [],
+          "api": "anthropic-messages",
+          "provider": "mock",
+          "model": "mock-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "aborted",
+          "errorMessage": "Interrupted by user",
+          "timestamp": 1791537684541
+        }
+      ],
+      "isTerminal": true,
+      "yielded": true
+    },
+    {
+      "at": 1791537684556,
+      "type": "extension_ui_request",
+      "id": "159f4b3c1303095e",
+      "method": "setWidget",
+      "widgetKey": "autoresearch"
+    }
+  ],
+  "requests": []
+}

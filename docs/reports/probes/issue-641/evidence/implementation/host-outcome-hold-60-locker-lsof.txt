@@ -1,0 +1,17 @@
+COMMAND   PID        USER   FD   TYPE             DEVICE SIZE/OFF                NODE NAME
+Python  26714 ufukaltinok  cwd    DIR               1,17       64          2655073902 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-03v5Sp/work
+Python  26714 ufukaltinok  txt    REG               1,17    52128          1273198841 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
+Python  26714 ufukaltinok  txt    REG               1,17    77368          2648572740 /private/var/db/diagnostics/logd/.plist-cache.suDbE15I
+Python  26714 ufukaltinok  txt    REG               1,17    32768          2655073973 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-03v5Sp/data/cortexkit/magic-context/context.db-shm
+Python  26714 ufukaltinok  txt    REG               1,17   107312          1273199533 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/math.cpython-39-darwin.so
+Python  26714 ufukaltinok  txt    REG               1,17    85488          1273199455 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_heapq.cpython-39-darwin.so
+Python  26714 ufukaltinok  txt    REG               1,17   141520          1273199445 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_datetime.cpython-39-darwin.so
+Python  26714 ufukaltinok  txt    REG               1,17   115056          1273199493 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/lib-dynload/_sqlite3.cpython-39-darwin.so
+Python  26714 ufukaltinok  txt    REG               1,17  4129840 1152921500312609216 /usr/lib/dyld
+Python  26714 ufukaltinok  txt    REG               1,17  2949168          1273198831 /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Python3
+Python  26714 ufukaltinok    0r   CHR                3,2      0t0                 336 /dev/null
+Python  26714 ufukaltinok    1u  unix 0x7db467246c42290a      0t0                     ->0xe15734da323270f1
+Python  26714 ufukaltinok    2u  unix 0x73b1c3e63a2c5c1e      0t0                     ->0xf1cf124cfe4aae66
+Python  26714 ufukaltinok    3u   REG               1,17     4096          2655073917 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-03v5Sp/data/cortexkit/magic-context/context.db
+Python  26714 ufukaltinok    4u   REG               1,17  3580312          2655073972 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-03v5Sp/data/cortexkit/magic-context/context.db-wal
+Python  26714 ufukaltinok    5u   REG               1,17    32768          2655073973 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/omp-e2e-03v5Sp/data/cortexkit/magic-context/context.db-shm

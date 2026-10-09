@@ -1,0 +1,23 @@
+bun test v1.4.2 (744846f84)
+
+src/issue-641-publication.test.ts:
+139 | 				outputMessages: output,
+140 | 				outputEntryIds: ["u"],
+141 | 				cacheBusting: false,
+142 | 				assertCurrentPass: budget.assert,
+143 | 			}),
+144 | 		).toThrow();
+          ^
+error: expect(received).toThrow()
+
+Received function did not throw
+Received value: undefined
+
+      at <anonymous> (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_630d1ecbfc2147b0/.cache/issue-641/ff8d438a16ebbc3eae82acd29ea572731b086971/packages/pi-plugin/src/issue-641-publication.test.ts:144:5)
+(fail) serialization stalled past deadline does not replace LKG or advance served tags [51.41ms]
+
+ 0 pass
+ 1 filtered out
+ 1 fail
+ 1 expect() calls
+Ran 1 test across 1 file. [71.00ms]

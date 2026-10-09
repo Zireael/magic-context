@@ -1,0 +1,40 @@
+{
+  "revision": "ff8d438a16ebbc3eae82acd29ea572731b086971",
+  "results": [
+    {
+      "file": "issue-641-deadline.test.ts",
+      "timeout": "5000",
+      "name": "emergency foreground never joins a still-running historian",
+      "exit": 1,
+      "red": true
+    },
+    {
+      "file": "issue-641-publication.test.ts",
+      "timeout": "5000",
+      "name": "expired deferred publication cannot flush LKG, served capture or a transform decision",
+      "exit": 1,
+      "red": true
+    },
+    {
+      "file": "issue-641-publication.test.ts",
+      "timeout": "5000",
+      "name": "serialization stalled past deadline does not replace LKG or advance served tags",
+      "exit": 1,
+      "red": true
+    },
+    {
+      "file": "issue-641-dispatch.test.ts",
+      "timeout": "5000",
+      "name": "OMP dispatch fence refuses missing, in-progress and expired receipts synchronously",
+      "exit": 1,
+      "red": true
+    },
+    {
+      "file": "issue-640-deadline-review-r2.test.ts",
+      "timeout": "90000",
+      "name": "r2: writer wait plus in-flight historian must fit OMP's 30-second deadline",
+      "exit": 1,
+      "red": true
+    }
+  ]
+}

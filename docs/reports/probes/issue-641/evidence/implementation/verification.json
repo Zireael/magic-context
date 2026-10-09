@@ -1,0 +1,35 @@
+{
+  "versions": {"bun":"1.4.2 (744846f84)","typescript":"5.9.3","biome":"2.5.1","omp":"18.8.6"},
+  "gates": [
+    {"command":"bun run build","platform":"linux and local macOS for real host artifacts","result":"passed","builds":"plugin v1 680 modules; plugin v2 727 modules; Pi 986 modules; CLI 404 modules"},
+    {"command":"bun run typecheck","platform":"linux","result":"passed","scope":"four package scripts plus shared retina build typecheck; silent on success"},
+    {"command":"bun packages/pi-plugin/node_modules/typescript/bin/tsc -p docs/reports/probes/issue-641/tsconfig.json","platform":"linux","result":"passed","scope":"nine probe sources and their imported Pi/core/e2e sources; silent on success"},
+    {"command":"bun run lint","platform":"linux","result":"passed","files":1678,"warnings":"pre-existing: plugin 6, Pi 10, CLI 1; existing infos also retained"},
+    {"command":"env -u OPENCODE_DB HOME=<throwaway> GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=$PWD bun run test","platform":"linux","result":"failed on unrelated Node WASM temporary-bundle dependency resolution","pass":7336,"skip":7,"fail":1,"tests":7344,"files":714,"failure":"Node WASM Transformers fixture > builds with real fs and persists a model for offline reuse: Cannot find module onnxruntime-web/webgpu from the temporary bundle"},
+    {"command":"env -u OPENCODE_DB HOME=<throwaway> GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=$PWD bun run --cwd packages/pi-plugin test","platform":"linux","result":"full suite run; three requested retained failures plus two source anchor mismatches subsequently repaired and independently mutation-proved","pass":1688,"skip":4,"fail":5,"tests":1697,"files":168},
+    {"command":"bun test packages/pi-plugin/src/issue-641-*.test.ts packages/pi-plugin/src/pi-context-budget.test.ts packages/pi-plugin/src/signal-peek-drain.test.ts","platform":"linux, isolated HOME, OPENCODE_DB unset","result":"passed after every mutant restored","pass":39,"fail":0,"expects":136,"files":6},
+    {"command":"bun test packages/pi-plugin/src/issue-641-*.test.ts packages/pi-plugin/src/pi-context-budget.test.ts packages/pi-plugin/src/context-handler.test.ts","platform":"linux, isolated HOME, OPENCODE_DB unset","result":"passed","pass":167,"fail":0,"expects":668,"files":6},
+    {"command":"MC640_R2_DEADLINE=1 bun test packages/pi-plugin/src/issue-640-deadline-review-r2.test.ts","platform":"macOS, isolated HOME/TMPDIR, OPENCODE_DB unset","result":"passed unchanged expectation after approved mandatory scheduling change","pass":1,"fail":0,"expects":9,"uncontendedMs":3183.80275,"held15500Ms":18461.292375},
+    {"command":"bun docs/reports/probes/issue-641/base-acceptance.ts","platform":"macOS for native lsof/SQLite control","result":"passed: five named behavioral failures on ff8d438a, no setup failures counted","cases":5},
+    {"command":"bun docs/reports/probes/issue-641/differential.ts","platform":"macOS with lsof isolation receipts","result":"passed: independent base/head managed arrays and selected rows byte-identical","turns":3},
+    {"command":"bun docs/reports/probes/issue-641/host.ts <fast|slow|refuse|late-mc|fenced|ephemeral|outcome> --fixed","platform":"macOS, real OMP 18.8.6 CLI","result":"passed all seven controls; no unmanaged main request in unlatched sessions","controls":7,"fallbackMs":4,"outcomeHandlerMs":25745,"hostDeadlineMs":30000},
+    {"command":"bun docs/reports/probes/issue-641/subagent.ts <2.2|10|60>","platform":"macOS, real OMP task children","result":"passed all three holds; completed managed children; none sent during the 60s lock","controls":3,"firstChildAfterLockMs":[2896,11052,60439]},
+    {"command":"bun docs/reports/probes/issue-641/collect.ts --implementation <10 disposable roots>","platform":"macOS, throwaway stores read-only","result":"passed real-body projection, refused-publication checks and durable collection","receipts":10},
+    {"command":"sidekick comment review of changed code files","result":"completed; 13 code files reviewed, generated data skipped; genuinely unclear comments rewritten"},
+    {"command":"aft inspect changed source; retry scoped to pi-context-budget.ts","result":"partial: TypeScript reports 0 diagnostics; Biome/callgraph producers unavailable. Explicit typecheck/lint gates passed."}
+  ],
+  "intentional_r2_failures": [
+    "r2: distinct multi-block real messages must not collide with one served fallback",
+    "r2: an unserved racing real row is not served evidence merely because user text mentions its number",
+    "r2: reloading a session must not forget its already-served fallback number"
+  ],
+  "notes": [
+    "The two final full-suite source-contract failures were caused solely by their old guardAwait matcher not recognizing budget.waitMandatory. Assertions/properties stayed intact; the repaired 25-test file passed and each source guard reddened alone under its original mutation.",
+    "Initial Linux suite attempts exposed Git dubious-ownership errors after isolating HOME. Command-local safe.directory removed that environment failure without changing global Git configuration.",
+    "One full Pi rerun was cancelled by the AFT restart (exit 130), not counted as verification; subsequent complete run and final targeted gate are recorded above.",
+    "The native fixture exposed load-sensitive 21s cutoff failures during tagging/serialization. Parent approved mandatory work through the same 25s outcome clock, preserving 21s optional search/retry cutoff and the absolute publication guard. No expectation was weakened.",
+    "Bun printed directory-mismatch diagnostics for --tsconfig-override during differential resolution; exit 0 and independent source-resolution assertions succeeded.",
+    "Pinned OMP install: 112 packages under ignored .cache/issue-641/host; two postinstalls blocked. Repository package scripts used frozen install with no manifest/lockfile changes.",
+    "Every host root and .db descriptor is disposable. No production store or production frequency sample was accessed. The shipped side-session latch explicitly degrades the independent dispatch fence after a verified side context."
+  ]
+}

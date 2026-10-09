@@ -1,0 +1,18 @@
+bun test v1.4.2 (744846f84)
+
+src/issue-641-dispatch.test.ts:
+44 | 		budget = pass;
+45 | 		await pending;
+46 | 		return { messages: event.messages };
+47 | 	});
+48 | 	const fence = h.handlers.get("before_provider_request");
+49 | 	if (!fence) throw new Error("dispatch fence missing");
+                            ^
+error: dispatch fence missing
+      at <anonymous> (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_630d1ecbfc2147b0/.cache/issue-641/ff8d438a16ebbc3eae82acd29ea572731b086971/packages/pi-plugin/src/issue-641-dispatch.test.ts:49:24)
+(fail) OMP dispatch fence refuses missing, in-progress and expired receipts synchronously [0.35ms]
+
+ 0 pass
+ 5 filtered out
+ 1 fail
+Ran 1 test across 1 file. [30.00ms]

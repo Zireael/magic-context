@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "turns": 3,
+  "receipts": [
+    {
+      "revision": "ff8d438a16ebbc3eae82acd29ea572731b086971",
+      "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/differential-W1WA4X/ff8d438a16ebbc3eae82acd29ea572731b086971",
+      "outputSha256": "4a6cd42cb4ec7b5e9c10bd9dfbd92a8ab1afd746a06f64c048952be9a568ec27",
+      "rowsSha256": "7b2ed501f344379577144e006b16e9605158cc38398e51755cced5885fd7f5a6"
+    },
+    {
+      "revision": "head",
+      "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/differential-W1WA4X/head",
+      "outputSha256": "4a6cd42cb4ec7b5e9c10bd9dfbd92a8ab1afd746a06f64c048952be9a568ec27",
+      "rowsSha256": "7b2ed501f344379577144e006b16e9605158cc38398e51755cced5885fd7f5a6"
+    }
+  ]
+}

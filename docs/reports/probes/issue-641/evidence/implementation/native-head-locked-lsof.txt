@@ -1,0 +1,21 @@
+COMMAND   PID        USER   FD     TYPE             DEVICE SIZE/OFF                NODE NAME
+bun     85589 ufukaltinok  cwd      DIR               1,17     1824          2650488372 /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_630d1ecbfc2147b0
+bun     85589 ufukaltinok  txt      REG               1,17 61884464          1288160918 /Users/ufukaltinok/.bun/bin/bun
+bun     85589 ufukaltinok  txt      REG               1,17   236480          2474481942 /private/var/db/timezone/tz/2026d.1.0/icutz/icutz44l.dat
+bun     85589 ufukaltinok  txt      REG               1,17    77368          2648572740 /private/var/db/diagnostics/logd/.plist-cache.suDbE15I
+bun     85589 ufukaltinok  txt      REG               1,17    32768          2654015299 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/native/magic-context/bg_a1704ae3546049d5/mc-test-owned-deadline-uXeGz5/context.db-shm
+bun     85589 ufukaltinok  txt      REG               1,17  4129840 1152921500312609216 /usr/lib/dyld
+bun     85589 ufukaltinok  txt      REG               1,17 36103568 1152921500312619766 /usr/share/icu/icudt78l.dat
+bun     85589 ufukaltinok    0r     CHR                3,2      0t0                 336 /dev/null
+bun     85589 ufukaltinok    1u     REG               1,17       28          2654013276 /Users/ufukaltinok/.local/share/cortexkit/aft/runner/bash-tasks/dea1ee4241a5c4da/bash-8a3698b7921c959b/io/stdout
+bun     85589 ufukaltinok    2u     REG               1,17       62          2654013277 /Users/ufukaltinok/.local/share/cortexkit/aft/runner/bash-tasks/dea1ee4241a5c4da/bash-8a3698b7921c959b/io/stderr
+bun     85589 ufukaltinok    3u  KQUEUE                                                 count=0, state=0x12
+bun     85589 ufukaltinok    4u  KQUEUE                                                 count=0, state=0x10
+bun     85589 ufukaltinok    5u     REG               1,17     4096          2654015296 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/native/magic-context/bg_a1704ae3546049d5/mc-test-owned-deadline-uXeGz5/context.db
+bun     85589 ufukaltinok    6u     REG               1,17  3551472          2654015298 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/native/magic-context/bg_a1704ae3546049d5/mc-test-owned-deadline-uXeGz5/context.db-wal
+bun     85589 ufukaltinok    7u     REG               1,17    32768          2654015299 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-641/native/magic-context/bg_a1704ae3546049d5/mc-test-owned-deadline-uXeGz5/context.db-shm
+bun     85589 ufukaltinok    8u  KQUEUE                                                 count=0, state=0x12
+bun     85589 ufukaltinok    9u    unix 0xf027bc665cb965d0      0t0                     ->0x81e59252fe59bbd2
+bun     85589 ufukaltinok   10u    unix 0x9c1d2a02c1f52794      0t0                     ->0x865758fdb0818a04
+bun     85589 ufukaltinok   11u    unix 0xb98f652080e20b0d      0t0                     ->0x8aaf7fefc9c2d0d5
+bun     85589 ufukaltinok   13u    unix 0x5558b1d960f76339      0t0                     ->0x15a3660414683a4a
