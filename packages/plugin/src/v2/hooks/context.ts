@@ -59,6 +59,7 @@ import {
 } from "../../hooks/magic-context/dropped-input-guard";
 import { EmergencyFailClosedError } from "../../hooks/magic-context/emergency-fail-closed";
 import { resolveContextLimit, resolveModelKey } from "../../hooks/magic-context/event-resolvers";
+import { estimateFinalWireInputTokens } from "../../hooks/magic-context/final-wire-token-estimate";
 import {
     type HistoryBoundaryRepair,
     repairMissingHistoryBoundary,
@@ -74,12 +75,16 @@ import {
     lkgProviderInputTotal,
     noteLkgProviderResponse,
 } from "../../hooks/magic-context/lkg-measured-request";
+import { lkgReplayLimit, measureLkgReplay } from "../../hooks/magic-context/lkg-replay-fit";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
 import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
-import { preloadTokenizer } from "../../hooks/magic-context/read-session-formatting";
+import {
+    estimateTokens,
+    preloadTokenizer,
+} from "../../hooks/magic-context/read-session-formatting";
 import { servedModuleM0Text } from "../../hooks/magic-context/rust-served-m0";
 import {
     STORAGE_BUSY_MESSAGE,
@@ -90,7 +95,10 @@ import { createTransform, type TransformDeps } from "../../hooks/magic-context/t
 import { UnmanagedOverWindowError } from "../../hooks/magic-context/unmanaged-over-window";
 import { UnresolvedHistoryBoundaryError } from "../../hooks/magic-context/unresolved-history-boundary";
 import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
-import { createMessagesTransformHandler } from "../../plugin/messages-transform";
+import {
+    createMessagesTransformHandler,
+    tryMessagesTransformLkgReplay,
+} from "../../plugin/messages-transform";
 import { registerRpcHandlers } from "../../plugin/rpc-handlers";
 import { hideSubagentTools } from "../../plugin/subagent-tool-policy";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
@@ -151,6 +159,7 @@ import { V2LkgSystemReplay } from "./lkg-system";
 import { modelLimitCacheWarm, warmModelLimitCacheFromCatalog } from "./model-limit-cache";
 import { adaptPayload, HEAD_IDS } from "./payload";
 import { interruptBeforeProvider, V2ContextRefusal } from "./refusal";
+
 import { RestoredRowCache } from "./restore-rows";
 import { createV2RpcLiveSessionState } from "./rpc-live-state";
 import { createV2RustRefusalRecovery, resolveV2RustModeModuleClient } from "./rust-mode";
@@ -176,6 +185,8 @@ import { registerTools } from "./tools";
 import type { SessionContext, V2Context } from "./types";
 import { persistV2UsageReading } from "./usage-persist";
 import { resolveUsageReading } from "./usage-reading";
+
+class V2LkgAdmissionReplay extends Error {}
 
 // The event stream can trail the terminal store row by a scheduler tick; keep failure surfacing fast.
 const HIDDEN_SESSION_ERROR_GRACE_MS = 50;
@@ -642,8 +653,8 @@ export async function registerContext(context: V2Context) {
      */
     const storeStorageNotice = (sessionID: string, text: string, what: string): void => {
         void withoutSqliteTransformPass(() =>
-            context.session
-                .wait({ sessionID })
+            Promise.resolve()
+                .then(() => context.session.wait({ sessionID }))
                 .then(() => deliverSynthetic(context, sessionID, text))
                 .catch((error: unknown) =>
                     sessionLog(
@@ -1409,13 +1420,78 @@ export async function registerContext(context: V2Context) {
         // descriptions become the baseline every later request (any session,
         // any model) starts from. Registration happens once, in tools.ts.
         applyV2PromptSurfaceTools(draft, promptSurfaceRuntime, config.prompt_surface);
+        const admissionDb = db ?? storage.current();
+        const replayFits: NonNullable<
+            Parameters<typeof tryMessagesTransformLkgReplay>[0]["replayFits"]
+        > = (messages) => {
+            // Every recovery path fits this draft's tools and the system paired
+            // with the saved messages, never the previous turn's tool counts.
+            const system = structuredClone(draft.system);
+            if (
+                !admissionDb ||
+                !draft.tools ||
+                !lkgSystems.restore(draft.sessionID, getSlot(draft.sessionID), draft.system, system)
+            )
+                return false;
+            const limit = lkgReplayLimit({
+                db: admissionDb,
+                sessionId: draft.sessionID,
+                model: {
+                    providerID: draft.model.providerID,
+                    modelID: draft.model.id,
+                },
+                modelKey: `${draft.model.providerID}/${draft.model.id}`,
+            });
+            if (limit === undefined) return false;
+            let toolDefinitionTokens = 0;
+            for (const tool of Object.values(draft.tools)) {
+                if (!tool || typeof tool.description !== "string" || !tool.input) return false;
+                const schema = JSON.stringify(tool.input);
+                if (!schema) return false;
+                toolDefinitionTokens += estimateTokens(tool.description) + estimateTokens(schema);
+            }
+            return (
+                measureLkgReplay({
+                    messages,
+                    limit,
+                    estimate: () =>
+                        estimateFinalWireInputTokens({
+                            messages,
+                            toolDefinitionTokens,
+                            systemPromptTokens: estimateTokens(JSON.stringify(system)),
+                            providerID: draft.model.providerID,
+                            modelID: draft.model.id,
+                            agentName: draft.agent,
+                        }),
+                }).fit === "under"
+            );
+        };
         let postFold = false;
         try {
             // Check writer admission before best-effort setup writers can each spend
             // their own busy timeout. No transform callback runs in this transaction.
-            const admissionDb = db ?? storage.current();
             if (!compactionOff && admissionDb)
-                await withAsyncPrivilegedWriter(admissionDb, () => undefined);
+                await withAsyncPrivilegedWriter(admissionDb, () => undefined, {
+                    beforeRetry: (error) => {
+                        const mapped = adaptPayload(draft);
+                        if (
+                            tryMessagesTransformLkgReplay({
+                                output: mapped as unknown as Parameters<
+                                    ReturnType<typeof createMessagesTransformHandler>
+                                >[1],
+                                sessionId: draft.sessionID,
+                                error,
+                                agent: draft.agent,
+                                rust: transform?.getRustReplayParticipant() ?? undefined,
+                                replayFits,
+                                onLkgReplay: restoreLkgSystem,
+                            })
+                        ) {
+                            mapped.commit();
+                            throw new V2LkgAdmissionReplay();
+                        }
+                    },
+                });
             // Hidden maintenance carriers returned above with their explicit
             // allow-lists. Only this request's map changes, never registrations
             // or the primary session's cached tool definitions.
@@ -1774,6 +1850,7 @@ export async function registerContext(context: V2Context) {
             await createMessagesTransformHandler({
                 magicContext: { "experimental.chat.messages.transform": transform },
                 compactionOff,
+                replayFits,
                 onLkgReplay: restoreLkgSystem,
                 rustReplayParticipant: () => transform?.getRustReplayParticipant() ?? null,
             })(
@@ -1826,6 +1903,7 @@ export async function registerContext(context: V2Context) {
                 lkgSystems.capture(draft.sessionID, capturedSlot, systemAtEntry, draft.system);
             }
         } catch (error) {
+            if (error instanceof V2LkgAdmissionReplay) return;
             if (error instanceof V2ContextRefusal) throw error;
             if (
                 !compactionOff &&
@@ -1835,6 +1913,7 @@ export async function registerContext(context: V2Context) {
                     const mapped = adaptPayload(draft);
                     try {
                         await createMessagesTransformHandler({
+                            replayFits,
                             onLkgReplay: restoreLkgSystem,
                             rustReplayParticipant: () =>
                                 transform?.getRustReplayParticipant() ?? null,

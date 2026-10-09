@@ -99,6 +99,7 @@ import {
 } from "./ctx-reduce-nudge-pi";
 import { injectM0M1Pi, mustMaterializePi } from "./inject-compartments-pi";
 import * as piHistorian from "./pi-historian-runner";
+import { capturePiServedArray } from "./served-array-ledger";
 import {
 	assistantMessage,
 	assistantToolCall,
@@ -365,7 +366,9 @@ describe("Pi project binding retry", () => {
 				.prepare(
 					"SELECT sql FROM sqlite_master WHERE name = 'session_projects'",
 				)
-				.get() as { sql: string }
+				.get() as {
+				sql: string;
+			}
 		).sql;
 		try {
 			db.exec("DROP TABLE session_projects");
@@ -1177,7 +1180,9 @@ describe("Pi fallback tag adoption", () => {
 				sessionId,
 				tagger,
 				fingerprints,
-				{ hasFallbackMessageTags: false },
+				{
+					hasFallbackMessageTags: false,
+				},
 			);
 			expect(readTagRow(db, sessionId, 7)?.messageId).toBe(`${realId}:p0`);
 			expect(tagger.getTag(sessionId, `${realId}:p0`, "message")).toBe(7);
@@ -1551,7 +1556,11 @@ describe("Pi fallback tag adoption", () => {
 				0,
 				null,
 				null,
-				{ tokenCount: 9, inputTokenCount: null, reasoningTokenCount: null },
+				{
+					tokenCount: 9,
+					inputTokenCount: null,
+					reasoningTokenCount: null,
+				},
 			);
 			db.prepare(
 				"UPDATE tags SET status = 'dropped' WHERE session_id = ? AND tag_number = 71",
@@ -1560,6 +1569,9 @@ describe("Pi fallback tag adoption", () => {
 			queuePendingOp(db, sessionId, 71, "drop", 200);
 			tagger.bindTag(sessionId, `${fallbackId}:p0`, 70);
 			tagger.bindTag(sessionId, `${realId}:p0`, 71);
+			capturePiServedArray(sessionId, [userMessage("§71§ hello", 70)], {
+				servedTagNumbers: [71],
+			});
 
 			contextHandlerInternals.adoptPiFallbackTags(
 				db,
@@ -1698,7 +1710,7 @@ describe("Pi fallback tag adoption", () => {
 		}
 	});
 
-	it("cheap-gate: does not build the owner map when no pi-msg tool owners exist", () => {
+	it("prepares tool owners outside the writer even if discovery found no synthetic owners", () => {
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-pi-tool-owner-cheap-gate";
@@ -1716,8 +1728,9 @@ describe("Pi fallback tag adoption", () => {
 				0,
 				"entry-real",
 			);
-			// Split a gate hole from a wrong test premise: the tool-owner gate MUST
-			// be false here (no pi-msg-* owners), so the branch-walk never runs.
+			// A sibling can add a synthetic tool-owner tag before BEGIN. Prepare
+			// assistant/call identities even when no such tag is visible yet, so
+			// resolving the new tag needs no branch walk while holding the writer.
 			expect(hasPiFallbackToolOwnerTags(db, sessionId)).toBe(false);
 
 			let resolverCalls = 0;
@@ -1729,15 +1742,14 @@ describe("Pi fallback tag adoption", () => {
 				{
 					messages: [assistantToolCall("call-real", "Read", {}, 90)],
 					resolveStableId: () => {
+						expect(db.inTransaction).toBe(false);
 						resolverCalls += 1;
 						return "entry-real";
 					},
 				},
 			);
 
-			// The cheap hasPiFallbackToolOwnerTags gate short-circuits before any
-			// branch walk, so the resolver is never consulted.
-			expect(resolverCalls).toBe(0);
+			expect(resolverCalls).toBe(1);
 		} finally {
 			closeQuietly(db);
 		}
@@ -2915,7 +2927,9 @@ describe("registerPiContextHandler", () => {
 			);
 			expect(
 				db.prepare("SELECT status FROM notes WHERE id=?").get(notice.id),
-			).toEqual({ status: "dismissed" });
+			).toEqual({
+				status: "dismissed",
+			});
 			clearContextHandlerSession(sessionId);
 			onNoteTrigger(db, sessionId, "todos_complete");
 			await turn("entry-3");
@@ -4427,6 +4441,8 @@ describe("registerPiContextHandler", () => {
 			await expect(
 				handler(throwingEvent, fakeContext("ses-context") as never),
 			).rejects.toMatchObject({ name: "PiStorageBusyError" });
+			// Refusal is immediate; storage diagnostics are deliberately deferred.
+			await new Promise<void>((resolve) => setImmediate(resolve));
 			expect(getOrCreateSessionMeta(db, "ses-context").lastTransformError).toBe(
 				"boom messages",
 			);
