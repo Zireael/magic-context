@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 const repo = resolve(import.meta.dir, "../../../..");
-const ref = "ff8d438a16ebbc3eae82acd29ea572731b086971";
+const ref = process.env.MC_PROBE_BASE_REF ?? "ff8d438a16ebbc3eae82acd29ea572731b086971";
 const snapshot = join(repo,".cache","issue-641",ref);
 mkdirSync(snapshot,{recursive:true});
 execFileSync("git",["archive","--format=tar","--output",join(snapshot,"source.tar"),ref],{cwd:repo});
@@ -37,7 +37,7 @@ for (const [revision,dir] of [[ref,snapshot],["head",repo]]) {
 for (const file of ["output.json","rows.json"]) {
   if (!readFileSync(join(receipts[0].root,file)).equals(readFileSync(join(receipts[1].root,file)))) throw new Error("differential differs: "+file);
 }
-const evidence=join(import.meta.dir,"evidence","implementation");
+const evidence=process.env.MC_PROBE_EVIDENCE_DIR ?? join(import.meta.dir,"evidence","implementation");
 mkdirSync(evidence,{recursive:true});
 for (const lane of receipts) for(const file of ["output.json","rows.json","lsof.txt"]) copyFileSync(join(lane.root,file),join(evidence,`diff-${lane.revision==='head'?'head':'base'}-${file}`));
 writeFileSync(join(evidence,"differential.json"),JSON.stringify({passed:true,turns:3,receipts},null,2)+"\n");

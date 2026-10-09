@@ -82,7 +82,7 @@ try{
  const lockedAt=audit.find(row=>row.phase==='locked')?.at;
  if(!lockedAt || (hold===60 && children.some(request=>request.receivedAt<lockedAt+hold*1000-500))) throw new Error("child dispatched while long writer held");
  const summary={version,root:iso.baseDir,hold,pid:host.pid,totalMs:Date.now()-start,childRequests:children.length,firstChildAfterLockMs:children[0].receivedAt-lockedAt,result:completed};
- const evidence=join(import.meta.dir,"evidence/implementation");
+  const evidence=process.env.MC_PROBE_EVIDENCE_DIR ?? join(import.meta.dir,"evidence/implementation");
  mkdirSync(evidence,{recursive:true});
  writeFileSync(join(evidence,`subagent-hold-${hold}.json`),JSON.stringify({summary,audit,requests},null,2)+"\n");
  writeFileSync(join(evidence,`subagent-hold-${hold}-lsof.txt`),lsof);

@@ -524,12 +524,14 @@ export function createMessagesTransformHandler(args: {
                         await withAsyncPrivilegedWriter(admissionDb, () => undefined, {
                             beforeRetry: (error) => {
                                 admissionRetried = true;
+                                entry = captureEntry();
                                 if (
                                     sessionId &&
                                     tryMessagesTransformLkgReplay({
                                         output,
                                         sessionId,
                                         error,
+                                        entry,
                                         rust: resolveRust(sessionId),
                                         agent,
                                         onLkgReplay: args.onLkgReplay,
