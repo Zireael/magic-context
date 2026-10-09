@@ -411,6 +411,8 @@ export function createMessagesTransformHandler(args: {
      */
     compactionOff?: boolean;
     onStorageBusyRefusal?: (sessionId: string, message: string) => Promise<void>;
+    /** Fit saved messages against the host's current tools and paired system prompt. */
+    replayFits?: (messages: MessageLike[]) => boolean;
     /** Validate and restore host-owned prompt segments before adopting replayed messages. */
     onLkgReplay?: () => void;
     internalChildSessions?: Set<string>;
@@ -534,6 +536,7 @@ export function createMessagesTransformHandler(args: {
                                         entry,
                                         rust: resolveRust(sessionId),
                                         agent,
+                                        replayFits: args.replayFits,
                                         onLkgReplay: args.onLkgReplay,
                                     })
                                 )
@@ -619,6 +622,7 @@ export function createMessagesTransformHandler(args: {
                     entry,
                     rust: resolveRust(sessionId),
                     agent,
+                    replayFits: args.replayFits,
                     onLkgReplay: args.onLkgReplay,
                 })
             ) {

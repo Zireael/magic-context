@@ -653,8 +653,8 @@ export async function registerContext(context: V2Context) {
      */
     const storeStorageNotice = (sessionID: string, text: string, what: string): void => {
         void withoutSqliteTransformPass(() =>
-            context.session
-                .wait({ sessionID })
+            Promise.resolve()
+                .then(() => context.session.wait({ sessionID }))
                 .then(() => deliverSynthetic(context, sessionID, text))
                 .catch((error: unknown) =>
                     sessionLog(
@@ -1420,11 +1420,56 @@ export async function registerContext(context: V2Context) {
         // descriptions become the baseline every later request (any session,
         // any model) starts from. Registration happens once, in tools.ts.
         applyV2PromptSurfaceTools(draft, promptSurfaceRuntime, config.prompt_surface);
+        const admissionDb = db ?? storage.current();
+        const replayFits: NonNullable<
+            Parameters<typeof tryMessagesTransformLkgReplay>[0]["replayFits"]
+        > = (messages) => {
+            // Every recovery path fits this draft's tools and the system paired
+            // with the saved messages, never the previous turn's tool counts.
+            const system = structuredClone(draft.system);
+            if (
+                !admissionDb ||
+                !draft.tools ||
+                !lkgSystems.restore(draft.sessionID, getSlot(draft.sessionID), draft.system, system)
+            )
+                return false;
+            const limit = lkgReplayLimit({
+                db: admissionDb,
+                sessionId: draft.sessionID,
+                model: {
+                    providerID: draft.model.providerID,
+                    modelID: draft.model.id,
+                },
+                modelKey: `${draft.model.providerID}/${draft.model.id}`,
+            });
+            if (limit === undefined) return false;
+            let toolDefinitionTokens = 0;
+            for (const tool of Object.values(draft.tools)) {
+                if (!tool || typeof tool.description !== "string" || !tool.input) return false;
+                const schema = JSON.stringify(tool.input);
+                if (!schema) return false;
+                toolDefinitionTokens += estimateTokens(tool.description) + estimateTokens(schema);
+            }
+            return (
+                measureLkgReplay({
+                    messages,
+                    limit,
+                    estimate: () =>
+                        estimateFinalWireInputTokens({
+                            messages,
+                            toolDefinitionTokens,
+                            systemPromptTokens: estimateTokens(JSON.stringify(system)),
+                            providerID: draft.model.providerID,
+                            modelID: draft.model.id,
+                            agentName: draft.agent,
+                        }),
+                }).fit === "under"
+            );
+        };
         let postFold = false;
         try {
             // Check writer admission before best-effort setup writers can each spend
             // their own busy timeout. No transform callback runs in this transaction.
-            const admissionDb = db ?? storage.current();
             if (!compactionOff && admissionDb)
                 await withAsyncPrivilegedWriter(admissionDb, () => undefined, {
                     beforeRetry: (error) => {
@@ -1438,62 +1483,7 @@ export async function registerContext(context: V2Context) {
                                 error,
                                 agent: draft.agent,
                                 rust: transform?.getRustReplayParticipant() ?? undefined,
-                                replayFits: (messages) => {
-                                    // Retry fitting uses this draft's tools and the system
-                                    // paired with the saved messages, never last turn's counts.
-                                    const system = structuredClone(draft.system);
-                                    if (
-                                        !draft.tools ||
-                                        !lkgSystems.restore(
-                                            draft.sessionID,
-                                            getSlot(draft.sessionID),
-                                            draft.system,
-                                            system,
-                                        )
-                                    )
-                                        return false;
-                                    const limit = lkgReplayLimit({
-                                        db: admissionDb,
-                                        sessionId: draft.sessionID,
-                                        model: {
-                                            providerID: draft.model.providerID,
-                                            modelID: draft.model.id,
-                                        },
-                                        modelKey: `${draft.model.providerID}/${draft.model.id}`,
-                                    });
-                                    if (limit === undefined) return false;
-                                    let toolDefinitionTokens = 0;
-                                    for (const tool of Object.values(draft.tools)) {
-                                        if (
-                                            !tool ||
-                                            typeof tool.description !== "string" ||
-                                            !tool.input
-                                        )
-                                            return false;
-                                        const schema = JSON.stringify(tool.input);
-                                        if (!schema) return false;
-                                        toolDefinitionTokens +=
-                                            estimateTokens(tool.description) +
-                                            estimateTokens(schema);
-                                    }
-                                    return (
-                                        measureLkgReplay({
-                                            messages,
-                                            limit,
-                                            estimate: () =>
-                                                estimateFinalWireInputTokens({
-                                                    messages,
-                                                    toolDefinitionTokens,
-                                                    systemPromptTokens: estimateTokens(
-                                                        JSON.stringify(system),
-                                                    ),
-                                                    providerID: draft.model.providerID,
-                                                    modelID: draft.model.id,
-                                                    agentName: draft.agent,
-                                                }),
-                                        }).fit === "under"
-                                    );
-                                },
+                                replayFits,
                                 onLkgReplay: restoreLkgSystem,
                             })
                         ) {
@@ -1860,6 +1850,7 @@ export async function registerContext(context: V2Context) {
             await createMessagesTransformHandler({
                 magicContext: { "experimental.chat.messages.transform": transform },
                 compactionOff,
+                replayFits,
                 onLkgReplay: restoreLkgSystem,
                 rustReplayParticipant: () => transform?.getRustReplayParticipant() ?? null,
             })(
@@ -1922,6 +1913,7 @@ export async function registerContext(context: V2Context) {
                     const mapped = adaptPayload(draft);
                     try {
                         await createMessagesTransformHandler({
+                            replayFits,
                             onLkgReplay: restoreLkgSystem,
                             rustReplayParticipant: () =>
                                 transform?.getRustReplayParticipant() ?? null,
