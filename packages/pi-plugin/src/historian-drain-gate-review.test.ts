@@ -112,10 +112,14 @@ it("review regression: Pi skipped low-pressure pass must end emergency catch-up 
 });
 
 for (const lane of ["defer", "flush", "fold", "force"] as const) {
-	// Maintainer Ufuk's decision on whether explicit flush bypasses the historian veto is pending.
-	const review = lane === "flush" ? it.skip : it;
-	const name = `review mutation contract: Pi ${lane} pass during a registered historian`;
-	review(name, async () => {
+	// An explicit flush is a deliberate user action and the exception to the historian hold.
+	const name =
+		lane === "flush"
+			? "review contract: Pi explicit flush drains drops during a registered historian"
+			: lane === "defer"
+				? "review contract: Pi automatic defer holds drops during a registered historian"
+				: `review mutation contract: Pi ${lane} pass during a registered historian`;
+	it(name, async () => {
 		const db = createTestDb();
 		const sessionId = `review-pi-wire-${lane}`;
 		const fake = createFakePi();
@@ -172,6 +176,7 @@ for (const lane of ["defer", "flush", "fold", "force"] as const) {
 			);
 			if (!old) throw new Error("Expected the old instruction to have tag 1");
 			queuePendingOp(db, sessionId, old.tagNumber, "drop");
+			expect(getPendingOps(db, sessionId)).toHaveLength(1);
 			remove = __test.setInFlightHistorianForTests(sessionId, held);
 			if (lane === "flush") signalPiPendingMaterialization(sessionId);
 			if (lane === "fold") model = "anthropic/claude-opus-4-6";
@@ -189,7 +194,7 @@ for (const lane of ["defer", "flush", "fold", "force"] as const) {
 			console.log(
 				`REVIEW_PI_WIRE ${JSON.stringify({ lane, pending, sameBytes: served === baseline, digest: createHash("sha256").update(served).digest("hex") })}`,
 			);
-			if (lane === "fold" || lane === "force") {
+			if (lane === "flush" || lane === "fold" || lane === "force") {
 				expect(pending).toBe(0);
 				expect(served).not.toBe(baseline);
 			} else {

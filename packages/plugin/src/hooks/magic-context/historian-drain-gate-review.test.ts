@@ -179,10 +179,14 @@ it("review startup: boundary preparation errors clear intent, registry and lease
 });
 
 for (const lane of ["defer", "flush", "fold", "force"] as const) {
-    // Maintainer Ufuk's decision on whether explicit flush bypasses the historian veto is pending.
-    const review = lane === "flush" ? it.skip : it;
-    const name = `review mutation contract: OpenCode ${lane} pass during a registered historian`;
-    review(name, async () => {
+    // An explicit flush is a deliberate user action and the exception to the historian hold.
+    const name =
+        lane === "flush"
+            ? "review contract: OpenCode explicit flush drains drops during a registered historian"
+            : lane === "defer"
+              ? "review contract: OpenCode automatic defer holds drops during a registered historian"
+              : `review mutation contract: OpenCode ${lane} pass during a registered historian`;
+    it(name, async () => {
         const sessionId = `review-wire-${lane}`;
         getOrCreateSessionMeta(db, sessionId);
         const materialize = new Set<string>();
@@ -229,6 +233,7 @@ for (const lane of ["defer", "flush", "fold", "force"] as const) {
         const old = getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === 1);
         if (!old) throw new Error("Expected the old instruction to have tag 1");
         queuePendingOp(db, sessionId, old.tagNumber, "drop");
+        expect(getPendingOps(db, sessionId)).toHaveLength(1);
         let release!: () => void;
         const active = registerActiveCompartmentRun(
             sessionId,
@@ -263,7 +268,7 @@ for (const lane of ["defer", "flush", "fold", "force"] as const) {
                 `REVIEW_WIRE ${JSON.stringify({ lane, active: getActiveCompartmentRun(sessionId) === active, inProgress: getOrCreateSessionMeta(db, sessionId).compartmentInProgress, pending, sameBytes: served === baseline, digest: createHash("sha256").update(served).digest("hex") })}`,
             );
             expect(getActiveCompartmentRun(sessionId)).toBe(active);
-            if (lane === "fold" || lane === "force") {
+            if (lane === "flush" || lane === "fold" || lane === "force") {
                 expect(pending).toBe(0);
                 expect(served).not.toBe(baseline);
             } else {
