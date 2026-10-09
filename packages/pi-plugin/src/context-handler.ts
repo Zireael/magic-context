@@ -235,6 +235,7 @@ import {
 	withoutSqliteTransformPass,
 	withSqliteBackgroundWriter,
 } from "@magic-context/core/shared/sqlite";
+import { stableStringify } from "@magic-context/core/shared/stable-json";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
 	TEXT_TAG_IDENTITY_MARKER,
@@ -2029,12 +2030,10 @@ function piMessageEntryFingerprint(message: unknown): string | null {
 		content?: unknown;
 	};
 	if (typeof record.role !== "string") return null;
-	const firstText = firstPiTextContent(record.content);
-	const firstTextHash = crypto
+	const contentHash = crypto
 		.createHash("sha256")
-		.update(firstText ?? "")
-		.digest("hex")
-		.slice(0, 16);
+		.update(stableStringify(record.content))
+		.digest("hex");
 	return JSON.stringify([
 		typeof record.responseId === "string" ? record.responseId : null,
 		typeof record.timestamp === "number" || typeof record.timestamp === "string"
@@ -2042,21 +2041,8 @@ function piMessageEntryFingerprint(message: unknown): string | null {
 			: null,
 		record.role,
 		typeof record.toolCallId === "string" ? record.toolCallId : null,
-		firstTextHash,
+		contentHash,
 	]);
-}
-
-function firstPiTextContent(content: unknown): string | null {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return null;
-	for (const part of content) {
-		if (!part || typeof part !== "object") continue;
-		const record = part as { type?: unknown; text?: unknown };
-		if (record.type === "text" && typeof record.text === "string") {
-			return record.text;
-		}
-	}
-	return null;
 }
 
 /**
