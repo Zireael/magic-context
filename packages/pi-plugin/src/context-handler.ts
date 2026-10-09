@@ -366,6 +366,7 @@ import {
 	capturePiServedArray,
 	clearPiServedArraySession,
 	getPiServedTagNumbers,
+	PiServedIdentityError,
 } from "./served-array-ledger";
 import { stripPiDroppedPlaceholderMessages } from "./strip-placeholders-pi";
 import { stripPiProcessedImages } from "./strip-processed-images-pi";
@@ -4312,6 +4313,12 @@ export function registerPiContextHandler(
 		} catch (err) {
 			budget.assertOutcome();
 			budget.stage = "recovery";
+			if (err instanceof PiServedIdentityError) {
+				// A newly prepared LKG is not served evidence when recording its
+				// numbers failed. Cancel that capture and refuse, rather than replay it.
+				if (sessionIdForError) clearPiLkgSessionState(sessionIdForError);
+				throw new PiStorageBusyError({ cause: err });
+			}
 			if (err instanceof PiLkgAdmissionReplay && sessionIdForError) {
 				budget.assertOutcome();
 				if (!budget.sideTurn)

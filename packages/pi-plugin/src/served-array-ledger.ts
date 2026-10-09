@@ -19,6 +19,15 @@ const FLUSH_DELAY_MS = 25;
 
 type JsonMessage = Record<string, unknown>;
 
+export class PiServedIdentityError extends Error {
+	constructor(cause: unknown) {
+		super("Pi served-number identity could not be persisted or restored", {
+			cause,
+		});
+		this.name = "PiServedIdentityError";
+	}
+}
+
 export interface PiServedArrayDigestRecord {
 	version: 1;
 	session_id: string;
@@ -365,7 +374,7 @@ export function capturePiServedArray(
 		return record;
 	} catch (error) {
 		options.assertCurrentPass?.();
-		if (identityPersistenceFailed) throw error;
+		if (identityPersistenceFailed) throw new PiServedIdentityError(error);
 		recordWriteFailure(error);
 		return undefined;
 	}

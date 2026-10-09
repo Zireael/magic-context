@@ -71,13 +71,16 @@ describe("Pi served-array digest ledger", () => {
 		const storageDir = temporaryDirectory();
 		const modulePath = join(import.meta.dir, "served-array-ledger.ts");
 		const run = (code: string) => {
-			const result = Bun.spawnSync([
-				process.execPath,
-				"--tsconfig-override",
-				join(import.meta.dir, "../tsconfig.json"),
-				"-e",
-				code,
-			]);
+			const result = Bun.spawnSync(
+				[
+					process.execPath,
+					"--tsconfig-override",
+					join(import.meta.dir, "../tsconfig.json"),
+					"-e",
+					code,
+				],
+				{ windowsHide: true },
+			);
 			expect(result.exitCode, result.stderr.toString()).toBe(0);
 			return result.stdout.toString().trim();
 		};
