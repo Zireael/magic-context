@@ -2637,12 +2637,13 @@ export function registerPiContextHandler(
 			);
 			assertCurrentPass();
 			// Raw side-turn snapshots are not acknowledgments of the main served prefix.
-			if (!budget.sideTurn) schedulePiTransformDecisionResolve({
-				db: options.db,
-				sessionId,
-				branchEntries,
-				assertCurrentPass,
-			});
+			if (!budget.sideTurn)
+				schedulePiTransformDecisionResolve({
+					db: options.db,
+					sessionId,
+					branchEntries,
+					assertCurrentPass,
+				});
 			let rawOrdinalCount: number | undefined;
 			const rawMessageProvider = {
 				getMessageCount: () =>

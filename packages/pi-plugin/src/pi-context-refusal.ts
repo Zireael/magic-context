@@ -7,7 +7,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { isCheckoutClaimRefusalError } from "@magic-context/core/features/magic-context/checkout-claim";
 import { log } from "@magic-context/core/shared/logger";
 import { withSqliteTransformPass } from "@magic-context/core/shared/sqlite";
-import { classifyOmpPayload, isOmpSideContext } from "./omp-request-kind";
+import { isOmpSideContext } from "./omp-request-kind";
 import { PiContextBudget } from "./pi-context-budget";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
 
@@ -23,7 +23,7 @@ interface Operation {
 	refused: boolean;
 	ended: boolean;
 }
-const receiptMaps = new Set<Map<string | object, Operation>>();
+const receiptMaps = new Set<Map<string | object, unknown>>();
 export function clearPiContextReceipt(sessionId: string): void {
 	for (const receipts of receiptMaps) receipts.delete(sessionId);
 }
@@ -59,7 +59,12 @@ export function registerPiGuardedContext(
 	} = {},
 ): void {
 	const operations = new Map<string | object, Operation>();
+	const sideSessions = new Map<
+		string | object,
+		{ contexts: number; sides: number }
+	>();
 	receiptMaps.add(operations);
+	receiptMaps.add(sideSessions);
 	const newOperation = (): Operation => ({
 		ready: false,
 		refused: false,
@@ -112,7 +117,13 @@ export function registerPiGuardedContext(
 			operations.set(operationKey(ctx), newOperation());
 		});
 		pi.on("agent_end", (_event, ctx) => {
-			const operation = operations.get(operationKey(ctx));
+			const key = operationKey(ctx);
+			const counts = sideSessions.get(key);
+			if (counts)
+				log(
+					`[magic-context][pi] OMP context counts session=${String(key)} side_contexts=${counts.sides} context_passes=${counts.contexts} dispatch_fence=${counts.sides ? "latched off" : "on"}`,
+				);
+			const operation = operations.get(key);
 			if (operation) {
 				operation.ended = true;
 				operation.ready = false;
@@ -121,10 +132,15 @@ export function registerPiGuardedContext(
 		// OMP supplies session identity, but no provider-attempt ID. The latest
 		// context pass is the receipt for this operation, including payload retries.
 		// No awaits, DB access or payload hashing are allowed in this backstop.
-		pi.on("before_provider_request", (event, ctx) => {
+		pi.on("before_provider_request", (_event, ctx) => {
 			if (options.compactionOff?.(ctx)) return;
-			if (classifyOmpPayload(event.payload) !== "main") return;
 			const key = operationKey(ctx);
+			// OMP erases the ephemeral request's attribution before this hook. Its
+			// abort API is session-wide, so after seeing OMP's attributed reminder
+			// and prompt in a context event we cannot safely abort any payload here.
+			// Every other session still requires a completed managed context pass,
+			// even when we do not recognize the provider's body format.
+			if (sideSessions.get(key)?.sides) return;
 			let operation = operations.get(key);
 			if (!operation) {
 				operation = newOperation();
@@ -152,6 +168,18 @@ export function registerPiGuardedContext(
 		const budget = new PiContextBudget();
 		budget.sideTurn = fenceEnabled && isOmpSideContext(event);
 		const key = operationKey(ctx);
+		if (fenceEnabled) {
+			let counts = sideSessions.get(key);
+			if (!counts) {
+				counts = { contexts: 0, sides: 0 };
+				sideSessions.set(key, counts);
+			}
+			counts.contexts++;
+			if (budget.sideTurn && ++counts.sides === 1)
+				log(
+					`[magic-context][pi] OMP dispatch fence disabled for session ${String(key)}: verified ephemeral context; session-wide abort cannot distinguish provider operations (side_contexts=${counts.sides} context_passes=${counts.contexts})`,
+				);
+		}
 		const owner = operations.get(key);
 		let operation = operations.get(key);
 		if (budget.sideTurn || !operation || !fenceEnabled) {

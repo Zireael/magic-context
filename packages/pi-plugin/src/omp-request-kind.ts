@@ -1,21 +1,26 @@
 import type { ContextEvent } from "@earendil-works/pi-coding-agent";
 
-// Oh My Pi 18.8.6 inserts this reminder in every ephemeral snapshot before its
-// side prompt. It is an opt-out signature, never authority to admit a main turn.
+// OMP marks an ephemeral request with a developer reminder and a final user
+// prompt, both attributed to "agent" in the context event. Provider adapters
+// erase attribution; reminder text on the wire is not proof of a side request.
 const SIDE_REMINDER =
-	"Ephemeral side-channel turn; reuses current conversation context.";
+	"<system-reminder>\nEphemeral side-channel turn; reuses current conversation context.\nTool catalog attached only to keep prompt cache warm; tools NOT available this turn.\nDo NOT emit tool calls; reply plain text only. Tool calls discarded without execution.\n</system-reminder>";
 
 function textContainsReminder(value: unknown): boolean {
-	if (typeof value === "string") return value.includes(SIDE_REMINDER);
+	if (typeof value === "string") return value.trim() === SIDE_REMINDER;
 	if (!Array.isArray(value)) return false;
 	return value.some((block) => {
 		if (!block || typeof block !== "object") return false;
 		const part = block as { text?: unknown; content?: unknown };
-		return typeof part.text === "string" && part.text.includes(SIDE_REMINDER);
+		return typeof part.text === "string" && part.text.trim() === SIDE_REMINDER;
 	});
 }
 
 export function isOmpSideContext(event: ContextEvent): boolean {
+	const tail = event.messages.at(-1) as
+		| { role?: unknown; attribution?: unknown }
+		| undefined;
+	if (tail?.role !== "user" || tail.attribution !== "agent") return false;
 	return event.messages.some((message) => {
 		const row = message as {
 			role?: unknown;
@@ -28,24 +33,4 @@ export function isOmpSideContext(event: ContextEvent): boolean {
 			textContainsReminder(row.content)
 		);
 	});
-}
-
-/** Inspect known provider message containers without serializing or hashing history. */
-export function classifyOmpPayload(
-	payload: unknown,
-): "main" | "side" | "unknown" {
-	if (!payload || typeof payload !== "object") return "unknown";
-	const body = payload as {
-		messages?: unknown;
-		input?: unknown;
-		contents?: unknown;
-	};
-	const messages = body.messages ?? body.input ?? body.contents;
-	if (!Array.isArray(messages)) return "unknown";
-	for (const message of messages) {
-		if (!message || typeof message !== "object") continue;
-		const row = message as { content?: unknown; parts?: unknown };
-		if (textContainsReminder(row.content ?? row.parts)) return "side";
-	}
-	return "main";
 }
