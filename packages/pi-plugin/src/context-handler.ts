@@ -100,7 +100,7 @@ import {
 	getPendingPiCompactionMarkerState,
 	getPersistedToolTagAccounting,
 	getTagsByNumbers,
-	type getTagsBySession,
+	getTagsBySession,
 	getTagsForPendingOperations,
 	isWrapupInProgress,
 	setSessionWorkMetrics,
@@ -3229,7 +3229,7 @@ export function registerPiContextHandler(
 				);
 			}
 
-			const sessionMeta = sessionMetaForUsage;
+			let sessionMeta = sessionMetaForUsage;
 			const modelKey = liveModelBySession.get(sessionId);
 			const providerId =
 				typeof ctx.model?.provider === "string"
@@ -3481,9 +3481,8 @@ export function registerPiContextHandler(
 				clearEmergencyDropSample(options.db, sessionId);
 			}
 
-			// Emergency reclaim uses already-published history and available tags.
-			// Never join the historian here: it can outlive the host's context deadline.
-			// Its independent publication remains available to the next admitted pass.
+			// Prefer already-published history and available tools. Prose-only history
+			// needs the historian's summary before its queued drops can reclaim bytes.
 			const hardUsagePercentage = needsEmergencyBump
 				? Math.max(EMERGENCY_BLOCK_PERCENTAGE, usagePercentage)
 				: windowGeometry?.usableHard && usageInputTokens > 0
@@ -3509,8 +3508,58 @@ export function registerPiContextHandler(
 					);
 					sessionLog(
 						sessionId,
-						`EMERGENCY: usage=${usagePercentage.toFixed(1)}% — notified user, evaluating available tiered emergency reclaim without joining historian`,
+						`EMERGENCY: usage=${usagePercentage.toFixed(1)}% — notified user, evaluating available emergency reclaim`,
 					);
+				}
+
+				const historian = inFlightHistorian.get(sessionId);
+				const visibleToolResults = new Set(
+					(event.messages as PiAgentMessage[]).flatMap((message) =>
+						message.role === "toolResult" ? [message.toolCallId] : [],
+					),
+				);
+				const toolTags = getTagsBySession(options.db, sessionId).filter(
+					(tag) => tag.type === "tool",
+				);
+				const knownTools = new Set(toolTags.map((tag) => tag.messageId));
+				const activeTools = new Set(
+					toolTags
+						.filter((tag) => tag.status === "active")
+						.map((tag) => tag.messageId),
+				);
+				const hasToolReclaim = (event.messages as PiAgentMessage[]).some(
+					(message) =>
+						message.role === "assistant" &&
+						message.content.some(
+							(part) =>
+								part.type === "toolCall" &&
+								visibleToolResults.has(part.id) &&
+								(!knownTools.has(part.id) || activeTools.has(part.id)),
+						),
+				);
+				if (
+					historian &&
+					!hasToolReclaim &&
+					getPendingOps(options.db, sessionId).length === 0 &&
+					!historyRefreshSessions.has(sessionId) &&
+					!deferredHistoryRefreshSessions.has(sessionId)
+				) {
+					budget.stage = "emergency historian";
+					// Charge the join to the existing optional clock, leaving the outcome
+					// reserve for replay or refusal. A timeout must not serve unreduced input.
+					await budget.wait(historian);
+					assertCurrentPass();
+					// Publication happened after the pass snapshot. Read both the new
+					// summary and its boundary so the queued drops are safe on this pass.
+					sessionMeta = getOrCreateSessionMeta(options.db, sessionId);
+					piM0M1PassSnapshot = options.injection
+						? createPiM0M1PassSnapshot({
+								db: options.db,
+								sessionId,
+								compactionOff: false,
+								sessionMeta,
+							})
+						: undefined;
 				}
 
 				// Disarm a stuck emergency-recovery flag only after real pressure has

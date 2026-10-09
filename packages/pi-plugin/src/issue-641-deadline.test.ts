@@ -9,10 +9,11 @@ import {
 	createFakePi,
 	createTestDb,
 	fakeContext,
+	toolResultMessage,
 	userMessage,
 } from "./test-utils.test";
 
-test("emergency foreground never joins a still-running historian", async () => {
+test("emergency foreground with tool reclaim never joins a still-running historian", async () => {
 	const db = createTestDb();
 	const sessionId = "deadline-historian";
 	let finish!: () => void;
@@ -23,9 +24,19 @@ test("emergency foreground never joins a still-running historian", async () => {
 	try {
 		const fake = createFakePi();
 		registerPiContextHandler(fake.pi as never, { db });
-		const raw = [userMessage("available state", 1)];
+		const raw = [
+			userMessage("available state", 1),
+			{
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "read-1", name: "read", arguments: {} },
+				],
+				timestamp: 2,
+			},
+			toolResultMessage("read-1", "available result", 3),
+		];
 		const ctx = Object.assign(
-			fakeContext(sessionId, process.cwd(), ["u"], raw),
+			fakeContext(sessionId, process.cwd(), ["u", "a", "r"], raw),
 			{
 				getContextUsage: () => ({
 					tokens: 96000,
