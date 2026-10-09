@@ -679,7 +679,8 @@ export function guardSqliteTransformPass(guard: { assert(): void; remainingMs():
     if (lease) lease.guard = guard;
 }
 
-function assertTransformWrite(): void {
+/** Check the attached generation/cancellation/deadline guard before SQL or cache publication. */
+export function assertTransformWrite(): void {
     if (!backgroundWriterScope.getStore()) transformPassScope.getStore()?.guard?.assert();
 }
 
