@@ -36,7 +36,7 @@ function harness(handler: Parameters<typeof registerPiGuardedContext>[1]) {
 
 afterEach(() => __setPiHarnessKindForTesting(undefined));
 
-test("OMP dispatch fence refuses missing, in-progress and expired receipts synchronously", async () => {
+test("OMP dispatch fence refuses missing and in-progress receipts but preserves completed receipts", async () => {
 	let finish!: () => void;
 	let budget!: PiContextBudget;
 	const pending = new Promise<void>((resolve) => {
@@ -74,10 +74,13 @@ test("OMP dispatch fence refuses missing, in-progress and expired receipts synch
 	h.order.length = 0;
 	fence({ payload: { messages: [] } }, h.ctx);
 	expect(h.order).toEqual([]);
+	// The transformed messages already returned before the preparation deadline;
+	// a delayed provider attempt must not abort that completed request.
 	budget.elapsed = () => 32000;
+	const entryCount = h.entries.length;
 	fence({ payload: { messages: [] } }, h.ctx);
-	expect(h.entries.at(-1)?.message).toContain("elapsed=32000ms");
-	expect(h.order).toEqual(["notice", "entry", "abort"]);
+	expect(h.entries).toHaveLength(entryCount);
+	expect(h.order).toEqual([]);
 });
 
 test("late old pass cannot abort or overwrite the newer operation receipt", async () => {

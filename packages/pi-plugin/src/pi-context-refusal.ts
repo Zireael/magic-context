@@ -152,8 +152,11 @@ export function registerPiGuardedContext(
 			const isCurrent = () => operations.get(key) === active;
 			const budget = active.pass ?? new PiContextBudget();
 			try {
-				budget.assertOutcome();
-				if (!active.ready || active.refused || active.ended)
+				// A context result completed before the preparation deadline remains
+				// valid on provider retries. Ownership, refusal and turn end still apply.
+				budget.assertOwner();
+				if (!budget.completed) budget.assertOutcome();
+				if (!active.ready || active.refused || active.ended || budget.abandoned)
 					throw new Error("missing managed context receipt");
 			} catch (error) {
 				active.refused = true;
