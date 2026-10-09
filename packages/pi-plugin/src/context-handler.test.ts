@@ -45,6 +45,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
+	DRAIN_WINDOW_MS,
 	getEmergencyInputSample,
 	getMergedReasoningStrippedIds,
 	getOverflowState,
@@ -97,6 +98,7 @@ import {
 	setPiChannel1Baseline,
 } from "./ctx-reduce-nudge-pi";
 import { injectM0M1Pi, mustMaterializePi } from "./inject-compartments-pi";
+import * as piHistorian from "./pi-historian-runner";
 import {
 	assistantMessage,
 	assistantToolCall,
@@ -109,6 +111,101 @@ import {
 } from "./test-utils.test";
 import { createCtxReduceTool } from "./tools/ctx-reduce";
 import { createPiTranscript } from "./transcript-pi";
+
+it("Pi spent drain budget prevents historian startup, preserves served bytes, and resumes asynchronously at reset", async () => {
+	const db = createTestDb();
+	const sessionId = "ses-pi-spent-drain-hot-path";
+	const fake = createFakePi();
+	const start = spyOn(piHistorian, "runPiHistorian").mockImplementation(
+		async () => {},
+	);
+	const logger = await import("@magic-context/core/shared/logger");
+	const log = spyOn(logger, "sessionLog");
+	try {
+		updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+		registerPiContextHandler(fake.pi as never, {
+			db,
+			protectedTags: 0,
+			historian: {
+				runner: {
+					harness: "pi",
+					run: mock(async () => ({
+						ok: true,
+						assistantText: "",
+						durationMs: 1,
+					})),
+				} as unknown as SubagentRunner,
+				model: "test/historian",
+				historianChunkTokens: 20_000,
+				executeThresholdPercentage: 80,
+				protectedTags: 0,
+			},
+		});
+		const handler = fake.handlers.get("context") as (
+			event: { messages: never[] },
+			ctx: never,
+		) => Promise<{ messages: unknown[] }>;
+		const raw = [
+			...Array.from({ length: 12 }, (_, i) =>
+				i % 2
+					? assistantMessage("history ".repeat(6000), i + 1)
+					: userMessage("history ".repeat(6000), i + 1),
+			),
+			...Array.from({ length: 5 }, (_, i) => userMessage("protected", i + 13)),
+		];
+		const pass = (tokens: number) => {
+			const messages = structuredClone(raw);
+			return handler({ messages: messages as never[] }, {
+				...fakeContext(
+					sessionId,
+					process.cwd(),
+					messages.map((_, i) => `entry-${i + 1}`),
+					messages,
+				),
+				getContextUsage: () => ({
+					tokens,
+					percent: tokens / 2000,
+					contextWindow: 200_000,
+				}),
+			} as never);
+		};
+		const startedAt = Date.now();
+		db.prepare(
+			"UPDATE session_meta SET protected_tail_drain_window_started_at = ?, protected_tail_drain_tokens = 500000 WHERE session_id = ?",
+		).run(startedAt, sessionId);
+		const first = await pass(156_000);
+		await awaitInFlightHistorians(sessionId);
+		const bytes = JSON.stringify(first.messages);
+		for (let i = 0; i < 2; i++) {
+			updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() });
+			expect(JSON.stringify((await pass(156_000)).messages)).toBe(bytes);
+			await awaitInFlightHistorians(sessionId);
+		}
+		expect(start).not.toHaveBeenCalled();
+		expect(getOrCreateSessionMeta(db, sessionId).compartmentInProgress).toBe(
+			false,
+		);
+		expect(
+			log.mock.calls.filter(
+				([id, text]) =>
+					id === sessionId && String(text).includes("next eligible at"),
+			),
+		).toHaveLength(1);
+		db.prepare(
+			"UPDATE session_meta SET protected_tail_drain_window_started_at = ? WHERE session_id = ?",
+		).run(Date.now() - DRAIN_WINDOW_MS, sessionId);
+		await pass(156_000);
+		expect(start).not.toHaveBeenCalled();
+		await awaitInFlightHistorians(sessionId);
+		expect(start).toHaveBeenCalledTimes(1);
+	} finally {
+		await awaitInFlightHistorians(sessionId);
+		start.mockRestore();
+		log.mockRestore();
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
+});
 
 describe("Pi context project identity cache", () => {
 	it("serves byte-identical output with cached identity and one host-usage read per context", async () => {
@@ -4841,6 +4938,10 @@ describe("registerPiContextHandler", () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-cleared-historian-publish";
 		let release!: () => void;
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
 		try {
 			incrementHistorianFailure(db, sessionId, "previous failure");
 			const runner = {
@@ -4848,6 +4949,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => {
 					await new Promise<void>((resolve) => {
 						release = resolve;
+						markStarted();
 					});
 					return {
 						ok: true as const,
@@ -4885,9 +4987,11 @@ describe("registerPiContextHandler", () => {
 					messages as never,
 				) as never,
 			);
+			await started;
 			expect(runner.run).toHaveBeenCalledTimes(1);
 
 			clearContextHandlerSession(sessionId);
+			await started;
 			release();
 			await awaitInFlightHistorians();
 
@@ -4903,6 +5007,10 @@ describe("registerPiContextHandler", () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-active-historian-publish";
 		let release!: () => void;
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
 		try {
 			incrementHistorianFailure(db, sessionId, "previous failure");
 			const runner = {
@@ -4910,6 +5018,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => {
 					await new Promise<void>((resolve) => {
 						release = resolve;
+						markStarted();
 					});
 					return {
 						ok: true as const,
@@ -4947,6 +5056,7 @@ describe("registerPiContextHandler", () => {
 					messages as never,
 				) as never,
 			);
+			await started;
 			release();
 			await awaitInFlightHistorians();
 
@@ -4963,6 +5073,10 @@ describe("registerPiContextHandler", () => {
 		const clearedSessionId = "ses-pi-cleared-multi-historian";
 		const activeSessionId = "ses-pi-active-multi-historian";
 		const releases: Array<() => void> = [];
+		let markBothStarted!: () => void;
+		const bothStarted = new Promise<void>((resolve) => {
+			markBothStarted = resolve;
+		});
 		try {
 			incrementHistorianFailure(db, clearedSessionId, "previous failure");
 			incrementHistorianFailure(db, activeSessionId, "previous failure");
@@ -4972,6 +5086,7 @@ describe("registerPiContextHandler", () => {
 					const callIndex = releases.length;
 					await new Promise<void>((resolve) => {
 						releases.push(resolve);
+						if (releases.length === 2) markBothStarted();
 					});
 					return {
 						ok: true as const,
@@ -5020,6 +5135,7 @@ describe("registerPiContextHandler", () => {
 					activeMessages as never,
 				) as never,
 			);
+			await bothStarted;
 			expect(runner.run).toHaveBeenCalledTimes(2);
 
 			clearContextHandlerSession(clearedSessionId);

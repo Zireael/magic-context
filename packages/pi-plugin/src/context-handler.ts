@@ -184,6 +184,7 @@ import {
 	resolveExecuteThreshold,
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
+import { isHistorianDrainBudgetSpent } from "@magic-context/core/hooks/magic-context/historian-drain-gate";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import {
 	hasActiveAnthropicThinkingTurn,
@@ -4555,7 +4556,9 @@ function spawnPiHistorianRun(args: {
 	historian: PiHistorianOptions;
 	provider: { readMessages: () => ReturnType<typeof readPiSessionMessages> };
 	unregister: () => void;
-	boundarySnapshot: ProtectedTailBoundarySnapshot;
+	boundarySnapshot:
+		| ProtectedTailBoundarySnapshot
+		| (() => ProtectedTailBoundarySnapshot | undefined);
 	refreshBoundarySnapshot?: () => ProtectedTailBoundarySnapshot;
 	currentContextLimit: number;
 	fallbackModelId?: string;
@@ -4577,6 +4580,8 @@ function spawnPiHistorianRun(args: {
 	const controller = new AbortController();
 	historianAbortControllers.set(sessionId, controller);
 	const runPromise = (async () => {
+		// Defer the runner's synchronous prefix until the context handler has returned.
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
 		if (controller.signal.aborted) return;
 		const lease = acquireCompartmentLease(db, sessionId, holderId);
 		if (!lease) {
@@ -4595,6 +4600,11 @@ function spawnPiHistorianRun(args: {
 		}
 		const renewal = startPiCompartmentLeaseRenewal(db, sessionId, holderId);
 		try {
+			const runBoundary =
+				typeof boundarySnapshot === "function"
+					? boundarySnapshot()
+					: boundarySnapshot;
+			if (!runBoundary) return;
 			await runPiHistorian({
 				db,
 				sessionId,
@@ -4626,7 +4636,7 @@ function spawnPiHistorianRun(args: {
 					)?.contextWindow;
 					return isSaneLimit(window) ? window : undefined;
 				},
-				boundarySnapshot,
+				boundarySnapshot: runBoundary,
 				refreshBoundarySnapshot,
 				currentContextLimit,
 				historianTimeoutMs: historian.timeoutMs,
@@ -4966,7 +4976,6 @@ function maybeFireHistorian(args: {
 			finalWatermark: number,
 		) => readPiSessionMessagePage(ctx, afterOrdinal, limit, finalWatermark),
 	};
-	const unregister = setRawMessageProvider(sessionId, provider);
 	const modelKey = liveModelBySession.get(sessionId);
 	const triggerInputs = resolvePiHistorianTriggerInputs({
 		db,
@@ -4979,6 +4988,22 @@ function maybeFireHistorian(args: {
 		triggerInputs.executeThresholdPercentage,
 	).forceMaterializationPercentage;
 	const boundaryContextLimit = triggerInputs.contextLimit;
+	if (
+		isHistorianDrainBudgetSpent({
+			db,
+			sessionId,
+			contextLimit: boundaryContextLimit,
+			executeThresholdPercentage: triggerInputs.executeThresholdPercentage,
+			usagePercentage: usage.percentage,
+		})
+	) {
+		if (sessionMeta.compartmentInProgress) {
+			updateSessionMeta(db, sessionId, { compartmentInProgress: false });
+			sessionMeta.compartmentInProgress = false;
+		}
+		return;
+	}
+	const unregister = setRawMessageProvider(sessionId, provider);
 	const resolvePiBoundarySnapshot = (
 		emergencyTailScale?: 0.5 | 0.25,
 	): ProtectedTailBoundarySnapshot =>
@@ -5033,22 +5058,23 @@ function maybeFireHistorian(args: {
 
 			const failureCount = historianStateSnapshot.historianFailureCount;
 			if (failureCount > 0) {
-				boundarySnapshot = resolveRunnablePiBoundarySnapshot();
-			}
-			const shouldRecoverOnFirstPass =
-				failureCount > 0 &&
-				boundarySnapshot !== undefined &&
-				hasEligiblePiCompartmentHistory(db, sessionId, boundarySnapshot);
-			if (shouldRecoverOnFirstPass) {
 				triggered = true;
-				sessionLog(
-					sessionId,
-					`historian recovery triggered on session load after ${failureCount} failure(s)`,
-				);
-				sendPiIgnoredNotification(
-					ctx,
-					`## Historian recovery\n\nHistorian previously failed ${failureCount} time(s), so Magic Context is retrying history comparting immediately after restart.`,
-				);
+				const prepareRecoveryBoundary = ():
+					| ProtectedTailBoundarySnapshot
+					| undefined => {
+					const snapshot = resolveRunnablePiBoundarySnapshot();
+					if (!hasEligiblePiCompartmentHistory(db, sessionId, snapshot))
+						return undefined;
+					sessionLog(
+						sessionId,
+						`historian recovery triggered on session load after ${failureCount} failure(s)`,
+					);
+					sendPiIgnoredNotification(
+						ctx,
+						`## Historian recovery\n\nHistorian previously failed ${failureCount} time(s), so Magic Context is retrying history comparting immediately after restart.`,
+					);
+					return snapshot;
+				};
 				spawnPiHistorianRun({
 					pi: args.pi,
 					ctx,
@@ -5057,7 +5083,7 @@ function maybeFireHistorian(args: {
 					historian,
 					provider,
 					unregister,
-					boundarySnapshot: boundarySnapshot as ProtectedTailBoundarySnapshot,
+					boundarySnapshot: prepareRecoveryBoundary,
 					refreshBoundarySnapshot: resolveRunnablePiBoundarySnapshot,
 					currentContextLimit: boundaryContextLimit,
 					fallbackModelId: modelKey,

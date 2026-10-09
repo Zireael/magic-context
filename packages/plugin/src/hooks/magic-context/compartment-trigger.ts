@@ -17,6 +17,7 @@ import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
 import { hasReclaimRide, type ReclaimRideSignals, reclaimRideLabel } from "./cache-busting-signals";
+import { isHistorianDrainBudgetSpent } from "./historian-drain-gate";
 import {
     createDefaultBoundarySnapshotForTests,
     getRawHistoryEligibility,
@@ -476,6 +477,17 @@ export function checkCompartmentTrigger(
         );
         return { shouldFire: false };
     }
+
+    if (
+        isHistorianDrainBudgetSpent({
+            db,
+            sessionId,
+            usagePercentage: usage.percentage,
+            contextLimit: resolveBoundaryContextLimit(usage, contextLimit),
+            executeThresholdPercentage,
+        })
+    )
+        return { shouldFire: false };
 
     const lazyInMemoryTail = typeof inMemoryTail === "function" ? inMemoryTail : undefined;
     let resolvedInMemoryTail = typeof inMemoryTail === "function" ? undefined : inMemoryTail;
