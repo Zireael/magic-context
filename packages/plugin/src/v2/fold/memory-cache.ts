@@ -63,9 +63,10 @@ export class NativeFoldCache {
         sessionID: string,
         through: number,
         rows: Omit<NativeRowRecord, "revision">[],
+        after = -1,
     ): void {
         const kept = this.nativeRows.get(sessionID) ?? new Map<string, NativeRowRecord>();
-        for (const [id, row] of kept) if (row.seq <= through) kept.delete(id);
+        for (const [id, row] of kept) if (row.seq > after && row.seq <= through) kept.delete(id);
         for (const row of rows) kept.set(row.id, Object.freeze({ ...row, revision: 0 }));
         this.nativeRows.set(sessionID, kept);
     }
@@ -75,6 +76,10 @@ export class NativeFoldCache {
     }
     sequenceForID(sessionID: string, id: string): number | undefined {
         return this.nativeRows.get(sessionID)?.get(id)?.seq;
+    }
+    containsRows(sessionID: string, ids: readonly string[]): boolean {
+        const kept = this.nativeRows.get(sessionID);
+        return ids.every((id) => kept?.has(id));
     }
     rows(sessionID: string, after: number, through: number): NativeRowRecord[] {
         return [...(this.nativeRows.get(sessionID)?.values() ?? [])]

@@ -56,6 +56,7 @@ export class NativeFoldReplay {
     private readonly dirty = new Set<string>();
     private readonly unavailable = new Set<string>();
     private readonly metadata = new Map<string, V2RowStamp[]>();
+    private readonly metadataThrough = new Map<string, number>();
     private readonly loaded = new Map<string, number>();
     private readonly sources = new Map<string, string>();
     constructor(
@@ -83,6 +84,7 @@ export class NativeFoldReplay {
         this.dirty.add(sessionID);
         this.changed.add(sessionID);
         this.metadata.delete(sessionID);
+        this.metadataThrough.delete(sessionID);
     }
     private tail(sessionID: string): NativeTail | undefined {
         const record = this.storage.tail(sessionID);
@@ -116,12 +118,16 @@ export class NativeFoldReplay {
         reader: V2StoreReader,
     ): Omit<NativeRowRecord, "revision">[] {
         let metadata = this.metadata.get(sessionID);
+        const through = reader.latestSequence(sessionID);
         const known = new Set(metadata?.map((row) => row.id));
-        if (!metadata || native.some((message) => message.id && !known.has(message.id))) {
-            metadata = reader
-                .rowStampsThrough(sessionID, reader.latestSequence(sessionID))
-                .filter(conversational);
+        if (
+            !metadata ||
+            (this.metadataThrough.get(sessionID) ?? -1) < through ||
+            native.some((message) => message.id && !known.has(message.id))
+        ) {
+            metadata = reader.rowStampsThrough(sessionID, through).filter(conversational);
             this.metadata.set(sessionID, metadata);
+            this.metadataThrough.set(sessionID, through);
         }
         const byID = new Map(metadata.map((row) => [row.id, row]));
         const grouped = new Map<V2RowStamp, V2Message[]>();
@@ -209,6 +215,7 @@ export class NativeFoldReplay {
         );
         this.dirty.delete(draft.sessionID);
         this.metadata.delete(draft.sessionID);
+        this.metadataThrough.delete(draft.sessionID);
         this.loaded.set(draft.sessionID, through);
         const snapshot: Snapshot = {
             source: this.storage.sourceID,
@@ -232,37 +239,6 @@ export class NativeFoldReplay {
         };
         const tail = this.tail(sessionID);
         if (tail && tail.model !== model) this.invalidate(sessionID);
-        if (
-            this.dirty.has(sessionID) ||
-            ((this.loaded.get(sessionID) ?? -1) < cut.seq - 1 &&
-                !this.storage.admission(sessionID, cut.id))
-        ) {
-            const reader = this.openReader(sessionID);
-            try {
-                const fresh = reader.range(sessionID, -1, cut.seq - 1).filter(conversational);
-                const records = fresh.map((row) =>
-                    this.record(row, this.rendered(row, resolvedModel)),
-                );
-                this.storage.replaceRows(sessionID, cut.seq - 1, records);
-                await this.storage.saveTail(
-                    sessionID,
-                    JSON.stringify({
-                        model,
-                        sourceSeq: cut.seq - 1,
-                        baseline: tail?.baseline ?? cut.data.summary,
-                    }),
-                    [],
-                );
-                this.metadata.set(
-                    sessionID,
-                    fresh.map((row) => ({ ...row, time_created: row.time_created ?? 0 })),
-                );
-                this.loaded.set(sessionID, cut.seq - 1);
-                this.dirty.delete(sessionID);
-            } finally {
-                reader.close();
-            }
-        }
         let after = options.after ?? -1;
         if (options.bounded && options.after === undefined && !this.changed.has(sessionID)) {
             const state = getOrCreateSessionMeta(this.storage.db, sessionID);
@@ -278,6 +254,53 @@ export class NativeFoldReplay {
             )?.id;
             if (max.id <= (state.cachedM0MaxMutationId ?? 0) && boundary)
                 after = this.storage.sequenceForID(sessionID, boundary) ?? -1;
+        }
+        const through = cut.seq - 1;
+        let reader: V2StoreReader | undefined;
+        try {
+            let metadata = this.metadata.get(sessionID);
+            if (!metadata || (this.metadataThrough.get(sessionID) ?? -1) < through) {
+                reader = this.openReader(sessionID);
+                metadata = reader.rowStampsThrough(sessionID, through).filter(conversational);
+                this.metadata.set(sessionID, metadata);
+                this.metadataThrough.set(sessionID, through);
+            }
+            const required = metadata.filter((row) => row.seq > after && row.seq <= through);
+            // Sequence numbers also cover non-message rows. Only explicit source-row
+            // membership can certify a sparse or previously trimmed captured interval.
+            if (
+                this.dirty.has(sessionID) ||
+                !tail ||
+                ((this.loaded.get(sessionID) ?? -1) < through &&
+                    !this.storage.admission(sessionID, cut.id)) ||
+                !this.storage.containsRows(
+                    sessionID,
+                    required.map((row) => row.id),
+                )
+            ) {
+                reader ??= this.openReader(sessionID);
+                const fresh = reader.range(sessionID, after, through).filter(conversational);
+                const records = fresh.map((row) =>
+                    this.record(row, this.rendered(row, resolvedModel)),
+                );
+                const restored = new Set(records.map((row) => row.id));
+                if (required.some((row) => !restored.has(row.id)))
+                    throw new NativeReplayUnavailable("Host restore omitted a required source row");
+                this.storage.replaceRows(sessionID, through, records, after);
+                await this.storage.saveTail(
+                    sessionID,
+                    JSON.stringify({
+                        model,
+                        sourceSeq: through,
+                        baseline: tail?.baseline ?? cut.data.summary,
+                    }),
+                    [],
+                );
+                this.loaded.set(sessionID, through);
+                this.dirty.delete(sessionID);
+            }
+        } finally {
+            reader?.close();
         }
         const messages: V2Message[] = [];
         for (const row of this.storage.rows(sessionID, after, cut.seq - 1)) {
@@ -312,6 +335,7 @@ export class NativeFoldReplay {
     async forget(sessionID: string): Promise<void> {
         this.sources.delete(sessionID);
         this.metadata.delete(sessionID);
+        this.metadataThrough.delete(sessionID);
         this.loaded.delete(sessionID);
         this.unavailable.delete(sessionID);
         this.dirty.delete(sessionID);
