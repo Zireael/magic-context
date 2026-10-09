@@ -133,7 +133,15 @@ import { applyJsonSchemaParameterDescriptions } from "../../tools/parameter-desc
 import { createV2RustCompactionMarkerStrategy, trimToRecordedBoundary } from "../fold/boundary";
 import { hostMediaAsset, hostUsesMediaAssets, rememberHostMedia } from "../fold/host-media";
 import { v2CompactionMarkerStrategy } from "../fold/markers";
+import { nativeFoldCache } from "../fold/memory-cache";
+import {
+    copyNativeInput,
+    isLocalCheckpoint,
+    NativeFoldReplay,
+    nativeRowID,
+} from "../fold/native-replay";
 import { FoldOwner, foldDigest } from "../fold/owner";
+import { HostFoldPolicy } from "../fold/policy";
 import { restoreRow } from "../fold/restore";
 import { seedV2ForkFromParent, sessionHasMagicContextState } from "../fork-inheritance";
 import { cleanupLegacyHiddenChildren } from "../hidden-child-cleanup";
@@ -182,7 +190,7 @@ import {
     servedBoundaryRow,
 } from "./store";
 import { registerTools } from "./tools";
-import type { SessionContext, V2Context } from "./types";
+import type { SessionContext, V2Context, V2Message } from "./types";
 import { persistV2UsageReading } from "./usage-persist";
 import { resolveUsageReading } from "./usage-reading";
 
@@ -607,6 +615,15 @@ export async function registerContext(context: V2Context) {
         return;
     }
     const folds = new FoldOwner(context.storage);
+    // Experimental opt-in: byte preservation across providers and restarts must
+    // remain verified before automatic host folding can become the default.
+    const nativeFoldMemory =
+        !compactionOff && process.env.MC_OC2_INVISIBLE_FOLD === "1"
+            ? nativeFoldCache(() => storage.require())
+            : undefined;
+    const nativeFoldReplay = nativeFoldMemory
+        ? new NativeFoldReplay(nativeFoldMemory, () => openStoreReader())
+        : undefined;
     setOutputReserveConfig(config.output_reserve);
     const queriedModels = new Set<string>();
     const rawLimits = new Map<string, { context: number; input?: number; output?: number }>();
@@ -1174,6 +1191,17 @@ export async function registerContext(context: V2Context) {
     };
     // Context runs before generation. Persist terminal usage at execution completion
     // so pressure is visible even when the user has not started another turn.
+    const hostFolds =
+        nativeFoldReplay && nativeFoldMemory
+            ? new HostFoldPolicy({
+                  session: context.session,
+                  storage: nativeFoldMemory,
+                  openReader: openStoreReader,
+                  canReplay: (sessionID, reader) => nativeFoldReplay.canReplay(sessionID, reader),
+                  threshold: Number(process.env.MC_OC2_HOST_FOLD_ROWS ?? 1000),
+                  log: sessionLog,
+              })
+            : undefined;
     const usageController = new AbortController();
     const usageDone = (async () => {
         try {
@@ -1185,6 +1213,13 @@ export async function registerContext(context: V2Context) {
                 };
                 if (!event.data?.sessionID) continue;
                 const sessionID = event.data.sessionID;
+                if (
+                    event.type?.startsWith("session.revert.") ||
+                    event.type === "session.message.content.updated"
+                ) {
+                    nativeFoldReplay?.onEvent(event);
+                    restoredRows.forget(sessionID);
+                }
                 if (event.type === "session.error" || event.type === "session.execution.failed") {
                     const error = hiddenTerminalError(event);
                     if (error !== undefined) hiddenSessionErrors.set(sessionID, error);
@@ -1223,6 +1258,7 @@ export async function registerContext(context: V2Context) {
                     pendingMaterializationSessions.delete(sessionID);
                     lastHeuristicsTurnId.delete(sessionID);
                     restoredRows.forget(sessionID);
+                    await nativeFoldReplay?.forget(sessionID);
                     generateReplay.forget(sessionID);
                     systemPromptRefreshSessions.delete(sessionID);
                     systemPrompt?.clearSession(sessionID);
@@ -1231,11 +1267,18 @@ export async function registerContext(context: V2Context) {
                 }
                 if (event.type !== "session.execution.succeeded") continue;
                 const model = liveModels.get(sessionID);
-                if (model)
+                if (model) {
                     await recordUsage({
                         sessionID,
                         model: { providerID: model.providerID, id: model.modelID },
                     });
+                    // Never hold the event subscriber while native queue admission settles.
+                    if (
+                        !compactionOff &&
+                        typeof (await nativeFoldReplay?.baseline(sessionID)) === "string"
+                    )
+                        void hostFolds?.idle(sessionID);
+                }
             }
         } catch (error) {
             if (!usageController.signal.aborted)
@@ -1289,6 +1332,7 @@ export async function registerContext(context: V2Context) {
         // Leaving `result` unset hands the request back to the host, exactly as if
         // no hook were registered.
         if (compactionOff) return;
+        if (nativeFoldReplay) rememberHostMedia(draft.messages);
         const reader = openStoreReader();
         try {
             const watermark = reader.latestSequenceForIds(
@@ -1319,6 +1363,35 @@ export async function registerContext(context: V2Context) {
                 : moduleBaseline === null
                   ? "typescript_fallback"
                   : "module";
+            if (nativeFoldReplay) {
+                try {
+                    if (await nativeFoldReplay.canReplay(draft.sessionID, reader)) {
+                        const state = getOrCreateSessionMeta(storage.require(), draft.sessionID);
+                        const summary =
+                            moduleBaseline ??
+                            (await nativeFoldReplay.baseline(draft.sessionID)) ??
+                            state.cachedM0Bytes?.toString("utf8") ??
+                            "<session-history></session-history>";
+                        if (
+                            await nativeFoldReplay.supply({
+                                draft,
+                                reader,
+                                previousCut: reader.latestCompaction(draft.sessionID),
+                                summary,
+                            })
+                        ) {
+                            draft.result = { summary };
+                            return;
+                        }
+                    }
+                } catch (error) {
+                    nativeFoldReplay.invalidate(draft.sessionID, true);
+                    sessionLog(
+                        draft.sessionID,
+                        `v2 host fold: legacy compaction reason=${JSON.stringify(String(error))}`,
+                    );
+                }
+            }
             const fold = await folds.supply({
                 sessionID: draft.sessionID,
                 watermark,
@@ -1715,6 +1788,7 @@ export async function registerContext(context: V2Context) {
                         admitted.add(message.id);
                 }
                 const cut = reader.latestCompaction(draft.sessionID);
+                if (nativeFoldReplay) await nativeFoldReplay.observeSource(draft.sessionID, reader);
                 // Before anything restores or trims against the history boundary,
                 // make sure the host store still has it. Only TypeScript mode keeps
                 // its boundary in the compartments this checks; Rust mode's module
@@ -1734,7 +1808,51 @@ export async function registerContext(context: V2Context) {
                 postFold = cut !== undefined;
                 if (cut && !incoming)
                     throw new Error("The host checkpoint disappeared from the context draft");
-                if (cut && incoming) {
+                let nativeRestored: V2Message[] | undefined;
+                if (cut && nativeFoldReplay && isLocalCheckpoint(cut)) {
+                    try {
+                        nativeRestored = await nativeFoldReplay.restore(
+                            draft.sessionID,
+                            cut,
+                            `${draft.model.providerID}/${draft.model.id}`,
+                            { bounded: !rustModeModuleClient },
+                        );
+                    } catch (error) {
+                        nativeFoldReplay.invalidate(draft.sessionID, true);
+                        sessionLog(
+                            draft.sessionID,
+                            "v2 host fold: cache unavailable; restoring host rows",
+                            error,
+                        );
+                        nativeRestored = await nativeFoldReplay.restoreRead(
+                            draft.sessionID,
+                            cut,
+                            draft.model,
+                        );
+                    }
+                }
+                if (nativeRestored && nativeFoldReplay?.sourceChanged(draft.sessionID)) {
+                    // A host edit/revert changes the history actually served. The
+                    // ordinary transform may rebuild its summary on that change;
+                    // pending operations must use that same rebuild, not cause a second one.
+                    historyRefreshSessions.add(draft.sessionID);
+                    pendingMaterializationSessions.add(draft.sessionID);
+                }
+                if (cut && incoming && nativeRestored) {
+                    const present = new Set(
+                        draft.messages.flatMap((message) => (message.id ? [message.id] : [])),
+                    );
+                    const hidden = nativeRestored.filter((message) => {
+                        const id = nativeRowID(message);
+                        return !id || !present.has(id);
+                    });
+                    draft.messages.splice(
+                        0,
+                        draft.messages.length,
+                        ...hidden,
+                        ...draft.messages.filter((message) => message !== incoming),
+                    );
+                } else if (cut && incoming) {
                     const identity = await folds.observe({
                         sessionID: draft.sessionID,
                         cutSeq: cut.seq,
@@ -1841,6 +1959,14 @@ export async function registerContext(context: V2Context) {
                         `v2 boundary trim: dropped ${dropped} messages before the module boundary`,
                     );
             }
+            let nativeMessages: V2Message[] | undefined;
+            if (nativeFoldReplay) {
+                try {
+                    nativeMessages = copyNativeInput(draft.messages);
+                } catch {
+                    nativeFoldReplay.invalidate(draft.sessionID, true);
+                }
+            }
             const mapped = adaptPayload(draft, admitted);
             beginV2LkgRequest(
                 draft.sessionID,
@@ -1889,6 +2015,18 @@ export async function registerContext(context: V2Context) {
                         draft.messages.length,
                         checkpoint,
                         ...draft.messages.filter((message) => message !== head),
+                    );
+                }
+            }
+            if (nativeMessages && !checkpoint) {
+                try {
+                    await nativeFoldReplay?.capture(draft, nativeMessages);
+                } catch (error) {
+                    nativeFoldReplay?.invalidate(draft.sessionID, true);
+                    sessionLog(
+                        draft.sessionID,
+                        "v2 host fold: optional capture unavailable",
+                        error,
                     );
                 }
             }

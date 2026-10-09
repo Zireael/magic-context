@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
+import { hostname } from "node:os";
 import { resolve } from "node:path";
 import type { Statement } from "better-sqlite3";
 import type { RawMessageOrdinalAnchor } from "../hooks/magic-context/read-session-raw";
@@ -295,6 +297,8 @@ interface ReaderConnection {
 }
 
 function connect(path: string, identity = ""): ReaderConnection {
+    const stat = statSync(path);
+    const acquiredIdentity = identity || `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
     const db = new Database(path, { readonly: true, fileMustExist: true });
     try {
         assertOpenCodeStoreGeneration(db, "v2", path);
@@ -306,7 +310,7 @@ function connect(path: string, identity = ""): ReaderConnection {
     counters.openReaders += 1;
     counters.readersOpened += 1;
     counters.maxOpenReaders = Math.max(counters.maxOpenReaders, counters.openReaders);
-    return { db, statements: new Map(), identity, leases: 0, retired: false };
+    return { db, statements: new Map(), identity: acquiredIdentity, leases: 0, retired: false };
 }
 
 function closeConnection(connection: ReaderConnection): void {
@@ -384,11 +388,19 @@ export class V2StoreReader {
     private readonly connection: ReaderConnection;
     private closed = false;
     constructor(
-        path: string,
+        private readonly path: string,
         private readonly pool?: V2StoreReaderPool,
     ) {
         this.connection = pool ? pool.acquire(path) : connect(path);
         this.db = this.connection.db;
+    }
+
+    /** Identify the acquired read connection, so a displaced old handle cannot
+     * advertise the replacement file's identity and reuse its cached history. */
+    hostIdentity(): string {
+        return createHash("sha256")
+            .update(JSON.stringify([hostname(), resolve(this.path), this.connection.identity]))
+            .digest("hex");
     }
 
     private prepare(sql: string): Statement {
@@ -663,6 +675,15 @@ export class V2StoreReader {
             time_created: number;
             text: string;
         }>;
+    }
+
+    /** Count session_message rows after a sequence, including idle and compaction
+     * rows. One stored assistant may render several model messages or tags. */
+    storedRowsAfter(sessionID: string, after: number): number {
+        const row = this.prepare(
+            "SELECT COUNT(*) AS count FROM session_message WHERE session_id = ? AND seq > ?",
+        ).get(sessionID, after) as { count: number };
+        return row.count;
     }
 
     storedMessageCount(sessionID: string): number {
