@@ -1,6 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import type { PiContextBudget } from "./pi-context-budget";
-import { registerPiGuardedContext } from "./pi-context-refusal";
+import {
+	clearPiContextReceipt,
+	registerPiGuardedContext,
+} from "./pi-context-refusal";
 import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
 import { fakeContext, userMessage } from "./test-utils.test";
 
@@ -177,6 +180,9 @@ test("verified side context latches the fence off for its session, not other ses
 	expect(h.order).toEqual([]);
 	h.handlers.get("agent_end")?.({}, h.ctx);
 	h.handlers.get("agent_start")?.({}, h.ctx);
+	fence?.({ payload: undefined }, h.ctx);
+	expect(h.order).toEqual([]);
+	clearPiContextReceipt("dispatch-641");
 	fence?.({ payload: undefined }, h.ctx);
 	expect(h.order).toEqual([]);
 	fence?.(

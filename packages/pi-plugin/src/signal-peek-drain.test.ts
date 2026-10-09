@@ -144,7 +144,10 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 	test("runPipeline does NOT eager-delete historyRefreshSessions before work", () => {
 		// The outer handler must retain the signal until the pipeline succeeds,
 		// whether the pipeline promise is awaited directly or through the pass guard.
-		const pipeline = /await\s+(?:guardAwait\(\s*)?runPipeline\(/.exec(code);
+		const pipeline =
+			/await\s+(?:\b(?:guardAwait|budget\.waitMandatory)\(\s*)?runPipeline\(/.exec(
+				code,
+			);
 		expect(pipeline).not.toBeNull();
 		const before = code.slice(0, pipeline?.index);
 		expect(before).not.toContain("historyRefreshSessions.delete(sessionId)");
@@ -226,7 +229,7 @@ describe("source contract: peek-then-drain in runPipeline (history)", () => {
 		// redesign (replaced by Channel 1 tool-result append + Channel 2
 		// sendUserMessage). Note nudges still run after the pipeline completes.
 		const pipelineIdx = code.search(
-			/const\s+result\s*=\s*await\s+(?:guardAwait\(\s*)?runPipeline\(/,
+			/const\s+result\s*=\s*await\s+(?:\b(?:guardAwait|budget\.waitMandatory)\(\s*)?runPipeline\(/,
 		);
 		const noteIdx = code.indexOf("applyNoteNudges(");
 		expect(pipelineIdx).toBeGreaterThan(0);

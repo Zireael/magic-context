@@ -23,7 +23,7 @@ interface Operation {
 	refused: boolean;
 	ended: boolean;
 }
-const receiptMaps = new Set<Map<string | object, unknown>>();
+const receiptMaps = new Set<Map<string | object, Operation>>();
 export function clearPiContextReceipt(sessionId: string): void {
 	for (const receipts of receiptMaps) receipts.delete(sessionId);
 }
@@ -64,7 +64,9 @@ export function registerPiGuardedContext(
 		{ contexts: number; sides: number }
 	>();
 	receiptMaps.add(operations);
-	receiptMaps.add(sideSessions);
+	// Keep the dispatch backstop disabled for previously observed side sessions
+	// after cache eviction or reload: OMP still erases side-request attribution.
+	// Only per-turn completion records are invalidated by cache cleanup.
 	const newOperation = (): Operation => ({
 		ready: false,
 		refused: false,

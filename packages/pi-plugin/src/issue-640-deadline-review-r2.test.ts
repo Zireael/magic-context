@@ -126,6 +126,13 @@ test.skipIf(
 					join(root, "timing.json"),
 					JSON.stringify(timings.at(-1)),
 				);
+				// Preserve small verification receipts outside the registered fixture
+				// root, which the test helper automatically removes on process exit.
+				writeFileSync(
+					join(parent, `deadline-${hold}-timing.json`),
+					JSON.stringify(timings.at(-1)),
+				);
+				writeFileSync(join(parent, `deadline-${hold}-lsof.txt`), descriptors);
 			} finally {
 				if (timer) clearTimeout(timer);
 				resolveHistory();

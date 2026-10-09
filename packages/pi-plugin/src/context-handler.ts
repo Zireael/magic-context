@@ -2549,7 +2549,7 @@ export function registerPiContextHandler(
 				);
 			signal?.throwIfAborted();
 		};
-		const assertCurrentPass = budget.assert;
+		let assertCurrentPass = budget.assert;
 		const guardAwait = budget.wait;
 		const passGuard = { assert: assertCurrentPass, wait: guardAwait };
 		guardSqliteTransformPass({
@@ -3560,9 +3560,17 @@ export function registerPiContextHandler(
 			logTransformTiming(sessionId, "prePipelineTotal", transformStartTime);
 			const tRunPipeline = performance.now();
 			budget.stage = "pipeline";
-			if (beforePipelineForTests) await guardAwait(beforePipelineForTests());
+			// Tagging and reclaim are required for a managed result. They can use
+			// the outcome margin; optional search still keeps the 21s cutoff.
+			assertCurrentPass = budget.assertOutcome;
+			guardSqliteTransformPass({
+				assert: assertCurrentPass,
+				remainingMs: budget.remainingOutcome,
+			});
+			if (beforePipelineForTests)
+				await budget.waitMandatory(beforePipelineForTests());
 			assertCurrentPass();
-			const result = await guardAwait(
+			const result = await budget.waitMandatory(
 				runPipeline({
 					assertCurrentPass,
 					db: options.db,
