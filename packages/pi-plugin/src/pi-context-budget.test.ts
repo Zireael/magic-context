@@ -45,3 +45,23 @@ test("elapsed time fences a commit after an event-loop stall without a timer fir
 		db.close();
 	}
 });
+
+test("only a completed managed result survives ownership change for decision attribution", () => {
+	let now = 0;
+	const budget = new PiContextBudget(0, () => now);
+	budget.assertOwner = () => {
+		throw new Error("superseded");
+	};
+	expect(() => budget.assertDecisionPublication()).toThrow("superseded");
+	budget.completed = true;
+	expect(() => budget.assertDecisionPublication()).not.toThrow();
+	now = 25000;
+	expect(() => budget.assertDecisionPublication()).toThrow(
+		PiContextDeadlineError,
+	);
+	now = 0;
+	budget.abandoned = true;
+	expect(() => budget.assertDecisionPublication()).toThrow(
+		PiContextDeadlineError,
+	);
+});

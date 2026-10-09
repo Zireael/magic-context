@@ -22,6 +22,8 @@ export class PiContextBudget {
 	stage = "entry";
 	recovery = "not attempted";
 	abandoned = false;
+	completed = false;
+	failureReason?: string;
 	assertOwner: () => void = () => {};
 	constructor(
 		readonly startedAt = performance.now(),
@@ -50,6 +52,14 @@ export class PiContextBudget {
 	assert = (): void => {
 		this.assertOutcome();
 		if (this.elapsed() >= PI_CONTEXT_BUDGET.workMs)
+			throw new PiContextDeadlineError(this.diagnostic());
+	};
+	// A returned managed result can be attributed to the next assistant, even
+	// after a new pass takes ownership. An unfinished or refused result cannot.
+	// The resolving pass supplies its own owner guard around the queued write.
+	assertDecisionPublication = (): void => {
+		if (!this.completed) this.assertOwner();
+		if (this.abandoned || this.elapsed() >= PI_CONTEXT_BUDGET.outcomeMs)
 			throw new PiContextDeadlineError(this.diagnostic());
 	};
 	diagnostic(): string {

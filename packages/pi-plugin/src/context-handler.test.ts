@@ -4320,6 +4320,8 @@ describe("registerPiContextHandler", () => {
 			await expect(
 				handler(throwingEvent, fakeContext("ses-context") as never),
 			).rejects.toMatchObject({ name: "PiStorageBusyError" });
+			// Refusal is immediate; storage diagnostics are deliberately deferred.
+			await new Promise<void>((resolve) => setImmediate(resolve));
 			expect(getOrCreateSessionMeta(db, "ses-context").lastTransformError).toBe(
 				"boom messages",
 			);

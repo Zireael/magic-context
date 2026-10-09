@@ -3697,7 +3697,7 @@ export function registerPiContextHandler(
 									bustedThisPass: true,
 								},
 								piDecisionSnapshotNewestAssistant,
-								assertCurrentPass,
+								budget.assertDecisionPublication,
 							);
 						}
 					: undefined;
@@ -4340,6 +4340,7 @@ export function registerPiContextHandler(
 				);
 			}
 			const message = err instanceof Error ? err.message : String(err);
+			budget.failureReason = message;
 			const stack = err instanceof Error ? err.stack : undefined;
 			const transientStorageFailure = isTransientPiStorageError(err);
 			// Every failed managed pass is handled like a busy store: Pi's own
@@ -4460,7 +4461,7 @@ export function registerPiContextHandler(
 							persistLastTransformErrorIfChanged(
 								baseOptions.db,
 								sessionId,
-								message,
+								budget.failureReason ?? message,
 							),
 						);
 					} catch (error) {

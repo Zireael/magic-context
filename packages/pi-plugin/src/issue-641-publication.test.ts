@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
@@ -12,6 +11,7 @@ import {
 	getSlot,
 	resetLkgSlotsForTest,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import { createTestTempDir } from "../../plugin/src/shared/test-temp-dir";
 import { PiContextBudget } from "./pi-context-budget";
 import { createPiLkgCoordinator } from "./pi-lkg";
 import {
@@ -25,7 +25,7 @@ import { createTestDb } from "./test-utils.test";
 
 // Publication tests advance the same monotonic clock without waiting 25 seconds.
 test("expired deferred publication cannot flush LKG, served capture or a transform decision", async () => {
-	const root = mkdtempSync(join(tmpdir(), "mc641-publication-"));
+	const { dir: root, cleanup } = createTestTempDir("mc641-publication-");
 	const db = openDatabase(join(root, "context.db"));
 	if (!db) throw new Error("throwaway database unavailable");
 	let now = 0;
@@ -102,7 +102,7 @@ test("expired deferred publication cannot flush LKG, served capture or a transfo
 		ledger.reset();
 		resetLkgSlotsForTest();
 		db.close();
-		rmSync(root, { recursive: true, force: true });
+		cleanup();
 	}
 });
 

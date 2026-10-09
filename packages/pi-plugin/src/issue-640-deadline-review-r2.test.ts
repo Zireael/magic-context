@@ -67,6 +67,7 @@ test.skipIf(
 						],
 						{
 							env: process.env,
+							windowsHide: true,
 							stdin: "ignore",
 							stdout: "pipe",
 							stderr: "pipe",
@@ -80,6 +81,7 @@ test.skipIf(
 				}
 				const descriptors = execFileSync("lsof", ["-p", String(process.pid)], {
 					encoding: "utf8",
+					windowsHide: true,
 				});
 				writeFileSync(join(root, "lsof-host.txt"), descriptors);
 				const databaseRows = descriptors

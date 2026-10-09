@@ -209,7 +209,10 @@ export function registerPiGuardedContext(
 				handler(event, ctx, budget),
 			);
 			budget.assertOutcome();
-			if (result?.messages) active.ready = true;
+			if (result?.messages) {
+				budget.completed = true;
+				active.ready = true;
+			}
 			return result;
 		} catch (error) {
 			// A newer pass owns this session now. Calling its session-wide abort
