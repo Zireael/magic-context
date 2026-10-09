@@ -502,21 +502,17 @@ export function createMessagesTransformHandler(args: {
         }
 
         const magicContext = args.getMagicContext ? args.getMagicContext() : args.magicContext;
-        const slotAtEntry = sessionId ? getSlot(sessionId) : undefined;
-        const entry = slotAtEntry
-            ? (() => {
-                  try {
-                      return noteEntry(sessionId as string, output.messages as MessageLike[]);
-                  } catch (error) {
-                      sessionLog(
-                          sessionId as string,
-                          "lkg entry snapshot failed; replay unavailable",
-                          error,
-                      );
-                      return null;
-                  }
-              })()
-            : null;
+        const captureEntry = (): ReturnType<typeof noteEntry> => {
+            if (!sessionId || !getSlot(sessionId)) return null;
+            try {
+                return noteEntry(sessionId, output.messages as MessageLike[]);
+            } catch (error) {
+                sessionLog(sessionId, "lkg entry snapshot failed; replay unavailable", error);
+                return null;
+            }
+        };
+        let entry = captureEntry();
+        let admissionRetried = false;
         try {
             if (magicContext) {
                 const admissionDb = openDatabase();
@@ -524,13 +520,13 @@ export function createMessagesTransformHandler(args: {
                     if (!args.compactionOff) {
                         await withAsyncPrivilegedWriter(admissionDb, () => undefined, {
                             beforeRetry: (error) => {
+                                admissionRetried = true;
                                 if (
                                     sessionId &&
                                     tryMessagesTransformLkgReplay({
                                         output,
                                         sessionId,
                                         error,
-                                        entry,
                                         rust: resolveRust(sessionId),
                                         agent,
                                         onLkgReplay: args.onLkgReplay,
@@ -570,6 +566,9 @@ export function createMessagesTransformHandler(args: {
                     }
                 }
             }
+            // A yielded writer wait can let the host reshape history. Preserve
+            // the new pre-transform entry for recovery, not the pre-wait one.
+            if (admissionRetried) entry = captureEntry();
             await magicContext?.["experimental.chat.messages.transform"]?.(input, output);
             return output.messages;
         } catch (error) {
