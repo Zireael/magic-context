@@ -59,6 +59,7 @@ import {
 } from "../../hooks/magic-context/dropped-input-guard";
 import { EmergencyFailClosedError } from "../../hooks/magic-context/emergency-fail-closed";
 import { resolveContextLimit, resolveModelKey } from "../../hooks/magic-context/event-resolvers";
+import { estimateFinalWireInputTokens } from "../../hooks/magic-context/final-wire-token-estimate";
 import {
     type HistoryBoundaryRepair,
     repairMissingHistoryBoundary,
@@ -73,12 +74,16 @@ import {
     lkgProviderInputTotal,
     noteLkgProviderResponse,
 } from "../../hooks/magic-context/lkg-measured-request";
+import { lkgReplayLimit, measureLkgReplay } from "../../hooks/magic-context/lkg-replay-fit";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
 import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
-import { preloadTokenizer } from "../../hooks/magic-context/read-session-formatting";
+import {
+    estimateTokens,
+    preloadTokenizer,
+} from "../../hooks/magic-context/read-session-formatting";
 import { servedModuleM0Text } from "../../hooks/magic-context/rust-served-m0";
 import {
     STORAGE_BUSY_MESSAGE,
@@ -1418,6 +1423,62 @@ export async function registerContext(context: V2Context) {
                                 error,
                                 agent: draft.agent,
                                 rust: transform?.getRustReplayParticipant() ?? undefined,
+                                replayFits: (messages) => {
+                                    // Retry fitting uses this draft's tools and the system
+                                    // paired with the saved messages, never last turn's counts.
+                                    const system = structuredClone(draft.system);
+                                    if (
+                                        !draft.tools ||
+                                        !lkgSystems.restore(
+                                            draft.sessionID,
+                                            getSlot(draft.sessionID),
+                                            systemAtEntry,
+                                            system,
+                                        )
+                                    )
+                                        return false;
+                                    const limit = lkgReplayLimit({
+                                        db: admissionDb,
+                                        sessionId: draft.sessionID,
+                                        model: {
+                                            providerID: draft.model.providerID,
+                                            modelID: draft.model.id,
+                                        },
+                                        modelKey: `${draft.model.providerID}/${draft.model.id}`,
+                                    });
+                                    if (limit === undefined) return false;
+                                    let toolDefinitionTokens = 0;
+                                    for (const tool of Object.values(draft.tools)) {
+                                        if (
+                                            !tool ||
+                                            typeof tool.description !== "string" ||
+                                            !tool.input
+                                        )
+                                            return false;
+                                        const schema = JSON.stringify(tool.input);
+                                        if (!schema) return false;
+                                        toolDefinitionTokens +=
+                                            estimateTokens(tool.description) +
+                                            estimateTokens(schema);
+                                    }
+                                    return (
+                                        measureLkgReplay({
+                                            messages,
+                                            limit,
+                                            estimate: () =>
+                                                estimateFinalWireInputTokens({
+                                                    messages,
+                                                    toolDefinitionTokens,
+                                                    systemPromptTokens: estimateTokens(
+                                                        JSON.stringify(system),
+                                                    ),
+                                                    providerID: draft.model.providerID,
+                                                    modelID: draft.model.id,
+                                                    agentName: draft.agent,
+                                                }),
+                                        }).fit === "under"
+                                    );
+                                },
                                 onLkgReplay: restoreLkgSystem,
                             })
                         ) {

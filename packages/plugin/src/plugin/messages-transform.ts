@@ -227,6 +227,8 @@ export function tryMessagesTransformLkgReplay(args: {
     agent?: string;
     onLkgReplay?: () => void;
     entry?: ReturnType<typeof noteEntry> | null;
+    /** Host-owned envelope validation, before adopting any saved messages. */
+    replayFits?: (messages: MessageLike[]) => boolean;
 }): boolean {
     const { output, sessionId, error, agent } = args;
     const slotAtEntry = getSlot(sessionId);
@@ -322,6 +324,7 @@ export function tryMessagesTransformLkgReplay(args: {
                 if (
                     replay.ok &&
                     (!tsFit ||
+                        args.replayFits?.(replay.messages) === false ||
                         (rust && !rust.replayFits(sessionId, replay.messages, inputMessages)))
                 ) {
                     replayBlocked = true;
