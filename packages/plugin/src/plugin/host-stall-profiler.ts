@@ -24,19 +24,14 @@
  * disables itself for the rest of the process.
  */
 
-import {
-    chmodSync,
-    existsSync,
-    mkdirSync,
-    readdirSync,
-    readFileSync,
-    renameSync,
-    unlinkSync,
-    writeFileSync,
-} from "node:fs";
+import { chmodSync, existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import { getMagicContextStorageDir } from "../shared/data-path";
 import { log } from "../shared/logger";
+import {
+    ensureStorageDirectorySync,
+    writeStorageFileAtomicSync,
+} from "../shared/storage-permissions";
 import { aggregateTraces, type JscSampleTrace } from "./host-stall-profiler-report";
 
 export const HOST_PROFILER_DIRNAME = "host-profiler";
@@ -298,15 +293,14 @@ export function createHostStallProfiler(deps: HostStallProfilerDeps): HostStallP
 
     const writeReport = (report: unknown, endWallMs: number): string => {
         const dir = deps.profilerDir();
-        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        // Reports are always owner-only, whatever the storage permission policy says.
+        ensureStorageDirectorySync(dir, true);
         chmodSync(dir, 0o700);
         const stamp = reportFileStamp(endWallMs);
         let name = `stall-${stamp}.json`;
         for (let n = 1; existsSync(path.join(dir, name)); n++) name = `stall-${stamp}-${n}.json`;
         const finalPath = path.join(dir, name);
-        const tempPath = path.join(dir, `.${name}.${deps.pid}.tmp`);
-        writeFileSync(tempPath, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
-        renameSync(tempPath, finalPath);
+        writeStorageFileAtomicSync(finalPath, `${JSON.stringify(report, null, 2)}\n`, true);
         const reports = readdirSync(dir)
             .filter((entry) => /^stall-.*\.json$/.test(entry))
             .sort();
