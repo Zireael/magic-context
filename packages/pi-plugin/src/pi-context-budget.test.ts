@@ -65,3 +65,32 @@ test("only a completed managed result survives ownership change for decision att
 		PiContextDeadlineError,
 	);
 });
+
+test("mandatory publication consumes the completion reserve but cannot outlive the outcome deadline", () => {
+	const db = createTestDb();
+	let now = 22000;
+	const budget = new PiContextBudget(0, () => now);
+	try {
+		expect(() => budget.assert()).toThrow(PiContextDeadlineError);
+		withSqliteTransformPass(() => {
+			guardSqliteTransformPass({
+				assert: budget.assertOutcome,
+				remainingMs: () => 25000 - now,
+			});
+			db.prepare(
+				"INSERT INTO session_meta (session_id) VALUES ('completed')",
+			).run();
+			now = 25000;
+			expect(() =>
+				db
+					.prepare("INSERT INTO session_meta (session_id) VALUES ('late')")
+					.run(),
+			).toThrow(PiContextDeadlineError);
+		});
+		expect(db.prepare("SELECT session_id FROM session_meta").all()).toEqual([
+			{ session_id: "completed" },
+		]);
+	} finally {
+		db.close();
+	}
+});

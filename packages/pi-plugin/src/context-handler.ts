@@ -4250,6 +4250,14 @@ export function registerPiContextHandler(
 			}
 			let serializedOutput: PiLkgSerializedOutput | undefined;
 			budget.stage = "LKG/served publication";
+			// Normal transform work is finished. Serialization and publication use
+			// the reserved completion margin, never a new budget or a raw fallback.
+			budget.assertOutcome();
+			guardSqliteTransformPass({
+				assert: budget.assertOutcome,
+				remainingMs: () =>
+					Math.max(0, PI_CONTEXT_BUDGET.outcomeMs - budget.elapsed()),
+			});
 			if (!budget.sideTurn && !lkgCompactionOff && lkgPassSnapshot) {
 				let hostEnvelopeSignature: string | undefined;
 				try {
@@ -4263,9 +4271,9 @@ export function registerPiContextHandler(
 				} catch {
 					/* Missing optional attribution must not prevent capturing the good prefix. */
 				}
-				assertCurrentPass();
+				budget.assertOutcome();
 				serializedOutput = lkgCoordinator.captureAppliedPass({
-					assertCurrentPass,
+					assertCurrentPass: budget.assertOutcome,
 					hostEnvelopeSignature,
 					snapshot: lkgPassSnapshot,
 					outputMessages,
@@ -4281,11 +4289,11 @@ export function registerPiContextHandler(
 					cacheBusting: result.bustedThisPass,
 				});
 			}
-			assertCurrentPass();
+			budget.assertOutcome();
 			if (!budget.sideTurn)
 				capturePiServedArray(sessionId, outputMessages, {
 					serializedOutput,
-					assertCurrentPass,
+					assertCurrentPass: budget.assertOutcome,
 				});
 			if (thinkingBindingRecoveryApplied) {
 				try {
@@ -4301,7 +4309,7 @@ export function registerPiContextHandler(
 					);
 				}
 			}
-			assertCurrentPass();
+			budget.assertOutcome();
 			publishTransformDecision?.();
 			return { messages: outputMessages } as {
 				messages: typeof event.messages;
