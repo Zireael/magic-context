@@ -236,6 +236,7 @@ import {
 	buildSyntheticToolReclaimOps,
 } from "@magic-context/core/hooks/magic-context/tool-reclaim";
 import { escalationBands } from "@magic-context/core/shared/escalation-bands";
+import { getHarness } from "@magic-context/core/shared/harness";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { ModelInput } from "@magic-context/core/shared/model-resolution";
@@ -621,6 +622,8 @@ const deferredMaterializationSessions = new Set<string>();
 const sessionsByProject = new Map<string, Set<string>>();
 const lastSeenProjectIdentityBySession = new Map<string, string>();
 const persistedProjectIdentityBySession = new Map<string, string>();
+const sessionProjectBindingFailureLogAtBySession = new Map<string, number>();
+const SESSION_PROJECT_BINDING_FAILURE_LOG_INTERVAL_MS = 10 * 60 * 1000;
 const rawMessageProviderUnregistersBySession = new Map<string, () => void>();
 const activeContextHandlerSessions = new Set<string>();
 const lastHeuristicsTurnIdBySession = new Map<string, string>();
@@ -988,6 +991,7 @@ function updateSessionProjectTracking(
 	sessionId: string,
 	projectIdentity: string | undefined,
 	db?: ContextDatabase,
+	observedCwd?: string,
 ): void {
 	if (!projectIdentity) return;
 	const prev = lastSeenProjectIdentityBySession.get(sessionId);
@@ -1005,11 +1009,44 @@ function updateSessionProjectTracking(
 		persistedProjectIdentityBySession.get(sessionId) !== projectIdentity
 	) {
 		try {
-			recordSessionProjectIdentity(db, sessionId, projectIdentity);
+			const change = recordSessionProjectIdentity(
+				db,
+				sessionId,
+				projectIdentity,
+			);
 			persistedProjectIdentityBySession.set(sessionId, projectIdentity);
-		} catch {
+			if (change) {
+				sessionLog(
+					sessionId,
+					`project binding changed harness=${getHarness()} cwd=${observedCwd ?? "unknown"} old=${change.previousProjectPath ?? "none"} new=${change.projectPath}`,
+				);
+			}
+		} catch (error) {
+			const now = Date.now();
+			const lastLoggedAt =
+				sessionProjectBindingFailureLogAtBySession.get(sessionId);
+			if (
+				lastLoggedAt === undefined ||
+				now - lastLoggedAt >= SESSION_PROJECT_BINDING_FAILURE_LOG_INTERVAL_MS
+			) {
+				sessionProjectBindingFailureLogAtBySession.set(sessionId, now);
+				sessionLog(
+					sessionId,
+					`project binding write failed harness=${getHarness()} cwd=${observedCwd ?? "unknown"} attempted=${projectIdentity}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 			// Retry on the next observation; tracking a session is not proof of persistence.
 		}
+	}
+	if (
+		db &&
+		persistedProjectIdentityBySession.get(sessionId) === projectIdentity &&
+		sessionProjectBindingFailureLogAtBySession.delete(sessionId)
+	) {
+		sessionLog(
+			sessionId,
+			`project binding write recovered harness=${getHarness()} cwd=${observedCwd ?? "unknown"} identity=${projectIdentity}`,
+		);
 	}
 	trackSessionForProject(projectIdentity, sessionId);
 	lastSeenProjectIdentityBySession.set(sessionId, projectIdentity);
@@ -2551,7 +2588,12 @@ export function registerPiContextHandler(
 					projectDirectory,
 					options.allowHomeProject,
 				) ?? "";
-			updateSessionProjectTracking(sessionId, projectIdentity, options.db);
+			updateSessionProjectTracking(
+				sessionId,
+				projectIdentity,
+				options.db,
+				projectDirectory,
+			);
 			logTransformTiming(
 				sessionId,
 				"findSessionId",
@@ -8292,6 +8334,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	routinePressureAppliedBySession.delete(sessionId);
 	lastSeenProjectIdentityBySession.delete(sessionId);
 	persistedProjectIdentityBySession.delete(sessionId);
+	sessionProjectBindingFailureLogAtBySession.delete(sessionId);
 	for (const [projectIdentity, sessions] of sessionsByProject) {
 		sessions.delete(sessionId);
 		if (sessions.size === 0) sessionsByProject.delete(projectIdentity);
