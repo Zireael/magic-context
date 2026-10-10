@@ -84,14 +84,22 @@ function getSessionMetaSelectColumns(db: Database): string {
     return projection;
 }
 
-export function getOrCreateSessionMeta(db: Database, sessionId: string): SessionMeta {
+function findSessionMeta(db: Database, sessionId: string): SessionMeta | undefined {
     const result = db
         .prepare(`SELECT ${getSessionMetaSelectColumns(db)} FROM session_meta WHERE session_id = ?`)
         .get(sessionId);
 
-    if (isSessionMetaRow(result)) {
-        return toSessionMeta(result);
-    }
+    return isSessionMetaRow(result) ? toSessionMeta(result) : undefined;
+}
+
+/** Read metadata without creating a row when a contention fallback has no writer. */
+export function readSessionMeta(db: Database, sessionId: string): SessionMeta {
+    return findSessionMeta(db, sessionId) ?? getDefaultSessionMeta(sessionId);
+}
+
+export function getOrCreateSessionMeta(db: Database, sessionId: string): SessionMeta {
+    const existing = findSessionMeta(db, sessionId);
+    if (existing) return existing;
 
     // Fresh row creation: bridge the race between OpenCode creating the
     // session (which writes `parent_id` synchronously) and the async
