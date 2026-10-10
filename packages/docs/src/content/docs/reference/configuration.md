@@ -73,7 +73,8 @@ When and how aggressively Magic Context manages the session's context window. Pe
 | `execute_threshold_tokens.default` | number (5000–2000000) | — |  |
 | `protected_tokens` | integer (4000–1000000) | — | Positive integer token floor to protect from automatic reclaim (min: 4_000, max: 1_000_000). When omitted, the derived default is clamp(round(0.05 × usableSoft), min(16_000, round(0.08 × usableSoft)), 64_000). |
 | `protected_tags` | unknown | — | Deprecated: number of recent tags to protect. Ignored for behaviour; use protected_tokens instead. |
-| `clear_reasoning_age` | number (10–) | `50` | Clear reasoning/thinking blocks older than N tags (default: 50) |
+| `clear_reasoning_age` | unknown | — | Deprecated and ignored. Use keep_reasoning_tokens instead. |
+| `keep_reasoning_tokens` | integer (0–1000000) \| map<string, integer (0–1000000)> | — | Reasoning tokens to keep on rebuilding passes. Number or per-model object; exact, shorter model keys, provider/\*, then default. Omitted: fixed 10,000. 0 removes all eligible historical reasoning; newest and exempt steps always stay. |
 | `history_budget_percentage` | number (0.05–0.5) | `0.15` | Fraction of usable context (context_limit × execute_threshold) reserved for the session history block (default: 0.15) |
 
 ## Model profiles
@@ -108,7 +109,7 @@ The background agent that condenses old conversation into compact history.
 | `historian.permission.doom_loop` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
 | `historian.permission.external_directory` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
 | `historian.maxTokens` **Live** | number | — | Maximum output tokens |
-| `historian.expand_tools` **Live** | map<string, string \| boolean> | — | Readable historian tool expansions, keyed by exact host tool name. Templates override built-in defaults; false disables an expansion. Supports ${input.path}, ${output.path}, bare ${output}, array [N], [\*].field, .each("${field}"), .join("separator"), .count and final .truncate(N). Missing fields are empty; placeholders default to 300 characters, lists to 10 elements, expansions to 1000 characters. Valid in user and project config; affects historian/recomp and verbose ctx_expand only, never the wire or default ctx_expand transcript. |
+| `historian.expand_tools` **Live** | map<string, string \| boolean> | — | Readable historian tool expansions, keyed by exact host tool name. Templates override built-in defaults; false disables an expansion. Supports ${input.path}, ${output.path}, bare ${output}, array [N], [\*].field, .each("${field}"), .join("separator"), .count and final .truncate(N). Missing fields are empty. Historian text and lists have no implicit caps; explicit .truncate(N) keeps complete sentences and marks omitted characters, or emits only the marker if no sentence fits. When the ctx_expand history-recovery tool is called in verbose mode, its tool-call previews retain their original built-in templates and limits (300 characters per placeholder, 10 list elements, 1000 characters per expansion). Valid in user and project config; never changes the wire or default ctx_expand transcript. |
 | `historian.opencode` | object | — | Strict OpenCode model-resolution block. It accepts no Pi vocabulary. |
 | `historian.opencode.model` **Live** | string \| object | — | Primary OpenCode model entry. |
 | `historian.opencode.fallback_models` **Live** | string \| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
@@ -176,7 +177,7 @@ Off-hours maintenance through Dreamer.
 | `dreamer.top_p` | number (0–1) | — | Nucleus sampling top_p (0-1) |
 | `dreamer.prompt` | string | — | Additional system prompt text |
 | `dreamer.tools` | map<string, boolean> | — | Tool enable/disable overrides |
-| `dreamer.disable` | boolean | — | Disable this agent |
+| `dreamer.disable` **Live** | boolean | — | Disable this agent |
 | `dreamer.description` | string | — | Agent description |
 | `dreamer.mode` | `"subagent"` \| `"primary"` \| `"all"` | — | Agent mode (subagent, primary, or all) |
 | `dreamer.color` | string | — | Hex color for the agent (e.g. '#a1b2c3') |

@@ -641,6 +641,10 @@ const AgentMetadataSchema = AgentOverrideConfigSchema.pick({
 
 /** Combined dreamer metadata plus independent strict execution blocks. */
 export const DreamerConfigSchema = AgentMetadataSchema.extend({
+    // Its own node rather than the one shared with the historian through
+    // AgentMetadataSchema: `dreamer.disable` is a live-reload key and the
+    // historian's is not, and the live marker is set on the schema node.
+    disable: z.boolean().optional().describe("Disable this agent"),
     runner: z
         .enum(["broca", "host"])
         .optional()
@@ -678,7 +682,7 @@ export const HistorianConfigSchema = AgentMetadataSchema.extend({
         )
         .optional()
         .describe(
-            'Readable historian tool expansions, keyed by exact host tool name. Templates override built-in defaults; false disables an expansion. Supports ${input.path}, ${output.path}, bare ${output}, array [N], [*].field, .each("${field}"), .join("separator"), .count and final .truncate(N). Missing fields are empty; placeholders default to 300 characters, lists to 10 elements, expansions to 1000 characters. Valid in user and project config; affects historian/recomp and verbose ctx_expand only, never the wire or default ctx_expand transcript.',
+            'Readable historian tool expansions, keyed by exact host tool name. Templates override built-in defaults; false disables an expansion. Supports ${input.path}, ${output.path}, bare ${output}, array [N], [*].field, .each("${field}"), .join("separator"), .count and final .truncate(N). Missing fields are empty. Historian text and lists have no implicit caps; explicit .truncate(N) keeps complete sentences and marks omitted characters, or emits only the marker if no sentence fits. When the ctx_expand history-recovery tool is called in verbose mode, its tool-call previews retain their original built-in templates and limits (300 characters per placeholder, 10 list elements, 1000 characters per expansion). Valid in user and project config; never changes the wire or default ctx_expand transcript.',
         ),
     opencode: OpenCodeHarnessBlockSchema.optional(),
     pi: PiHarnessBlockSchema.optional(),
@@ -959,7 +963,8 @@ export interface MagicContextConfig {
     protected_tokens?: number;
     protected_tags?: number;
     protected_tools: Record<string, number>;
-    clear_reasoning_age: number;
+    clear_reasoning_age?: unknown;
+    keep_reasoning_tokens?: number | Record<string, number>;
     history_budget_percentage: number;
     historian_timeout_ms: number;
     commit_cluster_trigger: {
@@ -1259,10 +1264,21 @@ export const MagicContextConfigSchema = z
             )
             .meta({ deprecated: true }),
         clear_reasoning_age: z
-            .number()
-            .min(10)
-            .default(50)
-            .describe("Clear reasoning/thinking blocks older than N tags (default: 50)"),
+            .unknown()
+            .optional()
+            .describe("Deprecated and ignored. Use keep_reasoning_tokens instead.")
+            .meta({ deprecated: true }),
+        keep_reasoning_tokens: z
+            .union([
+                z.number().int().min(0).max(1_000_000),
+                z
+                    .object({ default: z.number().int().min(0).max(1_000_000).optional() })
+                    .catchall(z.number().int().min(0).max(1_000_000)),
+            ])
+            .optional()
+            .describe(
+                "Reasoning tokens to keep on rebuilding passes. Number or per-model object; exact, shorter model keys, provider/*, then default. Omitted: fixed 10,000. 0 removes all eligible historical reasoning; newest and exempt steps always stay.",
+            ),
         history_budget_percentage: z
             .number()
             .min(0.05)
@@ -1603,6 +1619,7 @@ export const LIVE_RELOAD_CONFIG_PATHS = [
     "commit_cluster_trigger.enabled",
     "commit_cluster_trigger.min_clusters",
     "memory.auto_promote",
+    "dreamer.disable",
     "dreamer.maxTokens",
     "dreamer.opencode.model",
     "dreamer.opencode.fallback_models",

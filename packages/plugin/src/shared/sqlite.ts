@@ -245,6 +245,7 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
         configurable: true,
         writable: true,
         value: (sql: string) => {
+            if (/^\s*(?:COMMIT|END)\b/i.test(sql)) assertTransformWrite();
             if (/^\s*BEGIN\s+(?:IMMEDIATE|EXCLUSIVE)(?:\s+TRANSACTION)?\s*;?\s*$/i.test(sql)) {
                 // A transaction that ended without passing through exec (for
                 // example an automatic rollback) must not be timed as this one.
@@ -430,6 +431,18 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
 
 export const Database: typeof BetterSqlite3 = TrackedDatabase;
 
+/** The constructor path, without querying SQLite on the prompt thread. */
+export function getSqliteDatabasePath(db: Database): string | null {
+    for (const connection of trackedSqliteConnections.values()) {
+        if (connection.reference.deref() === db) {
+            return connection.filename === ":memory:" || connection.filename === "<buffer>"
+                ? null
+                : connection.filename;
+        }
+    }
+    return null;
+}
+
 function pragmaValue(db: BetterSqlite3.Database, name: string): unknown {
     const row = db.prepare(`PRAGMA ${name}`).get() as Record<string, unknown> | undefined;
     if (!row) return undefined;
@@ -556,6 +569,33 @@ interface StatementOwner {
 const statementOwners = new WeakMap<Database, StatementOwner>();
 const FIRST_PRUNE_AT = 256;
 
+/**
+ * Bun's default close (`sqlite3_close_v2`) only releases the native connection
+ * once every statement created by prepare() is finalized. The close override
+ * in ownPreparedStatement can finalize only statements that are still
+ * reachable. Once the garbage collector
+ * has marked a one-shot statement dead, its weak reference is already cleared,
+ * but the statement is finalized only when its memory is later swept. Until
+ * then the closed connection keeps the database, WAL and shared-memory files
+ * open, for an unbounded time.
+ *
+ * `close(true)` finalizes every outstanding statement, reachable or not, and
+ * releases the connection immediately. When the caller did not ask for errors
+ * and that close fails, fall back to the caller's own close so a teardown path
+ * never starts throwing; the fallback can defer the release as before.
+ */
+function closeReleasingStatements(
+    close: (...args: unknown[]) => unknown,
+    args: unknown[],
+): unknown {
+    if (args[0] === true) return close(true);
+    try {
+        return close(true);
+    } catch {
+        return close(...args);
+    }
+}
+
 function ownPreparedStatement(db: Database, statement: Statement): Statement {
     const finalizable = statement as FinalizableStatement;
     // Node finalizes its statements on close and exposes no finalize() method.
@@ -579,7 +619,7 @@ function ownPreparedStatement(db: Database, statement: Statement): Statement {
                     }
                 }
                 references.clear();
-                const result = close(...args);
+                const result = closeReleasingStatements(close, args);
                 if (failure) throw failure;
                 return result;
             },
@@ -617,7 +657,12 @@ export function prepareCachedStatement(db: Database, sql: string): Statement {
 
 const privilegeDepth = new WeakMap<Database, number>();
 const transformPassScope = new AsyncLocalStorage<
-    { active: boolean; remainingWaitMs: number } | undefined
+    | {
+          active: boolean;
+          remainingWaitMs: number;
+          guard?: { assert(): void; remainingMs(): number };
+      }
+    | undefined
 >();
 const admissionScope = new AsyncLocalStorage<boolean>();
 const backgroundWriterScope = new AsyncLocalStorage<boolean>();
@@ -653,6 +698,17 @@ export function withSqliteTransformPass<T>(operation: () => T): T {
 /** Start detached maintenance work without borrowing a foreground pass's budget. */
 export function withoutSqliteTransformPass<T>(operation: () => T): T {
     return transformPassScope.run(undefined, operation);
+}
+
+/** Attach the adapter's existing generation/cancellation/deadline guard to writes. */
+export function guardSqliteTransformPass(guard: { assert(): void; remainingMs(): number }): void {
+    const lease = transformPassScope.getStore();
+    if (lease) lease.guard = guard;
+}
+
+/** Check the attached generation/cancellation/deadline guard before SQL or cache publication. */
+export function assertTransformWrite(): void {
+    if (!backgroundWriterScope.getStore()) transformPassScope.getStore()?.guard?.assert();
 }
 
 /** Bun names SQLite codes; node:sqlite exposes the numeric (possibly extended) errcode. */
@@ -698,6 +754,7 @@ interface WriterAcquisition {
     startedAt: number;
     attempts: number;
     claimed: boolean;
+    remainingMs?: () => number;
 }
 
 /** A write transaction whose BEGIN went through `acquireShort` and has not ended yet. */
@@ -724,6 +781,7 @@ function foregroundWaitLease() {
  * native API cannot separate lock waiting from statement execution. Exhaustion
  * switches to zero-wait acquisition, not a refusal when the writer is free. */
 function withAutocommitTimeout<T>(db: Database, operation: () => T): T {
+    assertTransformWrite();
     const lease = foregroundWaitLease();
     if (isInTransaction(db) || (!lease && !backgroundWriterScope.getStore())) return operation();
     const previous = pragmaNumber(db, "busy_timeout");
@@ -749,6 +807,7 @@ function withAutocommitTimeout<T>(db: Database, operation: () => T): T {
 
 /** The connection is never handed back to another caller with a shortened timeout. */
 function acquireShort(db: Database, acquire: () => unknown, site: string): void {
+    assertTransformWrite();
     const started = performance.now();
     const previous = pragmaNumber(db, "busy_timeout");
     const outer = writerAcquisitionScope.getStore();
@@ -763,7 +822,12 @@ function acquireShort(db: Database, acquire: () => unknown, site: string): void 
         // stays short. An ordinary BEGIN inside a transform pass cannot yield;
         // give that single attempt enough time for a brief writer to finish.
         const lease = foregroundWaitLease();
-        const timeout = lease ? Math.floor(lease.remainingWaitMs) : SHORT_BUSY_TIMEOUT_MS;
+        const timeout = Math.floor(
+            Math.min(
+                lease ? lease.remainingWaitMs : SHORT_BUSY_TIMEOUT_MS,
+                owner?.remainingMs?.() ?? lease?.guard?.remainingMs() ?? Infinity,
+            ),
+        );
         db.exec(`PRAGMA busy_timeout=${timeout}`);
         acquire();
         acquiredAt = performance.now();
@@ -871,11 +935,28 @@ export async function beginSqliteWriterAsync(db: Database, site: string): Promis
 }
 
 /** Retry admission before any turn work, yielding between short lock attempts. */
-export async function withAsyncPrivilegedWriter<T>(db: Database, operation: () => T): Promise<T> {
+export async function withAsyncPrivilegedWriter<T>(
+    db: Database,
+    operation: () => T,
+    options: {
+        signal?: AbortSignal;
+        beforeRetry?: (error: SqliteAcquisitionBusyError) => void;
+        jitter?: boolean;
+        budgetMs?: number;
+        assertCurrentPass?: () => void;
+    } = {},
+): Promise<T> {
     const started = performance.now();
+    const budgetMs = Math.max(
+        0,
+        Math.min(FOREGROUND_ACQUISITION_BUDGET_MS, options.budgetMs ?? Infinity),
+    );
     let attempts = 0;
     for (;;) {
+        options.signal?.throwIfAborted();
+        options.assertCurrentPass?.();
         attempts++;
+        let entered = false;
         try {
             const acquisition: WriterAcquisition = {
                 site: "privileged_writer",
@@ -883,35 +964,51 @@ export async function withAsyncPrivilegedWriter<T>(db: Database, operation: () =
                 startedAt: started,
                 attempts,
                 claimed: false,
+                remainingMs: () => Math.max(0, budgetMs - (performance.now() - started)),
             };
             // The acquisition and hold of this transaction are reported when it
             // commits or rolls back (see endWriterTransaction).
             return admissionScope.run(true, () =>
                 withSqliteTransformPass(() =>
                     writerAcquisitionScope.run(acquisition, () =>
-                        withPrivilegedWriter(db, operation),
+                        withPrivilegedWriter(db, () => {
+                            entered = true;
+                            return operation();
+                        }),
                     ),
                 ),
             );
         } catch (error) {
             // A callback failure can occur after writes; only retry a failed BEGIN.
-            if (!(error instanceof SqliteAcquisitionBusyError)) throw error;
+            if (entered || !(error instanceof SqliteAcquisitionBusyError)) throw error;
+            // Adapters may serve a validated saved request instead of waiting.
+            // This runs only after a failed BEGIN, never after callback writes.
+            options.beforeRetry?.(error);
             const elapsed = performance.now() - started;
-            if (elapsed >= FOREGROUND_ACQUISITION_BUDGET_MS) {
+            if (elapsed >= budgetMs) {
                 reportSqliteDiagnostic(
                     `sqlite writer site=privileged_writer lane=foreground acquire_ms=${Math.round(elapsed)} attempts=${attempts} outcome=busy`,
                 );
                 throw error;
             }
-            await new Promise<void>((resolve) =>
-                setTimeout(
-                    resolve,
-                    Math.min(
-                        attempts === 1 ? 500 : 1000,
-                        FOREGROUND_ACQUISITION_BUDGET_MS - elapsed,
-                    ),
-                ),
+            const backoff = attempts === 1 ? 500 : 1000;
+            const delay = Math.min(
+                options.jitter ? backoff * (0.8 + Math.random() * 0.4) : backoff,
+                budgetMs - elapsed,
             );
+            await new Promise<void>((resolve, reject) => {
+                const abort = () => {
+                    clearTimeout(timer);
+                    options.signal?.removeEventListener("abort", abort);
+                    reject(options.signal?.reason ?? new Error("Writer wait aborted"));
+                };
+                const timer = setTimeout(() => {
+                    options.signal?.removeEventListener("abort", abort);
+                    resolve();
+                }, delay);
+                options.signal?.addEventListener("abort", abort, { once: true });
+                if (options.signal?.aborted) abort();
+            });
         }
     }
 }

@@ -41,7 +41,10 @@ import {
     getCurrentToolSetHash,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
-import type { HiddenCompletionExecutor } from "../../hooks/magic-context/compartment-runner-types";
+import {
+    type HiddenCompletionExecutor,
+    HiddenCompletionRefusal,
+} from "../../hooks/magic-context/compartment-runner-types";
 import { resolveCtxReduceAvailabilityFromMessages } from "../../hooks/magic-context/ctx-reduce-availability";
 import { DegradedPassRefusalError } from "../../hooks/magic-context/degraded-pass-refusal";
 import {
@@ -56,6 +59,7 @@ import {
 } from "../../hooks/magic-context/dropped-input-guard";
 import { EmergencyFailClosedError } from "../../hooks/magic-context/emergency-fail-closed";
 import { resolveContextLimit, resolveModelKey } from "../../hooks/magic-context/event-resolvers";
+import { estimateFinalWireInputTokens } from "../../hooks/magic-context/final-wire-token-estimate";
 import {
     type HistoryBoundaryRepair,
     repairMissingHistoryBoundary,
@@ -65,17 +69,22 @@ import {
     createToolExecuteAfterHook,
 } from "../../hooks/magic-context/hook-handlers";
 import { materializeM0 } from "../../hooks/magic-context/inject-compartments";
+import { armLatestThinkingRecoveryFromError } from "../../hooks/magic-context/latest-thinking-recovery";
 import {
     beginV2LkgRequest,
     lkgProviderInputTotal,
     noteLkgProviderResponse,
 } from "../../hooks/magic-context/lkg-measured-request";
+import { lkgReplayLimit, measureLkgReplay } from "../../hooks/magic-context/lkg-replay-fit";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
 import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
-import { preloadTokenizer } from "../../hooks/magic-context/read-session-formatting";
+import {
+    estimateTokens,
+    preloadTokenizer,
+} from "../../hooks/magic-context/read-session-formatting";
 import { servedModuleM0Text } from "../../hooks/magic-context/rust-served-m0";
 import {
     STORAGE_BUSY_MESSAGE,
@@ -86,7 +95,10 @@ import { createTransform, type TransformDeps } from "../../hooks/magic-context/t
 import { UnmanagedOverWindowError } from "../../hooks/magic-context/unmanaged-over-window";
 import { UnresolvedHistoryBoundaryError } from "../../hooks/magic-context/unresolved-history-boundary";
 import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
-import { createMessagesTransformHandler } from "../../plugin/messages-transform";
+import {
+    createMessagesTransformHandler,
+    tryMessagesTransformLkgReplay,
+} from "../../plugin/messages-transform";
 import { registerRpcHandlers } from "../../plugin/rpc-handlers";
 import { hideSubagentTools } from "../../plugin/subagent-tool-policy";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
@@ -121,7 +133,15 @@ import { applyJsonSchemaParameterDescriptions } from "../../tools/parameter-desc
 import { createV2RustCompactionMarkerStrategy, trimToRecordedBoundary } from "../fold/boundary";
 import { hostMediaAsset, hostUsesMediaAssets, rememberHostMedia } from "../fold/host-media";
 import { v2CompactionMarkerStrategy } from "../fold/markers";
+import { nativeFoldCache } from "../fold/memory-cache";
+import {
+    copyNativeInput,
+    isLocalCheckpoint,
+    NativeFoldReplay,
+    nativeRowID,
+} from "../fold/native-replay";
 import { FoldOwner, foldDigest } from "../fold/owner";
+import { HostFoldPolicy } from "../fold/policy";
 import { restoreRow } from "../fold/restore";
 import { seedV2ForkFromParent, sessionHasMagicContextState } from "../fork-inheritance";
 import { cleanupLegacyHiddenChildren } from "../hidden-child-cleanup";
@@ -141,12 +161,13 @@ import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
 import { registerV2DreamScheduleTimer } from "./dream-timer";
 import { startDreamTrigger } from "./dream-trigger";
 import { V2GenerateReplay } from "./generate";
-import { HiddenChildHook, registerHiddenChildAgents } from "./hidden-child";
+import { HiddenChildHook, hiddenToolCallRefusal, registerHiddenChildAgents } from "./hidden-child";
 import { hiddenTerminalError } from "./hidden-terminal-error";
 import { V2LkgSystemReplay } from "./lkg-system";
 import { modelLimitCacheWarm, warmModelLimitCacheFromCatalog } from "./model-limit-cache";
 import { adaptPayload, HEAD_IDS } from "./payload";
 import { interruptBeforeProvider, V2ContextRefusal } from "./refusal";
+
 import { RestoredRowCache } from "./restore-rows";
 import { createV2RpcLiveSessionState } from "./rpc-live-state";
 import { createV2RustRefusalRecovery, resolveV2RustModeModuleClient } from "./rust-mode";
@@ -169,9 +190,11 @@ import {
     servedBoundaryRow,
 } from "./store";
 import { registerTools } from "./tools";
-import type { SessionContext, V2Context } from "./types";
+import type { SessionContext, V2Context, V2Message } from "./types";
 import { persistV2UsageReading } from "./usage-persist";
 import { resolveUsageReading } from "./usage-reading";
+
+class V2LkgAdmissionReplay extends Error {}
 
 // The event stream can trail the terminal store row by a scheduler tick; keep failure surfacing fast.
 const HIDDEN_SESSION_ERROR_GRACE_MS = 50;
@@ -592,6 +615,18 @@ export async function registerContext(context: V2Context) {
         return;
     }
     const folds = new FoldOwner(context.storage);
+    // Experimental and opt-in (MC_OC2_INVISIBLE_FOLD=1). After OpenCode folds the
+    // history, the provider request bytes must stay identical to the ones sent
+    // before the fold, so the provider's prompt cache still matches. That has not
+    // yet been verified across providers and plugin restarts, so automatic host
+    // folding stays off by default.
+    const nativeFoldMemory =
+        !compactionOff && process.env.MC_OC2_INVISIBLE_FOLD === "1"
+            ? nativeFoldCache(() => storage.require())
+            : undefined;
+    const nativeFoldReplay = nativeFoldMemory
+        ? new NativeFoldReplay(nativeFoldMemory, () => openStoreReader())
+        : undefined;
     setOutputReserveConfig(config.output_reserve);
     const queriedModels = new Set<string>();
     const rawLimits = new Map<string, { context: number; input?: number; output?: number }>();
@@ -638,8 +673,8 @@ export async function registerContext(context: V2Context) {
      */
     const storeStorageNotice = (sessionID: string, text: string, what: string): void => {
         void withoutSqliteTransformPass(() =>
-            context.session
-                .wait({ sessionID })
+            Promise.resolve()
+                .then(() => context.session.wait({ sessionID }))
                 .then(() => deliverSynthetic(context, sessionID, text))
                 .catch((error: unknown) =>
                     sessionLog(
@@ -735,6 +770,19 @@ export async function registerContext(context: V2Context) {
         }
     });
     await registerHiddenChildAgents(context.agent);
+    // Registered before anything can start a hidden run. A hidden child's tool
+    // call is checked against that agent's fixed allowlist whatever the user's
+    // permissions allow: the host appends the user's rules after the agent's
+    // own, so the agent registration alone cannot keep edit or shell away.
+    await context.tool.hook("execute.before", (draft) => {
+        const refusal = hiddenToolCallRefusal(draft, hiddenChildHook);
+        if (refusal === undefined) return;
+        sessionLog(draft.sessionID, "hidden child tool call refused", {
+            tool: draft.tool,
+            agent: draft.agent ?? null,
+        });
+        throw new HiddenCompletionRefusal("hidden_prompt_unrecognized", refusal, true);
+    });
     let hiddenAgentsReady: Promise<void> | undefined;
     const readerPool = new V2StoreReaderPool();
     const openStoreReader = () =>
@@ -778,12 +826,20 @@ export async function registerContext(context: V2Context) {
         );
     };
     const dreamerAtBoot = config.dreamer;
+    /**
+     * Whether the user's current config turns the dreamer off. `dreamer.disable`
+     * is a live key: the trigger, the schedule timer and `/ctx-dream` re-read it
+     * before every run, and a dreamer turned on after boot is started by the
+     * next context pass (see `runManagedContext`).
+     */
+    const dreamerDisabledNow = (): boolean =>
+        dreamerRunConfig(config, liveConfigReader.poll().effective).dreamer?.disable === true;
     const startDreamer = (executor: HiddenCompletionExecutor) => {
         const projectIdentity = resolveProjectIdentityForSession(
             directory,
             config.allow_home_project,
         );
-        if (!projectIdentity || !dreamerAtBoot || dreamerAtBoot.disable) return undefined;
+        if (!projectIdentity || !dreamerAtBoot || dreamerDisabledNow()) return undefined;
         const cappedExecutor = withLiveDreamerOutputCap(
             executor,
             config,
@@ -1138,6 +1194,17 @@ export async function registerContext(context: V2Context) {
     };
     // Context runs before generation. Persist terminal usage at execution completion
     // so pressure is visible even when the user has not started another turn.
+    const hostFolds =
+        nativeFoldReplay && nativeFoldMemory
+            ? new HostFoldPolicy({
+                  session: context.session,
+                  storage: nativeFoldMemory,
+                  openReader: openStoreReader,
+                  canReplay: (sessionID, reader) => nativeFoldReplay.canReplay(sessionID, reader),
+                  threshold: Number(process.env.MC_OC2_HOST_FOLD_ROWS ?? 1000),
+                  log: sessionLog,
+              })
+            : undefined;
     const usageController = new AbortController();
     const usageDone = (async () => {
         try {
@@ -1149,9 +1216,30 @@ export async function registerContext(context: V2Context) {
                 };
                 if (!event.data?.sessionID) continue;
                 const sessionID = event.data.sessionID;
+                if (
+                    event.type?.startsWith("session.revert.") ||
+                    event.type === "session.message.content.updated"
+                ) {
+                    nativeFoldReplay?.onEvent(event);
+                    restoredRows.forget(sessionID);
+                }
                 if (event.type === "session.error" || event.type === "session.execution.failed") {
                     const error = hiddenTerminalError(event);
                     if (error !== undefined) hiddenSessionErrors.set(sessionID, error);
+                    if (error !== undefined && db && !compactionOff) {
+                        const model = liveModels.get(sessionID);
+                        try {
+                            armLatestThinkingRecoveryFromError({
+                                db,
+                                sessionId: sessionID,
+                                error,
+                                providerID: model?.providerID,
+                                modelID: model?.modelID,
+                            });
+                        } catch (armError) {
+                            log("[magic-context] v2 latest-thinking recovery arm failed", armError);
+                        }
+                    }
                     continue;
                 }
                 if (event.type === "session.deleted") {
@@ -1173,6 +1261,7 @@ export async function registerContext(context: V2Context) {
                     pendingMaterializationSessions.delete(sessionID);
                     lastHeuristicsTurnId.delete(sessionID);
                     restoredRows.forget(sessionID);
+                    await nativeFoldReplay?.forget(sessionID);
                     generateReplay.forget(sessionID);
                     systemPromptRefreshSessions.delete(sessionID);
                     systemPrompt?.clearSession(sessionID);
@@ -1181,11 +1270,19 @@ export async function registerContext(context: V2Context) {
                 }
                 if (event.type !== "session.execution.succeeded") continue;
                 const model = liveModels.get(sessionID);
-                if (model)
+                if (model) {
                     await recordUsage({
                         sessionID,
                         model: { providerID: model.providerID, id: model.modelID },
                     });
+                    // Do not block event handling while the automatic fold runs: idle()
+                    // queues a compaction and then waits for OpenCode to settle it.
+                    if (
+                        !compactionOff &&
+                        typeof (await nativeFoldReplay?.baseline(sessionID)) === "string"
+                    )
+                        void hostFolds?.idle(sessionID);
+                }
             }
         } catch (error) {
             if (!usageController.signal.aborted)
@@ -1231,7 +1328,7 @@ export async function registerContext(context: V2Context) {
         // checkpoint recognizable to the hidden-child guard. This holds even with
         // Magic Context's compaction off, where the host would otherwise summarize
         // the child with a model call and lose the marker.
-        const hiddenSummary = hiddenChildHook.compactionSummary(draft.sessionID);
+        const hiddenSummary = hiddenChildHook.compactionSummary(draft.sessionID, draft.agent);
         if (hiddenSummary !== undefined) {
             draft.result = { summary: hiddenSummary };
             return;
@@ -1239,6 +1336,7 @@ export async function registerContext(context: V2Context) {
         // Leaving `result` unset hands the request back to the host, exactly as if
         // no hook were registered.
         if (compactionOff) return;
+        if (nativeFoldReplay) rememberHostMedia(draft.messages);
         const reader = openStoreReader();
         try {
             const watermark = reader.latestSequenceForIds(
@@ -1269,6 +1367,35 @@ export async function registerContext(context: V2Context) {
                 : moduleBaseline === null
                   ? "typescript_fallback"
                   : "module";
+            if (nativeFoldReplay) {
+                try {
+                    if (await nativeFoldReplay.canReplay(draft.sessionID, reader)) {
+                        const state = getOrCreateSessionMeta(storage.require(), draft.sessionID);
+                        const summary =
+                            moduleBaseline ??
+                            (await nativeFoldReplay.baseline(draft.sessionID)) ??
+                            state.cachedM0Bytes?.toString("utf8") ??
+                            "<session-history></session-history>";
+                        if (
+                            await nativeFoldReplay.supply({
+                                draft,
+                                reader,
+                                previousCut: reader.latestCompaction(draft.sessionID),
+                                summary,
+                            })
+                        ) {
+                            draft.result = { summary };
+                            return;
+                        }
+                    }
+                } catch (error) {
+                    nativeFoldReplay.invalidate(draft.sessionID, true);
+                    sessionLog(
+                        draft.sessionID,
+                        `v2 host fold: legacy compaction reason=${JSON.stringify(String(error))}`,
+                    );
+                }
+            }
             const fold = await folds.supply({
                 sessionID: draft.sessionID,
                 watermark,
@@ -1296,6 +1423,10 @@ export async function registerContext(context: V2Context) {
         // after a host checkpoint can be rebuilt in the host's own shape.
         rememberHostMedia(draft.messages);
         if (hiddenChildHook.apply(draft)) return;
+        // A dreamer that was off at boot and has since been turned on in the
+        // config starts here; startDreamer stays a no-op while it is off.
+        if (dreamTrigger === undefined && hiddenCompletionExecutor !== undefined)
+            dreamTrigger = startDreamer(hiddenCompletionExecutor);
         removeDreamerOnlyTools(draft);
         // A deletion that races an in-flight pass must not let that pass rebuild
         // the state just cleared by the one deletion event.
@@ -1366,13 +1497,78 @@ export async function registerContext(context: V2Context) {
         // descriptions become the baseline every later request (any session,
         // any model) starts from. Registration happens once, in tools.ts.
         applyV2PromptSurfaceTools(draft, promptSurfaceRuntime, config.prompt_surface);
+        const admissionDb = db ?? storage.current();
+        const replayFits: NonNullable<
+            Parameters<typeof tryMessagesTransformLkgReplay>[0]["replayFits"]
+        > = (messages) => {
+            // Every recovery path fits this draft's tools and the system paired
+            // with the saved messages, never the previous turn's tool counts.
+            const system = structuredClone(draft.system);
+            if (
+                !admissionDb ||
+                !draft.tools ||
+                !lkgSystems.restore(draft.sessionID, getSlot(draft.sessionID), draft.system, system)
+            )
+                return false;
+            const limit = lkgReplayLimit({
+                db: admissionDb,
+                sessionId: draft.sessionID,
+                model: {
+                    providerID: draft.model.providerID,
+                    modelID: draft.model.id,
+                },
+                modelKey: `${draft.model.providerID}/${draft.model.id}`,
+            });
+            if (limit === undefined) return false;
+            let toolDefinitionTokens = 0;
+            for (const tool of Object.values(draft.tools)) {
+                if (!tool || typeof tool.description !== "string" || !tool.input) return false;
+                const schema = JSON.stringify(tool.input);
+                if (!schema) return false;
+                toolDefinitionTokens += estimateTokens(tool.description) + estimateTokens(schema);
+            }
+            return (
+                measureLkgReplay({
+                    messages,
+                    limit,
+                    estimate: () =>
+                        estimateFinalWireInputTokens({
+                            messages,
+                            toolDefinitionTokens,
+                            systemPromptTokens: estimateTokens(JSON.stringify(system)),
+                            providerID: draft.model.providerID,
+                            modelID: draft.model.id,
+                            agentName: draft.agent,
+                        }),
+                }).fit === "under"
+            );
+        };
         let postFold = false;
         try {
             // Check writer admission before best-effort setup writers can each spend
             // their own busy timeout. No transform callback runs in this transaction.
-            const admissionDb = db ?? storage.current();
             if (!compactionOff && admissionDb)
-                await withAsyncPrivilegedWriter(admissionDb, () => undefined);
+                await withAsyncPrivilegedWriter(admissionDb, () => undefined, {
+                    beforeRetry: (error) => {
+                        const mapped = adaptPayload(draft);
+                        if (
+                            tryMessagesTransformLkgReplay({
+                                output: mapped as unknown as Parameters<
+                                    ReturnType<typeof createMessagesTransformHandler>
+                                >[1],
+                                sessionId: draft.sessionID,
+                                error,
+                                agent: draft.agent,
+                                rust: transform?.getRustReplayParticipant() ?? undefined,
+                                replayFits,
+                                onLkgReplay: restoreLkgSystem,
+                            })
+                        ) {
+                            mapped.commit();
+                            throw new V2LkgAdmissionReplay();
+                        }
+                    },
+                });
             // Hidden maintenance carriers returned above with their explicit
             // allow-lists. Only this request's map changes, never registrations
             // or the primary session's cached tool definitions.
@@ -1512,7 +1708,7 @@ export async function registerContext(context: V2Context) {
                 pendingMaterializationSessions,
                 lastHeuristicsTurnId,
                 variantBySession: variants,
-                clearReasoningAge: config.clear_reasoning_age,
+                keepReasoningTokens: config.keep_reasoning_tokens,
                 directory,
                 sessionDirectoryBySession: sessionDirectories,
                 projectPath: directory,
@@ -1596,6 +1792,7 @@ export async function registerContext(context: V2Context) {
                         admitted.add(message.id);
                 }
                 const cut = reader.latestCompaction(draft.sessionID);
+                if (nativeFoldReplay) await nativeFoldReplay.observeSource(draft.sessionID, reader);
                 // Before anything restores or trims against the history boundary,
                 // make sure the host store still has it. Only TypeScript mode keeps
                 // its boundary in the compartments this checks; Rust mode's module
@@ -1615,7 +1812,55 @@ export async function registerContext(context: V2Context) {
                 postFold = cut !== undefined;
                 if (cut && !incoming)
                     throw new Error("The host checkpoint disappeared from the context draft");
-                if (cut && incoming) {
+                let nativeRestored: V2Message[] | undefined;
+                if (cut && nativeFoldReplay && isLocalCheckpoint(cut)) {
+                    try {
+                        nativeRestored = await nativeFoldReplay.restore(
+                            draft.sessionID,
+                            cut,
+                            `${draft.model.providerID}/${draft.model.id}`,
+                            { bounded: !rustModeModuleClient },
+                        );
+                    } catch (error) {
+                        nativeFoldReplay.invalidate(draft.sessionID, true);
+                        sessionLog(
+                            draft.sessionID,
+                            "v2 host fold: cache unavailable; restoring host rows",
+                            error,
+                        );
+                        nativeRestored = await nativeFoldReplay.restoreRead(
+                            draft.sessionID,
+                            cut,
+                            draft.model,
+                        );
+                    }
+                }
+                if (nativeRestored && nativeFoldReplay?.sourceChanged(draft.sessionID)) {
+                    // A host edit or revert changed the restored history, so the
+                    // ordinary transform may rebuild the history head (the
+                    // <session-history> block in the first head message). Each rebuild
+                    // changes the request prefix and invalidates the provider's prompt
+                    // cache, so pending operations (queued drops and heuristic
+                    // cleanup) are flagged to apply in that same pass rather than
+                    // causing a second cache rebuild later.
+                    historyRefreshSessions.add(draft.sessionID);
+                    pendingMaterializationSessions.add(draft.sessionID);
+                }
+                if (cut && incoming && nativeRestored) {
+                    const present = new Set(
+                        draft.messages.flatMap((message) => (message.id ? [message.id] : [])),
+                    );
+                    const hidden = nativeRestored.filter((message) => {
+                        const id = nativeRowID(message);
+                        return !id || !present.has(id);
+                    });
+                    draft.messages.splice(
+                        0,
+                        draft.messages.length,
+                        ...hidden,
+                        ...draft.messages.filter((message) => message !== incoming),
+                    );
+                } else if (cut && incoming) {
                     const identity = await folds.observe({
                         sessionID: draft.sessionID,
                         cutSeq: cut.seq,
@@ -1722,6 +1967,14 @@ export async function registerContext(context: V2Context) {
                         `v2 boundary trim: dropped ${dropped} messages before the module boundary`,
                     );
             }
+            let nativeMessages: V2Message[] | undefined;
+            if (nativeFoldReplay) {
+                try {
+                    nativeMessages = copyNativeInput(draft.messages);
+                } catch {
+                    nativeFoldReplay.invalidate(draft.sessionID, true);
+                }
+            }
             const mapped = adaptPayload(draft, admitted);
             beginV2LkgRequest(
                 draft.sessionID,
@@ -1731,6 +1984,7 @@ export async function registerContext(context: V2Context) {
             await createMessagesTransformHandler({
                 magicContext: { "experimental.chat.messages.transform": transform },
                 compactionOff,
+                replayFits,
                 onLkgReplay: restoreLkgSystem,
                 rustReplayParticipant: () => transform?.getRustReplayParticipant() ?? null,
             })(
@@ -1772,6 +2026,18 @@ export async function registerContext(context: V2Context) {
                     );
                 }
             }
+            if (nativeMessages && !checkpoint) {
+                try {
+                    await nativeFoldReplay?.capture(draft, nativeMessages);
+                } catch (error) {
+                    nativeFoldReplay?.invalidate(draft.sessionID, true);
+                    sessionLog(
+                        draft.sessionID,
+                        "v2 host fold: optional capture unavailable",
+                        error,
+                    );
+                }
+            }
             const capturedSlot = getSlot(draft.sessionID);
             if (
                 capturedSlot &&
@@ -1783,6 +2049,7 @@ export async function registerContext(context: V2Context) {
                 lkgSystems.capture(draft.sessionID, capturedSlot, systemAtEntry, draft.system);
             }
         } catch (error) {
+            if (error instanceof V2LkgAdmissionReplay) return;
             if (error instanceof V2ContextRefusal) throw error;
             if (
                 !compactionOff &&
@@ -1792,6 +2059,7 @@ export async function registerContext(context: V2Context) {
                     const mapped = adaptPayload(draft);
                     try {
                         await createMessagesTransformHandler({
+                            replayFits,
                             onLkgReplay: restoreLkgSystem,
                             rustReplayParticipant: () =>
                                 transform?.getRustReplayParticipant() ?? null,
@@ -1951,11 +2219,11 @@ export async function registerContext(context: V2Context) {
     // The v2 TUI reaches manual dreaming through RPC because this host has no
     // command-template path. The run continues in the background and reports its
     // result through the notification socket.
-    const manualDreamer =
-        config.dreamer && config.dreamer.disable !== true ? config.dreamer : undefined;
     rpcServer.handle("dream", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
+        // Read per request: `dreamer.disable` takes effect without a restart.
+        const manualDreamer = config.dreamer && !dreamerDisabledNow() ? config.dreamer : undefined;
         if (!manualDreamer || !hiddenCompletionExecutor) {
             pushNotification(
                 "toast",

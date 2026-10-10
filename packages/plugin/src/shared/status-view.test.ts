@@ -118,7 +118,12 @@ describe("status view model", () => {
         expect(rowLabels("Tags")).toEqual(["Active", "Dropped", "Total"]);
         expect(rowLabels("Reductions")).toEqual(["Execute threshold", "Last reduce anchor"]);
         expect(rowLabels("Pending Queue")).toEqual(["Drops", "Marker"]);
-        expect(rowLabels("Context Details")).toEqual(["Protected tags", "Subagent"]);
+        expect(rowLabels("Context Details")).toEqual([
+            "Protected tags",
+            "Subagent",
+            "Denominator",
+            "Window source",
+        ]);
         expect(rowLabels("Cache TTL")).toEqual([
             "Configured",
             "Last response",
@@ -398,6 +403,15 @@ describe("status view model", () => {
      * (issue 496).
      */
     describe("blocked background maintenance", () => {
+        test("shows a scheduled task's primary quota deadline in the status dialog", () => {
+            const error =
+                "primary quota exhausted until 2026-10-08T03:40:04.275Z; account=private@example.com";
+            const row = view({ dreamerFailures: [{ task: "verify", error }] })
+                .sections.find((section) => section.title === "History Compression")
+                ?.rows.find((entry) => entry.label === "Dreamer quota");
+            expect(row?.value).toBe("primary quota exhausted until 2026-10-08T03:40:04.275Z");
+            expect(row?.tone).toBe("warning");
+        });
         const failure = {
             at: NOW - 2 * 3_600_000,
             stage: "message-history maintenance",

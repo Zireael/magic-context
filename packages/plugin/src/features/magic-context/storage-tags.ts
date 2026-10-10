@@ -702,6 +702,34 @@ export function getAllStatusTagTokenTotalsFlat(
     return { totals, nullMessageIds };
 }
 
+/** Only message tags prove ownership of their own assistant's reasoning group.
+ * Tool tags describe the preceding thought, not their tool owner, and parallel
+ * tools repeat that estimate. Repeated text tags likewise charge the group once.
+ */
+export function getReasoningTokenEstimatesByMessage(
+    db: Database,
+    sessionId: string,
+    proseRatio: number,
+): Map<string, number> {
+    const rows = db
+        .prepare(
+            `SELECT type, message_id, tool_owner_message_id, reasoning_token_count FROM tags WHERE session_id = ? AND reasoning_token_count IS NOT NULL`,
+        )
+        .all(sessionId) as Array<{
+        type: string;
+        message_id: string;
+        tool_owner_message_id: string | null;
+        reasoning_token_count: number;
+    }>;
+    const totals = new Map<string, number>();
+    for (const row of rows) {
+        if (row.type !== "message") continue;
+        const id = ownerMessageIdForTagRow(row);
+        totals.set(id, Math.max(totals.get(id) ?? 0, row.reasoning_token_count * proseRatio));
+    }
+    return totals;
+}
+
 /** Bump a tag's input_token_count — the token mirror of `updateTagInputByteSize`. */
 export function updateTagInputTokenCount(
     db: Database,
@@ -1737,6 +1765,7 @@ export function adoptPiFallbackToolOwnerTag(
     callId: string,
     oldOwnerMessageId: string,
     newOwnerMessageId: string,
+    servedTagNumbers: ReadonlySet<number> = new Set(),
 ): PiFallbackTagAdoptionResult {
     const survivor = getPiFallbackFoldTagRowByNumber(db, sessionId, tagNumber);
     if (
@@ -1769,9 +1798,18 @@ export function adoptPiFallbackToolOwnerTag(
         return { action: "skipped" };
     }
 
-    // The real-id row may have been allocated by a racing pass after adoption's
-    // probe. Preserve that row's tag number so the §N§ already sent on the wire
-    // remains stable, and fold the stale fallback row into it.
+    if (servedTagNumbers.has(survivor.tagNumber)) {
+        if (servedTagNumbers.has(existing.tagNumber)) {
+            throw new Error("Conflicting served Pi tool tag numbers; refusing identity adoption");
+        }
+        foldDuplicateIntoSurvivor(db, sessionId, survivor, existing);
+        db.prepare(
+            "UPDATE tags SET tool_owner_message_id = ? WHERE session_id = ? AND tag_number = ?",
+        ).run(newOwnerMessageId, sessionId, tagNumber);
+        return { action: "folded", tagNumber, deletedTagNumbers: [existing.tagNumber] };
+    }
+    // A served real identity wins over an unsent fallback. Without served
+    // evidence either identity is safe; prefer the already-canonical real key.
     foldDuplicateIntoSurvivor(db, sessionId, existing, survivor);
     return {
         action: "folded",
@@ -1786,6 +1824,7 @@ export function adoptPiFallbackMessageTag(
     tagNumber: number,
     oldFallbackMessageId: string,
     newRealMessageId: string,
+    servedTagNumbers: ReadonlySet<number> = new Set(),
 ): PiFallbackTagAdoptionResult {
     if (oldFallbackMessageId.startsWith(WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX)) {
         return { action: "skipped" };
@@ -1819,16 +1858,28 @@ export function adoptPiFallbackMessageTag(
         return (result.changes ?? 0) > 0 ? { action: "rekeyed", tagNumber } : { action: "skipped" };
     }
 
-    // A real-id row can appear after the adoption probe but before allocation.
-    // Keep its already-visible tag identity and merge every fallback/duplicate
-    // row into it, rather than replacing the §N§ emitted by the racing pass.
-    const realSurvivor = duplicates[0];
+    // Allocation is not a serve acknowledgement. Preserve the number observed
+    // in a returned array; only prefer the canonical key when neither was sent.
+    const servedRows = [survivor, ...duplicates].filter((row) =>
+        servedTagNumbers.has(row.tagNumber),
+    );
+    if (servedRows.length > 1) {
+        throw new Error("Conflicting served Pi message tag numbers; refusing identity adoption");
+    }
+    const realSurvivor = servedRows[0] ?? duplicates[0];
     if (!realSurvivor) return { action: "skipped" };
-    const deletedTagNumbers = [tagNumber];
-    foldDuplicateIntoSurvivor(db, sessionId, realSurvivor, survivor);
-    for (const duplicate of duplicates.slice(1)) {
+    const deletedTagNumbers: number[] = [];
+    for (const duplicate of [survivor, ...duplicates]) {
+        if (duplicate.tagNumber === realSurvivor.tagNumber) continue;
         foldDuplicateIntoSurvivor(db, sessionId, realSurvivor, duplicate);
         deletedTagNumbers.push(duplicate.tagNumber);
+    }
+    if (realSurvivor.tagNumber === tagNumber) {
+        db.prepare("UPDATE tags SET message_id = ? WHERE session_id = ? AND tag_number = ?").run(
+            newRealMessageId,
+            sessionId,
+            tagNumber,
+        );
     }
     return {
         action: "folded",

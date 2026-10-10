@@ -713,7 +713,7 @@
           "type": "number"
         },
         "expand_tools": {
-          "description": "Readable historian tool expansions, keyed by exact host tool name. Templates override built-in defaults; false disables an expansion. Supports ${input.path}, ${output.path}, bare ${output}, array [N], [*].field, .each(\"${field}\"), .join(\"separator\"), .count and final .truncate(N). Missing fields are empty; placeholders default to 300 characters, lists to 10 elements, expansions to 1000 characters. Valid in user and project config; affects historian/recomp and verbose ctx_expand only, never the wire or default ctx_expand transcript.",
+          "description": "Readable historian tool expansions, keyed by exact host tool name. Templates override built-in defaults; false disables an expansion. Supports ${input.path}, ${output.path}, bare ${output}, array [N], [*].field, .each(\"${field}\"), .join(\"separator\"), .count and final .truncate(N). Missing fields are empty. Historian text and lists have no implicit caps; explicit .truncate(N) keeps complete sentences and marks omitted characters, or emits only the marker if no sentence fits. When the ctx_expand history-recovery tool is called in verbose mode, its tool-call previews retain their original built-in templates and limits (300 characters per placeholder, 10 list elements, 1000 characters per expansion). Valid in user and project config; never changes the wire or default ctx_expand transcript.",
           "x-mc-live-reload": true,
           "type": "object",
           "propertyNames": {
@@ -1065,6 +1065,7 @@
         },
         "disable": {
           "description": "Disable this agent",
+          "x-mc-live-reload": true,
           "type": "boolean"
         },
         "description": {
@@ -2240,10 +2241,33 @@
       "deprecated": true
     },
     "clear_reasoning_age": {
-      "default": 50,
-      "description": "Clear reasoning/thinking blocks older than N tags (default: 50)",
-      "type": "number",
-      "minimum": 10
+      "description": "Deprecated and ignored. Use keep_reasoning_tokens instead.",
+      "deprecated": true
+    },
+    "keep_reasoning_tokens": {
+      "description": "Reasoning tokens to keep on rebuilding passes. Number or per-model object; exact, shorter model keys, provider/*, then default. Omitted: fixed 10,000. 0 removes all eligible historical reasoning; newest and exempt steps always stay.",
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            }
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000
+          }
+        }
+      ]
     },
     "history_budget_percentage": {
       "default": 0.15,
