@@ -92,7 +92,11 @@ function findSessionMeta(db: Database, sessionId: string): SessionMeta | undefin
     return isSessionMetaRow(result) ? toSessionMeta(result) : undefined;
 }
 
-/** Read metadata without creating a row when a contention fallback has no writer. */
+/**
+ * Read session metadata, returning defaults instead of inserting a row. The
+ * history-head fallback that runs when another process holds the database write
+ * lock uses this: inserting would need that same lock, fail, and refuse the turn.
+ */
 export function readSessionMeta(db: Database, sessionId: string): SessionMeta {
     return findSessionMeta(db, sessionId) ?? getDefaultSessionMeta(sessionId);
 }

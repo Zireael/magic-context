@@ -1605,8 +1605,9 @@ function renderFreshM0PiNonPersisted(
 	);
 	const memoryBudget =
 		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
-	// Use the same mural plan as a HARD fold, but never require a database writer
-	// while serving the non-persisted contention fallback.
+	// Render the same mural image a full history rebuild would, so the bytes match
+	// what the next saved rebuild serves, but without saving it: this fallback runs
+	// only because another process holds the database write lock.
 	const mural = resolveMuralForM0Pi(
 		state,
 		db,

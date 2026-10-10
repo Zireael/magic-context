@@ -131,8 +131,10 @@ function harness(runtime: "TS" | "Pi", db: Database, muralEnabled = true) {
             pi.allowFreshContentionFallback = true;
         },
         forceSoftFailure(enabled: boolean) {
-            // Fail acquisition before any writer exists, so an accidental mural
-            // upsert would succeed and the zero-write assertion would detect it.
+            // Make the history-head refresh fail as if its write lock were busy, but
+            // with no other connection actually holding a lock. A mural upsert from
+            // the fallback would then succeed instead of failing, so the zero-write
+            // assertion (total_changes) is what catches it.
             const fail = enabled
                 ? () => {
                       throw new Error("forced soft acquisition failure");

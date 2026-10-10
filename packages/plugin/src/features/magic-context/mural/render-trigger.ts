@@ -108,9 +108,10 @@ export function muralCoverageGate(cuedMemoryCount: number, activeMemoryCount: nu
  * render. Returns the wire data for the injection path.
  *
  * @param budgetTokens the project memory injection budget, so the overflow set
- *   matches exactly what the m0 path dropped.
- * @param mode read-only reuses a matching stored PNG or renders the same plan
- *   without upserting, so writer contention cannot block a fresh history render.
+ *   matches exactly the memories the history head left out for lack of room.
+ * @param mode `read-only` reuses a matching stored PNG, or renders the same plan
+ *   without saving it. The history-head fallback that runs when another process
+ *   holds the database write lock uses it: saving would need that lock and fail.
  */
 export function ensureMuralRendered(
     db: Database,
