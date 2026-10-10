@@ -1027,7 +1027,7 @@ describe("Pi system-prompt section injection (#649)", () => {
 		await runtime.emitPiEvent("session_start", {}, ctx);
 
 		// Oh My Pi's before_agent_start event has no systemPromptOptions
-		// (issue #649, maintainer host matrix): the handler must not throw
+		// (verified on Oh My Pi 18.2.6 and 18.8.7): the handler must not throw
 		// and must keep injecting via a forced prompt return, or requests
 		// would go out with no guidance block at all.
 		const event = {

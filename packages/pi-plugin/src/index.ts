@@ -2445,11 +2445,19 @@ async function startPiMagicContextRuntime(
 			// recorded in the transcript but never sent to the provider
 			// (Pi renders forceSystemPrompt instead of the structured
 			// sections), so any extension registered after us silently
-			// loses its system-prompt section (issue #649). Oh My Pi's
-			// before_agent_start event has no systemPromptOptions at all
-			// (host matrix in #649), so the forced prompt return below
-			// remains the only injection path there.
-			const hostSections = event.systemPromptOptions?.sections;
+			// loses its system-prompt section. Oh My Pi's before_agent_start
+			// event has no systemPromptOptions at all, and Pi releases
+			// before 0.87 have no `sections` field, so the forced prompt
+			// return below remains the only injection path on those hosts.
+			// The plugin compiles against Pi 0.83 types, which predate
+			// `sections`; the widened type below describes newer hosts
+			// without claiming the field always exists.
+			const promptOptions:
+				| (NonNullable<typeof event.systemPromptOptions> & {
+						sections?: Record<string, string>;
+				  })
+				| undefined = event.systemPromptOptions;
+			const hostSections = promptOptions?.sections;
 			if (block && hostSections) {
 				hostSections.magic_context = block;
 			}
@@ -2494,7 +2502,7 @@ async function startPiMagicContextRuntime(
 			// On hosts with a sections API (Pi) the block already went
 			// out as a structured section above; returning a forced
 			// prompt here would hide later extensions' sections from the
-			// provider (issue #649). Only hosts without that API
+			// provider. Only hosts without that API
 			// (Oh My Pi) still need the forced return. Pi's prompt has
 			// no `Today's date:` line for processSystemPromptForCache
 			// to freeze, so dropping the force there loses nothing.

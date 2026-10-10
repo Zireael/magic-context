@@ -301,13 +301,14 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 	test("system-prompt injection prefers sections, with a guarded forced fallback for hosts without them", () => {
 		// Pi exposes systemPromptOptions.sections; Oh My Pi's
 		// before_agent_start event has no systemPromptOptions at all
-		// (issue #649, maintainer host matrix). Injection must prefer the
+		// (verified on Oh My Pi 18.2.6 and 18.8.7). Injection must prefer the
 		// shared sections map — an unconditional forced return hides later
 		// extensions' sections on Pi — and fall back to a forced prompt
 		// only when the host has no sections API, because an unconditional
 		// sections assignment throws on Oh My Pi and the handler's catch
 		// would then drop our guidance block entirely.
-		expect(code).toContain("event.systemPromptOptions?.sections");
+		expect(code).toContain("= event.systemPromptOptions;");
+		expect(code).toContain("const hostSections = promptOptions?.sections;");
 		expect(code).toContain("hostSections.magic_context = block");
 		// Exactly two forced fallbacks exist, each on its explicit
 		// no-sections guard: an unguarded forced return adds a third match
