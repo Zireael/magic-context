@@ -2428,21 +2428,37 @@ async function startPiMagicContextRuntime(
 				existingSystemPrompt: event.systemPrompt,
 			});
 
-			// Compose the final system prompt: base prompt from Pi + our
-			// magic-context block. We always run hash detection on the
-			// composed string so even sessions with no data block (e.g.
-			// memories disabled, no docs, no key files) still get
-			// sticky-date freezing and hash-change tracking.
+			// Compose the reference system prompt (base prompt from Pi +
+			// our magic-context block) for hash detection. We always run
+			// hash detection on the composed string so even sessions with
+			// no data block (e.g. memories disabled, no docs, no key
+			// files) still get hash-change tracking.
 			const composedPrompt = composeMagicContextSystemPrompt(
 				event.systemPrompt,
 				block,
 			);
 
+			// Inject through the host's structured sections API when it has
+			// one. On Pi, returning `systemPrompt` from before_agent_start
+			// makes the host replace the WHOLE prompt with opaque text:
+			// sections set by later-registered extensions are then still
+			// recorded in the transcript but never sent to the provider
+			// (Pi renders forceSystemPrompt instead of the structured
+			// sections), so any extension registered after us silently
+			// loses its system-prompt section (issue #649). Oh My Pi's
+			// before_agent_start event has no systemPromptOptions at all
+			// (host matrix in #649), so the forced prompt return below
+			// remains the only injection path there.
+			const hostSections = event.systemPromptOptions?.sections;
+			if (block && hostSections) {
+				hostSections.magic_context = block;
+			}
+
 			if (!sessionId) {
-				// No session id yet — return the composed prompt without
-				// cache logic. The next turn (with a session id) will
-				// compute the first hash and set sticky date.
-				if (block) return { systemPrompt: composedPrompt };
+				// No session id yet — inject without cache logic. The
+				// next turn (with a session id) will compute the first
+				// hash and set sticky date.
+				if (block && !hostSections) return { systemPrompt: composedPrompt };
 				return;
 			}
 
@@ -2475,6 +2491,16 @@ async function startPiMagicContextRuntime(
 				clearSystemPromptRefresh(sessionId);
 			}
 
+			// On hosts with a sections API (Pi) the block already went
+			// out as a structured section above; returning a forced
+			// prompt here would hide later extensions' sections from the
+			// provider (issue #649). Only hosts without that API
+			// (Oh My Pi) still need the forced return. Pi's prompt has
+			// no `Today's date:` line for processSystemPromptForCache
+			// to freeze, so dropping the force there loses nothing.
+			if (hostSections) {
+				return;
+			}
 			return { systemPrompt: result.systemPrompt };
 		} catch (error) {
 			warn("failed to build magic-context block:", error);
