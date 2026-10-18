@@ -492,3 +492,136 @@ describe("issue #723: hole-padded NUL tails in the served ledgers", () => {
 		);
 	});
 });
+
+describe("issue #723: writer hardening for zero-filled appends", () => {
+	function padNulTail(file: string, bytes: number): void {
+		appendFileSync(file, Buffer.alloc(bytes));
+	}
+
+	test("an append strips an existing hole tail first so the hole does not grow", () => {
+		const storageDir = temporaryDirectory();
+		capturePiServedArray("w-strip", [], { storageDir, servedTagNumbers: [3] });
+		flushPiServedArrayLedger();
+		const file = getPiServedArrayLedgerPath("w-strip", storageDir);
+		const firstRow = readFileSync(file, "utf8");
+		padNulTail(file, 512);
+
+		__test.reset();
+		const second = capturePiServedArray("w-strip", [message(0)], {
+			storageDir,
+			servedTagNumbers: [3],
+			now: new Date("2026-09-04T10:00:01.000Z"),
+		});
+		flushPiServedArrayLedger();
+
+		const bytes = readFileSync(file);
+		expect(bytes.includes(0)).toBe(false);
+		const rows = bytes
+			.toString("utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		const first = JSON.parse(firstRow);
+		expect(rows).toHaveLength(2);
+		expect(rows[0].sha256).toBe(first.sha256);
+		expect(rows[1].sha256).toBe(second?.sha256);
+		// __test.reset() cleared the in-memory pass mirror, so the second record
+		// opens a fresh sequence; the previous-sha chain only holds in production.
+		expect(rows[1].sequence).toBe(1);
+		expect(getPiLastServedDigest("w-strip", storageDir)).toBe(second?.sha256);
+	});
+
+	test("a zero-filled append region is rewritten and the ledger reads back intact", () => {
+		const storageDir = temporaryDirectory();
+		capturePiServedArray("w-zero", [], { storageDir, servedTagNumbers: [3] });
+		flushPiServedArrayLedger();
+		const file = getPiServedArrayLedgerPath("w-zero", storageDir);
+		const firstRow = JSON.parse(readFileSync(file, "utf8"));
+
+		__test.reset();
+		const second = capturePiServedArray("w-zero", [message(0)], {
+			storageDir,
+			servedTagNumbers: [3],
+			now: new Date("2026-09-04T10:00:01.000Z"),
+		});
+
+		// Reproduce the Windows/Bun failure observed in #723: the append call
+		// reports success but the kernel persists the region as zero bytes.
+		const realWrite = storagePermissions.writeStorageFileSync;
+		let zeroFills = 0;
+		const writer = spyOn(
+			storagePermissions,
+			"writeStorageFileSync",
+		).mockImplementation((path, content, ...options) => {
+			const appended = options[0] as { flag?: string } | undefined;
+			if (appended?.flag === "a") {
+				zeroFills += 1;
+				return realWrite(
+					path as string,
+					Buffer.alloc(Buffer.byteLength(content as string)),
+					...options,
+				);
+			}
+			return realWrite(path as string, content as string, ...options);
+		});
+		try {
+			flushPiServedArrayLedger();
+		} finally {
+			writer.mockRestore();
+		}
+		expect(zeroFills).toBeGreaterThan(0);
+
+		const bytes = readFileSync(file);
+		expect(bytes.includes(0)).toBe(false);
+		const rows = bytes
+			.toString("utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line)) as Array<{
+			sha256: string;
+			previous_sha256: string | null;
+		}>;
+		expect(rows).toHaveLength(2);
+		expect(rows[0].sha256).toBe(firstRow.sha256);
+		expect(rows[1].sha256).toBe(second?.sha256);
+		expect(getPiLastServedDigest("w-zero", storageDir)).toBe(second?.sha256);
+	});
+
+	test("verify and rewrite helpers confine the repair to the appended region", () => {
+		const storageDir = temporaryDirectory();
+		capturePiServedArray("w-region", [], { storageDir, servedTagNumbers: [3] });
+		flushPiServedArrayLedger();
+		const file = getPiServedArrayLedgerPath("w-region", storageDir);
+		const sizeBefore = statSync(file).size;
+		const previous = readFileSync(file);
+		const content = `${JSON.stringify({
+			version: 1,
+			session_id: "w-region",
+			sequence: 2,
+			sha256: "a".repeat(64),
+		})}\n`;
+		// Our region lands as a hole, and a peer appends complete lines after it.
+		appendFileSync(file, Buffer.alloc(content.length));
+		const peerJunk = `${JSON.stringify({ peerAppended: true })}\n`;
+		appendFileSync(file, peerJunk);
+
+		expect(
+			__test.verifyAppendedRegion(file, sizeBefore, content),
+		).toBe(false);
+		__test.rewriteAppendedRegion(file, sizeBefore, content);
+		expect(
+			__test.verifyAppendedRegion(file, sizeBefore, content),
+		).toBe(true);
+
+		const bytes = readFileSync(file);
+		expect(
+			bytes.subarray(0, sizeBefore).equals(previous),
+		).toBe(true);
+		expect(
+			bytes.toString("utf8", sizeBefore, sizeBefore + content.length),
+		).toBe(content);
+		expect(
+			bytes.toString("utf8", sizeBefore + content.length),
+		).toBe(peerJunk);
+	});
+});

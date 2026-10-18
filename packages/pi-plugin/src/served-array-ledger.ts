@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import {
+	closeSync,
+	openSync,
+	readFileSync,
+	readSync,
+	statSync,
+	writeSync,
+} from "node:fs";
 import * as path from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { log } from "@magic-context/core/shared/logger";
@@ -389,13 +396,111 @@ function recordWriteFailure(error: unknown): void {
 	}
 }
 
+/** Read only the file tail to decide whether the expensive full-file strip is needed. */
+const APPEND_TAIL_PROBE_BYTES = 64 * 1024;
+
+function isEnoent(error: unknown): boolean {
+	return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+/**
+ * Windows/Bun can commit a file-size extension while the data write is killed,
+ * leaving valid records followed by a zero-filled hole (#723). An append over
+ * such a tail would grow the hole into the middle of the next read, so strip
+ * the hole first — the reader's repair idiom, reused with a different label.
+ */
+function stripNulTailBeforeAppend(filePath: string): void {
+	try {
+		const size = statSync(filePath).size;
+		if (!size) return;
+		const fd = openSync(filePath, "r");
+		let tailHasNuls = false;
+		try {
+			const start = Math.max(0, size - APPEND_TAIL_PROBE_BYTES);
+			const probe = Buffer.alloc(size - start);
+			readSync(fd, probe, 0, probe.length, start);
+			tailHasNuls = probe.includes(0);
+		} finally {
+			closeSync(fd);
+		}
+		if (!tailHasNuls) return;
+	} catch (error) {
+		if (isEnoent(error)) return;
+		throw error;
+	}
+	const bytes = readFileSync(filePath);
+	const sanitized = splitNulTail(bytes);
+	if (!sanitized.nulTailBytes) return;
+	if (sanitized.midFileNul) {
+		// Zeros inside recorded content are the reader's typed fail-closed case.
+		log(`[magic-context][pi] append skipped NUL-tail strip in ${path.basename(filePath)}: zeros inside recorded content`);
+		return;
+	}
+	repairNulTailOnDisk(filePath, bytes, sanitized.nulTailBytes, "append");
+}
+
+function currentSize(filePath: string): number {
+	try {
+		return statSync(filePath).size;
+	} catch (error) {
+		if (isEnoent(error)) return 0;
+		throw error;
+	}
+}
+
+function verifyAppendedRegion(
+	filePath: string,
+	offset: number,
+	content: string,
+): boolean {
+	const expected = Buffer.from(content, "utf8");
+	if (expected.length === 0) return true;
+	const fd = openSync(filePath, "r");
+	try {
+		const buffer = Buffer.alloc(expected.length);
+		readSync(fd, buffer, 0, expected.length, offset);
+		return buffer.equals(expected);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** Rewrite only our own appended bytes: a peer append past the region keeps its bytes. */
+function rewriteAppendedRegion(
+	filePath: string,
+	offset: number,
+	content: string,
+): void {
+	const expected = Buffer.from(content, "utf8");
+	log(
+		`[magic-context][pi] repairing zero-filled append region in ${path.basename(filePath)}`,
+	);
+	const fd = openSync(filePath, "r+");
+	try {
+		writeSync(fd, expected, 0, expected.length, offset);
+	} finally {
+		closeSync(fd);
+	}
+	if (!verifyAppendedRegion(filePath, offset, content))
+		throw new Error(
+			"ledger append persisted as a zero-filled region after repair",
+		);
+}
+
 function appendPendingLines(filePath: string, lines: string[]): void {
 	try {
 		ensureStorageDirectorySync(path.dirname(filePath));
-		writeStorageFileSync(filePath, lines.join(""), {
+		stripNulTailBeforeAppend(filePath);
+		const content = lines.join("");
+		const offset = currentSize(filePath);
+		writeStorageFileSync(filePath, content, {
 			encoding: "utf8",
 			flag: "a",
 		});
+		// The append reports success even when the region persists as a hole,
+		// so verify the bytes we own and rewrite them once if the disk does not.
+		if (!verifyAppendedRegion(filePath, offset, content))
+			rewriteAppendedRegion(filePath, offset, content);
 	} catch (error) {
 		recordWriteFailure(error);
 	}
@@ -575,6 +680,8 @@ export const __test = {
 	blockVector,
 	firstDivergence,
 	fullBodyCaptureEnabled,
+	rewriteAppendedRegion,
+	verifyAppendedRegion,
 	getDiagnostics: () => ({ swallowedWriteCount, lastWriteError }),
 	reset(): void {
 		flushPiServedArrayLedger();
