@@ -1,12 +1,10 @@
 name: Windows Build
 
 on:
-  push:
-    branches:
-      - "fix/issue-97-multiplying-numbers"
-  pull_request:
-    branches:
-      - "fix/issue-97-multiplying-numbers"
+  # Automatic triggers (push / pull_request / schedule / release /
+  # workflow_run / ...) were removed on 2026-10-31. This workflow now
+  # runs only when started by hand: Actions tab -> Run workflow, or
+  # `gh workflow run <file>`.
   workflow_dispatch: # Allows you to manually trigger the build from the Actions tab
 
 jobs:
